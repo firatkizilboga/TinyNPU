@@ -1,0 +1,24 @@
+# Makefile for streaming skewer test
+
+SIM ?= verilator
+TOPLEVEL_LANG ?= verilog
+
+# RTL source files
+VERILOG_SOURCES = $(PWD)/../../rtl/defines.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/skewer.sv
+
+# Toplevel module
+TOPLEVEL = streaming_skewer
+
+# Python test module  
+MODULE = test_streaming_skewer
+
+# Include paths
+ifeq ($(SIM),verilator)
+    COMPILE_ARGS += -I$(PWD)/../../rtl -Wno-fatal --hierarchical
+else
+    COMPILE_ARGS += -g2012 -I$(PWD)/../../rtl
+endif
+
+# Include CocoTB makefiles
+include $(shell cocotb-config --makefiles)/Makefile.sim

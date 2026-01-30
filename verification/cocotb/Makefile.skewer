@@ -1,26 +1,23 @@
-# Makefile for CocoTB simulation
+# Makefile for skewer + systolic array test
 
-# Default simulator
 SIM ?= icarus
-
-# Toplevel RTL module
 TOPLEVEL_LANG ?= verilog
 
 # RTL source files
 VERILOG_SOURCES = $(PWD)/../../rtl/defines.sv
 VERILOG_SOURCES += $(PWD)/../../rtl/pe.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/systolic_array.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/skewer.sv
+VERILOG_SOURCES += $(PWD)/skewer_array_tb.sv
 
-# Toplevel module for PE test
-TOPLEVEL = pe
+# Toplevel module
+TOPLEVEL = skewer_array_tb
 
-# Python test module
-MODULE = test_pe
+# Python test module  
+COCOTB_TEST_MODULES = test_skewer
 
 # Include paths
 COMPILE_ARGS += -g2012 -I$(PWD)/../../rtl
-
-# Enable waveform dumping (use SIM_ARGS for vvp runtime arguments)
-SIM_ARGS += -lx2
 
 # Include CocoTB makefiles
 include $(shell cocotb-config --makefiles)/Makefile.sim

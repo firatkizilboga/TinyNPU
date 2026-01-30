@@ -1,0 +1,25 @@
+# Makefile for TinyNPU Top integration test
+
+SIM ?= verilator
+TOPLEVEL_LANG ?= verilog
+
+VERILOG_SOURCES = $(PWD)/../../rtl/defines.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/pe.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/systolic_array.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/skewer.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/unified_buffer.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/tinynpu_top.sv
+
+TOPLEVEL = tinynpu_top
+
+MODULE = test_top_markers
+
+ifeq ($(SIM),verilator)
+    COMPILE_ARGS += -I$(PWD)/../../rtl -Wno-fatal
+else
+    COMPILE_ARGS += -g2012 -I$(PWD)/../../rtl
+endif
+
+SIM_ARGS += -lx2
+
+include $(shell cocotb-config --makefiles)/Makefile.sim

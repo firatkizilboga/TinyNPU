@@ -1,0 +1,2 @@
+WARNING: /home/firatkizilboga/TinyNPU/verification/cocotb/../../rtl/unified_buffer.sv:43: $readmemh: The behaviour for reg[...] mem[N:0]; $readmemh("...", mem); changed in the 1364-2005 standard. To avoid ambiguity, use mem[0:N] or explicit range parameters $readmemh("...", mem, start, stop);. Defaulting to 1364-2005 behavior.
+WARNING: /home/firatkizilboga/TinyNPU/verification/cocotb/../../rtl/unified_buffer.sv:43: $readmemh(buffer_init.hex): Not enough words in the file for the requested range [0:1023].
