@@ -1,2 +1,6 @@
 docs/sv_guide.pdf
 docs/project-description.pdf
+verification/cocotb/results.xml
+verification/cocotb/__pycache__
+verification/cocotb/sim_build
+.nvim/

@@ -1,0 +1,42 @@
+// Unified Buffer Initialization File
+// Format: 64-bit hex values (16 digits), one per line
+// Each line = 4 x 16-bit packed values (element 0 at LSB)
+// Memory layout: memory[0], memory[1], ... memory[BUFFER_DEPTH-1]
+//
+// Example unpacking for line "0004000300020001":
+//   element[0] = 0x0001
+//   element[1] = 0x0002
+//   element[2] = 0x0003
+//   element[3] = 0x0004
+
+// Row 0-7: Simple test pattern (incrementing values)
+0004000300020001
+0008000700060005
+000C000B000A0009
+0010000F000E000D
+0014001300120011
+0018001700160015
+001C001B001A0019
+0020001F001E001D
+
+// Row 8-15: Identity-like pattern (diagonal ones)
+0000000000000001
+0000000000010000
+0000000100000000
+0001000000000000
+0000000000000001
+0000000000010000
+0000000100000000
+0001000000000000
+
+// Row 16-23: All zeros (padding)
+0000000000000000
+0000000000000000
+0000000000000000
+0000000000000000
+0000000000000000
+0000000000000000
+0000000000000000
+0000000000000000
+
+// Remaining rows default to X/0 (uninitialized)

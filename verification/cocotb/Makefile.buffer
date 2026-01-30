@@ -1,0 +1,30 @@
+# Makefile for unified buffer CocoTB simulation
+
+# Default simulator
+SIM ?= icarus
+
+# Toplevel RTL module
+TOPLEVEL_LANG ?= verilog
+
+# RTL source files
+VERILOG_SOURCES = $(PWD)/../../rtl/defines.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/unified_buffer.sv
+
+# Toplevel module
+TOPLEVEL = unified_buffer
+
+# Python test module
+MODULE = test_unified_buffer
+
+# Include paths
+ifeq ($(SIM),verilator)
+    COMPILE_ARGS += -I$(PWD)/../../rtl -Wno-fatal
+else
+    COMPILE_ARGS += -g2012 -I$(PWD)/../../rtl
+endif
+
+# Enable waveform dumping
+SIM_ARGS += -lx2
+
+# Include CocoTB makefiles
+include $(shell cocotb-config --makefiles)/Makefile.sim
