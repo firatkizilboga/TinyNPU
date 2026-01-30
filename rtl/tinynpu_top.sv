@@ -53,7 +53,12 @@ module tinynpu_top (
     output logic                      input_first_out,   // First input hit row 0 PE
     output logic                      input_last_out,    // Last input hit row 3 PE
     output logic                      weight_first_out,  // First weight hit row 0 PE
-    output logic                      weight_last_out    // Last weight hit row 3 PE
+    output logic                      weight_last_out,   // Last weight hit row 3 PE
+    
+    // Systolic array state indicators
+    output logic                      computation_started, // First valid data entered array
+    output logic                      computation_done,    // Last valid data entered array
+    output logic                      all_done             // Last marker reached PE[3][3] - all computation complete
 );
 
     // ========================================================================
@@ -156,13 +161,20 @@ module tinynpu_top (
         .rst_n          (rst_n),
         .input_data     (skewed_input),
         .weight_data    (skewed_weight),
+        .input_first    (input_first_out),
+        .input_last     (input_last_out),
+        .weight_first   (weight_first_out),
+        .weight_last    (weight_last_out),
         .precision_mode (precision_mode),
         .compute_enable (compute_enable),
         .drain_enable   (drain_enable),
         .acc_clear      (acc_clear),
         .results        (results),
         .results_flat   (results_flat),
-        .result_valid   (result_valid)
+        .result_valid   (result_valid),
+        .computation_started (computation_started),
+        .computation_done    (computation_done),
+        .all_done            (all_done)
     );
 
 endmodule

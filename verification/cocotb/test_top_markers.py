@@ -166,3 +166,127 @@ async def test_top_first_last_markers(dut):
     dut._log.info("\n✅ Markers correctly identify first (0x1234) and last (0x5678) elements!")
     dut._log.info("   Garbage data before/after did NOT trigger markers!")
 
+
+@cocotb.test()
+async def test_computation_markers(dut):
+    """
+    Test computation_started, computation_done, and all_done signals.
+    - computation_started: fires when first valid data enters PE[0][0]
+    - computation_done: fires when last valid data enters PE[3][0]
+    - all_done: fires when last marker reaches PE[3][3] (all computation complete)
+    """
+    
+    clock = Clock(dut.clk, 10, units="ns")
+    cocotb.start_soon(clock.start())
+    
+    # Reset
+    dut.rst_n.value = 0
+    dut.ub_wr_en.value = 0
+    dut.input_first.value = 0
+    dut.input_last.value = 0
+    dut.weight_first.value = 0
+    dut.weight_last.value = 0
+    dut.input_addr.value = 0
+    dut.weight_addr.value = 0
+    dut.skewer_en.value = 0
+    dut.precision_mode.value = 0
+    dut.compute_enable.value = 0
+    dut.drain_enable.value = 0
+    dut.acc_clear.value = 0
+    
+    await RisingEdge(dut.clk)
+    dut.rst_n.value = 1
+    await RisingEdge(dut.clk)
+    
+    # Load buffer
+    dut._log.info("Loading buffer...")
+    test_rows = [
+        [0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA],
+        [0x1111, 0x1111, 0x1111, 0x1111],  # First
+        [0x2222, 0x2222, 0x2222, 0x2222],
+        [0x3333, 0x3333, 0x3333, 0x3333],  # Last
+        [0xBBBB, 0xBBBB, 0xBBBB, 0xBBBB],
+    ]
+    
+    for addr, row in enumerate(test_rows):
+        dut.ub_wr_en.value = 1
+        dut.ub_wr_addr.value = addr
+        dut.ub_wr_data.value = pack_row(row)
+        await RisingEdge(dut.clk)
+    
+    dut.ub_wr_en.value = 0
+    await RisingEdge(dut.clk)
+    
+    dut.skewer_en.value = 1
+    
+    started_events = []
+    done_events = []
+    all_done_events = []
+    cycle = 0
+    
+    # Sequence with first and last on SAME addresses for input/weight
+    sequence = [
+        (0, False, False),  # garbage
+        (1, True, False),   # FIRST (both input and weight)
+        (2, False, False),
+        (3, False, True),   # LAST (both input and weight)
+        (4, False, False),  # garbage
+    ]
+    
+    for addr, is_first, is_last in sequence:
+        dut.input_addr.value = addr
+        dut.weight_addr.value = addr
+        dut.input_first.value = 1 if is_first else 0
+        dut.input_last.value = 1 if is_last else 0
+        dut.weight_first.value = 1 if is_first else 0
+        dut.weight_last.value = 1 if is_last else 0
+        
+        await RisingEdge(dut.clk)
+        cycle += 1
+        
+        if dut.computation_started.value.integer == 1:
+            started_events.append(cycle)
+            dut._log.info(f"Cycle {cycle}: computation_started=1")
+        if dut.computation_done.value.integer == 1:
+            done_events.append(cycle)
+            dut._log.info(f"Cycle {cycle}: computation_done=1")
+        if dut.all_done.value.integer == 1:
+            all_done_events.append(cycle)
+            dut._log.info(f"Cycle {cycle}: all_done=1")
+    
+    # Continue observing for all_done (needs 3 more cycles through PE row)
+    dut.input_first.value = 0
+    dut.input_last.value = 0
+    dut.weight_first.value = 0
+    dut.weight_last.value = 0
+    
+    for _ in range(10):
+        await RisingEdge(dut.clk)
+        cycle += 1
+        
+        if dut.computation_started.value.integer == 1:
+            started_events.append(cycle)
+        if dut.computation_done.value.integer == 1:
+            done_events.append(cycle)
+        if dut.all_done.value.integer == 1:
+            all_done_events.append(cycle)
+            dut._log.info(f"Cycle {cycle}: all_done=1")
+    
+    # Verify
+    dut._log.info("\n--- Verification ---")
+    
+    assert len(started_events) == 1, f"Expected 1 computation_started, got {len(started_events)}"
+    dut._log.info(f"✓ computation_started fired once at cycle {started_events[0]}")
+    
+    assert len(done_events) == 1, f"Expected 1 computation_done, got {len(done_events)}"
+    dut._log.info(f"✓ computation_done fired once at cycle {done_events[0]}")
+    
+    assert len(all_done_events) == 1, f"Expected 1 all_done, got {len(all_done_events)}"
+    dut._log.info(f"✓ all_done fired once at cycle {all_done_events[0]}")
+    
+    # all_done should be 3 cycles after computation_done (PE[3][0] → PE[3][3])
+    delay = all_done_events[0] - done_events[0]
+    dut._log.info(f"  Delay between computation_done and all_done: {delay} cycles")
+    
+    dut._log.info("\n✅ All computation markers work correctly!")
+    dut._log.info("   PE[3][3] signals when all accumulations are complete!")

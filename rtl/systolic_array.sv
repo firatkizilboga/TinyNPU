@@ -12,6 +12,12 @@ module systolic_array (
     // During drain mode, pass zeros from outside
     input  logic [`DATA_WIDTH-1:0] weight_data [`ARRAY_SIZE-1:0],
     
+    // Data flow markers (from skewer - indicates first/last valid data)
+    input  logic input_first,     // First valid input row arrived
+    input  logic input_last,      // Last valid input row arrived
+    input  logic weight_first,    // First valid weight column arrived
+    input  logic weight_last,     // Last valid weight column arrived
+    
     // Control signals
     input  precision_mode_t precision_mode,  // Bit-width mode for all PEs
     input  logic compute_enable,             // Enable computation in all PEs
@@ -22,7 +28,12 @@ module systolic_array (
     output logic signed [`ACC_WIDTH-1:0] results [`ARRAY_SIZE-1:0][`ARRAY_SIZE-1:0],
     // Flattened output for Verilator/Verification access
     output logic [(`ARRAY_SIZE * `ARRAY_SIZE * `ACC_WIDTH)-1:0] results_flat,
-    output logic result_valid
+    output logic result_valid,
+    
+    // Marker outputs (expose for external control/debug)
+    output logic computation_started,  // Pulses when first valid data enters array
+    output logic computation_done,     // Pulses when last valid data enters array (row 3 col 0)
+    output logic all_done              // Pulses when last valid data exits PE[3][3] (all computation complete)
 );
 
     // ------------------------------------------------------------------------
@@ -46,6 +57,10 @@ module systolic_array (
     // Extra column (+1) for boundary inputs
     logic [`DATA_WIDTH-1:0] horizontal_bus [`ARRAY_SIZE-1:0][`ARRAY_SIZE:0];
     
+    // Horizontal last marker flow: [row][col] to [row][col+1]
+    // Extra column (+1) for boundary inputs and outputs
+    logic last_marker_bus [`ARRAY_SIZE-1:0][`ARRAY_SIZE:0];
+    
     // Vertical data flow (weights/accumulators): [row][col] to [row+1][col] - 64-bit
     // Extra row (+1) for boundary inputs
     logic signed [`ACC_WIDTH-1:0] vertical_bus [`ARRAY_SIZE:0][`ARRAY_SIZE-1:0];
@@ -62,6 +77,12 @@ module systolic_array (
         // Connect input data to leftmost column (col=0 boundary)
         for (r = 0; r < `ARRAY_SIZE; r++) begin : input_boundary
             assign horizontal_bus[r][0] = input_data[r];
+        end
+        
+        // Connect last marker to leftmost column (col=0 boundary)
+        // Only row 3 (last row) gets the input_last marker
+        for (r = 0; r < `ARRAY_SIZE; r++) begin : last_boundary
+            assign last_marker_bus[r][0] = (r == `ARRAY_SIZE-1) ? input_last : 1'b0;
         end
         
         // Connect weight data to topmost row (row=0 boundary)
@@ -84,6 +105,10 @@ module systolic_array (
                     // Horizontal dataflow (16-bit inputs)
                     .input_from_left   (horizontal_bus[r][c]),
                     .input_to_right    (horizontal_bus[r][c+1]),
+                    
+                    // Horizontal last marker
+                    .last_in           (last_marker_bus[r][c]),
+                    .last_out          (last_marker_bus[r][c+1]),
                     
                     // Vertical dataflow (64-bit weights/accumulators)
                     .data_from_top     (vertical_bus[r][c]),
@@ -131,5 +156,15 @@ module systolic_array (
     end
     
     assign result_valid = valid_pipeline[VALID_DELAY-1];
+    
+    // ------------------------------------------------------------------------
+    // Computation Start/Done Markers
+    // ------------------------------------------------------------------------
+    // computation_started: fires when BOTH input and weight first markers arrive
+    // computation_done: fires when BOTH input and weight last markers arrive (enters array)
+    // all_done: fires when last marker exits PE[3][3] (all computation complete)
+    assign computation_started = input_first & weight_first;
+    assign computation_done    = input_last & weight_last;
+    assign all_done            = last_marker_bus[`ARRAY_SIZE-1][`ARRAY_SIZE];
 
 endmodule

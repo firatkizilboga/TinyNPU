@@ -29,6 +29,10 @@ module pe (
     input  logic [`DATA_WIDTH-1:0] input_from_left,
     output logic [`DATA_WIDTH-1:0] input_to_right,
     
+    // Horizontal marker flow: last valid input indicator
+    input  logic last_in,           // Last marker from left neighbor
+    output logic last_out,          // Last marker to right neighbor
+    
     // Vertical data flow (64-bit): weights during compute, accumulators during drain
     input  logic signed [`ACC_WIDTH-1:0] data_from_top,
     output logic signed [`ACC_WIDTH-1:0] data_to_bottom,
@@ -50,6 +54,7 @@ module pe (
     logic [`DATA_WIDTH-1:0] weight_latch;  // Extracted from lower 16 bits of data_from_top
     logic signed [`ACC_WIDTH-1:0] vertical_latch;  // Registered vertical output
     logic signed [`ACC_WIDTH-1:0] accumulator;
+    logic last_latch;  // Horizontal last marker register
     
     // ------------------------------------------------------------------------
     // Extract Weight from Vertical Bus (Compute Mode)
@@ -194,8 +199,10 @@ module pe (
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             input_latch <= '0;
+            last_latch  <= 1'b0;
         end else begin
             input_latch <= input_from_left;
+            last_latch  <= last_in;
         end
     end
     
@@ -203,6 +210,7 @@ module pe (
     // Output Assignments
     // ------------------------------------------------------------------------
     assign input_to_right = input_latch;    // Propagate input horizontally (16-bit)
+    assign last_out       = last_latch;     // Propagate last marker horizontally
     
     // Vertical output: pass WEIGHTS during compute, ACCUMULATORS during drain
     // This is critical for multi-row operation!
