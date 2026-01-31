@@ -33,13 +33,19 @@ module pe (
     input  logic last_in,           // Last marker from left neighbor
     output logic last_out,          // Last marker to right neighbor
     
+    // Systolic compute enable mesh (wavefront propagation)
+    input  logic valid_h_in,        // Valid signal from left
+    output logic valid_h_out,       // Valid signal to right
+    input  logic valid_v_in,        // Valid signal from top
+    output logic valid_v_out,       // Valid signal to bottom
+    
     // Vertical data flow (64-bit): weights during compute, accumulators during drain
     input  logic signed [`ACC_WIDTH-1:0] data_from_top,
     output logic signed [`ACC_WIDTH-1:0] data_to_bottom,
     
     // Control signals
     input  precision_mode_t precision_mode,   // Bit-width mode selection
-    input  logic compute_enable,              // Enable SWAR computation
+    input  logic compute_enable,              // Global compute enable (fallback)
     input  logic drain_enable,                // Enable drain mode (shift accumulators vertically)
     input  logic acc_clear,                   // Clear accumulator
     
@@ -55,6 +61,11 @@ module pe (
     logic signed [`ACC_WIDTH-1:0] vertical_latch;  // Registered vertical output
     logic signed [`ACC_WIDTH-1:0] accumulator;
     logic last_latch;  // Horizontal last marker register
+    
+    // Valid mesh registers (for OR-based wavefront propagation)
+    logic valid_h_latch;
+    logic valid_v_latch;
+    logic local_valid;  // OR of valid inputs - PE is active if EITHER is valid
     
     // ------------------------------------------------------------------------
     // Extract Weight from Vertical Bus (Compute Mode)
@@ -183,9 +194,9 @@ module pe (
             accumulator <= '0;
         end else if (drain_enable) begin
             accumulator <= data_from_top;
-        end else if (compute_enable) begin
+        end else if (compute_enable & local_valid) begin
+            // Compute when BOTH global enable AND local wavefront valid
             accumulator <= accumulator + $signed({{(`ACC_WIDTH-32){partial_sum[31]}}, partial_sum});
-        end else begin
         end
     end
     
@@ -194,19 +205,30 @@ module pe (
     // ------------------------------------------------------------------------
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            input_latch <= '0;
-            last_latch  <= 1'b0;
+            input_latch   <= '0;
+            last_latch    <= 1'b0;
+            valid_h_latch <= 1'b0;
+            valid_v_latch <= 1'b0;
         end else begin
-            input_latch <= input_from_left;
-            last_latch  <= last_in;
+            input_latch   <= input_from_left;
+            last_latch    <= last_in;
+            valid_h_latch <= valid_h_in;
+            valid_v_latch <= valid_v_in;
         end
     end
+    
+    // OR-based valid: active if EITHER direction has valid data
+    assign local_valid = valid_h_latch | valid_v_latch;
     
     // ------------------------------------------------------------------------
     // Output Assignments
     // ------------------------------------------------------------------------
     assign input_to_right = input_latch;    // Propagate input horizontally (16-bit)
     assign last_out       = last_latch;     // Propagate last marker horizontally
+    
+    // Valid wavefront propagation - pass through latched values
+    assign valid_h_out    = valid_h_latch;  // Propagate horizontally
+    assign valid_v_out    = valid_v_latch;  // Propagate vertically
     
     // Vertical output: pass WEIGHTS during compute, ACCUMULATORS during drain
     // This is critical for multi-row operation!

@@ -68,6 +68,12 @@ module systolic_array (
     // Accumulator outputs from each PE
     logic signed [`ACC_WIDTH-1:0] pe_accumulators [`ARRAY_SIZE-1:0][`ARRAY_SIZE-1:0];
     
+    // Valid mesh for systolic wavefront propagation
+    // Horizontal: [row][col] to [row][col+1], extra column for boundary
+    // Vertical: [row][col] to [row+1][col], extra row for boundary
+    logic valid_h_bus [`ARRAY_SIZE-1:0][`ARRAY_SIZE:0];
+    logic valid_v_bus [`ARRAY_SIZE:0][`ARRAY_SIZE-1:0];
+    
     // ------------------------------------------------------------------------
     // Boundary Input Assignment (Leftmost Column and Topmost Row)
     // ------------------------------------------------------------------------
@@ -90,6 +96,16 @@ module systolic_array (
         for (c = 0; c < `ARRAY_SIZE; c++) begin : weight_boundary
             assign vertical_bus[0][c] = {{(`ACC_WIDTH-`DATA_WIDTH){1'b0}}, weight_data[c]};
         end
+        
+        // Connect valid signals at boundaries
+        // All rows get valid_h from compute_enable at left edge
+        // All cols get valid_v from compute_enable at top edge
+        for (r = 0; r < `ARRAY_SIZE; r++) begin : valid_h_boundary
+            assign valid_h_bus[r][0] = compute_enable;
+        end
+        for (c = 0; c < `ARRAY_SIZE; c++) begin : valid_v_boundary
+            assign valid_v_bus[0][c] = compute_enable;
+        end
     endgenerate
     
     // ------------------------------------------------------------------------
@@ -109,6 +125,12 @@ module systolic_array (
                     // Horizontal last marker
                     .last_in           (last_marker_bus[r][c]),
                     .last_out          (last_marker_bus[r][c+1]),
+                    
+                    // Valid mesh (wavefront propagation)
+                    .valid_h_in        (valid_h_bus[r][c]),
+                    .valid_h_out       (valid_h_bus[r][c+1]),
+                    .valid_v_in        (valid_v_bus[r][c]),
+                    .valid_v_out       (valid_v_bus[r+1][c]),
                     
                     // Vertical dataflow (64-bit weights/accumulators)
                     .data_from_top     (vertical_bus[r][c]),
