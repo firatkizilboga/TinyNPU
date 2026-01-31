@@ -45,7 +45,6 @@ module pe (
     
     // Control signals
     input  precision_mode_t precision_mode,   // Bit-width mode selection
-    input  logic compute_enable,              // Global compute enable (fallback)
     input  logic drain_enable,                // Enable drain mode (shift accumulators vertically)
     input  logic acc_clear,                   // Clear accumulator
     
@@ -194,8 +193,8 @@ module pe (
             accumulator <= '0;
         end else if (drain_enable) begin
             accumulator <= data_from_top;
-        end else if (compute_enable & local_valid) begin
-            // Compute when BOTH global enable AND local wavefront valid
+        end else if (local_valid) begin
+            // Compute when local wavefront valid (OR of h/v valid signals)
             accumulator <= accumulator + $signed({{(`ACC_WIDTH-32){partial_sum[31]}}, partial_sum});
         end
     end
@@ -227,8 +226,8 @@ module pe (
     assign last_out       = last_latch;     // Propagate last marker horizontally
     
     // Valid wavefront propagation - pass through latched values
-    assign valid_h_out    = valid_h_latch;  // Propagate horizontally
-    assign valid_v_out    = valid_v_latch;  // Propagate vertically
+    assign valid_h_out    = local_valid;  // Propagate horizontally
+    assign valid_v_out    = local_valid;  // Propagate vertically
     
     // Vertical output: pass WEIGHTS during compute, ACCUMULATORS during drain
     // This is critical for multi-row operation!

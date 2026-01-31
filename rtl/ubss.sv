@@ -180,26 +180,6 @@ module ubss #(
   logic weight_valid_window;
   logic gated_compute_enable;
   
-  // Propagation counter: keep compute active for N cycles after last_out
-  // This allows data already in the systolic array to fully propagate
-  logic [$clog2(N+1):0] propagation_counter;
-  logic propagation_active;
-  
-  always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-      propagation_counter <= '0;
-      propagation_active <= 1'b0;
-    end else if (input_last_out || weight_last_out) begin
-      // Start countdown when last data enters array
-      propagation_counter <= N;
-      propagation_active <= 1'b1;
-    end else if (propagation_counter > 0) begin
-      propagation_counter <= propagation_counter - 1;
-    end else begin
-      propagation_active <= 1'b0;
-    end
-  end
-  
   // Input valid window: starts at first_out, ends after last_out
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
@@ -222,12 +202,12 @@ module ubss #(
     end
   end
   
-  // Gate compute_enable: compute when valid data OR during propagation phase
+  // Gate compute_enable: compute when valid data is flowing
   // Include the cycle where first/last asserts
   wire input_active = input_valid_window | input_first_out | input_last_out;
   wire weight_active = weight_valid_window | weight_first_out | weight_last_out;
   wire data_active = input_active & weight_active;
-  assign gated_compute_enable = compute_enable & (data_active | propagation_active);
+  assign gated_compute_enable = compute_enable & data_active;
 
   // ========================================================================
   // Systolic Array Instance

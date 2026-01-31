@@ -20,7 +20,7 @@ module systolic_array (
     
     // Control signals
     input  precision_mode_t precision_mode,  // Bit-width mode for all PEs
-    input  logic compute_enable,             // Enable computation in all PEs
+    input  logic compute_enable,             // Valid signal for wavefront injection
     input  logic drain_enable,               // Enable drain mode (shift accumulators)
     input  logic acc_clear,                  // Clear all accumulators
     
@@ -98,13 +98,14 @@ module systolic_array (
         end
         
         // Connect valid signals at boundaries
-        // All rows get valid_h from compute_enable at left edge
-        // All cols get valid_v from compute_enable at top edge
+        // Only inject valid at PE[0][0] to start the diagonal wavefront
+        // This valid signal will be OR-combined in PEs and propagate
+        // It should match the valid window of the inputs at the boundary
         for (r = 0; r < `ARRAY_SIZE; r++) begin : valid_h_boundary
-            assign valid_h_bus[r][0] = compute_enable;
+            assign valid_h_bus[r][0] = (r == 0) ? compute_enable : 1'b0;
         end
         for (c = 0; c < `ARRAY_SIZE; c++) begin : valid_v_boundary
-            assign valid_v_bus[0][c] = compute_enable;
+            assign valid_v_bus[0][c] = (c == 0) ? compute_enable : 1'b0;
         end
     endgenerate
     
@@ -138,7 +139,6 @@ module systolic_array (
                     
                     // Control (broadcast to all PEs)
                     .precision_mode    (precision_mode),
-                    .compute_enable    (compute_enable),
                     .drain_enable      (drain_enable),
                     .acc_clear         (acc_clear),
                     
