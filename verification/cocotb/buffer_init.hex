@@ -1,37 +1,32 @@
-// Unified Buffer Initialization File
-// Format: 64-bit hex values (16 digits), one per line
-// Each line = 4 x 16-bit packed values (element 0 at LSB)
-// Memory layout: memory[0], memory[1], ... memory[BUFFER_DEPTH-1]
-//
-// Example unpacking for line "0004000300020001":
-//   element[0] = 0x0001
-//   element[1] = 0x0002
-//   element[2] = 0x0003
-//   element[3] = 0x0004
+// buffer_init.hex - Initialization data for Unified Buffer
+// Format: Each line is 64 bits (4 x 16-bit elements, packed)
+// Elements are [elem3][elem2][elem1][elem0] when unpacked
 
-// Row 0: INVALID/SENTINEL (0xDEAD pattern to detect stale reads)
+// Row 0: Sentinel (DEAD pattern for stale data detection)
 DEADDEADDEADDEAD
 
-// Row 1-7: Simple test pattern (incrementing values)
-0004000300020001
-0008000700060005
-000C000B000A0009
-0010000F000E000D
-0014001300120011
-0018001700160015
-001C001B001A0019
+// Row 1-4: Matrix A COLUMNS (transposed for systolic array)
+// A = [[1,2,3,4], [5,6,7,8], [9,10,11,12], [13,14,15,16]]
+// Storing columns: Col0=[1,5,9,13], Col1=[2,6,10,14], etc.
+000D000900050001
+000E000A00060002
+000F000B00070003
+0010000C00080004
 
-// Row 8-15: Identity-like pattern (diagonal ones)
+// Row 5-7: Padding
+0000000000000000
+0000000000000000
+0000000000000000
+
+// Row 8-11: Identity matrix COLUMNS
+// I = [[1,0,0,0], [0,1,0,0], [0,0,1,0], [0,0,0,1]]
+// Col 0 = [1,0,0,0], Col 1 = [0,1,0,0], etc.
 0000000000000001
 0000000000010000
 0000000100000000
 0001000000000000
-0000000000000001
-0000000000010000
-0000000100000000
-0001000000000000
 
-// Row 16-23: All zeros (padding)
+// Row 12-31: Padding with zeros
 0000000000000000
 0000000000000000
 0000000000000000
@@ -40,5 +35,15 @@ DEADDEADDEADDEAD
 0000000000000000
 0000000000000000
 0000000000000000
-
-// Remaining rows default to X/0 (uninitialized)
+0000000000000000
+0000000000000000
+0000000000000000
+0000000000000000
+0000000000000000
+0000000000000000
+0000000000000000
+0000000000000000
+0000000000000000
+0000000000000000
+0000000000000000
+0000000000000000

@@ -63,8 +63,43 @@ module streaming_skewer #(
                 end
             end
             
-            // Output is the last stage
-            assign data_out[row] = shift_reg[STAGES-1];
+            // Per-row first marker chain (STAGES cycles delay)
+            logic [STAGES-1:0] first_chain;
+            always_ff @(posedge clk or negedge rst_n) begin
+                if (!rst_n) begin
+                    first_chain <= '0;
+                end else if (en) begin
+                    first_chain <= {first_chain[STAGES-2:0], first_in};
+                end
+            end
+            wire row_first = first_chain[STAGES-1];
+            
+            // Per-row last marker chain (STAGES cycles delay)  
+            logic [STAGES-1:0] last_chain;
+            always_ff @(posedge clk or negedge rst_n) begin
+                if (!rst_n) begin
+                    last_chain <= '0;
+                end else if (en) begin
+                    last_chain <= {last_chain[STAGES-2:0], last_in};
+                end
+            end
+            wire row_last = last_chain[STAGES-1];
+            
+            // Per-row valid window (starts at row_first, ends at row_last)
+            logic row_valid;
+            always_ff @(posedge clk or negedge rst_n) begin
+                if (!rst_n) begin
+                    row_valid <= 1'b0;
+                end else if (row_first) begin
+                    row_valid <= 1'b1;
+                end else if (row_last) begin
+                    row_valid <= 1'b0;
+                end
+            end
+            
+            // Output is the last stage, zero-gated when outside valid window
+            wire row_active = row_valid | row_first | row_last;
+            assign data_out[row] = row_active ? shift_reg[STAGES-1] : '0;
         end
     endgenerate
 

@@ -140,8 +140,8 @@ async def test_ubss_matmul(dut):
     dut.weight_addr.value = 0
 
     # Continue feeding zeros and let computation complete
-    # Need 2*N cycles for full diagonal wavefront
-    for _ in range(2 * N):
+    # Need 3*N cycles for full diagonal wavefront (N input + 2N drain)
+    for _ in range(3 * N):
         await RisingEdge(dut.clk)
         input_skewed.append(unpack_flat(dut.input_skewed_flat.value.integer))
         weight_skewed.append(unpack_flat(dut.weight_skewed_flat.value.integer))
@@ -175,10 +175,8 @@ async def test_ubss_matmul(dut):
         dut._log.info(f"  Row {row}: [{', '.join(row_str)}]")
 
     # Expected result: A * I = A
-    # Row 0: [1, 2, 3, 4]
-    # Row 1: [5, 6, 7, 8]
-    # Row 2: [9, 10, 11, 12]
-    # Row 3: [13, 14, 15, 16]
+    # Row 0: [1, 2, 3, 4], Row 1: [5, 6, 7, 8]
+    # Row 2: [9, 10, 11, 12], Row 3: [13, 14, 15, 16]
     expected = [
         [1, 2, 3, 4],
         [5, 6, 7, 8],
