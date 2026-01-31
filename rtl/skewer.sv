@@ -1,7 +1,7 @@
 `include "defines.sv"
 
 // ============================================================================
-// Streaming Skewer Module
+// Streaming Skewer Module (Fully Parametric)
 // ============================================================================
 // Converts streaming matrix columns/rows into skewed timing for Systolic Array.
 // 
@@ -38,88 +38,78 @@ module streaming_skewer #(
 );
 
     // ========================================================================
-    // Row 0: 1 stage delay
+    // Parametric delay pipeline using generate
     // ========================================================================
-    logic [DATA_WIDTH-1:0] d0_s0;
-    logic f0;  // first marker for row 0
+    // Row i gets (i+1) stages of delay
     
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            d0_s0 <= '0;
-            f0    <= 1'b0;
-        end else if (en) begin
-            d0_s0 <= data_in[0];
-            f0    <= first_in;
+    genvar row;
+    generate
+        for (row = 0; row < N; row++) begin : delay_row
+            localparam STAGES = row + 1;
+            
+            // Shift register for data
+            logic [DATA_WIDTH-1:0] shift_reg [STAGES-1:0];
+            
+            always_ff @(posedge clk or negedge rst_n) begin
+                if (!rst_n) begin
+                    for (int s = 0; s < STAGES; s++) begin
+                        shift_reg[s] <= '0;
+                    end
+                end else if (en) begin
+                    shift_reg[0] <= data_in[row];
+                    for (int s = 1; s < STAGES; s++) begin
+                        shift_reg[s] <= shift_reg[s-1];
+                    end
+                end
+            end
+            
+            // Output is the last stage
+            assign data_out[row] = shift_reg[STAGES-1];
         end
-    end
-    
-    assign data_out[0] = d0_s0;
-    assign first_out   = f0;  // Row 0 exits → computation starts
+    endgenerate
 
     // ========================================================================
-    // Row 1: 2 stage delay  
+    // Marker signal pipelines
     // ========================================================================
-    logic [DATA_WIDTH-1:0] d1_s0, d1_s1;
+    // Markers arrive from UB already delayed by 1 cycle (same as data).
+    // They need to go through the SAME delay as the corresponding row.
+    // first_out: aligned with row 0 output (1 stage delay)
+    // last_out: aligned with row N-1 output (N stages delay)
+    
+    // First marker: goes through row 0's delay (1 stage)
+    logic first_marker;
     
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            d1_s0 <= '0;
-            d1_s1 <= '0;
+            first_marker <= 1'b0;
         end else if (en) begin
-            d1_s0 <= data_in[1];
-            d1_s1 <= d1_s0;
+            first_marker <= first_in;
         end
     end
     
-    assign data_out[1] = d1_s1;
+    assign first_out = first_marker;
 
-    // ========================================================================
-    // Row 2: 3 stage delay
-    // ========================================================================
-    logic [DATA_WIDTH-1:0] d2_s0, d2_s1, d2_s2;
+    // Last marker: goes through row N-1's delay (N stages)
+    logic [N-1:0] last_marker_chain;
     
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            d2_s0 <= '0;
-            d2_s1 <= '0;
-            d2_s2 <= '0;
+            last_marker_chain <= '0;
         end else if (en) begin
-            d2_s0 <= data_in[2];
-            d2_s1 <= d2_s0;
-            d2_s2 <= d2_s1;
+            last_marker_chain <= {last_marker_chain[N-2:0], last_in};
         end
     end
     
-    assign data_out[2] = d2_s2;
-
-    // ========================================================================
-    // Row 3: 4 stage delay + last marker
-    // ========================================================================
-    logic [DATA_WIDTH-1:0] d3_s0, d3_s1, d3_s2, d3_s3;
-    logic [3:0] l3;  // last marker chain for row 3
-    
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            d3_s0 <= '0;
-            d3_s1 <= '0;
-            d3_s2 <= '0;
-            d3_s3 <= '0;
-            l3    <= '0;
-        end else if (en) begin
-            d3_s0 <= data_in[3];
-            d3_s1 <= d3_s0;
-            d3_s2 <= d3_s1;
-            d3_s3 <= d3_s2;
-            l3    <= {l3[2:0], last_in};
-        end
-    end
-    
-    assign data_out[3] = d3_s3;
-    assign last_out    = l3[3];  // Row 3 exits → all data loaded
+    assign last_out = last_marker_chain[N-1];
 
     // ========================================================================
     // Flattened outputs for Verilator
     // ========================================================================
-    assign data_out_flat = {d3_s3, d2_s2, d1_s1, d0_s0};
+    genvar i;
+    generate
+        for (i = 0; i < N; i++) begin : flatten_out
+            assign data_out_flat[(i+1)*DATA_WIDTH-1 -: DATA_WIDTH] = data_out[i];
+        end
+    endgenerate
 
 endmodule

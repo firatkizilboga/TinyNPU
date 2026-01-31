@@ -9,7 +9,10 @@
 //   element[2] = 0x0003
 //   element[3] = 0x0004
 
-// Row 0-7: Simple test pattern (incrementing values)
+// Row 0: INVALID/SENTINEL (0xDEAD pattern to detect stale reads)
+DEADDEADDEADDEAD
+
+// Row 1-7: Simple test pattern (incrementing values)
 0004000300020001
 0008000700060005
 000C000B000A0009
@@ -17,7 +20,6 @@
 0014001300120011
 0018001700160015
 001C001B001A0019
-0020001F001E001D
 
 // Row 8-15: Identity-like pattern (diagonal ones)
 0000000000000001
