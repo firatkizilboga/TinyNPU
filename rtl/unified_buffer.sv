@@ -1,7 +1,7 @@
 `include "defines.sv"
 
 module unified_buffer #(
-    parameter string INIT_FILE = ""  // Hex file path (empty = no init)
+    parameter INIT_FILE = ""  // Hex file path (empty = no init)
 ) (
     input logic clk,
     input logic rst_n,

@@ -11,7 +11,7 @@ module ub_skewer_wrapper #(
     parameter DATA_WIDTH = `DATA_WIDTH,
     parameter ADDR_WIDTH = `ADDR_WIDTH,
     parameter BUFFER_WIDTH = `BUFFER_WIDTH,
-    parameter string INIT_FILE = "buffer_init.hex"
+    parameter INIT_FILE = "buffer_init.hex"
 ) (
     input logic clk,
     input logic rst_n,

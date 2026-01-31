@@ -81,10 +81,6 @@ module pe (
         end
     end
 
-    always_ff @(negedge clk) begin : debugBlock
-        $display("[PE] Time=%0t weight_latch=0x%04X input_latch=0x%04X", $time, weight_latch, input_latch);
-        $display("[PE Acc] Time=%0t accumulator=0x%04X", $time, accumulator);
-    end 
     // ------------------------------------------------------------------------
     // Multi-Precision SWAR Dot Product Logic
     // ------------------------------------------------------------------------

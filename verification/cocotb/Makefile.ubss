@@ -1,0 +1,30 @@
+# Makefile for UBSS (UB + Skewer + Systolic) CocoTB simulation
+
+# Default simulator
+SIM ?= verilator
+EXTRA_ARGS += --trace --trace-structs
+
+# Toplevel RTL module
+TOPLEVEL_LANG ?= verilog
+
+# RTL source files
+VERILOG_SOURCES = $(PWD)/../../rtl/defines.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/unified_buffer.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/skewer.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/pe.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/systolic_array.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/ubss.sv
+
+# Toplevel module
+TOPLEVEL = ubss
+
+# Python test module
+MODULE = test_ubss
+
+# Include paths
+COMPILE_ARGS += -I$(PWD)/../../rtl
+COMPILE_ARGS += -Wno-WIDTHTRUNC
+COMPILE_ARGS += -Wno-WIDTHEXPAND
+
+# Include CocoTB makefiles
+include $(shell cocotb-config --makefiles)/Makefile.sim
