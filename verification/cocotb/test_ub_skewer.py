@@ -79,8 +79,10 @@ async def test_ub_skewer_hex_init(dut):
     weight_outputs = []
     input_markers = []
     weight_markers = []
-    ub_outputs = []  # Debug: UB stage outputs
-    ub_markers = []
+    ub_input_outputs = []  # Debug: UB input stage outputs
+    ub_input_markers = []
+    ub_weight_outputs = []  # Debug: UB weight stage outputs
+    ub_weight_markers = []
 
     # Feed N addresses: input from 1-4, weight from 8-11
     for col in range(N):
@@ -107,9 +109,13 @@ async def test_ub_skewer_hex_init(dut):
              int(dut.dut_weight_last_out.value))
         )
         # Debug: capture UB outputs
-        ub_outputs.append(unpack_flat(dut.mem_input_data_flat.value.integer))
-        ub_markers.append(
+        ub_input_outputs.append(unpack_flat(dut.mem_input_data_flat.value.integer))
+        ub_input_markers.append(
             (int(dut.mem_input_first.value), int(dut.mem_input_last.value))
+        )
+        ub_weight_outputs.append(unpack_flat(dut.mem_weight_data_flat.value.integer))
+        ub_weight_markers.append(
+            (int(dut.mem_weight_first.value), int(dut.mem_weight_last.value))
         )
 
     # Clear inputs and drain pipeline
@@ -131,23 +137,39 @@ async def test_ub_skewer_hex_init(dut):
             (int(dut.dut_weight_first_out.value),
              int(dut.dut_weight_last_out.value))
         )
-        ub_outputs.append(unpack_flat(dut.mem_input_data_flat.value.integer))
-        ub_markers.append(
+        ub_input_outputs.append(unpack_flat(dut.mem_input_data_flat.value.integer))
+        ub_input_markers.append(
             (int(dut.mem_input_first.value), int(dut.mem_input_last.value))
+        )
+        ub_weight_outputs.append(unpack_flat(dut.mem_weight_data_flat.value.integer))
+        ub_weight_markers.append(
+            (int(dut.mem_weight_first.value), int(dut.mem_weight_last.value))
         )
 
     # ========================================================================
     # Print timeline
     # ========================================================================
     dut._log.info("=" * 70)
-    dut._log.info("UB OUTPUT (before skewer):")
-    for t, (out, (f, l)) in enumerate(zip(ub_outputs, ub_markers)):
+    dut._log.info("INPUT CHANNEL - UB OUTPUT (before skewer):")
+    for t, (out, (f, l)) in enumerate(zip(ub_input_outputs, ub_input_markers)):
         out_hex = [f"0x{v:04x}" for v in out]
         dut._log.info(f"  Cycle {t:2d}: {out_hex}, first={f}, last={l}")
 
     dut._log.info("=" * 70)
-    dut._log.info("SKEWER OUTPUT (input path):")
+    dut._log.info("INPUT CHANNEL - SKEWER OUTPUT:")
     for t, (out, (f, l)) in enumerate(zip(input_outputs, input_markers)):
+        out_hex = [f"0x{v:04x}" for v in out]
+        dut._log.info(f"  Cycle {t:2d}: {out_hex}, first={f}, last={l}")
+
+    dut._log.info("=" * 70)
+    dut._log.info("WEIGHT CHANNEL - UB OUTPUT (before skewer):")
+    for t, (out, (f, l)) in enumerate(zip(ub_weight_outputs, ub_weight_markers)):
+        out_hex = [f"0x{v:04x}" for v in out]
+        dut._log.info(f"  Cycle {t:2d}: {out_hex}, first={f}, last={l}")
+
+    dut._log.info("=" * 70)
+    dut._log.info("WEIGHT CHANNEL - SKEWER OUTPUT:")
+    for t, (out, (f, l)) in enumerate(zip(weight_outputs, weight_markers)):
         out_hex = [f"0x{v:04x}" for v in out]
         dut._log.info(f"  Cycle {t:2d}: {out_hex}, first={f}, last={l}")
 

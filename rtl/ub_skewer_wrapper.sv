@@ -39,7 +39,7 @@ module ub_skewer_wrapper #(
     output logic                    dut_input_first_out,
     output logic                    dut_input_last_out,
 
-    // UB debug outputs (before skewer)
+    // UB debug outputs (before skewer) - input channel
     output logic [N*DATA_WIDTH-1:0] mem_input_data_flat,
     output logic                    mem_input_first,
     output logic                    mem_input_last,
@@ -47,7 +47,12 @@ module ub_skewer_wrapper #(
     // Weight skewer outputs (flattened for Verilator)
     output logic [N*DATA_WIDTH-1:0] weight_data_flat,
     output logic                    dut_weight_first_out,
-    output logic                    dut_weight_last_out
+    output logic                    dut_weight_last_out,
+
+    // UB debug outputs (before skewer) - weight channel
+    output logic [N*DATA_WIDTH-1:0] mem_weight_data_flat,
+    output logic                    mem_weight_first,
+    output logic                    mem_weight_last
 );
 
   // ========================================================================
@@ -114,6 +119,10 @@ module ub_skewer_wrapper #(
   assign mem_input_data_flat = ub_input_data;
   assign mem_input_first = ub_input_first;
   assign mem_input_last = ub_input_last;
+
+  assign mem_weight_data_flat = ub_weight_data;
+  assign mem_weight_first = ub_weight_first;
+  assign mem_weight_last = ub_weight_last;
 
   // ========================================================================
   // Input Skewer Instance
