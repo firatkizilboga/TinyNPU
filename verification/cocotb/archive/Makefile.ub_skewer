@@ -1,0 +1,27 @@
+# Makefile for UB + Skewer CocoTB simulation
+
+# Default simulator
+SIM ?= verilator
+EXTRA_ARGS += --trace --trace-structs
+
+# Toplevel RTL module
+TOPLEVEL_LANG ?= verilog
+
+# RTL source files
+VERILOG_SOURCES = $(PWD)/../../rtl/defines.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/unified_buffer.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/skewer.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/ub_skewer_wrapper.sv
+
+# Toplevel module
+TOPLEVEL = ub_skewer_wrapper
+
+# Python test module
+MODULE = test_ub_skewer
+
+# Include paths
+COMPILE_ARGS += -I$(PWD)/../../rtl
+COMPILE_ARGS += -Wno-WIDTHTRUNC
+
+# Include CocoTB makefiles
+include $(shell cocotb-config --makefiles)/Makefile.sim

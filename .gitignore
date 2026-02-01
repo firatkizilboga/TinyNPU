@@ -1,6 +1,12 @@
 docs/sv_guide.pdf
 docs/project-description.pdf
+docs/tiled_matmul.md
 verification/cocotb/results.xml
 verification/cocotb/__pycache__
 verification/cocotb/sim_build
+verification/cocotb/buffer_init_tiled.hex
+verification/cocotb/buffer_init_tiled_metadata.json
+verification/cocotb/buffer_init_4x4.hex
+verification/cocotb/buffer_init_4x4_metadata.json
+verification/cocotb/dump.vcd
 .nvim/

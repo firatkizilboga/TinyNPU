@@ -1,0 +1,36 @@
+# Makefile for tiled matrix multiplication test
+# Tests: 13×17 × 17×24 = 13×24 using 4×4 systolic array
+
+# Makefile for tiled matrix multiplication test
+# Tests: 13×17 × 17×24 = 13×24 using 4×4 systolic array
+
+SIM ?= verilator
+TOPLEVEL_LANG ?= verilog
+
+# Source files
+VERILOG_SOURCES = $(PWD)/../../rtl/defines.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/unified_buffer.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/skewer.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/ub_skewer_wrapper.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/pe.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/systolic_array.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/ubss.sv
+
+TOPLEVEL = ubss
+MODULE = test_tiled_matmul
+
+# Verilator settings
+COMPILE_ARGS += -I$(PWD)/../../rtl
+EXTRA_ARGS += --trace --trace-structs
+EXTRA_ARGS += -Wno-WIDTHTRUNC -Wno-WIDTHEXPAND -Wno-CASEINCOMPLETE -Wno-UNOPTFLAT -Wno-SELRANGE
+EXTRA_ARGS += -GINIT_FILE=\"$(PWD)/buffer_init_tiled.hex\"
+
+include $(shell cocotb-config --makefiles)/Makefile.sim
+
+.PHONY: gen_data
+gen_data:
+	python gen_tiled_test.py --m 13 --k 17 --n 24 --output buffer_init_tiled.hex
+
+.PHONY: clean_all
+clean_all: clean
+	rm -f buffer_init_tiled.hex buffer_init_tiled_metadata.json
