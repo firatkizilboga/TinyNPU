@@ -24,10 +24,11 @@ async def write_reg(dut, addr, data, width=8):
         await RisingEdge(dut.clk)
         dut.host_wr_en.value = 0
 
-async def load_matmul_instruction(dut, inst_idx, a_base, b_base, m, k, n):
+async def load_matmul_instruction(dut, inst_idx, a_base, b_base, c_base, m, k, n):
     base_word_addr = 0x8000 + (inst_idx * 4)
-    # Word 3: Opcode, A_Base, B_Base
-    word3 = (OP_MATMUL << 60) | (a_base << 40) | (b_base << 24)
+    # Word 3: Opcode, A_Base, B_Base, C_Base
+    # C_Base is [215:200] -> Bits [23:8] of Word 3
+    word3 = (OP_MATMUL << 60) | (a_base << 40) | (b_base << 24) | (c_base << 8)
     # Word 2: M, K, N
     word2 = (m << 40) | (k << 24) | (n << 8)
     
@@ -112,6 +113,7 @@ async def test_stress_matmul(dut):
     # --- 2. Load Data ---
     a_base = 0x0000
     b_base = 0x1000 # 4K words offset
+    c_base = 0x0200 # Output base (safe area between A and B)
     
     dut._log.info("Loading Matrix A...")
     # Layout: Row-Major of Tiles.
@@ -155,7 +157,7 @@ async def test_stress_matmul(dut):
             
     # --- 3. Load Program ---
     dut._log.info("Loading Program...")
-    await load_matmul_instruction(dut, 0, a_base, b_base, m_tiles, k_tiles, n_tiles)
+    await load_matmul_instruction(dut, 0, a_base, b_base, c_base, m_tiles, k_tiles, n_tiles)
     
     # HALT at PC=1
     await write_reg(dut, REG_CMD, CMD_WRITE_MEM)
