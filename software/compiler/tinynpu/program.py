@@ -72,15 +72,16 @@ class TinyNPUProgram:
             'shape': arr.shape
         }
 
-    def matmul(self, a_name, b_name, out_name):
+    def matmul(self, a_name, b_name, out_name, bias_name=None):
         """
-        Adds a MATMUL instruction: out = a * b
-        Dimensions are automatically inferred from declared shapes.
+        Adds a MATMUL instruction: out = a * b + bias
         """
         if a_name not in self.raw_symbols:
             raise ValueError(f"Symbol '{a_name}' not found.")
         if b_name not in self.raw_symbols:
             raise ValueError(f"Symbol '{b_name}' not found.")
+        if bias_name and bias_name not in self.raw_symbols:
+            raise ValueError(f"Bias symbol '{bias_name}' not found.")
             
         shape_a = self.raw_symbols[a_name]['shape']
         shape_b = self.raw_symbols[b_name]['shape']
@@ -105,6 +106,7 @@ class TinyNPUProgram:
             'a_name': a_name,
             'b_name': b_name,
             'c_name': out_name,
+            'bias_name': bias_name,
             'm': m_tiles,
             'k': k_tiles,
             'n': n_tiles
@@ -162,6 +164,19 @@ class TinyNPUProgram:
             kt, nt = (K+sz-1)//sz, (N+sz-1)//sz
             padded = np.zeros((kt*sz, nt*sz), dtype=np.uint16)
             padded[:K, :N] = data
+            
+            if K == 1:
+                # Optimized Vector (Bias) Packing: No vertical padding
+                packed = []
+                for n in range(nt):
+                    segment = padded[0, n*sz:n*sz+sz]
+                    word = 0
+                    for i in range(sz):
+                        word |= int(segment[i]) << (i * 16)
+                    packed.append(word)
+                return packed
+            
+            # Standard Matrix B Packing
             packed = []
             for k in range(kt):
                 for n in range(nt):
@@ -190,6 +205,7 @@ class TinyNPUProgram:
                 if instr['a_name'] not in roles: roles[instr['a_name']] = 'A'
                 if instr['b_name'] not in roles: roles[instr['b_name']] = 'B'
                 if instr['c_name'] not in roles: roles[instr['c_name']] = 'C'
+                if instr['bias_name'] and instr['bias_name'] not in roles: roles[instr['bias_name']] = 'B'
                 mkn_info[instr['c_name']] = (instr['m'], instr['k'], instr['n'])
             elif instr['type'] == 'MOVE':
                 if instr['src_name'] not in roles: roles[instr['src_name']] = 'A'
@@ -225,11 +241,16 @@ class TinyNPUProgram:
         compiled_im = []
         for instr in self.instructions:
             if instr['type'] == 'MATMUL':
+                bias_addr = 0xFFFF # Sentinel
+                if instr['bias_name']:
+                    bias_addr = self.symbol_to_addr[instr['bias_name']]
+                
                 raw = pack_matmul(Opcode.MATMUL, 
                                   self.symbol_to_addr[instr['a_name']], 
                                   self.symbol_to_addr[instr['b_name']], 
                                   self.symbol_to_addr[instr['c_name']],
-                                  instr['m'], instr['k'], instr['n'])
+                                  instr['m'], instr['k'], instr['n'],
+                                  bias_addr)
                 compiled_im.append(raw)
             elif instr['type'] == 'MOVE':
                 shape = self.raw_symbols[instr['src_name']]['shape']

@@ -18,7 +18,7 @@
 // ----------------------------------------------------------------------------
 // Systolic Array Dimensions
 // ----------------------------------------------------------------------------
-`define ARRAY_SIZE 16
+`define ARRAY_SIZE 8
               // N×N array (rows = columns)
 `define NUM_PES (`ARRAY_SIZE * `ARRAY_SIZE)
 

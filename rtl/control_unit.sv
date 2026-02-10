@@ -39,6 +39,8 @@ module control_unit (
 
     // PPU Control
     output logic                           ppu_wb_en,
+    output logic                           ppu_bias_en,
+    output logic                           ppu_bias_clear,
     output logic [$clog2(`ARRAY_SIZE)-1:0] ppu_cycle_idx,
     output logic                           ppu_capture_en,
 
@@ -81,7 +83,7 @@ module control_unit (
   logic move_phase, move_phase_next;
 
   // --- Internal Registers for MATMUL ---
-  logic [`ADDR_WIDTH-1:0] mm_a_base, mm_b_base, mm_c_base;
+  logic [`ADDR_WIDTH-1:0] mm_a_base, mm_b_base, mm_c_base, mm_bias_base;
   logic [15:0] mm_m_total, mm_k_total, mm_n_total;
   logic [15:0] m_idx, n_idx, k_idx;
 
@@ -98,7 +100,7 @@ module control_unit (
       ub_rdata_reg <= '0;
       {latched_cmd, latched_addr, latched_mmvr, latched_arg} <= '0;
       {move_src, move_dest, move_count, move_phase} <= '0;
-      {mm_a_base, mm_b_base, mm_c_base, mm_m_total, mm_k_total, mm_n_total} <= '0;
+      {mm_a_base, mm_b_base, mm_c_base, mm_bias_base, mm_m_total, mm_k_total, mm_n_total} <= '0;
       {m_idx, n_idx, k_idx, cycle_cnt} <= '0;
     end else begin
       state <= next_state;
@@ -131,6 +133,7 @@ module control_unit (
         mm_m_total <= im_rdata[183:168];
         mm_k_total <= im_rdata[167:152];
         mm_n_total <= im_rdata[151:136];
+        mm_bias_base <= im_rdata[135:120];
         m_idx <= '0;
         n_idx <= '0;
         k_idx <= '0;
@@ -167,6 +170,8 @@ module control_unit (
     ppu_capture_en = 1'b0;
     ppu_cycle_idx = cycle_cnt;
     ppu_wb_en = 1'b0;
+    ppu_bias_en = 1'b0;
+    ppu_bias_clear = 1'b0;
     mmvr_wr_en = 1'b0;
     mmvr_out = '0;
 
@@ -307,6 +312,7 @@ module control_unit (
       CTRL_MM_CLEAR: begin
         status_out = `STATUS_BUSY;
         acc_clear = 1'b1;
+        ppu_bias_clear = 1'b1;
         k_next = '0;
         cycle_next = '0;
         next_state = CTRL_MM_FEED;
@@ -343,7 +349,14 @@ module control_unit (
       CTRL_MM_WAIT: begin
         status_out = `STATUS_BUSY;
         compute_enable = 1'b1;  // Flush skewers
+        
+        // Latch bias when array is done (hiding latency)
         if (all_done_in) begin
+          if (mm_bias_base != 16'hFFFF) begin
+              ub_req = 1'b1;
+              ub_addr = mm_bias_base + n_idx;
+              ppu_bias_en = 1'b1;
+          end
           cycle_next = '0;
           next_state = CTRL_MM_DRAIN_SA;
         end
@@ -353,7 +366,7 @@ module control_unit (
         status_out = `STATUS_BUSY;
         drain_enable = 1'b1;
         ppu_capture_en = 1'b1;
-
+        
         if (cycle_cnt == (`ARRAY_SIZE - 1)) begin
           cycle_next = '0;
           next_state = CTRL_MM_WRITEBACK;
