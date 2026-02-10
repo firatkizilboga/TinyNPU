@@ -27,6 +27,8 @@ module tinynpu_top #(
     logic                        compute_enable;
     logic                        drain_enable;
     logic                        ppu_wb_en;
+    logic                        ppu_bias_en;
+    logic                        ppu_bias_clear;
     logic [$clog2(`ARRAY_SIZE)-1:0] ppu_cycle_idx;
     logic                        ppu_capture_en;
     logic                        sa_input_first, sa_input_last;
@@ -51,6 +53,8 @@ module tinynpu_top #(
         .compute_enable (compute_enable),
         .drain_enable   (drain_enable),
         .ppu_wb_en      (ppu_wb_en),
+        .ppu_bias_en    (ppu_bias_en),
+        .ppu_bias_clear  (ppu_bias_clear),
         .sa_input_first (sa_input_first),
         .sa_input_last  (sa_input_last),
         .sa_weight_first(sa_weight_first),
@@ -84,6 +88,8 @@ module tinynpu_top #(
         .compute_enable (compute_enable),
         .drain_enable   (drain_enable),
         .ppu_wb_en      (ppu_wb_en),
+        .ppu_bias_en    (ppu_bias_en),
+        .ppu_bias_clear  (ppu_bias_clear),
         .acc_clear      (acc_clear),
 
         .ppu_cycle_idx  (ppu_cycle_idx),

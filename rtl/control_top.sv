@@ -25,6 +25,8 @@ module control_top #(
     output logic                        compute_enable,
     output logic                        drain_enable,
     output logic                        ppu_wb_en,
+    output logic                        ppu_bias_en,
+    output logic                        ppu_bias_clear,
     
     // PPU Control
     output logic [$clog2(`ARRAY_SIZE)-1:0] ppu_cycle_idx,
@@ -110,6 +112,8 @@ module control_top #(
         .compute_enable (compute_enable),
         .drain_enable   (drain_enable),
         .ppu_wb_en      (ppu_wb_en),
+        .ppu_bias_en    (ppu_bias_en),
+        .ppu_bias_clear  (ppu_bias_clear),
         .sa_input_first (sa_input_first),
         .sa_input_last  (sa_input_last),
         .sa_weight_first(sa_weight_first),

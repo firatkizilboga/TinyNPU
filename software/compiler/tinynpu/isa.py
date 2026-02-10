@@ -71,7 +71,7 @@ def generate_host_messages(cmd_type, addr=0, arg=0, data_64=None):
     return messages
 
 
-def pack_matmul(opcode, a_addr, b_addr, c_addr, m, k, n):
+def pack_matmul(opcode, a_addr, b_addr, c_addr, m, k, n, bias_addr=0):
     """
     Packs a MATMUL instruction into a 256-bit integer.
 
@@ -83,6 +83,7 @@ def pack_matmul(opcode, a_addr, b_addr, c_addr, m, k, n):
     [183:168] M Total
     [167:152] K Total
     [151:136] N Total
+    [135:120] Bias Base (0 if none)
     """
     instr = 0
     instr |= (opcode & 0xF) << 252
@@ -92,6 +93,7 @@ def pack_matmul(opcode, a_addr, b_addr, c_addr, m, k, n):
     instr |= (m & 0xFFFF) << 168
     instr |= (k & 0xFFFF) << 152
     instr |= (n & 0xFFFF) << 136
+    instr |= (bias_addr & 0xFFFF) << 120
     return instr
 
 

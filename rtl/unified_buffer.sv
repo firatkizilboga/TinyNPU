@@ -77,4 +77,3 @@ module unified_buffer #(
   end
 
 endmodule
-

@@ -34,6 +34,8 @@ module ubss #(
 
     // PPU Control
     input  logic                     ppu_wb_en,
+    input  logic                     ppu_bias_en,
+    input  logic                     ppu_bias_clear,
     input  logic [$clog2(`ARRAY_SIZE)-1:0] ppu_cycle_idx,
     input  logic                           ppu_capture_en,
 
@@ -168,7 +170,10 @@ module ubss #(
         .clk(clk),
         .rst_n(rst_n),
         .capture_en(ppu_capture_en),
+        .bias_en(ppu_bias_en),
+        .bias_clear(ppu_bias_clear),
         .cycle_idx(ppu_cycle_idx),
+        .bias_in(cu_rdata),
         .acc_in(bottom_row_acc),
         .ub_wdata(ppu_wdata)
     );
