@@ -1,13 +1,53 @@
 import numpy as np
+import os
+import re
 from .isa import Opcode, HostCmd, generate_host_messages, pack_matmul, pack_move, pack_simple
 
+class HardwareConfig:
+    """Parses hardware parameters from defines.sv to ensure compiler sync."""
+    def __init__(self, defines_path=None):
+        if defines_path is None:
+            # Try to find defines.sv relative to this file
+            base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+            defines_path = os.path.join(base_dir, "rtl", "defines.sv")
+            
+        self.params = {
+            'ARRAY_SIZE': 4,
+            'DATA_WIDTH': 16,
+            'BUFFER_WIDTH': 64,
+            'IM_BASE_ADDR': 0x8000
+        }
+        
+        if os.path.exists(defines_path):
+            with open(defines_path, "r") as f:
+                content = f.read()
+                # Match `define NAME VALUE
+                matches = re.findall(r'`define\s+(\w+)\s+([\w\'h]+)', content)
+                for name, val in matches:
+                    # Handle hex values like 16'h8000
+                    if "'h" in val:
+                        val = int(val.split("'h")[1], 16)
+                    else:
+                        try:
+                            val = int(val)
+                        except ValueError:
+                            continue # Skip non-integer defines
+                    self.params[name] = val
+        
+        # Derived
+        self.params['BUFFER_WIDTH'] = self.params['DATA_WIDTH'] * self.params['ARRAY_SIZE']
+
 class TinyNPUProgram:
-    def __init__(self):
+    def __init__(self, defines_path=None):
+        self.hw = HardwareConfig(defines_path)
+        self.array_size = self.hw.params['ARRAY_SIZE']
+        self.buffer_width = self.hw.params['BUFFER_WIDTH']
+        self.im_base_addr = self.hw.params['IM_BASE_ADDR']
+        
         self.instructions = []
         self.raw_symbols = {} 
         self.symbol_to_addr = {}
         self.ub_data = []
-        self.im_base_addr = 0x8000
         
     def declare_data(self, name, data):
         """
@@ -42,10 +82,10 @@ class TinyNPUProgram:
         if shape_a[1] != shape_b[0]:
             raise ValueError(f"Dimension mismatch: {shape_a} and {shape_b}")
             
-        # Hardware uses 4x4 tiles
-        m_tiles = (shape_a[0] + 3) // 4
-        k_tiles = (shape_a[1] + 3) // 4
-        n_tiles = (shape_b[1] + 3) // 4
+        # Hardware uses N x N tiles
+        m_tiles = (shape_a[0] + self.array_size - 1) // self.array_size
+        k_tiles = (shape_a[1] + self.array_size - 1) // self.array_size
+        n_tiles = (shape_b[1] + self.array_size - 1) // self.array_size
         
         # If output symbol doesn't exist, record its expected shape
         if out_name not in self.raw_symbols:
@@ -71,38 +111,44 @@ class TinyNPUProgram:
         """
         Packs matrix data into the format expected by the TPU hardware.
         """
+        sz = self.array_size
         if role == 'A':
             # Matrix A (Left): Column-Major Tiles
             M, K = data.shape
-            mt, kt = (M+3)//4, (K+3)//4
-            padded = np.zeros((mt*4, kt*4), dtype=np.uint16)
+            mt, kt = (M+sz-1)//sz, (K+sz-1)//sz
+            padded = np.zeros((mt*sz, kt*sz), dtype=np.uint16)
             padded[:M, :K] = data
             packed = []
             for m in range(mt):
                 for k in range(kt):
-                    tile = padded[m*4:m*4+4, k*4:k*4+4]
-                    for col_idx in range(4):
+                    tile = padded[m*sz:m*sz+sz, k*sz:k*sz+sz]
+                    for col_idx in range(sz):
                         col = tile[:, col_idx]
-                        # Pack 4x 16-bit values into one 64-bit word
-                        packed.append(int(col[0]) | (int(col[1]) << 16) | (int(col[2]) << 32) | (int(col[3]) << 48))
+                        word = 0
+                        for i in range(sz):
+                            word |= int(col[i]) << (i * 16)
+                        packed.append(word)
             return packed
         elif role == 'B':
             # Matrix B (Top): Row-Major Tiles
             K, N = data.shape
-            kt, nt = (K+3)//4, (N+3)//4
-            padded = np.zeros((kt*4, nt*4), dtype=np.uint16)
+            kt, nt = (K+sz-1)//sz, (N+sz-1)//sz
+            padded = np.zeros((kt*sz, nt*sz), dtype=np.uint16)
             padded[:K, :N] = data
             packed = []
             for k in range(kt):
                 for n in range(nt):
-                    tile = padded[k*4:k*4+4, n*4:n*4+4]
-                    for row_idx in range(4):
+                    tile = padded[k*sz:k*sz+sz, n*sz:n*sz+sz]
+                    for row_idx in range(sz):
                         row = tile[row_idx, :]
-                        packed.append(int(row[0]) | (int(row[1]) << 16) | (int(row[2]) << 32) | (int(row[3]) << 48))
+                        word = 0
+                        for i in range(sz):
+                            word |= int(row[i]) << (i * 16)
+                        packed.append(word)
             return packed
         elif role == 'C':
             # Output space allocation (Row-Major Tiles)
-            return [0] * (m_tiles * n_tiles * 4)
+            return [0] * (m_tiles * n_tiles * sz)
         return []
 
     def compile(self):
@@ -110,14 +156,10 @@ class TinyNPUProgram:
         Compiles the program into Instruction Memory (IM) and Unified Buffer (UB) images.
         """
         # Pass 1: Resolve Roles and allocate addresses
-        # We need to decide which symbol is A, B, or C to pack it correctly.
-        # If a symbol is used in multiple roles (e.g. C of layer 1 is B of layer 2),
-        # we prioritize the packing that matches its 'source' (usually C).
         roles = {}
         mkn_info = {}
         for instr in self.instructions:
             if instr['type'] == 'MATMUL':
-                # Only set role if not already set (prevents overwriting B with A etc.)
                 if instr['a_name'] not in roles: roles[instr['a_name']] = 'A'
                 if instr['b_name'] not in roles: roles[instr['b_name']] = 'B'
                 if instr['c_name'] not in roles: roles[instr['c_name']] = 'C'
@@ -133,7 +175,6 @@ class TinyNPUProgram:
             role = roles.get(name, 'A')
             m, k, n = mkn_info.get(name, (0,0,0))
             
-            # If C-type output has no initial data, allocate zeros
             if info['data'] is None:
                 packed = self._pack_tiled(np.zeros(info['shape']), 'C', m, 0, n)
             else:
@@ -167,11 +208,16 @@ class TinyNPUProgram:
             self.compile()
             
         binary = self.last_compiled
+        sz_bytes = self.buffer_width // 8
         
         with open(filename, "w") as f:
             f.write("# Auto-generated TinyNPU Driver\n")
             f.write("import numpy as np\n\n")
             
+            f.write(f"ARRAY_SIZE = {self.array_size}\n")
+            f.write(f"BUFFER_WIDTH_BYTES = {sz_bytes}\n")
+            f.write(f"IM_BASE = {self.im_base_addr:#x}\n\n")
+
             f.write("SYMBOLS = {\n")
             for name, addr in self.symbol_to_addr.items():
                 f.write(f"    '{name}': {addr},\n")
@@ -184,29 +230,42 @@ class TinyNPUProgram:
 
             f.write("UB_DATA = [\n")
             for word in binary['ub']:
-                f.write(f"    {word:#018x},\n")
+                # Dynamic width hex formatting
+                hex_str = f"{word:0{self.buffer_width//4}x}"
+                f.write(f"    0x{hex_str},\n")
             f.write("]\n\n")
 
             f.write("DRIVER_MESSAGES = [\n")
-            # 1. Load UB (ADDR -> CMD -> DOORBELL)
+            # 1. Load UB (ADDR -> CMD -> MMVR)
             for addr, data in enumerate(binary['ub']):
                 f.write(f"    (0x08, {addr}), # ADDR\n")
                 f.write(f"    (0x04, 0x01), # CMD_WRITE_MEM\n")
-                f.write(f"    (0x10, {data}), # MMVR (Doorbell)\n")
+                f.write(f"    (0x10, {data}), # MMVR (Base)\n")
             
             # 2. Load IM
+            inst_width = 256
             for addr, inst in enumerate(binary['im']):
-                for i in range(4):
-                    chunk = (inst >> (i * 64)) & 0xFFFFFFFFFFFFFFFF
-                    im_addr = 0x8000 + (addr * 4) + i
-                    f.write(f"    (0x08, {im_addr}), # ADDR\n")
+                if self.buffer_width >= inst_width:
+                    # Write whole instruction in one go
+                    f.write(f"    (0x08, {self.im_base_addr + addr}), # ADDR\n")
                     f.write(f"    (0x04, 0x01), # CMD_WRITE_MEM\n")
-                    f.write(f"    (0x10, {chunk}), # MMVR (Doorbell)\n")
+                    f.write(f"    (0x10, {inst}), # MMVR (Base)\n")
+                else:
+                    # Power-of-2 chunking
+                    num_chunks = inst_width // self.buffer_width
+                    for i in range(num_chunks):
+                        chunk_mask = (1 << self.buffer_width) - 1
+                        chunk = (inst >> (i * self.buffer_width)) & chunk_mask
+                        im_addr = (addr * num_chunks) + i
+                        f.write(f"    (0x08, {self.im_base_addr + im_addr}), # ADDR\n")
+                        f.write(f"    (0x04, 0x01), # CMD_WRITE_MEM\n")
+                        f.write(f"    (0x10, {chunk}), # MMVR (Base)\n")
 
             # 3. Run
-            f.write("    (0x0C, 0x8000), # ARG (PC Start)\n")
+            doorbell_addr = 0x10 + (self.buffer_width // 8) - 1
+            f.write(f"    (0x0C, {self.im_base_addr:#x}), # ARG (PC Start)\n")
             f.write("    (0x04, 0x03), # CMD_RUN\n")
-            f.write("    (0x10, 0), # MMVR (Doorbell)\n")
+            f.write(f"    ({doorbell_addr:#x}, 0), # MMVR (Doorbell trigger)\n")
             f.write("]\n")
 
     def to_assembly(self): return "; Tiled Assembly"

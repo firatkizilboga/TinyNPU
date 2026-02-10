@@ -20,19 +20,33 @@ async def write_reg(dut, addr, data, width=8):
     dut.host_wr_en.value = 0
 
 async def read_ub_vector(dut, addr):
+    mmvr_bytes = chain_driver.BUFFER_WIDTH_BYTES
+    doorbell_addr = REG_MMVR + mmvr_bytes - 1
+    
     await write_reg(dut, REG_ADDR, addr, 16)
     await write_reg(dut, REG_CMD, 2, 8)
-    await write_reg(dut, REG_MMVR, 0, 64)
+    # Trigger read by writing to the doorbell byte
+    await write_reg(dut, doorbell_addr, 0, 8)
+    
+    # Wait for Data Valid
     for _ in range(100):
         dut.host_addr.value = REG_STATUS
         await RisingEdge(dut.clk)
         if int(dut.host_rd_data.value) == 0x02: break
+    else: raise AssertionError(f"Timeout waiting for read at {addr}")
+    
     res_bytes = []
-    for i in range(8):
+    for i in range(mmvr_bytes):
         dut.host_addr.value = REG_MMVR + i
         await RisingEdge(dut.clk)
         res_bytes.append(int(dut.host_rd_data.value))
-    return [res_bytes[i*2] | (res_bytes[i*2+1] << 8) for i in range(4)]
+    
+    # Reconstruct 16-bit elements (ARRAY_SIZE of them)
+    res = []
+    for i in range(chain_driver.ARRAY_SIZE):
+        val = res_bytes[i*2] | (res_bytes[i*2+1] << 8)
+        res.append(val)
+    return res
 
 @cocotb.test()
 async def test_chain(dut):
@@ -43,8 +57,20 @@ async def test_chain(dut):
     dut.rst_n.value = 1
     
     dut._log.info("Loading Chain Test Program...")
+    mmvr_width = chain_driver.BUFFER_WIDTH_BYTES * 8
     for reg, val in chain_driver.DRIVER_MESSAGES:
-        width = 64 if reg == REG_MMVR else (32 if reg == REG_ARG else (16 if reg == REG_ADDR else 8))
+        # If writing to Base MMVR (0x10), it's a full buffer write.
+        # If writing to a higher address (e.g. 0x1F), it's a specific byte write (like RUN trigger).
+        if reg == REG_MMVR:
+            width = mmvr_width
+        elif reg > REG_MMVR:
+            width = 8
+        elif reg == REG_ARG:
+            width = 32
+        elif reg == REG_ADDR:
+            width = 16
+        else:
+            width = 8
         await write_reg(dut, reg, val, width)
 
     dut._log.info("Waiting for HALT...")
@@ -60,17 +86,18 @@ async def test_chain(dut):
     dut._log.info(f"Verifying Final A_out ({dim}x{dim})...")
     
     actual_a = np.zeros((dim, dim), dtype=np.uint64)
-    tiles_m = dim // 4
-    tiles_n = dim // 4
+    sz = chain_driver.ARRAY_SIZE
+    tiles_m = dim // sz
+    tiles_n = dim // sz
     base_addr = chain_driver.ADDR_A_OUT
     
     for m in range(tiles_m):
         for n in range(tiles_n):
             tile_idx = (m * tiles_n) + n
-            tile_addr = base_addr + (tile_idx * 4)
-            for r in range(4):
+            tile_addr = base_addr + (tile_idx * sz)
+            for r in range(sz):
                 row_vals = await read_ub_vector(dut, tile_addr + r)
-                actual_a[m*4 + r, n*4 : n*4 + 4] = row_vals
+                actual_a[m*sz + r, n*sz : n*sz + sz] = row_vals
     
     expected = np.array(chain_driver.EXPECTED_A_OUT)
     

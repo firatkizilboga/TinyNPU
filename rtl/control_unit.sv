@@ -105,12 +105,16 @@ module control_unit (
       pc    <= pc_next;
       ub_rdata_reg <= ub_rdata;
 
+
       // Doorbell Latching
       if ((state == CTRL_IDLE || state == CTRL_READ_WAIT || state == CTRL_HALT) && doorbell_pulse) begin
         latched_cmd  <= cmd_in;
         latched_addr <= addr_in;
         latched_mmvr <= mmvr_in;
-        latched_arg  <= arg_in;
+        // Only latch ARG if it's a RUN command to avoid corruption from memory data
+        if (cmd_in == `CMD_RUN) begin
+            latched_arg  <= arg_in;
+        end
       end
 
       // MOVE Update
@@ -178,13 +182,13 @@ module control_unit (
     case (state)
       CTRL_IDLE: begin
         if (doorbell_pulse) begin
-          status_out = `STATUS_BUSY;
           if (cmd_in == `CMD_WRITE_MEM) next_state = CTRL_HOST_WRITE;
           else if (cmd_in == `CMD_READ_MEM) next_state = CTRL_HOST_READ;
           else if (cmd_in == `CMD_RUN) begin
             pc_next = arg_in[`ADDR_WIDTH-1:0];
             next_state = CTRL_FETCH;
           end
+          status_out = `STATUS_BUSY;
         end
       end
 
@@ -192,7 +196,7 @@ module control_unit (
         status_out = `STATUS_BUSY;
         if (latched_addr >= `IM_BASE_ADDR) begin
           im_wr_en = 1'b1;
-          im_addr  = latched_addr - `IM_BASE_ADDR;
+          im_addr  = latched_addr;
         end else begin
           ub_req   = 1'b1;
           ub_wr_en = 1'b1;
@@ -204,7 +208,7 @@ module control_unit (
       CTRL_HOST_READ: begin
         status_out = `STATUS_BUSY;
         if (latched_addr >= `IM_BASE_ADDR) begin
-          im_addr = latched_addr - `IM_BASE_ADDR;
+          im_addr = latched_addr;
         end else begin
           ub_req  = 1'b1;
           ub_addr = latched_addr;
@@ -217,7 +221,7 @@ module control_unit (
         mmvr_wr_en = 1'b1;
         // Hold addresses to keep combinational data valid
         if (latched_addr >= `IM_BASE_ADDR) begin
-          im_addr = latched_addr - `IM_BASE_ADDR;
+          im_addr = latched_addr;
           mmvr_out = im_rdata;
         end else begin
           ub_req  = 1'b1;
@@ -239,7 +243,7 @@ module control_unit (
 
       CTRL_FETCH: begin
         status_out = `STATUS_BUSY;
-        im_addr = {pc[`ADDR_WIDTH-3:0], 2'b00};
+        im_addr = pc;
         next_state = CTRL_DECODE;
       end
 
@@ -247,11 +251,11 @@ module control_unit (
         status_out = `STATUS_BUSY;
         case (im_rdata[255:252])
           ISA_OP_HALT: begin
-            pc_next = pc + 1;
+            pc_next = pc + `INST_CHUNKS;
             next_state = CTRL_HALT;
           end
           ISA_OP_NOP: begin
-            pc_next = pc + 1;
+            pc_next = pc + `INST_CHUNKS;
             next_state = CTRL_FETCH;
           end
           ISA_OP_MOVE: begin
@@ -271,7 +275,7 @@ module control_unit (
         ub_req = 1'b1;
 
         if (move_count == 0) begin
-          pc_next = pc + 1;
+          pc_next = pc + `INST_CHUNKS;
           next_state = CTRL_FETCH;
         end else if (move_phase == 1'b0) begin
           ub_addr = move_src;
@@ -290,7 +294,7 @@ module control_unit (
       CTRL_EXEC_MATMUL: begin
         status_out = `STATUS_BUSY;
         if (m_idx >= mm_m_total) begin
-          pc_next = pc + 1;
+          pc_next = pc + `INST_CHUNKS;
           next_state = CTRL_FETCH;
         end else if (n_idx >= mm_n_total) begin
           m_next = m_idx + 1;
