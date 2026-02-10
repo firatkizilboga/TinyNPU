@@ -185,20 +185,6 @@ module systolic_array (
     // computation_started: fires when BOTH input and weight first markers arrive
     // computation_done: fires when BOTH input and weight last markers arrive (enters array)
     // all_done: fires when last marker exits PE[3][3] (all computation complete)
-    
-    always_ff @(posedge clk) begin : debugBlock
-        if (compute_enable) begin
-            $display("=== [Systolic Array @ %0t] compute_enable=1 ===", $time);
-            $display("  Input (horizontal, enters left edge):");
-            $display("    Row0=%04h  Row1=%04h  Row2=%04h  Row3=%04h", 
-                     input_data[0], input_data[1], input_data[2], input_data[3]);
-            $display("  Weight (vertical, enters top edge):");
-            $display("    Col0=%04h  Col1=%04h  Col2=%04h  Col3=%04h", 
-                     weight_data[0], weight_data[1], weight_data[2], weight_data[3]);
-            $display("  Markers: input_first=%b input_last=%b weight_first=%b weight_last=%b",
-                     input_first, input_last, weight_first, weight_last);
-        end
-    end 
 
     assign computation_started = input_first & weight_first;
     assign computation_done    = input_last & weight_last;

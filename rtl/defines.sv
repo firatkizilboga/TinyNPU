@@ -24,7 +24,7 @@
 // ----------------------------------------------------------------------------
 // Buffer Parameters
 // ----------------------------------------------------------------------------
-`define BUFFER_DEPTH 1024         // Number of vectors in unified buffer
+`define BUFFER_DEPTH 8192         // Number of vectors in unified buffer
 `define BUFFER_WIDTH (`DATA_WIDTH * `ARRAY_SIZE)  // 1024 vectors × N elements
 
 // ----------------------------------------------------------------------------

@@ -9,13 +9,22 @@ module control_top (
     input  logic                        host_wr_en,
     output logic [`HOST_DATA_WIDTH-1:0] host_rd_data,
 
+    output logic                        ub_req,
     output logic                        ub_wr_en,
     output logic [`ADDR_WIDTH-1:0]      ub_addr,
+    output logic [`ADDR_WIDTH-1:0]      ub_w_addr, // New Weight Addr
     output logic [`BUFFER_WIDTH-1:0]    ub_wdata,
     input  logic [`BUFFER_WIDTH-1:0]    ub_rdata,
 
     output logic                        acc_clear,
-    output logic                        compute_enable
+    output logic                        compute_enable,
+    
+    // Sequencer Markers
+    output logic                        sa_input_first,
+    output logic                        sa_input_last,
+    output logic                        sa_weight_first,
+    output logic                        sa_weight_last,
+    input  logic                        all_done_in
 );
 
     logic [`HOST_DATA_WIDTH-1:0] cmd_bus;
@@ -68,12 +77,19 @@ module control_top (
         .im_addr        (im_addr),
         .im_wdata       (im_wdata),
         .im_rdata       (im_rdata),
+        .ub_req         (ub_req),
         .ub_wr_en       (ub_wr_en),
         .ub_addr        (ub_addr),
+        .ub_w_addr      (ub_w_addr),
         .ub_wdata       (ub_wdata),
         .ub_rdata       (ub_rdata),
         .acc_clear      (acc_clear),
-        .compute_enable (compute_enable)
+        .compute_enable (compute_enable),
+        .sa_input_first (sa_input_first),
+        .sa_input_last  (sa_input_last),
+        .sa_weight_first(sa_weight_first),
+        .sa_weight_last (sa_weight_last),
+        .all_done_in    (all_done_in)
     );
 
 endmodule
