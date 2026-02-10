@@ -1,6 +1,7 @@
 import numpy as np
 import os
 import re
+import json
 from .isa import Opcode, HostCmd, generate_host_messages, pack_matmul, pack_move, pack_simple
 
 class HardwareConfig:
@@ -8,7 +9,7 @@ class HardwareConfig:
     def __init__(self, defines_path=None):
         if defines_path is None:
             # Try to find defines.sv relative to this file
-            base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+            base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
             defines_path = os.path.join(base_dir, "rtl", "defines.sv")
             
         self.params = {
@@ -48,6 +49,11 @@ class TinyNPUProgram:
         self.raw_symbols = {} 
         self.symbol_to_addr = {}
         self.ub_data = []
+        self.expected_results = {} # name -> np.array
+
+    def add_expected_result(self, name, data):
+        """Sets the golden reference for an output symbol."""
+        self.expected_results[name] = np.array(data, dtype=np.uint16)
         
     def declare_data(self, name, data):
         """
@@ -102,6 +108,27 @@ class TinyNPUProgram:
             'm': m_tiles,
             'k': k_tiles,
             'n': n_tiles
+        })
+
+    def move(self, src_name, dest_name):
+        """
+        Adds a MOVE instruction: copies src matrix to dest.
+        """
+        if src_name not in self.raw_symbols:
+            raise ValueError(f"Source symbol '{src_name}' not found.")
+        
+        shape = self.raw_symbols[src_name]['shape']
+        
+        if dest_name not in self.raw_symbols:
+            self.raw_symbols[dest_name] = {
+                'data': None,
+                'shape': shape
+            }
+            
+        self.instructions.append({
+            'type': 'MOVE',
+            'src_name': src_name,
+            'dest_name': dest_name
         })
 
     def halt(self):
@@ -164,9 +191,19 @@ class TinyNPUProgram:
                 if instr['b_name'] not in roles: roles[instr['b_name']] = 'B'
                 if instr['c_name'] not in roles: roles[instr['c_name']] = 'C'
                 mkn_info[instr['c_name']] = (instr['m'], instr['k'], instr['n'])
+            elif instr['type'] == 'MOVE':
+                if instr['src_name'] not in roles: roles[instr['src_name']] = 'A'
+                # Destination must have the same role as source to maintain layout
+                roles[instr['dest_name']] = roles[instr['src_name']]
+                # For move, we need to know the tile dimensions to calculate word count
+                shape = self.raw_symbols[instr['src_name']]['shape']
+                mt = (shape[0] + self.array_size - 1) // self.array_size
+                nt = (shape[1] + self.array_size - 1) // self.array_size
+                mkn_info[instr['dest_name']] = (mt, 0, nt)
 
         self.ub_data = []
         self.symbol_to_addr = {}
+        self.symbol_roles = roles
         next_addr = 0
         
         # Sort symbols for deterministic layout
@@ -193,6 +230,16 @@ class TinyNPUProgram:
                                   self.symbol_to_addr[instr['b_name']], 
                                   self.symbol_to_addr[instr['c_name']],
                                   instr['m'], instr['k'], instr['n'])
+                compiled_im.append(raw)
+            elif instr['type'] == 'MOVE':
+                shape = self.raw_symbols[instr['src_name']]['shape']
+                mt = (shape[0] + self.array_size - 1) // self.array_size
+                nt = (shape[1] + self.array_size - 1) // self.array_size
+                count = mt * nt * self.array_size
+                raw = pack_move(Opcode.MOVE,
+                                self.symbol_to_addr[instr['src_name']],
+                                self.symbol_to_addr[instr['dest_name']],
+                                count)
                 compiled_im.append(raw)
             elif instr['type'] == 'HALT':
                 compiled_im.append(pack_simple(Opcode.HALT))
@@ -267,5 +314,41 @@ class TinyNPUProgram:
             f.write("    (0x04, 0x03), # CMD_RUN\n")
             f.write(f"    ({doorbell_addr:#x}, 0), # MMVR (Doorbell trigger)\n")
             f.write("]\n")
+
+    def save_npu(self, filename):
+        """
+        Exports the program to a unified .npu (JSON) format for testing.
+        """
+        if not hasattr(self, 'last_compiled'):
+            self.compile()
+        
+        binary = self.last_compiled
+        
+        # We need to export UB and IM as lists of hex strings for JSON portability
+        # and include symbol table for verification
+        npu_data = {
+            "config": {
+                "array_size": self.array_size,
+                "buffer_width": self.buffer_width,
+                "im_base": self.im_base_addr
+            },
+            "symbols": {
+                name: {
+                    "addr": addr,
+                    "shape": list(self.raw_symbols[name]['shape']),
+                    "role": self.symbol_roles.get(name, 'A')
+                } for name, addr in self.symbol_to_addr.items()
+            },
+            "im": [f"0x{inst:064x}" for inst in binary['im']],
+            "ub": [f"0x{word:0{self.buffer_width//4}x}" for word in binary['ub']],
+            "expected": {
+                name: self.expected_results[name].tolist() 
+                for name in self.expected_results if name in self.raw_symbols
+            }
+        }
+        
+        with open(filename, "w") as f:
+            json.dump(npu_data, f, indent=2)
+        print(f"Saved NPU program to {filename}")
 
     def to_assembly(self): return "; Tiled Assembly"
