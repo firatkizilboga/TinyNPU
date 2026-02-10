@@ -1,6 +1,8 @@
 `include "defines.sv"
 
-module control_top (
+module control_top #(
+    parameter IM_INIT_FILE = ""
+) (
     input  logic clk,
     input  logic rst_n,
 
@@ -22,6 +24,7 @@ module control_top (
     output logic                        acc_clear,
     output logic                        compute_enable,
     output logic                        drain_enable,
+    output logic                        ppu_wb_en,
     
     // PPU Control
     output logic [$clog2(`ARRAY_SIZE)-1:0] ppu_cycle_idx,
@@ -41,6 +44,8 @@ module control_top (
     logic [`BUFFER_WIDTH-1:0]    mmvr_bus;
     logic                        doorbell_pulse;
     logic [`HOST_DATA_WIDTH-1:0] status_bus;
+    logic                        mmvr_wr_en;
+    logic [`BUFFER_WIDTH-1:0]    mmvr_internal;
 
     // Instruction Memory Internal Signals
     logic                        im_wr_en;
@@ -60,12 +65,16 @@ module control_top (
         .addr_out       (addr_bus),
         .arg_out        (arg_bus),
         .mmvr_out       (mmvr_bus),
+        .mmvr_wr_en     (mmvr_wr_en),
+        .mmvr_in        (mmvr_internal),
         .doorbell_pulse (doorbell_pulse),
         .status_in      (status_bus)
     );
 
     // Instruction Memory Instance
-    instruction_memory u_im (
+    instruction_memory #(
+        .INIT_FILE(IM_INIT_FILE)
+    ) u_im (
         .clk     (clk),
         .rst_n   (rst_n),
         .wr_en   (im_wr_en),
@@ -85,6 +94,8 @@ module control_top (
         .mmvr_in        (mmvr_bus),
         .doorbell_pulse (doorbell_pulse),
         .status_out     (status_bus),
+        .mmvr_wr_en     (mmvr_wr_en),
+        .mmvr_out       (mmvr_internal),
         .im_wr_en       (im_wr_en),
         .im_addr        (im_addr),
         .im_wdata       (im_wdata),
@@ -98,6 +109,7 @@ module control_top (
         .acc_clear      (acc_clear),
         .compute_enable (compute_enable),
         .drain_enable   (drain_enable),
+        .ppu_wb_en      (ppu_wb_en),
         .sa_input_first (sa_input_first),
         .sa_input_last  (sa_input_last),
         .sa_weight_first(sa_weight_first),

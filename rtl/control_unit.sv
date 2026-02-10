@@ -11,6 +11,8 @@ module control_unit (
     input  logic [   `BUFFER_WIDTH-1:0] mmvr_in,
     input  logic                        doorbell_pulse,
     output logic [`HOST_DATA_WIDTH-1:0] status_out,
+    output logic                        mmvr_wr_en,
+    output logic [   `BUFFER_WIDTH-1:0] mmvr_out,
 
     // Instruction Memory Interface
     output logic                     im_wr_en,
@@ -36,6 +38,7 @@ module control_unit (
     output logic sa_weight_last,
 
     // PPU Control
+    output logic                           ppu_wb_en,
     output logic [$clog2(`ARRAY_SIZE)-1:0] ppu_cycle_idx,
     output logic                           ppu_capture_en,
 
@@ -46,6 +49,7 @@ module control_unit (
     CTRL_IDLE,
     CTRL_HOST_WRITE,
     CTRL_HOST_READ,
+    CTRL_READ_WAIT,
     CTRL_FETCH,
     CTRL_DECODE,
     CTRL_EXEC_MOVE,
@@ -102,7 +106,7 @@ module control_unit (
       ub_rdata_reg <= ub_rdata;
 
       // Doorbell Latching
-      if (state == CTRL_IDLE && doorbell_pulse) begin
+      if ((state == CTRL_IDLE || state == CTRL_READ_WAIT || state == CTRL_HALT) && doorbell_pulse) begin
         latched_cmd  <= cmd_in;
         latched_addr <= addr_in;
         latched_mmvr <= mmvr_in;
@@ -158,6 +162,9 @@ module control_unit (
     sa_weight_last = 1'b0;
     ppu_capture_en = 1'b0;
     ppu_cycle_idx = cycle_cnt;
+    ppu_wb_en = 1'b0;
+    mmvr_wr_en = 1'b0;
+    mmvr_out = '0;
 
     move_src_next = move_src;
     move_dest_next = move_dest;
@@ -171,6 +178,7 @@ module control_unit (
     case (state)
       CTRL_IDLE: begin
         if (doorbell_pulse) begin
+          status_out = `STATUS_BUSY;
           if (cmd_in == `CMD_WRITE_MEM) next_state = CTRL_HOST_WRITE;
           else if (cmd_in == `CMD_READ_MEM) next_state = CTRL_HOST_READ;
           else if (cmd_in == `CMD_RUN) begin
@@ -201,7 +209,32 @@ module control_unit (
           ub_req  = 1'b1;
           ub_addr = latched_addr;
         end
-        next_state = CTRL_IDLE;
+        next_state = CTRL_READ_WAIT;
+      end
+
+      CTRL_READ_WAIT: begin
+        status_out = doorbell_pulse ? `STATUS_BUSY : `STATUS_DATA_VALID;
+        mmvr_wr_en = 1'b1;
+        // Hold addresses to keep combinational data valid
+        if (latched_addr >= `IM_BASE_ADDR) begin
+          im_addr = latched_addr - `IM_BASE_ADDR;
+          mmvr_out = im_rdata;
+        end else begin
+          ub_req  = 1'b1;
+          ub_addr = latched_addr;
+          mmvr_out = ub_rdata;
+        end
+        
+        if (doorbell_pulse) begin
+          if (cmd_in == `CMD_WRITE_MEM) next_state = CTRL_HOST_WRITE;
+          else if (cmd_in == `CMD_READ_MEM) next_state = CTRL_HOST_READ;
+          else if (cmd_in == `CMD_RUN) begin
+            pc_next = arg_in[`ADDR_WIDTH-1:0];
+            next_state = CTRL_FETCH;
+          end else begin
+            next_state = CTRL_IDLE;
+          end
+        end
       end
 
       CTRL_FETCH: begin
@@ -329,9 +362,12 @@ module control_unit (
         status_out = `STATUS_BUSY;
         ub_req = 1'b1;
         ub_wr_en = 1'b1;
+        ppu_wb_en = 1'b1;
 
-        // Writeback Address: C_Base + Tile Offset + Column Index
-        ub_addr = mm_c_base + (m_idx * mm_n_total * `ARRAY_SIZE) + (n_idx * `ARRAY_SIZE) + cycle_cnt;
+        // Writeback Address: C_Base + Tile Offset + Row Index
+        // Note: storage[0] is Row 3, storage[3] is Row 0.
+        // So we use (3 - cycle_cnt) to map storage index to Row index.
+        ub_addr = mm_c_base + (m_idx * mm_n_total * `ARRAY_SIZE) + (n_idx * `ARRAY_SIZE) + (`ARRAY_SIZE - 1 - cycle_cnt);
 
         if (cycle_cnt == (`ARRAY_SIZE - 1)) begin
           cycle_next = '0;
@@ -343,8 +379,17 @@ module control_unit (
       end
 
       CTRL_HALT: begin
-        status_out = `STATUS_HALTED;
-        if (doorbell_pulse) next_state = CTRL_IDLE;
+        status_out = doorbell_pulse ? `STATUS_BUSY : `STATUS_HALTED;
+        if (doorbell_pulse) begin
+          if (cmd_in == `CMD_WRITE_MEM) next_state = CTRL_HOST_WRITE;
+          else if (cmd_in == `CMD_READ_MEM) next_state = CTRL_HOST_READ;
+          else if (cmd_in == `CMD_RUN) begin
+            pc_next = arg_in[`ADDR_WIDTH-1:0];
+            next_state = CTRL_FETCH;
+          end else begin
+            next_state = CTRL_IDLE;
+          end
+        end
       end
 
       default: next_state = CTRL_IDLE;

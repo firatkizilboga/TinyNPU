@@ -1,0 +1,28 @@
+# Makefile for predetermined test
+SIM ?= verilator
+TOPLEVEL_LANG ?= verilog
+
+VERILOG_SOURCES += $(PWD)/../../rtl/tinynpu_top.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/control_top.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/control_unit.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/instruction_memory.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/mmio_interface.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/ubss.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/unified_buffer.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/skewer.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/systolic_array.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/pe.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/ppu.sv
+
+TOPLEVEL = tinynpu_top
+MODULE = test_predetermined
+
+# Pass Parameters to Verilator
+# Note: Cocotb/Verilator handles parameters via EXTRA_ARGS
+EXTRA_ARGS += -I$(PWD)/../../rtl
+EXTRA_ARGS += -GIM_INIT_FILE=\"predetermined_im.hex\"
+EXTRA_ARGS += -GUB_INIT_FILE=\"predetermined_ub.hex\"
+EXTRA_ARGS += --trace --trace-structs
+EXTRA_ARGS += -Wno-fatal
+
+include $(shell cocotb-config --makefiles)/Makefile.sim
