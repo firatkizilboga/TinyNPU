@@ -1,6 +1,8 @@
 `include "defines.sv"
 
-module instruction_memory (
+module instruction_memory #(
+    parameter INIT_FILE = ""
+) (
     input  logic clk,
     input  logic rst_n,
 
@@ -16,6 +18,13 @@ module instruction_memory (
 
     // Memory is 256 bits wide
     logic [`INST_WIDTH-1:0] memory [`IM_SIZE-1:0];
+
+    // Initialization
+    initial begin
+        if (INIT_FILE != "") begin
+            $readmemh(INIT_FILE, memory);
+        end
+    end
 
     // Host Write Logic (Splicing 64-bit writes into 256-bit rows)
     always_ff @(posedge clk) begin

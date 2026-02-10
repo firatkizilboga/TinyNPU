@@ -225,9 +225,9 @@ module pe (
     assign input_to_right = input_latch;    // Propagate input horizontally (16-bit)
     assign last_out       = last_latch;     // Propagate last marker horizontally
     
-    // Valid wavefront propagation - pass through latched values
-    assign valid_h_out    = local_valid;  // Propagate horizontally
-    assign valid_v_out    = local_valid;  // Propagate vertically
+    // Valid wavefront propagation - pass through latched values independently
+    assign valid_h_out    = valid_h_latch; // Propagate horizontally
+    assign valid_v_out    = valid_v_latch; // Propagate vertically
     
     // Vertical output: pass WEIGHTS during compute, ACCUMULATORS during drain
     // This is critical for multi-row operation!

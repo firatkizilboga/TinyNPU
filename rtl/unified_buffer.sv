@@ -25,11 +25,18 @@ module unified_buffer #(
     input  logic [  `ADDR_WIDTH-1:0] weight_addr,
     output logic                     weight_first_out,
     output logic                     weight_last_out,
-    output logic [`BUFFER_WIDTH-1:0] weight_data
+    output logic [`BUFFER_WIDTH-1:0] weight_data,
+
+    // NEW: Dedicated Read Port for Control Unit / MMIO
+    input  logic [`ADDR_WIDTH-1:0]   cu_rd_addr,
+    output logic [`BUFFER_WIDTH-1:0] cu_rd_data
 );
 
   // Memory: BUFFER_DEPTH rows × BUFFER_WIDTH bits per row
   logic [`BUFFER_WIDTH-1:0] memory[`BUFFER_DEPTH-1:0];
+
+  // Random access read (combinational for simplicity in this CU)
+  assign cu_rd_data = memory[cu_rd_addr];
 
   // Write logic (negedge for timing hygiene)
   always_ff @(negedge clk) begin
@@ -62,6 +69,11 @@ module unified_buffer #(
     if (INIT_FILE != "") begin
       $readmemh(INIT_FILE, memory);
     end
+  end
+
+  // Dump memory at end of simulation for debugging
+  final begin
+      $writememh("ub_dump_rtl.hex", memory);
   end
 
 endmodule

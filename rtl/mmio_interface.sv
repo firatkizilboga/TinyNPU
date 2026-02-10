@@ -16,6 +16,10 @@ module mmio_interface (
     output logic [`ARG_WIDTH-1:0]       arg_out,
     output logic [`BUFFER_WIDTH-1:0]    mmvr_out,
 
+    // Internal Write Interface (from CU)
+    input  logic                        mmvr_wr_en,
+    input  logic [`BUFFER_WIDTH-1:0]    mmvr_in,
+
     output logic        doorbell_pulse
 );
 
@@ -34,6 +38,8 @@ module mmio_interface (
             doorbell_q     <= 1'b0;
         end else begin
             doorbell_q <= 1'b0;
+            
+            // Host writes
             if (host_wr_en) begin
                 case (host_addr)
                     `REG_CMD: cmd_reg <= host_wr_data;
@@ -60,10 +66,15 @@ module mmio_interface (
                     default: ;
                 endcase
             end
+
+            // Internal override (TPU writes to Host)
+            // If both write in same cycle, Internal wins for MMVR
+            if (mmvr_wr_en) begin
+                mmvr_reg <= mmvr_in;
+            end
         end
     end
 
-    // Pulse is high for 1 cycle AFTER the write is complete
     assign doorbell_pulse = doorbell_q;
 
     always_comb begin

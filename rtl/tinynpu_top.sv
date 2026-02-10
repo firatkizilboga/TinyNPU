@@ -1,6 +1,9 @@
 `include "defines.sv"
 
-module tinynpu_top (
+module tinynpu_top #(
+    parameter IM_INIT_FILE = "",
+    parameter UB_INIT_FILE = ""
+) (
     input  logic clk,
     input  logic rst_n,
 
@@ -22,10 +25,16 @@ module tinynpu_top (
     logic [`BUFFER_WIDTH-1:0]    ub_rdata;
     logic                        acc_clear;
     logic                        compute_enable;
+    logic                        drain_enable;
+    logic                        ppu_wb_en;
+    logic [$clog2(`ARRAY_SIZE)-1:0] ppu_cycle_idx;
+    logic                        ppu_capture_en;
     logic                        sa_input_first, sa_input_last;
     logic                        sa_weight_first, sa_weight_last;
 
-    control_top u_brain (
+    control_top #(
+        .IM_INIT_FILE(IM_INIT_FILE)
+    ) u_brain (
         .clk            (clk),
         .rst_n          (rst_n),
         .host_addr      (host_addr),
@@ -40,14 +49,20 @@ module tinynpu_top (
         .ub_rdata       (ub_rdata),
         .acc_clear      (acc_clear),
         .compute_enable (compute_enable),
+        .drain_enable   (drain_enable),
+        .ppu_wb_en      (ppu_wb_en),
         .sa_input_first (sa_input_first),
         .sa_input_last  (sa_input_last),
         .sa_weight_first(sa_weight_first),
         .sa_weight_last (sa_weight_last),
+        .ppu_cycle_idx  (ppu_cycle_idx),
+        .ppu_capture_en (ppu_capture_en),
         .all_done_in    (all_done)
     );
 
-    ubss u_muscle (
+    ubss #(
+        .UB_INIT_FILE(UB_INIT_FILE)
+    ) u_muscle (
         .clk            (clk),
         .rst_n          (rst_n),
         .en             (1'b1),
@@ -67,8 +82,12 @@ module tinynpu_top (
         
         .precision_mode (2'b10), 
         .compute_enable (compute_enable),
-        .drain_enable   (1'b0),
+        .drain_enable   (drain_enable),
+        .ppu_wb_en      (ppu_wb_en),
         .acc_clear      (acc_clear),
+
+        .ppu_cycle_idx  (ppu_cycle_idx),
+        .ppu_capture_en (ppu_capture_en),
         
         .results_flat   (results_flat),
         .result_valid   (result_valid),

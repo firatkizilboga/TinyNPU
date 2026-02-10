@@ -98,14 +98,12 @@ module systolic_array (
         end
         
         // Connect valid signals at boundaries
-        // Only inject valid at PE[0][0] to start the diagonal wavefront
-        // This valid signal will be OR-combined in PEs and propagate
-        // It should match the valid window of the inputs at the boundary
+        // Inject valid across all boundaries matching compute_enable
         for (r = 0; r < `ARRAY_SIZE; r++) begin : valid_h_boundary
-            assign valid_h_bus[r][0] = (r == 0) ? compute_enable : 1'b0;
+            assign valid_h_bus[r][0] = compute_enable;
         end
         for (c = 0; c < `ARRAY_SIZE; c++) begin : valid_v_boundary
-            assign valid_v_bus[0][c] = (c == 0) ? compute_enable : 1'b0;
+            assign valid_v_bus[0][c] = compute_enable;
         end
     endgenerate
     
@@ -145,6 +143,20 @@ module systolic_array (
                     // Accumulator output (stationary)
                     .acc_out           (pe_accumulators[r][c])
                 );
+                
+                // DEBUG for PE[0][0]
+                if (r == 0 && c == 0) begin : debug_pe00
+                    always_ff @(posedge clk) begin
+                        if (valid_h_bus[r][c] && !drain_enable && !acc_clear) begin
+                             // Since inputs are latched inside PE, we should look at bus values 
+                             // that WILL be latched.
+                             // $display("PE[0][0]: Input=%d Weight=%d Acc=%d", 
+                             //     $signed(horizontal_bus[r][c]), 
+                             //     $signed(vertical_bus[r][c][15:0]), 
+                             //     pe_accumulators[r][c]);
+                        end
+                    end
+                end
             end
         end
     endgenerate

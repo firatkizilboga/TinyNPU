@@ -4,47 +4,41 @@ module ppu (
     input  logic clk,
     input  logic rst_n,
 
-    // Control
-    input  logic       capture_en,
-    // Automatically calculate required width for the counter
+    // Control from sequencer
+    input  logic                           capture_en,
     input  logic [$clog2(`ARRAY_SIZE)-1:0] cycle_idx,
 
-    // Data from Systolic Array (Bottom row vertical bus)
-    input  logic signed [`ACC_WIDTH-1:0] acc_in [`ARRAY_SIZE-1:0],
-    
-    // Output to Unified Buffer
-    output logic [`BUFFER_WIDTH-1:0] ub_wdata
+    // Data from Systolic Array (Bottom Row)
+    input  logic signed [`ACC_WIDTH-1:0]   acc_in [`ARRAY_SIZE-1:0],
+
+    // Output to Unified Buffer (64-bit vector)
+    output logic [`BUFFER_WIDTH-1:0]       ub_wdata
 );
 
-    // Parameterized Tile Buffer: [Column][Row]
-    logic [15:0] tile_buffer [`ARRAY_SIZE-1:0][`ARRAY_SIZE-1:0];
+    // Internal storage for one full 4x4 tile (quantized to 16-bit)
+    logic [15:0] storage [`ARRAY_SIZE-1:0][`ARRAY_SIZE-1:0];
 
-    // ------------------------------------------------------------------------
-    // Capture Logic (Row-Major In)
-    // ------------------------------------------------------------------------
-    integer c;
-    always_ff @(posedge clk) begin
-        if (capture_en) begin
-            // We receive rows in reverse order: Row (N-1) down to Row 0.
-            // acc_in[c] holds the value for Column 'c' of the current Row.
-            for (c = 0; c < `ARRAY_SIZE; c++) begin
-                tile_buffer[c][`ARRAY_SIZE - 1 - cycle_idx] <= acc_in[c][15:0];
+    // Capture Logic: Store bottom row into storage[cycle_idx]
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            for (int r=0; r<`ARRAY_SIZE; r++) begin
+                for (int c=0; c<`ARRAY_SIZE; c++) begin
+                    storage[r][c] <= '0;
+                end
+            end
+        end else if (capture_en) begin
+            for (int i=0; i<`ARRAY_SIZE; i++) begin
+                // Simple truncation quantization
+                storage[cycle_idx][i] <= acc_in[i][15:0];
             end
         end
     end
 
-    // ------------------------------------------------------------------------
-    // Writeback Logic (Column-Major Out)
-    // ------------------------------------------------------------------------
-    // Use generate to construct the wide output vector from the selected column.
-    // We map rows 0..N-1 to the output vector segments.
-    
-    generate
-        genvar r;
-        for (r = 0; r < `ARRAY_SIZE; r++) begin : gen_out
-             // Element 0 (Row 0) goes to LSBs, Element N-1 (Row N-1) goes to MSBs
-             assign ub_wdata[(r*16) +: 16] = tile_buffer[cycle_idx][r];
-        end
-    endgenerate
+    // Output Selection: Present storage[cycle_idx] to UB
+    // This assumes the CU sets cycle_idx during WRITEBACK state as well.
+    assign ub_wdata = {storage[cycle_idx][3], 
+                       storage[cycle_idx][2], 
+                       storage[cycle_idx][1], 
+                       storage[cycle_idx][0]};
 
 endmodule
