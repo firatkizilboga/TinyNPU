@@ -71,4 +71,50 @@ typedef enum logic [1:0] {
     OP_IDLE     = 2'b11           // Idle state
 } pe_op_t;
 
+// ============================================================================
+// Control Plane & ISA Definitions (Added Feb 2026)
+// ============================================================================
+`define MMIO_ADDR_WIDTH 5
+`define HOST_DATA_WIDTH 8
+`define ARG_WIDTH       32
+
+// MMIO Register Map (Offsets)
+`define REG_STATUS  5'h00
+`define REG_CMD     5'h04
+`define REG_ADDR    5'h08
+`define REG_ARG     5'h0C
+`define REG_MMVR    5'h10
+
+// Memory Map
+`define IM_BASE_ADDR 16'h8000 // Instructions start here
+`define IM_SIZE      1024     // Depth of Instruction Memory (256-bit words)
+`define INST_WIDTH   256      // Fixed Instruction Width (4 * 64-bit)
+
+// ----------------------------------------------------------------------------
+// Status Codes (Read from STATUS_REG)
+// ----------------------------------------------------------------------------
+`define STATUS_IDLE          8'h00 // WAITING-FOR-IO
+`define STATUS_BUSY          8'h01 // Executing instructions
+`define STATUS_DATA_VALID    8'h02 // Read complete, data in MMVR
+`define STATUS_READY_WRITE   8'h03 // Ready for MMVR write
+`define STATUS_ERROR         8'hFE // Illegal state/instruction
+`define STATUS_HALTED        8'hFF // Execution finished
+
+// ----------------------------------------------------------------------------
+// Host Commands (Write to CMD_REG)
+// ----------------------------------------------------------------------------
+`define CMD_WRITE_MEM        8'h01 // MMVR -> Memory[ADDR]
+`define CMD_READ_MEM         8'h02 // Memory[ADDR] -> MMVR
+`define CMD_RUN              8'h03 // Start Execution from Memory[ARG]
+
+// ----------------------------------------------------------------------------
+// Instruction Set Architecture (ISA)
+// ----------------------------------------------------------------------------
+typedef enum logic [3:0] {
+    ISA_OP_NOP    = 4'h0,
+    ISA_OP_HALT   = 4'h1,
+    ISA_OP_MATMUL = 4'h2,      // Super Instruction (Includes Quant Config)
+    ISA_OP_MOVE   = 4'h3       // Internal DMA
+} opcode_t;
+
 `endif // DEFINES_SV

@@ -1,0 +1,15 @@
+# Makefile for MMIO Interface Unit Test
+SIM ?= verilator
+TOPLEVEL_LANG ?= verilog
+
+VERILOG_SOURCES += $(PWD)/../../rtl/mmio_interface.sv
+
+TOPLEVEL = mmio_interface
+MODULE = test_mmio
+
+# Verilator specific flags
+ifeq ($(SIM), verilator)
+EXTRA_ARGS += --trace --trace-structs -Wno-fatal -I$(PWD)/../../rtl
+endif
+
+include $(shell cocotb-config --makefiles)/Makefile.sim
