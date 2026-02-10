@@ -1,0 +1,27 @@
+# Makefile for generic .npu test runner
+SIM ?= verilator
+TOPLEVEL_LANG ?= verilog
+
+VERILOG_SOURCES += $(PWD)/../../rtl/defines.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/unified_buffer.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/skewer.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/pe.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/systolic_array.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/ubss.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/mmio_interface.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/instruction_memory.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/control_unit.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/control_top.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/tinynpu_top.sv
+
+TOPLEVEL = tinynpu_top
+MODULE = test_npu
+
+# Extra flags for Verilator
+EXTRA_ARGS += --trace --trace-structs -Wno-fatal
+EXTRA_ARGS += -I$(PWD)/../../rtl
+
+# Allow passing NPU_FILE via environment
+export NPU_FILE
+
+include $(shell cocotb-config --makefiles)/Makefile.sim
