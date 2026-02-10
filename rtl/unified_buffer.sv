@@ -35,6 +35,7 @@ module unified_buffer #(
   always_ff @(negedge clk) begin
     if (wr_en) begin
       memory[wr_addr] <= wr_data;
+      $display("[UB] Write to addr 0x%h: data=0x%h", wr_addr, wr_data);
     end
   end
 

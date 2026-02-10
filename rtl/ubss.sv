@@ -50,6 +50,13 @@ module ubss (
     logic [`BUFFER_WIDTH-1:0] ub_final_wdata;
     assign ub_final_wdata = (drain_enable) ? ppu_wdata : cu_wdata; // Drain implies PPU writing
 
+    // Debug: Show when PPU data is being written
+    always @(posedge clk) begin
+        if (cu_wr_en && drain_enable) begin
+            $display("[UBSS] CU Wrote PPU data to UB (drain_enable=1)");
+        end
+    end
+
     // ========================================================================
     // Unified Buffer Instance
     // ========================================================================

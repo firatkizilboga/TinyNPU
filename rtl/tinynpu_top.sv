@@ -22,8 +22,11 @@ module tinynpu_top (
     logic [`BUFFER_WIDTH-1:0]    ub_rdata;
     logic                        acc_clear;
     logic                        compute_enable;
+    logic                        drain_enable;
     logic                        sa_input_first, sa_input_last;
     logic                        sa_weight_first, sa_weight_last;
+    logic [$clog2(`ARRAY_SIZE)-1:0] ppu_cycle_idx;
+    logic                           ppu_capture_en;
 
     control_top u_brain (
         .clk            (clk),
@@ -40,6 +43,9 @@ module tinynpu_top (
         .ub_rdata       (ub_rdata),
         .acc_clear      (acc_clear),
         .compute_enable (compute_enable),
+        .drain_enable   (drain_enable),
+        .ppu_cycle_idx  (ppu_cycle_idx),
+        .ppu_capture_en (ppu_capture_en),
         .sa_input_first (sa_input_first),
         .sa_input_last  (sa_input_last),
         .sa_weight_first(sa_weight_first),
@@ -51,25 +57,28 @@ module tinynpu_top (
         .clk            (clk),
         .rst_n          (rst_n),
         .en             (1'b1),
-        
+
         .cu_req         (ub_req),
         .cu_wr_en       (ub_wr_en),
         .cu_addr        (ub_addr),
         .cu_wdata       (ub_wdata),
         .cu_rdata       (ub_rdata),
-        
+
         .sa_input_addr  (ub_addr),
         .sa_input_first (sa_input_first),
         .sa_input_last  (sa_input_last),
         .sa_weight_addr (ub_w_addr),
         .sa_weight_first(sa_weight_first),
         .sa_weight_last (sa_weight_last),
-        
-        .precision_mode (2'b10), 
+
+        .precision_mode (2'b10),
         .compute_enable (compute_enable),
-        .drain_enable   (1'b0),
+        .drain_enable   (drain_enable),
         .acc_clear      (acc_clear),
-        
+
+        .ppu_cycle_idx  (ppu_cycle_idx),
+        .ppu_capture_en (ppu_capture_en),
+
         .results_flat   (results_flat),
         .result_valid   (result_valid),
         .all_done       (all_done)

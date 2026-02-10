@@ -333,6 +333,10 @@ module control_unit (
         // Writeback Address: C_Base + Tile Offset + Column Index
         ub_addr = mm_c_base + (m_idx * mm_n_total * `ARRAY_SIZE) + (n_idx * `ARRAY_SIZE) + cycle_cnt;
 
+        if (cycle_cnt == 0) begin
+          $display("[CU] Writeback Tile[%0d][%0d] to addr 0x%h", m_idx, n_idx, ub_addr);
+        end
+
         if (cycle_cnt == (`ARRAY_SIZE - 1)) begin
           cycle_next = '0;
           n_next = n_idx + 1;
