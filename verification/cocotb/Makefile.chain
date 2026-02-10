@@ -13,7 +13,7 @@ VERILOG_SOURCES += $(PWD)/../../rtl/control_top.sv
 VERILOG_SOURCES += $(PWD)/../../rtl/tinynpu_top.sv
 
 TOPLEVEL = tinynpu_top
-MODULE = test_autonomous_matmul
+MODULE = test_chain
 
 EXTRA_ARGS += --trace --trace-structs -Wno-fatal -I$(PWD)/../../rtl
 EXTRA_ARGS += -Wno-PINMISSING -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-SELRANGE -Wno-UNOPTFLAT -Wno-CASEINCOMPLETE
