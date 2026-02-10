@@ -1,0 +1,18 @@
+# Makefile for Control Top Integration Test
+SIM ?= verilator
+TOPLEVEL_LANG ?= verilog
+
+VERILOG_SOURCES += $(PWD)/../../rtl/mmio_interface.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/instruction_memory.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/control_unit.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/control_top.sv
+
+TOPLEVEL = control_top
+MODULE = test_control_top
+
+# Verilator specific flags
+ifeq ($(SIM), verilator)
+EXTRA_ARGS += --trace --trace-structs -Wno-fatal -I$(PWD)/../../rtl
+endif
+
+include $(shell cocotb-config --makefiles)/Makefile.sim
