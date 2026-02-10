@@ -34,11 +34,30 @@ module ppu (
         end
     end
 
-    // Output Selection: Present storage[cycle_idx] to UB
-    // This assumes the CU sets cycle_idx during WRITEBACK state as well.
-    assign ub_wdata = {storage[cycle_idx][3], 
-                       storage[cycle_idx][2], 
-                       storage[cycle_idx][1], 
-                       storage[cycle_idx][0]};
+            // Output Selection: Present storage[cycle_idx] to UB
 
-endmodule
+            // This assumes the CU sets cycle_idx during WRITEBACK state as well.
+
+            generate
+
+                for (genvar i = 0; i < `ARRAY_SIZE; i++) begin : gen_output
+
+                    // Since ub_wdata is [BUFFER_WIDTH-1:0] and BUFFER_WIDTH = DATA_WIDTH * ARRAY_SIZE
+
+                    // We can slice it directly.
+
+                    // DATA_WIDTH is 16.
+
+                    assign ub_wdata[i*16 +: 16] = storage[cycle_idx][i];
+
+                end
+
+            endgenerate
+
+        
+
+    
+
+    endmodule
+
+    

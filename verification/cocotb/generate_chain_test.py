@@ -8,9 +8,9 @@ from tinynpu import TinyNPUProgram
 
 def generate_chain_test():
     # Chain: A_out = W4 @ W3 @ W2 @ W1 @ A_in
-    # Dimensions: All 16x16 for simplicity (4x4 tiles)
+    # Dimensions: All 32x32 (16x16 tiles)
     
-    dim = 16
+    dim = 32
     
     # Input Activation A (Random values)
     # Using small values 0,1
