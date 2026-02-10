@@ -23,6 +23,7 @@ module mmio_interface (
     logic [`ADDR_WIDTH-1:0]      addr_reg;
     logic [`ARG_WIDTH-1:0]       arg_reg;
     logic [`BUFFER_WIDTH-1:0]    mmvr_reg;
+    logic                        doorbell_q;
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -30,9 +31,9 @@ module mmio_interface (
             addr_reg       <= '0;
             arg_reg        <= '0;
             mmvr_reg       <= '0;
-            doorbell_pulse <= 1'b0;
+            doorbell_q     <= 1'b0;
         end else begin
-            doorbell_pulse <= 1'b0;
+            doorbell_q <= 1'b0;
             if (host_wr_en) begin
                 case (host_addr)
                     `REG_CMD: cmd_reg <= host_wr_data;
@@ -54,13 +55,16 @@ module mmio_interface (
                     `REG_MMVR+6: mmvr_reg[55:48] <= host_wr_data;
                     `REG_MMVR+7: begin
                         mmvr_reg[63:56] <= host_wr_data;
-                        doorbell_pulse  <= 1'b1;
+                        doorbell_q      <= 1'b1;
                     end
                     default: ;
                 endcase
             end
         end
     end
+
+    // Pulse is high for 1 cycle AFTER the write is complete
+    assign doorbell_pulse = doorbell_q;
 
     always_comb begin
         case (host_addr)
