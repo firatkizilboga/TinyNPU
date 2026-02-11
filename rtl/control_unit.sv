@@ -43,6 +43,11 @@ module control_unit (
     output logic                           ppu_bias_clear,
     output logic [$clog2(`ARRAY_SIZE)-1:0] ppu_cycle_idx,
     output logic                           ppu_capture_en,
+    output logic [ 7:0]                    ppu_shift,
+    output logic [15:0]                    ppu_multiplier,
+    output logic [ 7:0]                    ppu_activation,
+    output logic [ 1:0]                    ppu_precision,
+    output logic [ 1:0]                    ppu_write_offset,
 
     input logic all_done_in
 );
@@ -85,6 +90,11 @@ module control_unit (
   // --- Internal Registers for MATMUL ---
   logic [`ADDR_WIDTH-1:0] mm_a_base, mm_b_base, mm_c_base, mm_bias_base;
   logic [15:0] mm_m_total, mm_k_total, mm_n_total;
+  logic [ 7:0] mm_shift;
+  logic [15:0] mm_multiplier;
+  logic [ 7:0] mm_activation;
+  logic [ 1:0] mm_precision;
+  logic [ 1:0] mm_write_offset;
   logic [15:0] m_idx, n_idx, k_idx;
 
   // Flexible counter width for NxN support
@@ -101,6 +111,7 @@ module control_unit (
       {latched_cmd, latched_addr, latched_mmvr, latched_arg} <= '0;
       {move_src, move_dest, move_count, move_phase} <= '0;
       {mm_a_base, mm_b_base, mm_c_base, mm_bias_base, mm_m_total, mm_k_total, mm_n_total} <= '0;
+      {mm_shift, mm_multiplier, mm_activation, mm_precision, mm_write_offset} <= '0;
       {m_idx, n_idx, k_idx, cycle_cnt} <= '0;
     end else begin
       state <= next_state;
@@ -134,6 +145,11 @@ module control_unit (
         mm_k_total <= im_rdata[167:152];
         mm_n_total <= im_rdata[151:136];
         mm_bias_base <= im_rdata[135:120];
+        mm_shift      <= im_rdata[119:112];
+        mm_multiplier <= im_rdata[111:96];
+        mm_activation <= im_rdata[95:88];
+        mm_precision  <= im_rdata[87:86];
+        mm_write_offset <= im_rdata[85:84];
         m_idx <= '0;
         n_idx <= '0;
         k_idx <= '0;
@@ -172,6 +188,11 @@ module control_unit (
     ppu_wb_en = 1'b0;
     ppu_bias_en = 1'b0;
     ppu_bias_clear = 1'b0;
+    ppu_shift = mm_shift;
+    ppu_multiplier = mm_multiplier;
+    ppu_activation = mm_activation;
+    ppu_precision = mm_precision;
+    ppu_write_offset = mm_write_offset;
     mmvr_wr_en = 1'b0;
     mmvr_out = '0;
 

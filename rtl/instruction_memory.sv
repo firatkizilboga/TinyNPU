@@ -37,14 +37,18 @@ module instruction_memory #(
     // Host Write Logic
     always_ff @(posedge clk) begin
         if (wr_en) begin
-            if (`BUFFER_WIDTH >= `INST_WIDTH) begin
-                if (wr_addr_rel < `IM_SIZE)
-                    memory[wr_addr_rel] <= wr_data[`INST_WIDTH-1:0];
-            end else begin
-                automatic logic [CHUNK_BITS-1:0] chunk_idx = wr_addr_rel[CHUNK_BITS-1:0];
-                automatic int row_idx = wr_addr_rel >> CHUNK_BITS;
-                if (row_idx < `IM_SIZE) begin
-                    memory[row_idx][chunk_idx * `BUFFER_WIDTH +: `BUFFER_WIDTH] <= wr_data;
+            automatic int row_idx = wr_addr_rel >> CHUNK_BITS;
+            if (row_idx < `IM_SIZE) begin
+                if (CHUNK_BITS == 0) begin
+                    // One chunk per instruction
+                    memory[row_idx] <= wr_data[`INST_WIDTH-1:0];
+                end else begin
+                    // Multiple chunks per instruction
+                    for (int c=0; c < (1 << CHUNK_BITS); c++) begin
+                        if (wr_addr_rel[CHUNK_BITS-1:0] == c[CHUNK_BITS-1:0]) begin
+                            memory[row_idx][c * `BUFFER_WIDTH +: `BUFFER_WIDTH] <= wr_data;
+                        end
+                    end
                 end
             end
         end
@@ -55,18 +59,11 @@ module instruction_memory #(
         if (!rst_n) begin
             rd_data <= '0;
         end else begin
-            if (`BUFFER_WIDTH >= `INST_WIDTH) begin
-                if (rd_addr_rel < `IM_SIZE)
-                    rd_data <= memory[rd_addr_rel];
-                else
-                    rd_data <= '0;
-            end else begin
-                automatic int row_idx = rd_addr_rel >> CHUNK_BITS;
-                if (row_idx < `IM_SIZE)
-                    rd_data <= memory[row_idx];
-                else
-                    rd_data <= '0;
-            end
+            automatic int row_idx = rd_addr_rel >> CHUNK_BITS;
+            if (row_idx < `IM_SIZE)
+                rd_data <= memory[row_idx];
+            else
+                rd_data <= '0;
         end
     end
 

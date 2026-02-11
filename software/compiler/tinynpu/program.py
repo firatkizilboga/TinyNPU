@@ -72,9 +72,11 @@ class TinyNPUProgram:
             'shape': arr.shape
         }
 
-    def matmul(self, a_name, b_name, out_name, bias_name=None):
+    def matmul(self, a_name, b_name, out_name, bias_name=None, shift=0, multiplier=1, activation=0, precision=2, write_offset=0):
         """
         Adds a MATMUL instruction: out = a * b + bias
+        Precision: 0=INT4, 1=INT8, 2=INT16
+        Write Offset: 0-3 (sub-word index for packing)
         """
         if a_name not in self.raw_symbols:
             raise ValueError(f"Symbol '{a_name}' not found.")
@@ -109,7 +111,12 @@ class TinyNPUProgram:
             'bias_name': bias_name,
             'm': m_tiles,
             'k': k_tiles,
-            'n': n_tiles
+            'n': n_tiles,
+            'shift': shift,
+            'multiplier': multiplier,
+            'activation': activation,
+            'precision': precision,
+            'write_offset': write_offset
         })
 
     def move(self, src_name, dest_name):
@@ -250,7 +257,12 @@ class TinyNPUProgram:
                                   self.symbol_to_addr[instr['b_name']], 
                                   self.symbol_to_addr[instr['c_name']],
                                   instr['m'], instr['k'], instr['n'],
-                                  bias_addr)
+                                  bias_addr,
+                                  instr['shift'],
+                                  instr['multiplier'],
+                                  instr['activation'],
+                                  instr['precision'],
+                                  instr['write_offset'])
                 compiled_im.append(raw)
             elif instr['type'] == 'MOVE':
                 shape = self.raw_symbols[instr['src_name']]['shape']

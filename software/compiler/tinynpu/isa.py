@@ -71,7 +71,12 @@ def generate_host_messages(cmd_type, addr=0, arg=0, data_64=None):
     return messages
 
 
-def pack_matmul(opcode, a_addr, b_addr, c_addr, m, k, n, bias_addr=0):
+class PrecisionMode(IntEnum):
+    INT4 = 0
+    INT8 = 1
+    INT16 = 2
+
+def pack_matmul(opcode, a_addr, b_addr, c_addr, m, k, n, bias_addr=0xFFFF, shift=0, multiplier=1, activation=0, precision=PrecisionMode.INT16, write_offset=0):
     """
     Packs a MATMUL instruction into a 256-bit integer.
 
@@ -83,7 +88,12 @@ def pack_matmul(opcode, a_addr, b_addr, c_addr, m, k, n, bias_addr=0):
     [183:168] M Total
     [167:152] K Total
     [151:136] N Total
-    [135:120] Bias Base (0 if none)
+    [135:120] Bias Base (0xFFFF if none)
+    [119:112] Shift Right (Quantization)
+    [111:96]  Multiplier (Quantization)
+    [95:88]   Activation Type (0: None, 1: ReLU)
+    [87:86]   Precision Mode (0: INT4, 1: INT8, 2: INT16)
+    [85:84]   Write Offset (0-3)
     """
     instr = 0
     instr |= (opcode & 0xF) << 252
@@ -94,6 +104,11 @@ def pack_matmul(opcode, a_addr, b_addr, c_addr, m, k, n, bias_addr=0):
     instr |= (k & 0xFFFF) << 152
     instr |= (n & 0xFFFF) << 136
     instr |= (bias_addr & 0xFFFF) << 120
+    instr |= (shift & 0xFF) << 112
+    instr |= (multiplier & 0xFFFF) << 96
+    instr |= (activation & 0xFF) << 88
+    instr |= (precision & 0x3) << 86
+    instr |= (write_offset & 0x3) << 84
     return instr
 
 

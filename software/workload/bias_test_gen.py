@@ -32,7 +32,8 @@ def generate_bias_test():
     
     # 3. Calculate Expected
     # A * B + Bias (Standard broadcasting in NumPy)
-    expected = (np.matmul(A.astype(np.uint64), B.astype(np.uint64)) + bias) & 0xFFFF
+    acc = np.matmul(A.astype(np.int64), B.astype(np.int64)) + bias.astype(np.int64)
+    expected = np.clip(acc, -32768, 32767).astype(np.int16)
     
     prog.add_expected_result("Out", expected)
     

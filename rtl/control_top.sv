@@ -31,6 +31,11 @@ module control_top #(
     // PPU Control
     output logic [$clog2(`ARRAY_SIZE)-1:0] ppu_cycle_idx,
     output logic                           ppu_capture_en,
+    output logic [ 7:0]                    ppu_shift,
+    output logic [15:0]                    ppu_multiplier,
+    output logic [ 7:0]                    ppu_activation,
+    output logic [ 1:0]                    ppu_precision,
+    output logic [ 1:0]                    ppu_write_offset,
 
     // Sequencer Markers
     output logic                        sa_input_first,
@@ -120,6 +125,11 @@ module control_top #(
         .sa_weight_last (sa_weight_last),
         .ppu_cycle_idx  (ppu_cycle_idx),
         .ppu_capture_en (ppu_capture_en),
+        .ppu_shift      (ppu_shift),
+        .ppu_multiplier (ppu_multiplier),
+        .ppu_activation (ppu_activation),
+        .ppu_precision  (ppu_precision),
+        .ppu_write_offset(ppu_write_offset),
         .all_done_in    (all_done_in)
     );
 

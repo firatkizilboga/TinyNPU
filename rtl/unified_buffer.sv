@@ -8,6 +8,7 @@ module unified_buffer #(
 
     // Write interface (for loading data)
     input logic                     wr_en,
+    input logic [`BUFFER_WIDTH-1:0] wr_mask, // Bit-mask for partial writes
     input logic [  `ADDR_WIDTH-1:0] wr_addr,
     input logic [`BUFFER_WIDTH-1:0] wr_data,
 
@@ -41,7 +42,8 @@ module unified_buffer #(
   // Write logic (negedge for timing hygiene)
   always_ff @(negedge clk) begin
     if (wr_en) begin
-      memory[wr_addr] <= wr_data;
+      // Bit-masked write: only update bits where wr_mask is high
+      memory[wr_addr] <= (memory[wr_addr] & ~wr_mask) | (wr_data & wr_mask);
     end
   end
 
