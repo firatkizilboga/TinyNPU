@@ -54,9 +54,18 @@ def generate_dnn_example():
     # 3. Calculate Golden Model (NumPy)
     # Hardware performs: (A_col_major * B_row_major) + Bias_row_major
     # Truncating to 16-bit at every layer.
-    
-    def layer_op(w, x, b):
-        return (np.matmul(w.astype(np.uint64), x.astype(np.uint64)) + b) & 0xFFFF
+
+    def layer_op(w, x, b, shift=0, multiplier=1):
+        # 1. Bias Addition (High precision)
+        acc = np.matmul(w.astype(np.int64), x.astype(np.int64)) + b.astype(np.int64)
+        
+        # 2. Rescale & Shift
+        # Note: Multiplier is 16-bit unsigned in HW (treated as positive)
+        rescaled = acc * multiplier
+        shifted = rescaled >> shift
+        
+        # 3. Saturate to 16-bit Signed
+        return np.clip(shifted, -32768, 32767).astype(np.int16)
     
     Y1 = layer_op(W1, X, B1)
     Y2 = layer_op(W2, Y1, B2)

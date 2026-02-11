@@ -31,6 +31,11 @@ module tinynpu_top #(
     logic                        ppu_bias_clear;
     logic [$clog2(`ARRAY_SIZE)-1:0] ppu_cycle_idx;
     logic                        ppu_capture_en;
+    logic [ 7:0]                 ppu_shift;
+    logic [15:0]                 ppu_multiplier;
+    logic [ 7:0]                 ppu_activation;
+    logic [ 1:0]                 ppu_precision;
+    logic [ 1:0]                 ppu_write_offset;
     logic                        sa_input_first, sa_input_last;
     logic                        sa_weight_first, sa_weight_last;
 
@@ -61,6 +66,11 @@ module tinynpu_top #(
         .sa_weight_last (sa_weight_last),
         .ppu_cycle_idx  (ppu_cycle_idx),
         .ppu_capture_en (ppu_capture_en),
+        .ppu_shift      (ppu_shift),
+        .ppu_multiplier (ppu_multiplier),
+        .ppu_activation (ppu_activation),
+        .ppu_precision  (ppu_precision),
+        .ppu_write_offset(ppu_write_offset),
         .all_done_in    (all_done)
     );
 
@@ -84,7 +94,7 @@ module tinynpu_top #(
         .sa_weight_first(sa_weight_first),
         .sa_weight_last (sa_weight_last),
         
-        .precision_mode (2'b10), 
+        .precision_mode (precision_mode_t'(ppu_precision)), 
         .compute_enable (compute_enable),
         .drain_enable   (drain_enable),
         .ppu_wb_en      (ppu_wb_en),
@@ -94,6 +104,11 @@ module tinynpu_top #(
 
         .ppu_cycle_idx  (ppu_cycle_idx),
         .ppu_capture_en (ppu_capture_en),
+        .ppu_shift      (ppu_shift),
+        .ppu_multiplier (ppu_multiplier),
+        .ppu_activation (ppu_activation),
+        .ppu_precision  (ppu_precision),
+        .ppu_write_offset(ppu_write_offset),
         
         .results_flat   (results_flat),
         .result_valid   (result_valid),

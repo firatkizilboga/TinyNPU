@@ -38,6 +38,11 @@ module ubss #(
     input  logic                     ppu_bias_clear,
     input  logic [$clog2(`ARRAY_SIZE)-1:0] ppu_cycle_idx,
     input  logic                           ppu_capture_en,
+    input  logic [ 7:0]                    ppu_shift,
+    input  logic [15:0]                    ppu_multiplier,
+    input  logic [ 7:0]                    ppu_activation,
+    input  logic [ 1:0]                    ppu_precision,
+    input  logic [ 1:0]                    ppu_write_offset,
 
     // ------------------------------------------------------------------------
     // Outputs
@@ -50,7 +55,28 @@ module ubss #(
     // Internal Wires
     logic [`BUFFER_WIDTH-1:0] ub_rdata_internal;
     logic [`BUFFER_WIDTH-1:0] ppu_wdata;
+    logic [`BUFFER_WIDTH-1:0] ub_wr_mask;
     
+    // Mask Generation for Compact Packing
+    always_comb begin
+        ub_wr_mask = '1; // Default: Write all bits (for MMIO/Load)
+        if (ppu_wb_en) begin
+            unique case (ppu_precision)
+                2'b00: begin // INT4
+                    for (int i=0; i<`ARRAY_SIZE; i++) 
+                        ub_wr_mask[i*16 +: 16] = 16'h000F << (ppu_write_offset * 4);
+                end
+                2'b01: begin // INT8
+                    for (int i=0; i<`ARRAY_SIZE; i++)
+                        ub_wr_mask[i*16 +: 16] = 16'h00FF << (ppu_write_offset * 8);
+                end
+                default: begin // INT16 (2'b10)
+                    ub_wr_mask = '1;
+                end
+            endcase
+        end
+    end
+
     // Mux for UB Write Data: Either from CU (MMIO Load) or PPU (Compute Result)
     logic [`BUFFER_WIDTH-1:0] ub_final_wdata;
     assign ub_final_wdata = (ppu_wb_en) ? ppu_wdata : cu_wdata;
@@ -71,7 +97,8 @@ module ubss #(
     ) u_buffer (
         .clk             (clk),
         .rst_n           (rst_n),
-        .wr_en           (cu_wr_en),
+        .wr_en           (cu_wr_en | ppu_wb_en),
+        .wr_mask         (ub_wr_mask),
         .wr_addr         (cu_addr),
         .wr_data         (ub_final_wdata),
         
@@ -173,6 +200,11 @@ module ubss #(
         .bias_en(ppu_bias_en),
         .bias_clear(ppu_bias_clear),
         .cycle_idx(ppu_cycle_idx),
+        .shift(ppu_shift),
+        .multiplier(ppu_multiplier),
+        .activation(ppu_activation),
+        .precision(ppu_precision),
+        .write_offset(ppu_write_offset),
         .bias_in(cu_rdata),
         .acc_in(bottom_row_acc),
         .ub_wdata(ppu_wdata)
