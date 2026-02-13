@@ -65,6 +65,7 @@ module control_unit (
     CTRL_MM_CLEAR,
     CTRL_MM_FEED,
     CTRL_MM_WAIT,
+    CTRL_MM_LOAD_BIAS,  // New: Load second half of 32-bit bias
     CTRL_MM_DRAIN_SA,   // Drain array into PPU
     CTRL_MM_WRITEBACK,  // Write PPU to Buffer
     CTRL_HALT
@@ -400,16 +401,28 @@ module control_unit (
         status_out = `STATUS_BUSY;
         compute_enable = 1'b1;  // Flush skewers
         
-        // Latch bias when array is done (hiding latency)
+        // Latch first 128 bits of bias (Cols 0-3)
         if (all_done_in) begin
           if (mm_bias_base != 16'hFFFF) begin
               ub_req = 1'b1;
-              ub_addr = mm_bias_base + n_idx;
+              ub_addr = mm_bias_base + (n_idx * 2);
               ppu_bias_en = 1'b1;
+              next_state = CTRL_MM_LOAD_BIAS;
+          end else begin
+              cycle_next = '0;
+              next_state = CTRL_MM_DRAIN_SA;
           end
-          cycle_next = '0;
-          next_state = CTRL_MM_DRAIN_SA;
         end
+      end
+
+      CTRL_MM_LOAD_BIAS: begin
+        status_out = `STATUS_BUSY;
+        // Latch second 128 bits of bias (Cols 4-7)
+        ub_req = 1'b1;
+        ub_addr = mm_bias_base + (n_idx * 2) + 1;
+        ppu_bias_en = 1'b1;
+        cycle_next = '0;
+        next_state = CTRL_MM_DRAIN_SA;
       end
 
       CTRL_MM_DRAIN_SA: begin

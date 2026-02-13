@@ -39,7 +39,7 @@ class Packer:
         elif role == 'B':
             return k_tiles * n_tiles * self.sz
         elif role == 'BIAS':
-            return n_tiles
+            return n_tiles * 2
         else: # Role C
             mt_phys = (m_tiles + p - 1) // p
             return mt_phys * n_tiles * self.sz
@@ -99,22 +99,17 @@ class Packer:
         bits = 16 // p
         mask = (1 << bits) - 1
         mt_phys = (m_tiles + p - 1) // p
-        
-        # Padded height must accommodate strided M-packing
         padded_height = mt_phys * self.sz * p
         padded = np.zeros((padded_height, n_tiles * self.sz), dtype=np.int32)
         if data is not None:
             d_m, d_n = data.shape
             padded[:min(d_m, padded_height), :min(d_n, n_tiles*self.sz)] = data[:min(d_m, padded_height), :min(d_n, n_tiles*self.sz)]
-        
         packed = []
         for mt in range(mt_phys):
             for nt in range(n_tiles):
                 for i in range(self.sz):
                     word = 0
                     for j in range(self.sz):
-                        # Each 16-bit lane j contains P elements from DIFFERENT logical M-tiles
-                        # Elements are separated by self.sz (strided along M)
                         start_m = mt * (self.sz * p) + i
                         col_idx = nt * self.sz + j
                         subword = 0
@@ -128,14 +123,18 @@ class Packer:
     def _pack_bias(self, data, n_tiles):
         flat_data = data.flatten()
         padded_N = n_tiles * self.sz
-        padded = np.zeros(padded_N, dtype=np.int32)
+        padded = np.zeros(padded_N, dtype=np.int64)
         padded[:min(flat_data.shape[0], padded_N)] = flat_data[:min(flat_data.shape[0], padded_N)]
-        
         packed = []
         for n in range(n_tiles):
-            word = 0
-            for j in range(self.sz):
-                val = int(padded[n*self.sz + j]) & 0xFFFF
-                word |= val << (j * 16)
-            packed.append(word)
+            word0 = 0
+            for j in range(4):
+                val = int(padded[n*self.sz + j]) & 0xFFFFFFFF
+                word0 |= val << (j * 32)
+            packed.append(word0)
+            word1 = 0
+            for j in range(4):
+                val = int(padded[n*self.sz + 4 + j]) & 0xFFFFFFFF
+                word1 |= val << (j * 32)
+            packed.append(word1)
         return packed
