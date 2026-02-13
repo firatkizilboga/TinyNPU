@@ -42,13 +42,13 @@ def generate_complex_chain():
     # L7: In INT16 -> Out INT8
     
     layers = [
-        ("L1", PrecisionMode.INT16), # In INT8 -> Out INT16
-        ("L2", PrecisionMode.INT16), # In INT16 -> Out INT16
-        ("L3", PrecisionMode.INT16), # In INT16 -> Out INT16
-        ("L4", PrecisionMode.INT16), # In INT16 -> Out INT16
-        ("L5", PrecisionMode.INT16), # In INT16 -> Out INT16
-        ("L6", PrecisionMode.INT16), # In INT16 -> Out INT16
-        ("L7", PrecisionMode.INT16), # In INT16 -> Out INT16
+        ("L1", PrecisionMode.INT8),  # In INT8 -> Out INT8 (M-Packed)
+        ("L2", PrecisionMode.INT16), # In INT8 (Packed) -> Out INT16
+        ("L3", PrecisionMode.INT4),  # In INT16 -> Out INT4 (M-Packed)
+        ("L4", PrecisionMode.INT8),  # In INT4 (Packed) -> Out INT8 (M-Packed)
+        ("L5", PrecisionMode.INT4),  # In INT8 (Packed) -> Out INT4 (M-Packed)
+        ("L6", PrecisionMode.INT16), # In INT4 (Packed) -> Out INT16
+        ("L7", PrecisionMode.INT8),  # In INT16 -> Out INT8
     ]
 
     current_input = "Input"
@@ -57,10 +57,7 @@ def generate_complex_chain():
     golden_input = Input.copy()
 
     for idx, (layer_name, out_prec) in enumerate(layers):
-        # Generate Weights and Bias
-        # For alternating precision, we'll manually set the internal multiplication precision
-        # even if the input/output are INT16.
-        # Layer internal precisions (cycling INT8, INT16, INT4)
+        # Layer computation precision cycling: INT8, INT16, INT4...
         multi_precs = [PrecisionMode.INT8, PrecisionMode.INT16, PrecisionMode.INT4, 
                        PrecisionMode.INT8, PrecisionMode.INT4, PrecisionMode.INT16, PrecisionMode.INT8]
         
@@ -78,7 +75,8 @@ def generate_complex_chain():
             W = np.clip(W, -128, 127)
             
         # Weights MUST match the computation precision for the PE to unpack correctly
-        prog.declare_data(w_name, W, precision=comp_prec)
+        # They feed from the Left (Role A)
+        prog.declare_data(w_name, W, precision=comp_prec, role='A')
         prog.declare_data(b_name, B, precision=PrecisionMode.INT16) 
 
         shift = 5
@@ -86,8 +84,8 @@ def generate_complex_chain():
         
         print(f"Adding Layer {layer_name}: {comp_prec.name} Mul -> {out_prec.name} Out")
         
-        # KEY FIX: W is Matrix A (Left), Input is Matrix B (Top)
-        # Multiplication precision is set to comp_prec
+        # KEY FIX: Activation Chaining (Output -> Matrix B)
+        # Previous Layer Output (Row-Major, M-Packed) -> Layer 2 Input B (Row-Major, K-Packed)
         prog.matmul(w_name, current_input, layer_name, bias_name=b_name,
                     shift=shift, multiplier=multiplier,
                     in_precision=comp_prec, out_precision=out_prec)
@@ -103,7 +101,7 @@ def generate_complex_chain():
         prog.add_expected_result(layer_name, golden_output)
         
         current_input = layer_name
-        current_in_prec = out_prec # This will be INT16 for all intermediate
+        current_in_prec = out_prec 
         golden_input = golden_output
 
     prog.halt()

@@ -43,7 +43,7 @@ class Symbol:
         self.name = name
         self.shape = shape
         self.precision = precision
-        self.role = role
+        self.storage_role = role
         self.data = data
         self.addr = None
         self.word_count = 0
@@ -62,13 +62,13 @@ class TinyNPUProgram:
         self.memory = MemoryManager()
         self.packer = Packer(self.array_size)
 
-    def declare_data(self, name, data, precision=PrecisionMode.INT16):
+    def declare_data(self, name, data, precision=PrecisionMode.INT16, role='A'):
         if name in self.symbols:
             raise ValueError(f"Symbol '{name}' already declared.")
-        arr = np.array(data, dtype=np.uint16)
+        arr = np.array(data, dtype=np.int16)
         if len(arr.shape) != 2:
             raise ValueError(f"Symbol '{name}' must be a 2D matrix.")
-        self.symbols[name] = Symbol(name, arr.shape, precision, data=arr)
+        self.symbols[name] = Symbol(name, arr.shape, precision, role=role, data=arr)
 
     def add_expected_result(self, name, data):
         self.expected_results[name] = np.array(data)
@@ -81,8 +81,12 @@ class TinyNPUProgram:
             raise ValueError(f"Symbol '{b_name}' not found.")
         
         A, B = self.symbols[a_name], self.symbols[b_name]
-        A.role, B.role = 'A', 'B'
-        A.precision = B.precision = in_precision
+        
+        # Don't overwrite established roles, but check for compatibility
+        # For now, we assume user knows what they are doing or we use INT16
+        if A.storage_role == 'C' and A.precision != PrecisionMode.INT16:
+             # In a real compiler we would insert a REPACK instruction here
+             pass
 
         if A.shape[1] != B.shape[0]:
             raise ValueError(f"Dimension mismatch: {A.shape} and {B.shape}")
@@ -95,9 +99,6 @@ class TinyNPUProgram:
         if bias_name and bias_name not in self.symbols:
             bias_shape = (1, B.shape[1])
             self.symbols[bias_name] = Symbol(bias_name, bias_shape, PrecisionMode.INT16, role='BIAS')
-        elif bias_name:
-            self.symbols[bias_name].role = 'BIAS'
-            self.symbols[bias_name].precision = PrecisionMode.INT16
 
         # 3. Create Instruction and calculate tiles
         instr = MatMul(a_name, b_name, out_name, bias_name, shift, multiplier, activation, in_precision, out_precision, write_offset)
@@ -116,7 +117,7 @@ class TinyNPUProgram:
         
         src = self.symbols[src_name]
         if dest_name not in self.symbols:
-            self.symbols[dest_name] = Symbol(dest_name, src.shape, src.precision, role=src.role)
+            self.symbols[dest_name] = Symbol(dest_name, src.shape, src.precision, role=src.storage_role)
         
         self.instructions.append(Move(src_name, dest_name))
 
@@ -131,14 +132,14 @@ class TinyNPUProgram:
             # Infer m, k, n for address allocation if not set
             p = 1 << (2 - sym.precision)
             m = (sym.shape[0] + self.array_size - 1) // self.array_size
-            if sym.role == 'A':
+            if sym.storage_role == 'A':
                 k = (sym.shape[1]//p + self.array_size - 1) // self.array_size
                 n = 1
-            elif sym.role == 'B':
+            elif sym.storage_role == 'B':
                 k = (sym.shape[0]//p + self.array_size - 1) // self.array_size
                 n = (sym.shape[1] + self.array_size - 1) // self.array_size
                 m = 1
-            elif sym.role == 'BIAS':
+            elif sym.storage_role == 'BIAS':
                 m, k = 1, 1
                 n = (sym.shape[1] + self.array_size - 1) // self.array_size
             else: # C
@@ -146,7 +147,7 @@ class TinyNPUProgram:
                 n = (sym.shape[1] + self.array_size - 1) // self.array_size
                 k = 1
 
-            sym.word_count = self.packer.get_physical_word_count(sym.role, sym.precision, m, k, n)
+            sym.word_count = self.packer.get_physical_word_count(sym.storage_role, sym.precision, m, k, n)
             sym.addr = self.memory.allocate(name, sym.word_count)
 
         # Pass 2: Update instruction counts (for MOVE)
@@ -165,14 +166,14 @@ class TinyNPUProgram:
             # Re-calculate tiles for packing
             p = 1 << (2 - sym.precision)
             m = (sym.shape[0] + self.array_size - 1) // self.array_size
-            if sym.role == 'A':
+            if sym.storage_role == 'A':
                 k = (sym.shape[1]//p + self.array_size - 1) // self.array_size
                 n = 1
-            elif sym.role == 'B':
+            elif sym.storage_role == 'B':
                 k = (sym.shape[0]//p + self.array_size - 1) // self.array_size
                 n = (sym.shape[1] + self.array_size - 1) // self.array_size
                 m = 1
-            elif sym.role == 'BIAS':
+            elif sym.storage_role == 'BIAS':
                 m, k = 1, 1
                 n = (sym.shape[1] + self.array_size - 1) // self.array_size
             else: # C
@@ -180,7 +181,7 @@ class TinyNPUProgram:
                 n = (sym.shape[1] + self.array_size - 1) // self.array_size
                 k = 1
 
-            packed_words = self.packer.pack(sym.data, sym.role, sym.precision, m, k, n)
+            packed_words = self.packer.pack(sym.data, sym.storage_role, sym.precision, m, k, n)
             ub_image.extend(packed_words)
 
         binary_im = [instr.encode(symbol_to_addr) for instr in self.instructions]
@@ -203,7 +204,7 @@ class TinyNPUProgram:
                 name: {
                     "addr": sym.addr,
                     "shape": list(sym.shape),
-                    "role": sym.role,
+                    "role": sym.storage_role,
                     "precision": int(sym.precision)
                 } for name, sym in self.symbols.items()
             },

@@ -41,8 +41,8 @@ class Packer:
         elif role == 'BIAS':
             return n_tiles
         else: # Role C
-            nt_phys = (n_tiles + p - 1) // p
-            return m_tiles * nt_phys * self.sz
+            mt_phys = (m_tiles + p - 1) // p
+            return mt_phys * n_tiles * self.sz
 
     def _pack_role_a(self, data, precision, m_tiles, k_tiles):
         p = 1 << (2 - precision)
@@ -98,23 +98,28 @@ class Packer:
         p = 1 << (2 - precision)
         bits = 16 // p
         mask = (1 << bits) - 1
-        nt_phys = (n_tiles + p - 1) // p
-        padded_width = nt_phys * self.sz * p
-        padded = np.zeros((m_tiles * self.sz, padded_width), dtype=np.int32)
-        d_m, d_n = data.shape
-        padded[:min(d_m, m_tiles*self.sz), :min(d_n, n_tiles*self.sz)] = data[:min(d_m, m_tiles*self.sz), :min(d_n, n_tiles*self.sz)]
+        mt_phys = (m_tiles + p - 1) // p
+        
+        # Padded height must accommodate strided M-packing
+        padded_height = mt_phys * self.sz * p
+        padded = np.zeros((padded_height, n_tiles * self.sz), dtype=np.int32)
+        if data is not None:
+            d_m, d_n = data.shape
+            padded[:min(d_m, padded_height), :min(d_n, n_tiles*self.sz)] = data[:min(d_m, padded_height), :min(d_n, n_tiles*self.sz)]
         
         packed = []
-        for m in range(m_tiles):
-            for nt in range(nt_phys):
+        for mt in range(mt_phys):
+            for nt in range(n_tiles):
                 for i in range(self.sz):
-                    row_idx = m * self.sz + i
                     word = 0
                     for j in range(self.sz):
-                        start_n = nt * (self.sz * p) + j
+                        # Each 16-bit lane j contains P elements from DIFFERENT logical M-tiles
+                        # Elements are separated by self.sz (strided along M)
+                        start_m = mt * (self.sz * p) + i
+                        col_idx = nt * self.sz + j
                         subword = 0
                         for bit_idx in range(p):
-                            val = int(padded[row_idx, start_n + bit_idx * self.sz]) & mask
+                            val = int(padded[start_m + bit_idx * self.sz, col_idx]) & mask
                             subword |= val << (bit_idx * bits)
                         word |= (subword & 0xFFFF) << (j * 16)
                     packed.append(word)
