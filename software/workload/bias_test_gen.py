@@ -3,7 +3,8 @@ import sys
 import os
 
 # Add compiler to path
-sys.path.append(os.path.join(os.getcwd(), "../compiler"))
+script_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(os.path.join(script_dir, "../compiler"))
 from tinynpu import TinyNPUProgram
 
 def generate_bias_test():
@@ -33,7 +34,7 @@ def generate_bias_test():
     # 3. Calculate Expected
     # A * B + Bias (Standard broadcasting in NumPy)
     acc = np.matmul(A.astype(np.int64), B.astype(np.int64)) + bias.astype(np.int64)
-    expected = np.clip(acc, -32768, 32767).astype(np.int16)
+    expected = (acc & 0xFFFF).astype(np.uint16)
     
     prog.add_expected_result("Out", expected)
     

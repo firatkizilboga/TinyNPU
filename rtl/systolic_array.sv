@@ -15,8 +15,10 @@ module systolic_array (
     // Data flow markers (from skewer - indicates first/last valid data)
     input  logic input_first,     // First valid input row arrived
     input  logic input_last,      // Last valid input row arrived
+    input  logic [`ARRAY_SIZE-1:0] input_valid,
     input  logic weight_first,    // First valid weight column arrived
     input  logic weight_last,     // Last valid weight column arrived
+    input  logic [`ARRAY_SIZE-1:0] weight_valid,
     
     // Control signals
     input  precision_mode_t precision_mode,  // Bit-width mode for all PEs
@@ -100,10 +102,10 @@ module systolic_array (
         // Connect valid signals at boundaries
         // Inject valid across all boundaries matching compute_enable
         for (r = 0; r < `ARRAY_SIZE; r++) begin : valid_h_boundary
-            assign valid_h_bus[r][0] = compute_enable;
+            assign valid_h_bus[r][0] = input_valid[r];
         end
         for (c = 0; c < `ARRAY_SIZE; c++) begin : valid_v_boundary
-            assign valid_v_bus[0][c] = compute_enable;
+            assign valid_v_bus[0][c] = weight_valid[c];
         end
     endgenerate
     

@@ -32,6 +32,9 @@ module streaming_skewer #(
     input  logic last_in,           // Pulse: feeding last row (row N-1)
     output logic first_out,         // Pulse: row 0 data exits
     output logic last_out,          // Pulse: row N-1 data exits
+
+    // Per-row valid signal
+    output logic [N-1:0] valid_out,
     
     // Flattened outputs for Verilator verification
     output logic [N*DATA_WIDTH-1:0] data_out_flat
@@ -107,6 +110,7 @@ module streaming_skewer #(
             // Output is the last stage, zero-gated when outside valid window
             wire row_active = row_valid | row_first | row_last;
             assign data_out[row] = row_active ? shift_reg[STAGES-1] : '0;
+            assign valid_out[row] = row_active;
         end
     endgenerate
 
