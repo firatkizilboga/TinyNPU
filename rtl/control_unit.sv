@@ -166,29 +166,28 @@ module control_unit (
     end
   end
 
-    // Tile packing: derive physical address and byte lane from n_idx and precision.
-    // INT8: 2 N-tiles pack into 1 physical word (n=0 low byte, n=1 high byte)
-    // INT4: 4 N-tiles pack into 1 physical word (n=0..3 → nibble 0..3)
+    // Tile packing: derive physical address and byte lane from m_idx and precision.
+    // This aligns Row-Major Output C with Row-Major Input B for chaining.
     logic [ 1:0] packed_write_offset;
-    logic [15:0] n_idx_packed;
-    logic [15:0] n_total_packed;
+    logic [15:0] m_idx_packed;
+    logic [15:0] m_total_packed;
 
     always_comb begin
         unique case (mm_out_precision)
             2'b00: begin // INT4: 4 tiles per word
-                n_idx_packed     = n_idx >> 2;
-                packed_write_offset = n_idx[1:0];
-                n_total_packed   = (mm_n_total + 16'd3) >> 2;
+                m_idx_packed     = m_idx >> 2;
+                packed_write_offset = m_idx[1:0];
+                m_total_packed   = (mm_m_total + 16'd3) >> 2;
             end
             2'b01: begin // INT8: 2 tiles per word
-                n_idx_packed     = n_idx >> 1;
-                packed_write_offset = {1'b0, n_idx[0]};
-                n_total_packed   = (mm_n_total + 16'd1) >> 1;
+                m_idx_packed     = m_idx >> 1;
+                packed_write_offset = {1'b0, m_idx[0]};
+                m_total_packed   = (mm_m_total + 16'd1) >> 1;
             end
             default: begin // INT16: 1 tile per word
-                n_idx_packed     = n_idx;
+                m_idx_packed     = m_idx;
                 packed_write_offset = 2'b0;
-                n_total_packed   = mm_n_total;
+                m_total_packed   = mm_m_total;
             end
         endcase
     end
@@ -432,9 +431,9 @@ module control_unit (
         ub_wr_en = 1'b1;
         ppu_wb_en = 1'b1;
 
-        // Writeback Address: pack consecutive N-tiles into the same physical word.
-        // n_idx_packed and n_total_packed collapse tiles based on output precision.
-        ub_addr = mm_c_base + (m_idx * n_total_packed * `ARRAY_SIZE) + (n_idx_packed * `ARRAY_SIZE) + (`ARRAY_SIZE - 1 - cycle_cnt);
+        // Writeback Address: pack consecutive M-tiles into the same physical word.
+        // This makes output compatible with Input B (Top Matrix) packing for Layer 2.
+        ub_addr = mm_c_base + (m_idx_packed * mm_n_total * `ARRAY_SIZE) + (n_idx * `ARRAY_SIZE) + (`ARRAY_SIZE - 1 - cycle_cnt);
 
         if (cycle_cnt == (`ARRAY_SIZE - 1)) begin
           cycle_next = '0;

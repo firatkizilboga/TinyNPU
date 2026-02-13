@@ -94,26 +94,26 @@ async def test_npu(dut):
         
         # Physical tiles count depends on role and precision
         if role == 'C':
-            nt_phys = (n_tiles + p - 1) // p
-            for mt in range(m_tiles):
-                for ntp in range(nt_phys):
-                    tile_addr = addr + (mt * nt_phys * array_size) + (ntp * array_size)
+            mt_phys = (m_tiles + p - 1) // p
+            for mtp in range(mt_phys):
+                for nt in range(n_tiles):
+                    tile_addr = addr + (mtp * n_tiles * array_size) + (nt * array_size)
                     for i in range(array_size):
                         vec = await npu_driver.read_ub_vector(dut, tile_addr + i, array_size)
-                        row_idx = mt * array_size + i
-                        if row_idx < shape[0]:
-                            for lane in range(array_size):
-                                word = vec[lane]
-                                for bit_idx in range(p):
-                                    # logical tile index (n)
-                                    nt = ntp * p + bit_idx
-                                    col_idx = nt * array_size + lane
-                                    if col_idx < shape[1]:
-                                        val = (word >> (bit_idx * bits)) & mask
-                                        # Sign extend if needed
-                                        if val & (1 << (bits - 1)):
-                                            val -= (1 << bits)
-                                        actual[row_idx, col_idx] = val
+                        # Word i contains elements from multiple M-tiles
+                        for lane in range(array_size):
+                            word = vec[lane]
+                            col_idx = nt * array_size + lane
+                            for bit_idx in range(p):
+                                # logical M-tile index
+                                mt = mtp * p + bit_idx
+                                row_idx = mt * array_size + i
+                                if row_idx < shape[0] and col_idx < shape[1]:
+                                    val = (word >> (bit_idx * bits)) & mask
+                                    # Sign extend if needed
+                                    if val & (1 << (bits - 1)):
+                                        val -= (1 << bits)
+                                    actual[row_idx, col_idx] = val
         else:
             # For A/B, just handle basic tiling for now (used for debugging)
             # Mixed precision for A/B is more complex, but we mainly care about C

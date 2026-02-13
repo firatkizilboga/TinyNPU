@@ -1,0 +1,44 @@
+##[pylyzer] failed /home/firatkizilboga/TinyNPU/software/compiler/tinynpu/isa.py 1770837391 3614
+.___v_desugar_1: Never
+.IntEnum: Never
+.Opcode: ClassType
+.Opcode <: Never
+.Opcode.NOP: {0}
+.Opcode.HALT: {1}
+.Opcode.MATMUL: {2}
+.Opcode.MOVE: {3}
+
+.MMIOReg: ClassType
+.MMIOReg <: Never
+.MMIOReg.STATUS: {0}
+.MMIOReg.CMD: {4}
+.MMIOReg.ADDR: {8}
+.MMIOReg.ARG: {12}
+.MMIOReg.MMVR: {16}
+
+.HostCmd: ClassType
+.HostCmd <: Never
+.HostCmd.WRITE_MEM: {1}
+.HostCmd.READ_MEM: {2}
+.HostCmd.RUN: {3}
+
+.Status: ClassType
+.Status <: Never
+.Status.IDLE: {0}
+.Status.BUSY: {1}
+.Status.DATA_VALID: {2}
+.Status.READY_WRITE: {3}
+.Status.ERROR: {254}
+.Status.HALTED: {255}
+
+.INST_WIDTH: {256}
+.generate_host_messages: |E :> {3}, E <: Structural({.__and__ = (self: Never, R) -> O}), R :> {255}, R <: Int, R :> {4294967295}, O :> Int, R :> {65535}|(cmd_type: E, addr: Structural({.__and__ = (self: Never, R) -> O}) := {0} and Structural({.__and__ = (self: Never, R) -> O}), arg: Structural({.__and__ = (self: Never, R) -> O}) := {0} and Structural({.__and__ = (self: Never, R) -> O}), data_64: Obj := {None}) -> global::List!(global::Tuple([Nat, Obj]), 5)
+.PrecisionMode: ClassType
+.PrecisionMode <: Never
+.PrecisionMode.INT4: {0}
+.PrecisionMode.INT8: {1}
+.PrecisionMode.INT16: {2}
+
+.pack_matmul: |O <: Structural({.__lshift__ = (self: Never, R) -> R}), O <: Structural({.__lshift__ = (self: Never, R) -> R}), O <: Structural({.__lshift__ = (self: Never, R) -> R}), O <: Structural({.__lshift__ = (self: Never, R) -> R}), R :> {3}, R :> {65535}, R :> {200}, R :> {216}, R :> {112}, O <: Structural({.__lshift__ = (self: Never, R) -> R}), R :> {96}, R :> {82}, O <: Structural({.__lshift__ = (self: Never, R) -> R}), R :> {84}, O <: Structural({.__lshift__ = (self: Never, R) -> R}), R :> {15}, O <: Structural({.__lshift__ = (self: Never, R) -> R}), O <: Structural({.__lshift__ = (self: Never, R) -> R}), O <: Structural({.__lshift__ = (self: Never, R) -> R}), O :> Int, O <: Structural({.__lshift__ = (self: Never, R) -> R}), R <: Int, Type_55108 <: Structural({.__and__ = (self: Never, R) -> O}), O <: Structural({.__lshift__ = (self: Never, R) -> R}), R :> {168}, R :> {252}, R :> {152}, R :> {88}, R :> {232}, R :> {136}, O <: Structural({.__lshift__ = (self: Never, R) -> R}), R :> {120}, O <: Structural({.__lshift__ = (self: Never, R) -> R}), R :> {86}, R :> {255}|(opcode: Type_55108, a_addr: Structural({.__and__ = (self: Never, R) -> O}), b_addr: Structural({.__and__ = (self: Never, R) -> O}), c_addr: Structural({.__and__ = (self: Never, R) -> O}), m: Structural({.__and__ = (self: Never, R) -> O}), k: Structural({.__and__ = (self: Never, R) -> O}), n: Structural({.__and__ = (self: Never, R) -> O}), bias_addr: Structural({.__and__ = (self: Never, R) -> O}) := {65535} and Structural({.__and__ = (self: Never, R) -> O}), shift: Structural({.__and__ = (self: Never, R) -> O}) := {0} and Structural({.__and__ = (self: Never, R) -> O}), multiplier: Structural({.__and__ = (self: Never, R) -> O}) := {1} and Structural({.__and__ = (self: Never, R) -> O}), activation: Structural({.__and__ = (self: Never, R) -> O}) := {0} and Structural({.__and__ = (self: Never, R) -> O}), in_precision: Structural({.__and__ = (self: Never, R) -> O}) := {2} and Structural({.__and__ = (self: Never, R) -> O}), out_precision: Structural({.__and__ = (self: Never, R) -> O}) := {2} and Structural({.__and__ = (self: Never, R) -> O}), write_offset: Structural({.__and__ = (self: Never, R) -> O}) := {0} and Structural({.__and__ = (self: Never, R) -> O})) -> O
+.pack_move: |O <: Structural({.__lshift__ = (self: Never, R) -> R}), R :> {15}, R :> {252}, O <: Structural({.__lshift__ = (self: Never, R) -> R}), R :> {232}, O :> Int, R :> {200}, R <: Int, Type_55130 <: Structural({.__and__ = (self: Never, R) -> O}), R :> {216}, O <: Structural({.__lshift__ = (self: Never, R) -> R}), R :> {65535}, O <: Structural({.__lshift__ = (self: Never, R) -> R})|(opcode: Type_55130, src: Structural({.__and__ = (self: Never, R) -> O}), dest: Structural({.__and__ = (self: Never, R) -> O}), count: Structural({.__and__ = (self: Never, R) -> O})) -> O
+.pack_simple: |R <: Int, R :> {15}, Type_55135 <: Structural({.__and__ = (self: Never, R) -> O}), R :> {252}, O <: Structural({.__lshift__ = (self: Never, R) -> R}), O :> Int|(opcode: Type_55135) -> O
