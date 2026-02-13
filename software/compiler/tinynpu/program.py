@@ -151,7 +151,8 @@ class TinyNPUProgram:
                 n = (sym.shape[1] + sz - 1) // sz
                 m = 1
             elif sym.storage_role == 'BIAS':
-                m, k, n = 1, 1, (sym.shape[1] + sz - 1) // sz
+                m, k = 1, 1
+                n = (sym.shape[1] + sz - 1) // sz
             else: # C
                 m, n, k = (sym.shape[0] + sz - 1) // sz, (sym.shape[1] + sz - 1) // sz, 1
             sym.word_count = self.packer.get_physical_word_count(sym.storage_role, sym.precision, m, k, n)
@@ -170,7 +171,8 @@ class TinyNPUProgram:
             elif sym.storage_role == 'B':
                 k, n, m = (sym.shape[0]//p + sz - 1) // sz, (sym.shape[1] + sz - 1) // sz, 1
             elif sym.storage_role == 'BIAS':
-                m, k, n = 1, 1, (sym.shape[1] + sz - 1) // sz
+                m, k = 1, 1
+                n = (sym.shape[1] + sz - 1) // sz
             else: # C
                 m, n, k = (sym.shape[0] + sz - 1) // sz, (sym.shape[1] + sz - 1) // sz, 1
             packed_words = self.packer.pack(sym.data, sym.storage_role, sym.precision, m, k, n)
