@@ -41,7 +41,8 @@ module ubss #(
     input  logic [ 7:0]                    ppu_shift,
     input  logic [15:0]                    ppu_multiplier,
     input  logic [ 7:0]                    ppu_activation,
-    input  logic [ 1:0]                    ppu_precision,
+    input  logic [ 1:0]                    ppu_in_precision,
+    input  logic [ 1:0]                    ppu_out_precision,
     input  logic [ 1:0]                    ppu_write_offset,
 
     // ------------------------------------------------------------------------
@@ -61,7 +62,7 @@ module ubss #(
     always_comb begin
         ub_wr_mask = '1; // Default: Write all bits (for MMIO/Load)
         if (ppu_wb_en) begin
-            unique case (ppu_precision)
+            unique case (ppu_out_precision)
                 2'b00: begin // INT4
                     for (int i=0; i<`ARRAY_SIZE; i++) 
                         ub_wr_mask[i*16 +: 16] = 16'h000F << (ppu_write_offset * 4);
@@ -128,6 +129,8 @@ module ubss #(
     // ========================================================================
     logic [`DATA_WIDTH-1:0] skewed_input  [`ARRAY_SIZE-1:0];
     logic [`DATA_WIDTH-1:0] skewed_weight [`ARRAY_SIZE-1:0];
+    logic [`ARRAY_SIZE-1:0] input_valid_bus;
+    logic [`ARRAY_SIZE-1:0] weight_valid_bus;
     logic                   array_input_first, array_input_last;
     logic                   array_weight_first, array_weight_last;
     
@@ -148,6 +151,7 @@ module ubss #(
         .data_in(input_vec), .data_out(skewed_input),
         .first_in(skewer_input_first), .last_in(skewer_input_last),
         .first_out(array_input_first), .last_out(array_input_last),
+        .valid_out(input_valid_bus),
         .data_out_flat()
     );
 
@@ -156,6 +160,7 @@ module ubss #(
         .data_in(weight_vec), .data_out(skewed_weight),
         .first_in(skewer_weight_first), .last_in(skewer_weight_last),
         .first_out(array_weight_first), .last_out(array_weight_last),
+        .valid_out(weight_valid_bus),
         .data_out_flat()
     );
 
@@ -168,7 +173,9 @@ module ubss #(
         .clk(clk), .rst_n(rst_n),
         .input_data(skewed_input), .weight_data(skewed_weight),
         .input_first(array_input_first), .input_last(array_input_last),
+        .input_valid(input_valid_bus),
         .weight_first(array_weight_first), .weight_last(array_weight_last),
+        .weight_valid(weight_valid_bus),
         .precision_mode(precision_mode),
         .compute_enable(compute_enable),
         .drain_enable(drain_enable),
@@ -203,7 +210,7 @@ module ubss #(
         .shift(ppu_shift),
         .multiplier(ppu_multiplier),
         .activation(ppu_activation),
-        .precision(ppu_precision),
+        .precision(ppu_out_precision),
         .write_offset(ppu_write_offset),
         .bias_in(cu_rdata),
         .acc_in(bottom_row_acc),

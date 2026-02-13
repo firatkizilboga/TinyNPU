@@ -34,7 +34,8 @@ module control_top #(
     output logic [ 7:0]                    ppu_shift,
     output logic [15:0]                    ppu_multiplier,
     output logic [ 7:0]                    ppu_activation,
-    output logic [ 1:0]                    ppu_precision,
+    output logic [ 1:0]                    ppu_in_precision,
+    output logic [ 1:0]                    ppu_out_precision,
     output logic [ 1:0]                    ppu_write_offset,
 
     // Sequencer Markers
@@ -128,7 +129,8 @@ module control_top #(
         .ppu_shift      (ppu_shift),
         .ppu_multiplier (ppu_multiplier),
         .ppu_activation (ppu_activation),
-        .ppu_precision  (ppu_precision),
+        .ppu_in_precision (ppu_in_precision),
+        .ppu_out_precision(ppu_out_precision),
         .ppu_write_offset(ppu_write_offset),
         .all_done_in    (all_done_in)
     );

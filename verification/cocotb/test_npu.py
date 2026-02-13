@@ -80,36 +80,63 @@ async def test_npu(dut):
         addr = sym_info["addr"]
         shape = sym_info["shape"] # [M, N]
         role = sym_info.get("role", "C")
+        precision = sym_info.get("precision", 2) # Default INT16
         
-        expected = np.array(expected_list, dtype=np.uint16)
-        actual = np.zeros(shape, dtype=np.uint16)
+        expected = np.array(expected_list, dtype=np.int32)
+        actual = np.zeros(shape, dtype=np.int32)
+        
+        p = 1 << (2 - precision) # Elements per 16-bit word
+        bits = 16 // p
+        mask = (1 << bits) - 1
         
         m_tiles = (shape[0] + array_size - 1) // array_size
         n_tiles = (shape[1] + array_size - 1) // array_size
         
-        for mt in range(m_tiles):
-            for nt in range(n_tiles):
-                tile_idx = (mt * n_tiles) + nt
-                tile_addr = addr + (tile_idx * array_size)
-                for i in range(array_size):
-                    vec = await npu_driver.read_ub_vector(dut, tile_addr + i, array_size)
-                    
-                    if role == 'A':
-                        # Vector is a COLUMN of this tile
-                        col_idx = nt * array_size + i
-                        if col_idx < shape[1]:
-                            start_row = mt * array_size
-                            end_row = min(start_row + array_size, shape[0])
-                            num_elements = end_row - start_row
-                            actual[start_row:end_row, col_idx] = vec[:num_elements]
-                    else:
-                        # Vector is a ROW of this tile
+        # Physical tiles count depends on role and precision
+        if role == 'C':
+            nt_phys = (n_tiles + p - 1) // p
+            for mt in range(m_tiles):
+                for ntp in range(nt_phys):
+                    tile_addr = addr + (mt * nt_phys * array_size) + (ntp * array_size)
+                    for i in range(array_size):
+                        vec = await npu_driver.read_ub_vector(dut, tile_addr + i, array_size)
+                        row_idx = mt * array_size + i
+                        if row_idx < shape[0]:
+                            for lane in range(array_size):
+                                word = vec[lane]
+                                for bit_idx in range(p):
+                                    # logical tile index (n)
+                                    nt = ntp * p + bit_idx
+                                    col_idx = nt * array_size + lane
+                                    if col_idx < shape[1]:
+                                        val = (word >> (bit_idx * bits)) & mask
+                                        # Sign extend if needed
+                                        if val & (1 << (bits - 1)):
+                                            val -= (1 << bits)
+                                        actual[row_idx, col_idx] = val
+        else:
+            # For A/B, just handle basic tiling for now (used for debugging)
+            # Mixed precision for A/B is more complex, but we mainly care about C
+            for mt in range(m_tiles):
+                for nt in range(n_tiles):
+                    tile_idx = (mt * n_tiles) + nt
+                    tile_addr = addr + (tile_idx * array_size)
+                    for i in range(array_size):
+                        vec = await npu_driver.read_ub_vector(dut, tile_addr + i, array_size)
                         row_idx = mt * array_size + i
                         if row_idx < shape[0]:
                             start_col = nt * array_size
                             end_col = min(start_col + array_size, shape[1])
                             num_elements = end_col - start_col
                             actual[row_idx, start_col:end_col] = vec[:num_elements]
+        
+        if np.array_equal(actual, expected):
+            dut._log.info(f"✅ Symbol '{name}' matched!")
+        else:
+            dut._log.error(f"❌ Mismatch in symbol '{name}'!")
+            dut._log.error(f"Expected:\n{expected}")
+            dut._log.error(f"Actual:\n{actual}")
+            assert False, f"Result mismatch for {name}"
         
         if np.array_equal(actual, expected):
             dut._log.info(f"✅ Symbol '{name}' matched!")

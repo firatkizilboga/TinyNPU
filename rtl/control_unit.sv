@@ -46,7 +46,8 @@ module control_unit (
     output logic [ 7:0]                    ppu_shift,
     output logic [15:0]                    ppu_multiplier,
     output logic [ 7:0]                    ppu_activation,
-    output logic [ 1:0]                    ppu_precision,
+    output logic [ 1:0]                    ppu_in_precision,
+    output logic [ 1:0]                    ppu_out_precision,
     output logic [ 1:0]                    ppu_write_offset,
 
     input logic all_done_in
@@ -93,7 +94,8 @@ module control_unit (
   logic [ 7:0] mm_shift;
   logic [15:0] mm_multiplier;
   logic [ 7:0] mm_activation;
-  logic [ 1:0] mm_precision;
+  logic [ 1:0] mm_in_precision;
+  logic [ 1:0] mm_out_precision;
   logic [ 1:0] mm_write_offset;
   logic [15:0] m_idx, n_idx, k_idx;
 
@@ -111,7 +113,7 @@ module control_unit (
       {latched_cmd, latched_addr, latched_mmvr, latched_arg} <= '0;
       {move_src, move_dest, move_count, move_phase} <= '0;
       {mm_a_base, mm_b_base, mm_c_base, mm_bias_base, mm_m_total, mm_k_total, mm_n_total} <= '0;
-      {mm_shift, mm_multiplier, mm_activation, mm_precision, mm_write_offset} <= '0;
+      {mm_shift, mm_multiplier, mm_activation, mm_in_precision, mm_out_precision, mm_write_offset} <= '0;
       {m_idx, n_idx, k_idx, cycle_cnt} <= '0;
     end else begin
       state <= next_state;
@@ -148,8 +150,9 @@ module control_unit (
         mm_shift      <= im_rdata[119:112];
         mm_multiplier <= im_rdata[111:96];
         mm_activation <= im_rdata[95:88];
-        mm_precision  <= im_rdata[87:86];
-        mm_write_offset <= im_rdata[85:84];
+        mm_out_precision  <= im_rdata[87:86];
+        mm_write_offset   <= im_rdata[85:84];
+        mm_in_precision   <= im_rdata[83:82];
         m_idx <= '0;
         n_idx <= '0;
         k_idx <= '0;
@@ -163,38 +166,65 @@ module control_unit (
     end
   end
 
-  // --- Combinational Logic ---
-  always_comb begin
-    next_state = state;
-    pc_next = pc;
-    status_out = `STATUS_IDLE;
-    im_wr_en = 1'b0;
-    im_addr = '0;
-    im_wdata = latched_mmvr;
-    ub_req = 1'b0;
-    ub_wr_en = 1'b0;
-    ub_addr = '0;
-    ub_w_addr = '0;
-    ub_wdata = latched_mmvr;
-    acc_clear = 1'b0;
-    compute_enable = 1'b0;
-    drain_enable = 1'b0;
-    sa_input_first = 1'b0;
-    sa_input_last = 1'b0;
-    sa_weight_first = 1'b0;
-    sa_weight_last = 1'b0;
-    ppu_capture_en = 1'b0;
-    ppu_cycle_idx = cycle_cnt;
-    ppu_wb_en = 1'b0;
-    ppu_bias_en = 1'b0;
-    ppu_bias_clear = 1'b0;
-    ppu_shift = mm_shift;
-    ppu_multiplier = mm_multiplier;
-    ppu_activation = mm_activation;
-    ppu_precision = mm_precision;
-    ppu_write_offset = mm_write_offset;
-    mmvr_wr_en = 1'b0;
-    mmvr_out = '0;
+    // Tile packing: derive physical address and byte lane from n_idx and precision.
+    // INT8: 2 N-tiles pack into 1 physical word (n=0 low byte, n=1 high byte)
+    // INT4: 4 N-tiles pack into 1 physical word (n=0..3 → nibble 0..3)
+    logic [ 1:0] packed_write_offset;
+    logic [15:0] n_idx_packed;
+    logic [15:0] n_total_packed;
+
+    always_comb begin
+        unique case (mm_out_precision)
+            2'b00: begin // INT4: 4 tiles per word
+                n_idx_packed     = n_idx >> 2;
+                packed_write_offset = n_idx[1:0];
+                n_total_packed   = (mm_n_total + 16'd3) >> 2;
+            end
+            2'b01: begin // INT8: 2 tiles per word
+                n_idx_packed     = n_idx >> 1;
+                packed_write_offset = {1'b0, n_idx[0]};
+                n_total_packed   = (mm_n_total + 16'd1) >> 1;
+            end
+            default: begin // INT16: 1 tile per word
+                n_idx_packed     = n_idx;
+                packed_write_offset = 2'b0;
+                n_total_packed   = mm_n_total;
+            end
+        endcase
+    end
+
+    always_comb begin
+        next_state = state;
+        pc_next = pc;
+        status_out = `STATUS_IDLE;
+        im_wr_en = 1'b0;
+        im_addr = '0;
+        im_wdata = latched_mmvr;
+        ub_req = 1'b0;
+        ub_wr_en = 1'b0;
+        ub_addr = '0;
+        ub_w_addr = '0;
+        ub_wdata = latched_mmvr;
+        acc_clear = 1'b0;
+        compute_enable = 1'b0;
+        drain_enable = 1'b0;
+        sa_input_first = 1'b0;
+        sa_input_last = 1'b0;
+        sa_weight_first = 1'b0;
+        sa_weight_last = 1'b0;
+        ppu_capture_en = 1'b0;
+        ppu_cycle_idx = cycle_cnt;
+        ppu_wb_en = 1'b0;
+        ppu_bias_en = 1'b0;
+        ppu_bias_clear = 1'b0;
+        ppu_shift = mm_shift;
+        ppu_multiplier = mm_multiplier;
+        ppu_activation = mm_activation;
+        ppu_in_precision = mm_in_precision;
+        ppu_out_precision = mm_out_precision;
+        ppu_write_offset = packed_write_offset;
+        mmvr_wr_en = 1'b0;
+        mmvr_out = '0;
 
     move_src_next = move_src;
     move_dest_next = move_dest;
@@ -402,10 +432,9 @@ module control_unit (
         ub_wr_en = 1'b1;
         ppu_wb_en = 1'b1;
 
-        // Writeback Address: C_Base + Tile Offset + Row Index
-        // Note: storage[0] is Row 3, storage[3] is Row 0.
-        // So we use (3 - cycle_cnt) to map storage index to Row index.
-        ub_addr = mm_c_base + (m_idx * mm_n_total * `ARRAY_SIZE) + (n_idx * `ARRAY_SIZE) + (`ARRAY_SIZE - 1 - cycle_cnt);
+        // Writeback Address: pack consecutive N-tiles into the same physical word.
+        // n_idx_packed and n_total_packed collapse tiles based on output precision.
+        ub_addr = mm_c_base + (m_idx * n_total_packed * `ARRAY_SIZE) + (n_idx_packed * `ARRAY_SIZE) + (`ARRAY_SIZE - 1 - cycle_cnt);
 
         if (cycle_cnt == (`ARRAY_SIZE - 1)) begin
           cycle_next = '0;

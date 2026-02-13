@@ -48,6 +48,15 @@ cd $COCOTB_DIR
 NPU_FILE=dnn_example.npu make -f Makefile.npu > /dev/null 2>&1
 echo "✅ dnn_example.npu: PASSED"
 
+# Test 5: Mixed Precision (INT8 Packing + Masked Write)
+echo "📂 Running: mixed_test.npu"
+cd $WORKLOAD_DIR
+PYTHONPATH=../compiler python3 mixed_precision_gen.py
+mv mixed_test.npu $COCOTB_DIR/
+cd $COCOTB_DIR
+NPU_FILE=mixed_test.npu make -f Makefile.npu > /dev/null 2>&1
+echo "✅ mixed_test.npu: PASSED"
+
 echo "--------------------------------------------------------"
 echo "🎉 ALL TESTS PASSED SUCCESSFULLY!"
 echo "--------------------------------------------------------"

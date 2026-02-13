@@ -3,33 +3,33 @@ import sys
 import os
 
 # Add compiler to path
-script_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(os.path.join(script_dir, "../compiler"))
+sys.path.append(os.path.join(os.getcwd(), "../compiler"))
 from tinynpu import TinyNPUProgram, PrecisionMode
 
-def generate_mixed_test():
+def generate_mixed_stress_test():
     prog = TinyNPUProgram()
     sz = prog.array_size
 
-    print(f"Generating INT8 Tile Packing test for {sz}x{sz} array...")
+    print(f"Generating Multi-Tile INT8 Packing Stress Test for {sz}x{sz} array...")
 
-    # Single matmul: W(8x8) * X(8x16) + B -> Output(8x16)
+    # Multi-tile matmul: W(16x16) * X(16x16) + B -> Output(16x16)
     # INT8 output: 2 N-tiles pack into 1 physical tile
-    # Physical output: 8x8 words, each holding 2 INT8 values
-    M, K, N = sz, sz, sz * 2  # 8x8 x 8x16 -> 8x16
+    # Logical: m_tiles=2, k_tiles=2, n_tiles=2
+    # Physical output: 16x8 words (n_total_packed=1)
+    M, K, N = sz * 2, sz * 2, sz * 2  # 16x16 x 16x16 -> 16x16
 
-    W = np.random.randint(0, 3, size=(M, K), dtype=np.uint16)
-    X = np.random.randint(0, 5, size=(K, N), dtype=np.uint16)
-    B = np.random.randint(0, 20, size=(1, N), dtype=np.uint16)
+    W = np.random.randint(0, 5, size=(M, K), dtype=np.uint16)
+    X = np.random.randint(0, 10, size=(K, N), dtype=np.uint16)
+    B = np.random.randint(0, 50, size=(1, N), dtype=np.uint16)
 
     prog.declare_data("W", W)
     prog.declare_data("X", X)
     prog.declare_data("B", B)
 
-    # Declare output with LOGICAL shape (8x16)
+    # Declare output with LOGICAL shape (16x16)
     prog.declare_data("PackedOutput", np.zeros((M, N), dtype=np.uint16))
 
-    shift, multiplier = 1, 2
+    shift, multiplier = 3, 5
     prog.matmul("W", "X", "PackedOutput", bias_name="B",
                 out_precision=PrecisionMode.INT8, shift=shift, multiplier=multiplier)
     prog.halt()
@@ -42,9 +42,9 @@ def generate_mixed_test():
 
     prog.add_expected_result("PackedOutput", Y)
 
-    output_path = "mixed_test.npu"
+    output_path = "mixed_stress.npu"
     prog.save_npu(output_path)
-    print(f"Mixed precision test generated: {output_path}")
+    print(f"Mixed stress test generated: {output_path}")
 
 if __name__ == "__main__":
-    generate_mixed_test()
+    generate_mixed_stress_test()

@@ -34,7 +34,8 @@ module tinynpu_top #(
     logic [ 7:0]                 ppu_shift;
     logic [15:0]                 ppu_multiplier;
     logic [ 7:0]                 ppu_activation;
-    logic [ 1:0]                 ppu_precision;
+    logic [ 1:0]                 ppu_in_precision;
+    logic [ 1:0]                 ppu_out_precision;
     logic [ 1:0]                 ppu_write_offset;
     logic                        sa_input_first, sa_input_last;
     logic                        sa_weight_first, sa_weight_last;
@@ -69,7 +70,8 @@ module tinynpu_top #(
         .ppu_shift      (ppu_shift),
         .ppu_multiplier (ppu_multiplier),
         .ppu_activation (ppu_activation),
-        .ppu_precision  (ppu_precision),
+        .ppu_in_precision (ppu_in_precision),
+        .ppu_out_precision(ppu_out_precision),
         .ppu_write_offset(ppu_write_offset),
         .all_done_in    (all_done)
     );
@@ -94,7 +96,7 @@ module tinynpu_top #(
         .sa_weight_first(sa_weight_first),
         .sa_weight_last (sa_weight_last),
         
-        .precision_mode (precision_mode_t'(ppu_precision)), 
+        .precision_mode (precision_mode_t'(ppu_in_precision)), 
         .compute_enable (compute_enable),
         .drain_enable   (drain_enable),
         .ppu_wb_en      (ppu_wb_en),
@@ -107,7 +109,8 @@ module tinynpu_top #(
         .ppu_shift      (ppu_shift),
         .ppu_multiplier (ppu_multiplier),
         .ppu_activation (ppu_activation),
-        .ppu_precision  (ppu_precision),
+        .ppu_in_precision (ppu_in_precision),
+        .ppu_out_precision(ppu_out_precision),
         .ppu_write_offset(ppu_write_offset),
         
         .results_flat   (results_flat),
