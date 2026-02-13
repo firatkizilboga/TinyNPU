@@ -130,20 +130,38 @@ async def test_npu(dut):
                             num_elements = end_col - start_col
                             actual[row_idx, start_col:end_col] = vec[:num_elements]
         
-        if np.array_equal(actual, expected):
-            dut._log.info(f"✅ Symbol '{name}' matched!")
-        else:
-            dut._log.error(f"❌ Mismatch in symbol '{name}'!")
-            dut._log.error(f"Expected:\n{expected}")
-            dut._log.error(f"Actual:\n{actual}")
-            assert False, f"Result mismatch for {name}"
+                if np.array_equal(actual, expected):
         
-        if np.array_equal(actual, expected):
-            dut._log.info(f"✅ Symbol '{name}' matched!")
-        else:
-            dut._log.error(f"❌ Mismatch in symbol '{name}'!")
-            dut._log.error(f"Expected:\n{expected}")
-            dut._log.error(f"Actual:\n{actual}")
-            assert False, f"Result mismatch for {name}"
-
-    dut._log.info("✅ All verifications passed!")
+                    dut._log.info(f"✅ Symbol '{name}' matched!")
+        
+                else:
+        
+                    diff = actual != expected
+        
+                    num_mismatches = np.sum(diff)
+        
+                    dut._log.error(f"❌ Mismatch in symbol '{name}'! {num_mismatches} elements differ.")
+        
+                    
+        
+                    # Find first mismatch
+        
+                    idx = np.where(diff)
+        
+                    r, c = idx[0][0], idx[1][0]
+        
+                    dut._log.error(f"First mismatch at ({r}, {c}): Expected {expected[r,c]}, Actual {actual[r,c]}")
+        
+                    
+        
+                    # dut._log.error(f"Expected:\n{expected}")
+        
+                    # dut._log.error(f"Actual:\n{actual}")
+        
+                    assert False, f"Result mismatch for {name}"
+        
+        
+        
+            dut._log.info("✅ All verifications passed!")
+        
+        
