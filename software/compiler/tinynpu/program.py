@@ -73,7 +73,6 @@ class TinyNPUProgram:
     def declare_image(self, name, data, h, w, c, precision=PrecisionMode.INT16):
         """Declares a 3D image and stores its logical dimensions."""
         arr = np.array(data, dtype=np.int16).reshape(h, w, c)
-        # Store flattened 2D version for the packer (H*W, C)
         sym = Symbol(name, (h*w, c), precision, role='B', data=arr.reshape(h*w, c))
         sym.dims = (h, w, c)
         self.symbols[name] = sym
@@ -81,7 +80,6 @@ class TinyNPUProgram:
     def declare_kernel(self, name, data, kh, kw, c, oc, precision=PrecisionMode.INT16):
         """Declares a 4D kernel and stores its logical dimensions."""
         arr = np.array(data, dtype=np.int16).reshape(kh, kw, c, oc)
-        # Store flattened 2D version for the packer (KH*KW*C, OC)
         sym = Symbol(name, (kh*kw*c, oc), precision, role='A', data=arr.reshape(-1, oc))
         sym.dims = (kh, kw, c, oc)
         self.symbols[name] = sym
@@ -97,6 +95,10 @@ class TinyNPUProgram:
         if out_name not in self.symbols:
             out_shape = (A.shape[0], B.shape[1])
             self.symbols[out_name] = Symbol(out_name, out_shape, out_precision, role='C')
+        else:
+            # Update existing symbol to reflect it's now a MATMUL output
+            self.symbols[out_name].storage_role = 'C'
+            self.symbols[out_name].precision = out_precision
         if bias_name and bias_name not in self.symbols:
             bias_shape = (1, B.shape[1])
             self.symbols[bias_name] = Symbol(bias_name, bias_shape, PrecisionMode.INT16, role='BIAS')
@@ -121,13 +123,14 @@ class TinyNPUProgram:
         for y in range(0, H + 2*padding - KH + 1, stride):
             for x in range(0, W + 2*padding - KW + 1, stride):
                 patch = img_data[y:y+KH, x:x+KW, :]
-                col_matrix.append(patch.flatten())
-        col_matrix = np.array(col_matrix, dtype=np.int16).T 
-        kernel_matrix = ker_sym.data.reshape(-1, OC).T
+                col_matrix.append(patch.transpose(2, 0, 1).flatten())
+        col_matrix = np.array(col_matrix, dtype=np.int16).T # (K, HW)
+        kernel_matrix = ker_sym.data.reshape(-1, OC).T # (OC, K)
         col_sym_name, ker_flat_name = f"_{image_name}_im2col", f"_{kernel_name}_flat"
         self.declare_data(ker_flat_name, kernel_matrix, precision=in_precision, role='A')
         self.declare_data(col_sym_name, col_matrix, precision=in_precision, role='B')
         self.matmul(ker_flat_name, col_sym_name, out_name, bias_name=bias_name, shift=shift, multiplier=multiplier, activation=activation, in_precision=in_precision, out_precision=out_precision)
+        self.symbols[out_name].dims = (OH, OW, OC)
 
     def move(self, src_name, dest_name):
         if src_name not in self.symbols: raise ValueError(f"Source symbol '{src_name}' not found.")
@@ -151,8 +154,7 @@ class TinyNPUProgram:
                 n = (sym.shape[1] + sz - 1) // sz
                 m = 1
             elif sym.storage_role == 'BIAS':
-                m, k = 1, 1
-                n = (sym.shape[1] + sz - 1) // sz
+                m, k, n = 1, 1, (sym.shape[1] + sz - 1) // sz
             else: # C
                 m, n, k = (sym.shape[0] + sz - 1) // sz, (sym.shape[1] + sz - 1) // sz, 1
             sym.word_count = self.packer.get_physical_word_count(sym.storage_role, sym.precision, m, k, n)
@@ -171,8 +173,7 @@ class TinyNPUProgram:
             elif sym.storage_role == 'B':
                 k, n, m = (sym.shape[0]//p + sz - 1) // sz, (sym.shape[1] + sz - 1) // sz, 1
             elif sym.storage_role == 'BIAS':
-                m, k = 1, 1
-                n = (sym.shape[1] + sz - 1) // sz
+                m, k, n = 1, 1, (sym.shape[1] + sz - 1) // sz
             else: # C
                 m, n, k = (sym.shape[0] + sz - 1) // sz, (sym.shape[1] + sz - 1) // sz, 1
             packed_words = self.packer.pack(sym.data, sym.storage_role, sym.precision, m, k, n)
