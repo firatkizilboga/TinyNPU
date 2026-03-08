@@ -40,6 +40,13 @@ module tinynpu_top #(
     logic                        sa_input_first, sa_input_last;
     logic                        sa_weight_first, sa_weight_last;
 
+    initial begin
+        if ($test$plusargs("trace")) begin
+            $dumpfile("tinynpu_trace.vcd");
+            $dumpvars(0, tinynpu_top);
+        end
+    end
+
     control_top #(
         .IM_INIT_FILE(IM_INIT_FILE)
     ) u_brain (
@@ -82,20 +89,17 @@ module tinynpu_top #(
         .clk            (clk),
         .rst_n          (rst_n),
         .en             (1'b1),
-        
         .cu_req         (ub_req),
         .cu_wr_en       (ub_wr_en),
         .cu_addr        (ub_addr),
         .cu_wdata       (ub_wdata),
         .cu_rdata       (ub_rdata),
-        
         .sa_input_addr  (ub_addr),
         .sa_input_first (sa_input_first),
         .sa_input_last  (sa_input_last),
         .sa_weight_addr (ub_w_addr),
         .sa_weight_first(sa_weight_first),
         .sa_weight_last (sa_weight_last),
-        
         .precision_mode (precision_mode_t'(ppu_in_precision)), 
         .compute_enable (compute_enable),
         .drain_enable   (drain_enable),
@@ -103,7 +107,6 @@ module tinynpu_top #(
         .ppu_bias_en    (ppu_bias_en),
         .ppu_bias_clear  (ppu_bias_clear),
         .acc_clear      (acc_clear),
-
         .ppu_cycle_idx  (ppu_cycle_idx),
         .ppu_capture_en (ppu_capture_en),
         .ppu_shift      (ppu_shift),
@@ -112,7 +115,6 @@ module tinynpu_top #(
         .ppu_in_precision (ppu_in_precision),
         .ppu_out_precision(ppu_out_precision),
         .ppu_write_offset(ppu_write_offset),
-        
         .results_flat   (results_flat),
         .result_valid   (result_valid),
         .all_done       (all_done)

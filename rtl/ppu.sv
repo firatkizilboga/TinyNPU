@@ -8,7 +8,7 @@ module ppu (
     input logic                           capture_en,
     input logic                           bias_en,
     input logic                           bias_clear,
-    input logic [$clog2(`ARRAY_SIZE)-1:0] cycle_idx,
+    input logic [$clog2(`ARRAY_SIZE)-1:0] ppu_cycle_idx,
     input logic [                    7:0] shift,
     input logic [                   15:0] multiplier,
     input logic [                    7:0] activation,
@@ -63,7 +63,7 @@ module ppu (
         shifted = rescaled;
       end
 
-      // D. Activation (ReLU)
+      // D. Activation (ReLU) - Bit 0 of activation triggers ReLU
       if (activation[0]) begin
         if (shifted < 0) shifted = 0;
       end
@@ -86,11 +86,21 @@ module ppu (
           if (shifted > 32767)       sat16 = 32767;
           else if (shifted < -32768) sat16 = -32768;
           else                       sat16 = shifted[15:0];
-          result_val = unsigned'(sat16);
+          result_val = 16'(unsigned'(sat16));
         end
       endcase
       
       quantized_row[i] = result_val;
+    end
+  end
+
+  always_ff @(posedge clk) begin
+    if (rst_n && capture_en) begin
+        $display("PPU CAPTURE: cycle=%d | B0=%d B1=%d B2=%d B3=%d B4=%d B5=%d B6=%d B7=%d | Lane0: acc=%d, res=%x", 
+            ppu_cycle_idx, bias_reg[0], bias_reg[1], bias_reg[2], bias_reg[3],
+            bias_reg[4], bias_reg[5], bias_reg[6], bias_reg[7],
+            acc_in[0], quantized_row[0]);
+        $fflush();
     end
   end
 
@@ -118,7 +128,7 @@ module ppu (
 
       if (capture_en) begin
         for (int i = 0; i < `ARRAY_SIZE; i++) begin
-          storage[cycle_idx][i] <= quantized_row[i];
+          storage[ppu_cycle_idx][i] <= quantized_row[i];
         end
       end
     end
@@ -126,7 +136,7 @@ module ppu (
 
   generate
     for (genvar i = 0; i < `ARRAY_SIZE; i++) begin : gen_output
-      assign ub_wdata[i*16+:16] = storage[cycle_idx][i];
+      assign ub_wdata[i*16+:16] = storage[ppu_cycle_idx][i];
     end
   endgenerate
 
