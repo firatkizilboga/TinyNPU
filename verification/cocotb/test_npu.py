@@ -100,68 +100,56 @@ async def test_npu(dut):
                     tile_addr = addr + (mtp * n_tiles * array_size) + (nt * array_size)
                     for i in range(array_size):
                         vec = await npu_driver.read_ub_vector(dut, tile_addr + i, array_size)
-                        # Word i contains elements from multiple M-tiles
                         for lane in range(array_size):
                             word = vec[lane]
                             col_idx = nt * array_size + lane
                             for bit_idx in range(p):
-                                # logical M-tile index
                                 mt = mtp * p + bit_idx
                                 row_idx = mt * array_size + i
                                 if row_idx < shape[0] and col_idx < shape[1]:
                                     val = (word >> (bit_idx * bits)) & mask
-                                    # Sign extend if needed
                                     if val & (1 << (bits - 1)):
                                         val -= (1 << bits)
                                     actual[row_idx, col_idx] = val
-        else:
-            # For A/B, just handle basic tiling for now (used for debugging)
-            # Mixed precision for A/B is more complex, but we mainly care about C
+        elif role == 'A':
+            # A packing: tile order (m, k), word = K-column, lane = M-row
+            k_tiles = n_tiles  # shape[1] is K for A
             for mt in range(m_tiles):
-                for nt in range(n_tiles):
-                    tile_idx = (mt * n_tiles) + nt
-                    tile_addr = addr + (tile_idx * array_size)
+                for kt in range(k_tiles):
+                    tile_addr = addr + (mt * k_tiles + kt) * array_size
                     for i in range(array_size):
                         vec = await npu_driver.read_ub_vector(dut, tile_addr + i, array_size)
-                        row_idx = mt * array_size + i
+                        col_idx = kt * array_size + i
+                        if col_idx < shape[1]:
+                            for j in range(array_size):
+                                row_idx = mt * array_size + j
+                                if row_idx < shape[0]:
+                                    actual[row_idx, col_idx] = vec[j]
+        else:
+            # B packing: tile order (k, n), word = K-row, lane = N-column
+            k_tiles = m_tiles  # shape[0] is K for B
+            for kt in range(k_tiles):
+                for nt in range(n_tiles):
+                    tile_addr = addr + (kt * n_tiles + nt) * array_size
+                    for i in range(array_size):
+                        vec = await npu_driver.read_ub_vector(dut, tile_addr + i, array_size)
+                        row_idx = kt * array_size + i
                         if row_idx < shape[0]:
-                            start_col = nt * array_size
-                            end_col = min(start_col + array_size, shape[1])
-                            num_elements = end_col - start_col
-                            actual[row_idx, start_col:end_col] = vec[:num_elements]
-        
-                if np.array_equal(actual, expected):
-        
-                    dut._log.info(f"✅ Symbol '{name}' matched!")
-        
-                else:
-        
-                    diff = actual != expected
-        
-                    num_mismatches = np.sum(diff)
-        
-                    dut._log.error(f"❌ Mismatch in symbol '{name}'! {num_mismatches} elements differ.")
-        
-                    
-        
-                    # Find first mismatch
-        
-                    idx = np.where(diff)
-        
-                    r, c = idx[0][0], idx[1][0]
-        
-                    dut._log.error(f"First mismatch at ({r}, {c}): Expected {expected[r,c]}, Actual {actual[r,c]}")
-        
-                    
-        
-                    # dut._log.error(f"Expected:\n{expected}")
-        
-                    # dut._log.error(f"Actual:\n{actual}")
-        
-                    assert False, f"Result mismatch for {name}"
-        
-        
-        
-            dut._log.info("✅ All verifications passed!")
-        
+                            for j in range(array_size):
+                                col_idx = nt * array_size + j
+                                if col_idx < shape[1]:
+                                    actual[row_idx, col_idx] = vec[j]
+
+        if np.array_equal(actual, expected):
+            dut._log.info(f"PASS Symbol '{name}' matched!")
+        else:
+            diff = actual != expected
+            num_mismatches = np.sum(diff)
+            dut._log.error(f"FAIL Mismatch in symbol '{name}'! {num_mismatches} elements differ.")
+            idx = np.where(diff)
+            r, c = idx[0][0], idx[1][0]
+            dut._log.error(f"First mismatch at ({r}, {c}): Expected {expected[r,c]}, Actual {actual[r,c]}")
+            assert False, f"Result mismatch for {name}"
+
+    dut._log.info("All verifications passed!")
         
