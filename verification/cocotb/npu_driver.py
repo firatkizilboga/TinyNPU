@@ -37,6 +37,7 @@ async def read_ub_vector(dut, addr, array_size):
     for i in range(mmvr_bytes):
         dut.host_addr.value = REG_MMVR + i
         await RisingEdge(dut.clk)
+        await RisingEdge(dut.clk) # Wait for combinational/sync read logic to update data
         res_bytes.append(int(dut.host_rd_data.value))
     
     res = []

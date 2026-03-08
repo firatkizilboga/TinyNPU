@@ -93,8 +93,15 @@ def generate_complex_chain():
         # Update Golden Model: W * Input + B
         acc = np.matmul(W.astype(np.int64), golden_input.astype(np.int64)) + B.astype(np.int64).T
         
+        # 2. Scale & Shift with Rounding
         rescaled = acc * multiplier
-        shifted = rescaled >> shift
+        if shift > 0:
+            rounding_offset = 1 << (shift - 1)
+            shifted = (rescaled + rounding_offset) >> shift
+        else:
+            shifted = rescaled
+        
+        # 3. Saturation (Output Precision)
         golden_output = clip_and_quantize(shifted, out_prec)
         
         # Add expected result for EVERY layer for debugging
