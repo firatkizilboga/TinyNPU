@@ -158,7 +158,6 @@ module control_unit (
         n_idx <= '0;
         k_idx <= '0;
         cycle_cnt <= '0;
-        ppu_bias_clear <= 1'b1;
       end else begin
         m_idx <= m_next;
         n_idx <= n_next;
@@ -322,7 +321,10 @@ module control_unit (
             move_phase_next = 1'b0;
             next_state = CTRL_EXEC_MOVE;
           end
-          ISA_OP_MATMUL: next_state = CTRL_EXEC_MATMUL;
+          ISA_OP_MATMUL: begin
+            ppu_bias_clear = 1'b1;
+            next_state = CTRL_EXEC_MATMUL;
+          end
           default: next_state = CTRL_HALT;
         endcase
       end
@@ -424,12 +426,6 @@ module control_unit (
           cycle_next = '0;
           next_state = CTRL_MM_DRAIN_SA;
         end
-      end
-
-      CTRL_MM_LOAD_BIAS: begin
-        status_out = `STATUS_BUSY;
-        cycle_next = '0;
-        next_state = CTRL_MM_DRAIN_SA;
       end
 
       CTRL_MM_DRAIN_SA: begin
