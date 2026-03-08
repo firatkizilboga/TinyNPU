@@ -158,6 +158,7 @@ module control_unit (
         n_idx <= '0;
         k_idx <= '0;
         cycle_cnt <= '0;
+        ppu_bias_clear <= 1'b1;
       end else begin
         m_idx <= m_next;
         n_idx <= n_next;
@@ -355,6 +356,7 @@ module control_unit (
         end else if (n_idx >= mm_n_total) begin
           m_next = m_idx + 1;
           n_next = '0;
+          ppu_bias_clear = 1'b1;
         end else begin
           next_state = CTRL_MM_CLEAR;
         end
@@ -363,10 +365,27 @@ module control_unit (
       CTRL_MM_CLEAR: begin
         status_out = `STATUS_BUSY;
         acc_clear = 1'b1;
-        ppu_bias_clear = 1'b1;
         k_next = '0;
         cycle_next = '0;
-        next_state = CTRL_MM_FEED;
+        if (mm_bias_base != 16'hFFFF) begin
+            next_state = CTRL_MM_LOAD_BIAS;
+        end else begin
+            next_state = CTRL_MM_FEED;
+        end
+      end
+
+      CTRL_MM_LOAD_BIAS: begin
+        status_out = `STATUS_BUSY;
+        ub_req = 1'b1;
+        ppu_bias_en = 1'b1;
+        if (cycle_cnt == 0) begin
+            ub_addr = mm_bias_base + (n_idx * 2);
+            cycle_next = 1;
+        end else begin
+            ub_addr = mm_bias_base + (n_idx * 2) + 1;
+            cycle_next = 0;
+            next_state = CTRL_MM_FEED;
+        end
       end
 
       CTRL_MM_FEED: begin
@@ -401,26 +420,14 @@ module control_unit (
         status_out = `STATUS_BUSY;
         compute_enable = 1'b1;  // Flush skewers
         
-        // Latch first 128 bits of bias (Cols 0-3)
         if (all_done_in) begin
-          if (mm_bias_base != 16'hFFFF) begin
-              ub_req = 1'b1;
-              ub_addr = mm_bias_base + (n_idx * 2);
-              ppu_bias_en = 1'b1;
-              next_state = CTRL_MM_LOAD_BIAS;
-          end else begin
-              cycle_next = '0;
-              next_state = CTRL_MM_DRAIN_SA;
-          end
+          cycle_next = '0;
+          next_state = CTRL_MM_DRAIN_SA;
         end
       end
 
       CTRL_MM_LOAD_BIAS: begin
         status_out = `STATUS_BUSY;
-        // Latch second 128 bits of bias (Cols 4-7)
-        ub_req = 1'b1;
-        ub_addr = mm_bias_base + (n_idx * 2) + 1;
-        ppu_bias_en = 1'b1;
         cycle_next = '0;
         next_state = CTRL_MM_DRAIN_SA;
       end
@@ -446,7 +453,7 @@ module control_unit (
 
         // Writeback Address: pack consecutive M-tiles into the same physical word.
         // This makes output compatible with Input B (Top Matrix) packing for Layer 2.
-        ub_addr = mm_c_base + (m_idx_packed * mm_n_total * `ARRAY_SIZE) + (n_idx * `ARRAY_SIZE) + (`ARRAY_SIZE - 1 - cycle_cnt);
+        ub_addr = mm_c_base + (m_idx_packed * mm_n_total * `ARRAY_SIZE) + (n_idx * `ARRAY_SIZE) + cycle_cnt;
 
         if (cycle_cnt == (`ARRAY_SIZE - 1)) begin
           cycle_next = '0;
