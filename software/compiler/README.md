@@ -5,6 +5,7 @@ A Python-based compiler for the TinyNPU architecture.
 ## New Segmented JIT Path
 
 The repository now also contains a new experimental compiler/runtime path under `tinynpu_jit/`.
+It also now contains the beginnings of a PyTorch-side quantization toolkit under `tinynpu_quant/`.
 
 This path is designed around:
 - PyTorch/FX as the frontend
@@ -16,7 +17,7 @@ This path is designed around:
 Current scope:
 - TinyNPU lowering: explicit `matmul`, exported `linear`, exported `conv2d` lowered through host-side `im2col`, plus ordinary quantized `torch.ao.nn.quantized.Linear`
 - PyTorch quant boundary support: `torch.ao.nn.quantized.Quantize` / `DeQuantize`, plus `QuantStub` / `DeQuantStub` when explicit qparams are attached
-- ordinary quantized `torch.ao.nn.quantized.Conv2d` lowered through host-side `im2col` in host emulation
+- ordinary quantized `torch.ao.nn.quantized.Conv2d` lowered through host-side `im2col`
 - host-emulation runtime for compile/run/verify validation
 - async simulator runtime entrypoint that targets the existing cocotb driver path
 - structured runtime debug tracing for host ops, NPU segments, verification, and simulator IO overlays
@@ -49,6 +50,10 @@ Examples:
 - `software/workload/jit_quantized_modules.py`: ordinary quantized `Linear` / `Conv2d` PyTorch module examples
 - `software/workload/inspect_simple_chain.py`: prints the segmented plan, logical previews, and packed output vectors for the migrated simple-chain artifact
 
+PyTorch quantization toolkit:
+- `software/compiler/tinynpu_quant/`: extracted reusable quantization utilities
+- `quant-by-claude.py`: still the MNIST-specific workflow script, but now backed by shared `tinynpu_quant` helpers instead of owning all quant logic itself
+
 Simulator smoke test:
 - `cd verification/cocotb && MODULE=test_jit_runtime make -f Makefile.npu`
 - Migrated simple-chain RTL test: `cd verification/cocotb && MODULE=test_jit_simple_chain make -f Makefile.npu`
@@ -56,6 +61,7 @@ Simulator smoke test:
 - Mixed host/NPU chain RTL test: `cd verification/cocotb && MODULE=test_jit_hostop_chain make -f Makefile.npu`
 - Quant/dequant stub RTL test: `cd verification/cocotb && MODULE=test_jit_qdq_chain make -f Makefile.npu`
 - Quantized PyTorch `Linear` RTL test: `cd verification/cocotb && MODULE=test_jit_quantized_linear make -f Makefile.npu`
+- Quantized PyTorch `Conv2d` RTL test: `cd verification/cocotb && MODULE=test_jit_quantized_conv make -f Makefile.npu`
 - Exported MNIST conv RTL smoke test: `cd verification/cocotb && MODULE=test_jit_mnist_conv1 make -f Makefile.npu`
 - Full exported MNIST JIT RTL chain: `cd verification/cocotb && MODULE=test_jit_mnist_full_chain make -f Makefile.npu`
 
@@ -71,7 +77,7 @@ Open risks:
   - symmetric `zero_point = 0`
   - scale-derived `multiplier` / `shift`
 - exported workloads like MNIST still use export-backed quant config through transitional helpers such as `npu_matmul(...)`
-- ordinary quantized `Conv2d` lowering is validated in host emulation, not yet with a dedicated RTL smoke test
+- ordinary quantized `Conv2d` lowering is validated on RTL for the current narrow quantized frontend path, but broader mixed-op graphs are still incomplete
 - a reusable PyTorch-side quantization toolkit is not built yet; `quant-by-claude.py` is still a script, not the final `tinynpu_quant` package
 - old `A/B/C/BIAS` role semantics still exist in lowering as a migration bridge
 
