@@ -417,12 +417,18 @@ Current proven JIT/compiler/runtime capabilities:
 - export-backed MNIST conv/fc execution on the new path
 - full exported MNIST chain on RTL matching the old path
 - ordinary quantized `torch.ao.nn.quantized.Linear` lowered to TinyNPU and validated on RTL
-- ordinary quantized `torch.ao.nn.quantized.Conv2d` lowered through host `im2col` and validated in host emulation
+- ordinary quantized `torch.ao.nn.quantized.Conv2d` lowered through host `im2col` and validated on RTL
 - structured runtime debug trace showing:
   - host quantize / dequantize
   - host im2col / layout restore
   - NPU segment inputs / outputs
   - verification points
+- first reusable PyTorch-side quantization toolkit pieces now live in `tinynpu_quant`:
+  - fused-parameter math
+  - per-layer quant config objects
+  - reusable QAT layer modules
+  - calibration helpers
+  - sensitivity-analysis helpers
 
 Current non-capabilities:
 - arbitrary PyTorch float models are not automatically prepared for TinyNPU
@@ -449,6 +455,16 @@ Near-term migration path from `quant-by-claude.py`:
 3. keep model-specific MNIST code thin and outside the shared quant toolkit
 4. converge the toolkit output with what `compile_module(...)` expects
 
+Progress against that plan today:
+- step 1 is done
+- step 2 has started:
+  - fake-quant utilities
+  - `LayerQuantConfig`
+  - `QConv2d` / `QLinear`
+  - calibration helpers
+  - sensitivity helpers
+- the remaining gap is turning those extracted pieces into a compiler-prepared-model pipeline instead of just a cleaner script foundation
+
 ### 10.14 Transformer Constraint
 
 Transformer-style models should stay in design scope even while near-term validation is CNN/MLP-heavy.
@@ -467,15 +483,15 @@ This section is here so the project can survive context compaction without losin
 Short-term execution order:
 1. Continue extracting `quant-by-claude.py` into `tinynpu_quant`.
    - next concrete extraction targets:
-     - fake-quant utilities
-     - layer quant-config objects
-     - calibration helpers
-     - sensitivity-analysis helpers
+     - PTQ/QAT orchestration helpers
+     - export helpers
+     - model-agnostic conversion helpers
 2. Keep `quant-by-claude.py` as a thin model-specific workflow script that imports shared logic from `tinynpu_quant`.
 3. Define one compiler-supported prepared-model contract for PyTorch quantization.
    - near-term target: standard quantized `torch.ao` modules plus explicit quant/dequant boundaries
    - training-time custom modules are not the compiler contract unless we explicitly choose to support them
 4. Add a dedicated RTL smoke test for the ordinary quantized `Conv2d` frontend path.
+   - done for the current narrow quantized `Conv2d` path
 5. After the quant toolkit is more complete, teach `compile_module(...)` to accept the prepared output of that toolkit directly.
 
 Guardrails for the next steps:
