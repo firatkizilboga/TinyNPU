@@ -1,6 +1,8 @@
 `include "defines.sv"
 
-module control_top (
+module control_top #(
+    parameter IM_INIT_FILE = ""
+) (
     input  logic clk,
     input  logic rst_n,
 
@@ -22,10 +24,19 @@ module control_top (
     output logic                        acc_clear,
     output logic                        compute_enable,
     output logic                        drain_enable,
+    output logic                        ppu_wb_en,
+    output logic                        ppu_bias_en,
+    output logic                        ppu_bias_clear,
     
     // PPU Control
     output logic [$clog2(`ARRAY_SIZE)-1:0] ppu_cycle_idx,
     output logic                           ppu_capture_en,
+    output logic [ 7:0]                    ppu_shift,
+    output logic [15:0]                    ppu_multiplier,
+    output logic [ 7:0]                    ppu_activation,
+    output logic [ 1:0]                    ppu_in_precision,
+    output logic [ 1:0]                    ppu_out_precision,
+    output logic [ 1:0]                    ppu_write_offset,
 
     // Sequencer Markers
     output logic                        sa_input_first,
@@ -41,6 +52,8 @@ module control_top (
     logic [`BUFFER_WIDTH-1:0]    mmvr_bus;
     logic                        doorbell_pulse;
     logic [`HOST_DATA_WIDTH-1:0] status_bus;
+    logic                        mmvr_wr_en;
+    logic [`BUFFER_WIDTH-1:0]    mmvr_internal;
 
     // Instruction Memory Internal Signals
     logic                        im_wr_en;
@@ -60,12 +73,16 @@ module control_top (
         .addr_out       (addr_bus),
         .arg_out        (arg_bus),
         .mmvr_out       (mmvr_bus),
+        .mmvr_wr_en     (mmvr_wr_en),
+        .mmvr_in        (mmvr_internal),
         .doorbell_pulse (doorbell_pulse),
         .status_in      (status_bus)
     );
 
     // Instruction Memory Instance
-    instruction_memory u_im (
+    instruction_memory #(
+        .INIT_FILE(IM_INIT_FILE)
+    ) u_im (
         .clk     (clk),
         .rst_n   (rst_n),
         .wr_en   (im_wr_en),
@@ -85,6 +102,8 @@ module control_top (
         .mmvr_in        (mmvr_bus),
         .doorbell_pulse (doorbell_pulse),
         .status_out     (status_bus),
+        .mmvr_wr_en     (mmvr_wr_en),
+        .mmvr_out       (mmvr_internal),
         .im_wr_en       (im_wr_en),
         .im_addr        (im_addr),
         .im_wdata       (im_wdata),
@@ -98,12 +117,21 @@ module control_top (
         .acc_clear      (acc_clear),
         .compute_enable (compute_enable),
         .drain_enable   (drain_enable),
+        .ppu_wb_en      (ppu_wb_en),
+        .ppu_bias_en    (ppu_bias_en),
+        .ppu_bias_clear  (ppu_bias_clear),
         .sa_input_first (sa_input_first),
         .sa_input_last  (sa_input_last),
         .sa_weight_first(sa_weight_first),
         .sa_weight_last (sa_weight_last),
         .ppu_cycle_idx  (ppu_cycle_idx),
         .ppu_capture_en (ppu_capture_en),
+        .ppu_shift      (ppu_shift),
+        .ppu_multiplier (ppu_multiplier),
+        .ppu_activation (ppu_activation),
+        .ppu_in_precision (ppu_in_precision),
+        .ppu_out_precision(ppu_out_precision),
+        .ppu_write_offset(ppu_write_offset),
         .all_done_in    (all_done_in)
     );
 

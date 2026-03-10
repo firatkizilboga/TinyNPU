@@ -18,7 +18,8 @@
 // ----------------------------------------------------------------------------
 // Systolic Array Dimensions
 // ----------------------------------------------------------------------------
-`define ARRAY_SIZE 4              // N×N array (rows = columns)
+`define ARRAY_SIZE 8
+              // N×N array (rows = columns)
 `define NUM_PES (`ARRAY_SIZE * `ARRAY_SIZE)
 
 // ----------------------------------------------------------------------------
@@ -74,21 +75,23 @@ typedef enum logic [1:0] {
 // ============================================================================
 // Control Plane & ISA Definitions (Added Feb 2026)
 // ============================================================================
-`define MMIO_ADDR_WIDTH 5
+// Calculate required address width: Base (0x10) + Buffer Size (Bytes)
+`define MMIO_ADDR_WIDTH $clog2('h10 + (`BUFFER_WIDTH/8))
 `define HOST_DATA_WIDTH 8
 `define ARG_WIDTH       32
 
 // MMIO Register Map (Offsets)
-`define REG_STATUS  5'h00
-`define REG_CMD     5'h04
-`define REG_ADDR    5'h08
-`define REG_ARG     5'h0C
-`define REG_MMVR    5'h10
+`define REG_STATUS  'h00
+`define REG_CMD     'h04
+`define REG_ADDR    'h08
+`define REG_ARG     'h0C
+`define REG_MMVR    'h10
 
 // Memory Map
 `define IM_BASE_ADDR 16'h8000 // Instructions start here
 `define IM_SIZE      1024     // Depth of Instruction Memory (256-bit words)
 `define INST_WIDTH   256      // Fixed Instruction Width (4 * 64-bit)
+`define INST_CHUNKS  (`INST_WIDTH / `BUFFER_WIDTH < 1 ? 1 : `INST_WIDTH / `BUFFER_WIDTH)
 
 // ----------------------------------------------------------------------------
 // Status Codes (Read from STATUS_REG)

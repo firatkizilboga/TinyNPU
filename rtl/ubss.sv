@@ -1,6 +1,8 @@
 `include "defines.sv"
 
-module ubss (
+module ubss #(
+    parameter UB_INIT_FILE = ""
+) (
     input  logic clk,
     input  logic rst_n,
     input  logic en, // Top-level enable
@@ -31,8 +33,17 @@ module ubss (
     input  logic                     acc_clear,
 
     // PPU Control
+    input  logic                     ppu_wb_en,
+    input  logic                     ppu_bias_en,
+    input  logic                     ppu_bias_clear,
     input  logic [$clog2(`ARRAY_SIZE)-1:0] ppu_cycle_idx,
     input  logic                           ppu_capture_en,
+    input  logic [ 7:0]                    ppu_shift,
+    input  logic [15:0]                    ppu_multiplier,
+    input  logic [ 7:0]                    ppu_activation,
+    input  logic [ 1:0]                    ppu_in_precision,
+    input  logic [ 1:0]                    ppu_out_precision,
+    input  logic [ 1:0]                    ppu_write_offset,
 
     // ------------------------------------------------------------------------
     // Outputs
@@ -45,18 +56,36 @@ module ubss (
     // Internal Wires
     logic [`BUFFER_WIDTH-1:0] ub_rdata_internal;
     logic [`BUFFER_WIDTH-1:0] ppu_wdata;
+    logic [`BUFFER_WIDTH-1:0] ub_wr_mask;
     
+    // Mask Generation for Compact Packing
+    always_comb begin
+        ub_wr_mask = '1; // Default: Write all bits (for MMIO/Load)
+        if (ppu_wb_en) begin
+            unique case (ppu_out_precision)
+                2'b00: begin // INT4
+                    for (int i=0; i<`ARRAY_SIZE; i++) 
+                        ub_wr_mask[i*16 +: 16] = 16'h000F << (ppu_write_offset * 4);
+                end
+                2'b01: begin // INT8
+                    for (int i=0; i<`ARRAY_SIZE; i++)
+                        ub_wr_mask[i*16 +: 16] = 16'h00FF << (ppu_write_offset * 8);
+                end
+                default: begin // INT16 (2'b10)
+                    ub_wr_mask = '1;
+                end
+            endcase
+        end
+    end
+
     // Mux for UB Write Data: Either from CU (MMIO Load) or PPU (Compute Result)
     logic [`BUFFER_WIDTH-1:0] ub_final_wdata;
-    assign ub_final_wdata = (drain_enable) ? ppu_wdata : cu_wdata; // Drain implies PPU writing
+    assign ub_final_wdata = (ppu_wb_en) ? ppu_wdata : cu_wdata;
 
     // ========================================================================
     // Unified Buffer Instance
     // ========================================================================
     // The Buffer needs to handle requests from both CU and the Streaming Logic.
-    // Ideally, we'd have a priority arbiter. 
-    // For now, we assume CU and Streaming phases are mutually exclusive 
-    // OR that CU access during compute is for non-conflicting addresses (not enforced here).
     
     // Wire up the Skewer ports
     logic [`BUFFER_WIDTH-1:0] skewer_input_data;
@@ -64,10 +93,13 @@ module ubss (
     logic                     skewer_input_first, skewer_input_last;
     logic                     skewer_weight_first, skewer_weight_last;
 
-    unified_buffer u_buffer (
+    unified_buffer #(
+        .INIT_FILE(UB_INIT_FILE)
+    ) u_buffer (
         .clk             (clk),
         .rst_n           (rst_n),
-        .wr_en           (cu_wr_en), // Note: control_unit handles pulsing this for PPU too
+        .wr_en           (cu_wr_en | ppu_wb_en),
+        .wr_mask         (ub_wr_mask),
         .wr_addr         (cu_addr),
         .wr_data         (ub_final_wdata),
         
@@ -85,25 +117,20 @@ module ubss (
         .weight_addr     (sa_weight_addr),
         .weight_first_out(skewer_weight_first),
         .weight_last_out (skewer_weight_last),
-        .weight_data     (skewer_weight_data)
+        .weight_data     (skewer_weight_data),
+
+        // CU Random Access
+        .cu_rd_addr      (cu_addr),
+        .cu_rd_data      (cu_rdata)
     );
     
-    // Hook up read data for CU (only valid if not streaming?)
-    // Actually, unified_buffer doesn't have a dedicated random-access read port yet 
-    // beyond the streaming ports.
-    // Wait, check unified_buffer.sv definition.
-    // It has NO random access read port. It only reads via the 'input' and 'weight' streams.
-    // This is a limitation for `CMD_READ_MEM` and `ISA_OP_MOVE`.
-    // FOR NOW: We will assume CU reads via the "Input" port logic or we need to add a port.
-    // But 'unified_buffer.sv' is custom. 
-    // Let's assume for this task we are focusing on the Compute Path.
-    assign cu_rdata = '0; // STUB for now as requested task is Drain.
-
     // ========================================================================
     // Skewers
     // ========================================================================
     logic [`DATA_WIDTH-1:0] skewed_input  [`ARRAY_SIZE-1:0];
     logic [`DATA_WIDTH-1:0] skewed_weight [`ARRAY_SIZE-1:0];
+    logic [`ARRAY_SIZE-1:0] input_valid_bus;
+    logic [`ARRAY_SIZE-1:0] weight_valid_bus;
     logic                   array_input_first, array_input_last;
     logic                   array_weight_first, array_weight_last;
     
@@ -124,6 +151,7 @@ module ubss (
         .data_in(input_vec), .data_out(skewed_input),
         .first_in(skewer_input_first), .last_in(skewer_input_last),
         .first_out(array_input_first), .last_out(array_input_last),
+        .valid_out(input_valid_bus),
         .data_out_flat()
     );
 
@@ -132,6 +160,7 @@ module ubss (
         .data_in(weight_vec), .data_out(skewed_weight),
         .first_in(skewer_weight_first), .last_in(skewer_weight_last),
         .first_out(array_weight_first), .last_out(array_weight_last),
+        .valid_out(weight_valid_bus),
         .data_out_flat()
     );
 
@@ -144,7 +173,9 @@ module ubss (
         .clk(clk), .rst_n(rst_n),
         .input_data(skewed_input), .weight_data(skewed_weight),
         .input_first(array_input_first), .input_last(array_input_last),
+        .input_valid(input_valid_bus),
         .weight_first(array_weight_first), .weight_last(array_weight_last),
+        .weight_valid(weight_valid_bus),
         .precision_mode(precision_mode),
         .compute_enable(compute_enable),
         .drain_enable(drain_enable),
@@ -173,7 +204,15 @@ module ubss (
         .clk(clk),
         .rst_n(rst_n),
         .capture_en(ppu_capture_en),
-        .cycle_idx(ppu_cycle_idx),
+              .bias_en       (ppu_bias_en),
+              .bias_clear    (ppu_bias_clear),
+              .ppu_cycle_idx (ppu_cycle_idx),
+              .shift         (ppu_shift),
+        .multiplier(ppu_multiplier),
+        .activation(ppu_activation),
+        .precision(ppu_out_precision),
+        .write_offset(ppu_write_offset),
+        .bias_in(cu_rdata),
         .acc_in(bottom_row_acc),
         .ub_wdata(ppu_wdata)
     );

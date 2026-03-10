@@ -19,7 +19,7 @@ VERILOG_SOURCES += $(PWD)/../../rtl/ubss.sv
 TOPLEVEL = ubss
 
 # Python test module
-MODULE = test_ubss
+MODULE = test_ubss_isolation
 
 # Include paths
 COMPILE_ARGS += -I$(PWD)/../../rtl
