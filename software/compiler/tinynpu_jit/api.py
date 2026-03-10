@@ -5,6 +5,7 @@ from typing import Any
 import numpy as np
 
 from .artifact import CompiledArtifact
+from .benchmark import CostModel
 from .executor import HostEmulationExecutor
 from .ir import ExecutionPlan, VerificationMode
 from .lowering import SegmentCompiler
@@ -117,5 +118,14 @@ def run_host_emulation(
     verification: VerificationMode = VerificationMode.OFF,
     *,
     debug: bool = False,
+    benchmark: bool = False,
+    cost_model: CostModel | None = None,
 ):
-    return HostEmulationExecutor().run(artifact, inputs, verification, debug=debug)
+    return HostEmulationExecutor().run(
+        artifact,
+        inputs,
+        verification,
+        debug=debug,
+        benchmark=benchmark,
+        cost_model=cost_model,
+    )
