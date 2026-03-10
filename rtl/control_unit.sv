@@ -1,6 +1,8 @@
 `include "defines.sv"
 
-module control_unit (
+module control_unit #(
+    parameter PERF_ENABLE = 0
+) (
     input logic clk,
     input logic rst_n,
 
@@ -73,6 +75,9 @@ module control_unit (
 
   ctrl_state_t state, next_state;
   logic [`ADDR_WIDTH-1:0] pc, pc_next;
+  localparam int CTRL_STATE_COUNT = 15;
+  localparam int PERF_COUNTER_WIDTH = 64;
+  localparam int PERF_COUNTERS_FLAT_WIDTH = CTRL_STATE_COUNT * PERF_COUNTER_WIDTH;
 
   // Safety Latches for MMIO inputs
   logic [`HOST_DATA_WIDTH-1:0] latched_cmd;
@@ -104,6 +109,21 @@ module control_unit (
   logic [$clog2(`ARRAY_SIZE)-1:0] cycle_cnt, cycle_next;
 
   logic [15:0] m_next, n_next, k_next;
+  logic [PERF_COUNTER_WIDTH-1:0] perf_total_cycles;
+  logic [PERF_COUNTER_WIDTH-1:0] perf_state_cycles [0:CTRL_STATE_COUNT-1];
+  logic [PERF_COUNTER_WIDTH-1:0] perf_state_entries[0:CTRL_STATE_COUNT-1];
+  logic [PERF_COUNTERS_FLAT_WIDTH-1:0] perf_state_cycles_flat;
+  logic [PERF_COUNTERS_FLAT_WIDTH-1:0] perf_state_entries_flat;
+  logic [3:0] perf_state_id;
+
+  assign perf_state_id = state;
+
+  generate
+    for (genvar perf_idx = 0; perf_idx < CTRL_STATE_COUNT; perf_idx++) begin : gen_perf_flatten
+      assign perf_state_cycles_flat[(perf_idx * PERF_COUNTER_WIDTH) +: PERF_COUNTER_WIDTH] = perf_state_cycles[perf_idx];
+      assign perf_state_entries_flat[(perf_idx * PERF_COUNTER_WIDTH) +: PERF_COUNTER_WIDTH] = perf_state_entries[perf_idx];
+    end
+  endgenerate
 
   // --- Sequential State ---
   always_ff @(posedge clk or negedge rst_n) begin
@@ -116,6 +136,14 @@ module control_unit (
       {mm_a_base, mm_b_base, mm_c_base, mm_bias_base, mm_m_total, mm_k_total, mm_n_total} <= '0;
       {mm_shift, mm_multiplier, mm_activation, mm_in_precision, mm_out_precision, mm_write_offset} <= '0;
       {m_idx, n_idx, k_idx, cycle_cnt} <= '0;
+      perf_total_cycles <= '0;
+      for (int perf_i = 0; perf_i < CTRL_STATE_COUNT; perf_i++) begin
+        perf_state_cycles[perf_i] <= '0;
+        perf_state_entries[perf_i] <= '0;
+      end
+      if (PERF_ENABLE) begin
+        perf_state_entries[CTRL_IDLE] <= 64'd1;
+      end
     end else begin
       state <= next_state;
       pc    <= pc_next;
@@ -163,6 +191,14 @@ module control_unit (
         n_idx <= n_next;
         k_idx <= k_next;
         cycle_cnt <= cycle_next;
+      end
+
+      if (PERF_ENABLE) begin
+        perf_total_cycles <= perf_total_cycles + 64'd1;
+        perf_state_cycles[state] <= perf_state_cycles[state] + 64'd1;
+        if (state != next_state) begin
+          perf_state_entries[next_state] <= perf_state_entries[next_state] + 64'd1;
+        end
       end
     end
   end

@@ -2,7 +2,8 @@
 
 module tinynpu_top #(
     parameter IM_INIT_FILE = "",
-    parameter UB_INIT_FILE = ""
+    parameter UB_INIT_FILE = "",
+    parameter PERF_ENABLE = 0
 ) (
     input  logic clk,
     input  logic rst_n,
@@ -48,7 +49,8 @@ module tinynpu_top #(
     end
 
     control_top #(
-        .IM_INIT_FILE(IM_INIT_FILE)
+        .IM_INIT_FILE(IM_INIT_FILE),
+        .PERF_ENABLE(PERF_ENABLE)
     ) u_brain (
         .clk            (clk),
         .rst_n          (rst_n),

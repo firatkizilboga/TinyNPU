@@ -1,7 +1,8 @@
 `include "defines.sv"
 
 module control_top #(
-    parameter IM_INIT_FILE = ""
+    parameter IM_INIT_FILE = "",
+    parameter PERF_ENABLE = 0
 ) (
     input  logic clk,
     input  logic rst_n,
@@ -93,7 +94,9 @@ module control_top #(
     );
 
     // Control Unit Instance
-    control_unit u_cu (
+    control_unit #(
+        .PERF_ENABLE(PERF_ENABLE)
+    ) u_cu (
         .clk            (clk),
         .rst_n          (rst_n),
         .cmd_in         (cmd_bus),
