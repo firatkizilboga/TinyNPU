@@ -127,8 +127,10 @@ module ppu (
       end
 
       if (capture_en) begin
+        // Drain outputs row N-1 first (cycle 0), row 0 last (cycle N-1).
+        // Reverse the index so storage[0] = row 0, storage[N-1] = row N-1.
         for (int i = 0; i < `ARRAY_SIZE; i++) begin
-          storage[ppu_cycle_idx][i] <= quantized_row[i];
+          storage[(`ARRAY_SIZE-1) - ppu_cycle_idx][i] <= quantized_row[i];
         end
       end
     end
