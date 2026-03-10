@@ -29,22 +29,15 @@ def build_hostop_chain_artifact(seed: int = 11, dim: int = 16, reentry_scale: fl
 
     module = HostOpChainModule(w1, w2, reentry_scale)
     artifact = compile_module(module, (torch.tensor(x.astype(np.float32)),))
-
-    scores = np.matmul(w1.astype(np.int64), x.astype(np.int64))
-    scores = np.clip(scores, -32768, 32767).astype(np.int32)
-    shifted = scores.astype(np.float32) - np.max(scores.astype(np.float32), axis=0, keepdims=True)
-    exp = np.exp(shifted)
-    probs = exp / np.sum(exp, axis=0, keepdims=True)
-    q_probs = np.clip(np.rint(probs * np.float32(reentry_scale)), -32768, 32767).astype(np.int16)
-    out = np.matmul(w2.astype(np.int64), q_probs.astype(np.int64))
-    out = np.clip(out, -32768, 32767).astype(np.int32)
+    verify_names = {spec.verify_label: name for name, spec in artifact.plan.tensors.items() if spec.verify_label}
+    expected = {
+        "scores": np.array(artifact.expected_tensors[verify_names["scores"]], copy=True),
+        "q_probs": np.array(artifact.expected_tensors[verify_names["q_probs"]], copy=True),
+        artifact.plan.outputs[0]: np.array(artifact.expected_tensors[artifact.plan.outputs[0]], copy=True),
+    }
 
     return {
         "artifact": artifact,
         "inputs": {"x": x},
-        "expected": {
-            "scores": scores,
-            "q_probs": q_probs,
-            artifact.plan.outputs[0]: out,
-        },
+        "expected": expected,
     }

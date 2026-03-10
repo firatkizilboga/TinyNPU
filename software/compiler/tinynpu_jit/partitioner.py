@@ -61,22 +61,13 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
         return mapping[normalized]
 
     def coerce_npu_tensor(name: str) -> np.ndarray:
-        value = np.array(env[name], copy=False)
-        if np.issubdtype(value.dtype, np.integer):
-            return value.astype(np.int16, copy=False)
-        rounded = np.rint(value)
-        if np.allclose(value, rounded, rtol=0.0, atol=1e-6):
-            coerced = rounded.astype(np.int16)
-            env[name] = coerced
-            if name in tensors and tensors[name].dtype == DType.FLOAT32:
-                tensors[name].dtype = DType.INT16
-                if tensors[name].data is not None:
-                    tensors[name].data = np.array(coerced, copy=True)
-            return coerced
-        raise NotImplementedError(
-            f"Tensor '{name}' is floating-point at an NPU boundary. "
-            "Insert quantize_for_npu(...) before feeding it into a TinyNPU segment."
-        )
+        coerced = golden.coerce_npu_input(env[name], out_dtype=DType.INT16, tensor_name=name)
+        env[name] = coerced
+        if name in tensors and tensors[name].dtype == DType.FLOAT32:
+            tensors[name].dtype = DType.INT16
+            if tensors[name].data is not None:
+                tensors[name].data = np.array(coerced, copy=True)
+        return coerced
 
     modules = dict(graph_module.named_modules())
 
@@ -227,10 +218,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             axis = int(node.kwargs.get("dim", -1))
             out_name = node.name
             steps.append(HostOp(name=node.name, kind="softmax", inputs=[source], outputs=[out_name], attrs={"axis": axis}))
-            source_arr = env[source].astype(np.float32)
-            shifted = source_arr - np.max(source_arr, axis=axis, keepdims=True)
-            exp = np.exp(shifted)
-            env[out_name] = exp / np.sum(exp, axis=axis, keepdims=True)
+            env[out_name] = golden.softmax(env[source], axis=axis)
             tensors[out_name] = TensorSpec(out_name, normalize_shape(env[out_name].shape), DType.FLOAT32, TensorKind.INTERMEDIATE)
             expected_tensors[out_name] = np.array(env[out_name], copy=True)
             continue
