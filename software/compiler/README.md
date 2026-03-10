@@ -34,9 +34,11 @@ Examples:
 - `example_segmented_jit.py`: manual execution-plan construction
 - `example_torch_jit.py`: traced PyTorch module with `mark_for_verify(...)`
 - `software/workload/mnist_npu_compiler.py::compile_mnist_layer_jit(...)`: FC-layer MNIST export example on the new PyTorch JIT path
+- `software/workload/jit_test_gen.py::build_simple_chain_artifact(...)`: migrated old simple-chain workload on the new JIT path
 
 Simulator smoke test:
 - `cd verification/cocotb && MODULE=test_jit_runtime make -f Makefile.npu`
+- Migrated simple-chain RTL test: `cd verification/cocotb && MODULE=test_jit_simple_chain make -f Makefile.npu`
 
 Current limitation:
 - `torch` is an optional dependency and is not bundled by this repository today

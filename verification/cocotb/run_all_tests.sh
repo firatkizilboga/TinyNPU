@@ -18,14 +18,11 @@ cd $COCOTB_DIR
 MODULE=test_jit_runtime make -f Makefile.npu > /dev/null 2>&1
 echo "✅ test_jit_runtime.py: PASSED"
 
-# Test 1: Simple Chain
-echo "📂 Running: simple_chain.npu"
-cd $WORKLOAD_DIR
-PYTHONPATH=../compiler python3 -c "from npu_test_gen import generate_sample_test; generate_sample_test()"
-mv simple_chain.npu $COCOTB_DIR/
+# Test 1: Simple Chain via segmented JIT runtime
+echo "📂 Running: test_jit_simple_chain.py"
 cd $COCOTB_DIR
-NPU_FILE=simple_chain.npu make -f Makefile.npu > /dev/null 2>&1
-echo "✅ simple_chain.npu: PASSED"
+MODULE=test_jit_simple_chain make -f Makefile.npu > /dev/null 2>&1
+echo "✅ test_jit_simple_chain.py: PASSED"
 
 # Test 2: MOVE Instruction
 echo "📂 Running: move_test.npu"
