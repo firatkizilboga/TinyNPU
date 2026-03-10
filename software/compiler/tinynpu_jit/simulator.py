@@ -30,6 +30,7 @@ class SimulatorExecutor:
         verification: VerificationMode = VerificationMode.OFF,
         reset: bool = False,
         capture_vectors: bool = False,
+        debug: bool = False,
     ) -> ExecutionResult:
         try:
             from verification.cocotb import npu_driver
@@ -59,11 +60,20 @@ class SimulatorExecutor:
 
         verified: list[str] = []
         vector_captures: dict[str, dict[str, Any]] = {}
+        debug_trace: list[dict[str, Any]] = []
         for step in artifact.plan.steps:
             if isinstance(step, NpuSegment):
                 segment = artifact.segment_artifacts[step.name]
                 await self._load_ub_image(dut, npu_driver, segment.binary["ub"])
-                await self._overlay_runtime_inputs(dut, npu_driver, artifact, segment.symbol_table, step.inputs, values)
+                input_writes = await self._overlay_runtime_inputs(
+                    dut,
+                    npu_driver,
+                    artifact,
+                    segment.symbol_table,
+                    step.inputs,
+                    values,
+                    capture_debug=debug,
+                )
                 await self._load_im_image(dut, npu_driver, segment.binary["im"])
                 await self._run_until_halt(dut, npu_driver, RisingEdge)
                 for output_name in step.outputs:
@@ -76,8 +86,50 @@ class SimulatorExecutor:
                             symbol=symbol,
                         )
                     values[output_name] = await self._read_tensor(dut, npu_driver, artifact.plan.tensors[output_name], symbol)
+                if debug:
+                    debug_trace.append(
+                        self.host_executor._debug_event(
+                            step=step.name,
+                            kind="npu_segment",
+                            inputs={name: values[name] for name in step.inputs if name in values},
+                            outputs={name: values[name] for name in step.outputs if name in values},
+                            attrs={
+                                "input_writes": input_writes,
+                                "ops": [
+                                    {
+                                        "name": op.name,
+                                        "lhs": op.lhs,
+                                        "rhs": op.rhs,
+                                        "out": op.out,
+                                        "bias": op.bias,
+                                        "multiplier": op.multiplier,
+                                        "shift": op.shift,
+                                        "activation": op.activation,
+                                        "in_dtype": op.in_dtype.value,
+                                        "out_dtype": op.out_dtype.value,
+                                    }
+                                    for op in step.ops
+                                ],
+                                "captured_outputs": {
+                                    name: vector_captures[name]
+                                    for name in step.outputs
+                                    if name in vector_captures
+                                },
+                            },
+                        )
+                    )
             elif step.__class__.__name__ == "HostOp":
                 self.host_executor._run_host_op(step, values)
+                if debug:
+                    debug_trace.append(
+                        self.host_executor._debug_event(
+                            step=step.name,
+                            kind=f"host_{step.kind}",
+                            inputs={name: values[name] for name in step.inputs if name in values},
+                            outputs={name: values[name] for name in step.outputs if name in values},
+                            attrs=step.attrs,
+                        )
+                    )
             elif isinstance(step, VerifyTensor):
                 if self.host_executor._should_verify(step, verification):
                     expected = artifact.expected_tensors[step.tensor_name]
@@ -89,6 +141,16 @@ class SimulatorExecutor:
                     if not matches:
                         raise AssertionError(f"Verification failed for '{step.label}' ({step.tensor_name}).")
                     verified.append(step.label)
+                    if debug:
+                        debug_trace.append(
+                            self.host_executor._debug_event(
+                                step=step.label,
+                                kind="verify",
+                                inputs={step.tensor_name: values[step.tensor_name]},
+                                outputs={},
+                                attrs={"tensor_name": step.tensor_name, "is_final_output": step.is_final_output},
+                            )
+                        )
 
         outputs = {name: np.array(values[name], copy=True) for name in artifact.plan.outputs}
         trace_tensors = {name: np.array(value, copy=True) for name, value in values.items()}
@@ -97,6 +159,7 @@ class SimulatorExecutor:
             verified=verified,
             trace_tensors=trace_tensors,
             vector_captures=vector_captures,
+            debug_trace=debug_trace,
         )
 
     async def _load_ub_image(self, dut: Any, driver: Any, ub_words: list[int]) -> None:
@@ -113,7 +176,10 @@ class SimulatorExecutor:
         symbol_table: dict[str, dict[str, Any]],
         tensor_names: list[str],
         values: dict[str, np.ndarray],
-    ) -> None:
+        *,
+        capture_debug: bool = False,
+    ) -> list[dict[str, Any]]:
+        writes: list[dict[str, Any]] = []
         for name in tensor_names:
             if name not in values:
                 continue
@@ -122,10 +188,22 @@ class SimulatorExecutor:
                 continue
             symbol = symbol_table[name]
             packed = self._pack_tensor(values[name], symbol)
+            if capture_debug:
+                writes.append(
+                    {
+                        "tensor": name,
+                        "addr": int(symbol["addr"]),
+                        "role": symbol["role"],
+                        "precision": PrecisionMode(symbol["precision"]).name,
+                        "word_count": len(packed),
+                        "preview_words": packed[: min(8, len(packed))],
+                    }
+                )
             for offset, word in enumerate(packed):
                 await driver.write_reg(dut, driver.REG_ADDR, symbol["addr"] + offset, 16)
                 await driver.write_reg(dut, driver.REG_CMD, 0x01, 8)
                 await driver.write_reg(dut, driver.REG_MMVR, int(word), self.buffer_width)
+        return writes
 
     async def _load_im_image(self, dut: Any, driver: Any, instructions: list[int]) -> None:
         inst_width = 256
@@ -236,6 +314,7 @@ async def run_sim(
     reset: bool = False,
     defines_path: str | None = None,
     capture_vectors: bool = False,
+    debug: bool = False,
 ):
     return await SimulatorExecutor(defines_path=defines_path).run(
         artifact,
@@ -244,4 +323,5 @@ async def run_sim(
         verification=verification,
         reset=reset,
         capture_vectors=capture_vectors,
+        debug=debug,
     )
