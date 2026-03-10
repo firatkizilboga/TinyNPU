@@ -46,6 +46,44 @@ def format_debug_trace(execution_result: Any) -> str:
     return "\n".join(lines).rstrip() + ("\n" if lines else "")
 
 
+def format_benchmark_report(execution_result: Any) -> str:
+    report = getattr(execution_result, "benchmark", None)
+    if report is None:
+        return ""
+
+    payload = report.to_dict()
+    totals = payload["totals"]
+    lines = [
+        "Benchmark Report",
+        f"  cpu_replaced_cycles: {totals['cpu_replaced_cycles']}",
+        f"  npu_compute_cycles: {totals['npu_compute_cycles']}",
+        f"  npu_overhead_cycles: {totals['npu_overhead_cycles']}",
+        f"  host_intrinsic_cycles: {totals['host_intrinsic_cycles']}",
+        f"  pure_acceleration_speedup: {totals['pure_acceleration_speedup']}",
+        f"  integration_adjusted_speedup: {totals['integration_adjusted_speedup']}",
+        "",
+    ]
+    for entry in payload["entries"]:
+        lines.append(f"[{entry['bucket']}] {entry['step']}: cycles={entry['cycles']} counts={entry['counts']}")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def format_benchmark_comparison(execution_result: Any, cost_models: list[Any]) -> str:
+    report = getattr(execution_result, "benchmark", None)
+    if report is None:
+        return ""
+    lines = ["Benchmark Model Comparison"]
+    for summary in report.model_comparison(cost_models):
+        lines.append(
+            f"  {summary['name']}: cpu_replaced={summary['cpu_replaced_cycles']} "
+            f"npu_compute={summary['npu_compute_cycles']} "
+            f"npu_overhead={summary['npu_overhead_cycles']} "
+            f"pure={summary['pure_acceleration_speedup']} "
+            f"integration={summary['integration_adjusted_speedup']}"
+        )
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def inspect_artifact(
     artifact: CompiledArtifact,
     inputs: dict[str, np.ndarray],
