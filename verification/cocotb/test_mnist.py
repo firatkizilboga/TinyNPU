@@ -38,6 +38,8 @@ async def test_mnist_full(dut):
     
     dut._log.info("--- Starting Bit-Perfect MNIST NPU Verification ---")
 
+    reload_bias_before_run = os.getenv("TINYNPU_DEFENSIVE_BIAS_RELOAD", "0") == "1"
+
     for i, layer in enumerate(manifest['layers']):
         name = layer['name']
         ltype = layer['type']
@@ -84,15 +86,16 @@ async def test_mnist_full(dut):
             await npu_driver.write_reg(dut, npu_driver.REG_CMD, 0x01, 8)
             await npu_driver.write_reg(dut, npu_driver.REG_MMVR, inst >> 128, 128)
 
-        # Defensive reload: we have observed sporadic corruption of UB word 0 in long flows.
-        # Re-writing bias payload right before RUN keeps layer behavior deterministic.
-        bias_sym = prog.symbols.get("Bias")
-        if bias_sym is not None:
-            for off in range(bias_sym.word_count):
-                word = binary["ub"][bias_sym.addr + off]
-                await npu_driver.write_reg(dut, npu_driver.REG_ADDR, bias_sym.addr + off, 16)
-                await npu_driver.write_reg(dut, npu_driver.REG_CMD, 0x01, 8)
-                await npu_driver.write_reg(dut, npu_driver.REG_MMVR, word, 128)
+        # Historical mitigation for UB word-0 instability.
+        # Default is OFF; set TINYNPU_DEFENSIVE_BIAS_RELOAD=1 to re-enable.
+        if reload_bias_before_run:
+            bias_sym = prog.symbols.get("Bias")
+            if bias_sym is not None:
+                for off in range(bias_sym.word_count):
+                    word = binary["ub"][bias_sym.addr + off]
+                    await npu_driver.write_reg(dut, npu_driver.REG_ADDR, bias_sym.addr + off, 16)
+                    await npu_driver.write_reg(dut, npu_driver.REG_CMD, 0x01, 8)
+                    await npu_driver.write_reg(dut, npu_driver.REG_MMVR, word, 128)
 
         # Run
         await npu_driver.write_reg(dut, npu_driver.REG_ARG, im_base, 32)
