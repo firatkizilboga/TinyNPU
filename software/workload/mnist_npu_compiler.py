@@ -7,6 +7,7 @@ import math
 # Add compiler to path
 sys.path.append(os.path.join(os.getcwd(), "software/compiler"))
 from tinynpu import TinyNPUProgram, PrecisionMode
+from software.compiler.tinynpu_jit import npu_matmul as jit_npu_matmul
 
 
 def precision_from_bits(bits):
@@ -130,19 +131,41 @@ def compile_mnist_layer_jit(name, layer_info, input_data, export_dir='./mnist_mi
             f"JIT MNIST path currently supports only linear layers, got {layer_info['type']!r}."
         )
 
-    w = np.load(os.path.join(export_dir, f"{name}_weights.npy")).astype(np.int16)
+    w = np.load(os.path.join(export_dir, f"{name}_weights.npy"))
     b = np.load(os.path.join(export_dir, f"{name}_bias.npy")).astype(np.int32)
+    in_dtype_name = f"int{int(layer_info['a_bits'])}"
+    if int(layer_info['w_bits']) != int(layer_info['a_bits']):
+        raise ValueError(
+            f"JIT MNIST path currently requires a_bits == w_bits, got a_bits={layer_info['a_bits']} "
+            f"and w_bits={layer_info['w_bits']} for layer {name!r}."
+        )
+    if int(layer_info['a_bits']) == 8:
+        input_hw = input_hw.astype(np.int8)
+        w = w.astype(np.int8)
+    elif int(layer_info['a_bits']) == 16:
+        input_hw = input_hw.astype(np.int16)
+        w = w.astype(np.int16)
+    else:
+        raise ValueError(f"Unsupported JIT MNIST activation precision a_bits={layer_info['a_bits']}.")
 
     class ExportedLinearModule(nn.Module):
         def __init__(self, weight, bias):
             super().__init__()
-            self.weight = nn.Parameter(torch.tensor(weight.astype(np.float32)), requires_grad=False)
-            self.bias = nn.Parameter(torch.tensor(bias.astype(np.float32)), requires_grad=False)
+            self.register_buffer("weight", torch.tensor(weight))
+            self.register_buffer("bias", torch.tensor(bias))
 
         def forward(self, x):
-            y = torch.matmul(self.weight, x)
+            y = jit_npu_matmul(
+                self.weight,
+                x,
+                multiplier=int(layer_info["M0"]),
+                shift=int(layer_info["shift"]),
+                activation="none",
+                in_dtype=in_dtype_name,
+                out_dtype="int16",
+            )
             return y + self.bias.reshape(-1, 1)
 
     module = ExportedLinearModule(w, b)
-    example = torch.tensor(input_hw.astype(np.float32))
+    example = torch.tensor(input_hw)
     return compile_module(module, (example,))

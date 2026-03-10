@@ -60,6 +60,25 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             raise ValueError(f"Unsupported dtype annotation {name!r}.")
         return mapping[normalized]
 
+    def infer_dtype(value: np.ndarray) -> DType:
+        if np.issubdtype(value.dtype, np.floating):
+            return DType.FLOAT32
+        if value.dtype == np.int8:
+            return DType.INT8
+        if value.dtype == np.int16:
+            return DType.INT16
+        if value.dtype == np.int32:
+            return DType.INT32
+        if np.issubdtype(value.dtype, np.integer):
+            min_val = int(value.min(initial=0))
+            max_val = int(value.max(initial=0))
+            if -128 <= min_val and max_val <= 127:
+                return DType.INT8
+            if -32768 <= min_val and max_val <= 32767:
+                return DType.INT16
+            return DType.INT32
+        raise ValueError(f"Unsupported numpy dtype {value.dtype}.")
+
     def coerce_npu_tensor(name: str) -> np.ndarray:
         coerced = golden.coerce_npu_input(env[name], out_dtype=DType.INT16, tensor_name=name)
         env[name] = coerced
@@ -93,7 +112,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             tensors[node.name] = TensorSpec(
                 name=node.name,
                 shape=normalize_shape(value.shape),
-                dtype=DType.INT16,
+                dtype=infer_dtype(value),
                 kind=TensorKind.INPUT,
             )
             inputs.append(node.name)
@@ -108,9 +127,9 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             tensors[node.name] = TensorSpec(
                 name=node.name,
                 shape=normalize_shape(value.shape),
-                dtype=DType.INT16 if np.issubdtype(value.dtype, np.integer) else DType.FLOAT32,
+                dtype=infer_dtype(value),
                 kind=TensorKind.CONSTANT,
-                data=value.astype(np.int16) if np.issubdtype(value.dtype, np.integer) else value,
+                data=np.array(value, copy=True),
             )
             continue
 
@@ -152,6 +171,53 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             env[out_name] = expected.astype(np.int32)
             tensors[out_name] = TensorSpec(out_name, normalize_shape(expected.shape), DType.INT16, TensorKind.INTERMEDIATE)
             current_ops.append(MatMulOp(name=node.name, lhs=lhs_name, rhs=rhs_name, out=out_name))
+            continue
+
+        if node.op == "call_function" and getattr(node.target, "__name__", None) == "npu_matmul":
+            lhs_name = node.args[0].name
+            rhs_name = node.args[1].name
+            multiplier = int(node.kwargs.get("multiplier", 1))
+            shift = int(node.kwargs.get("shift", 0))
+            activation = str(node.kwargs.get("activation", "none"))
+            in_dtype = parse_dtype(node.kwargs.get("in_dtype", "int16"))
+            out_dtype = parse_dtype(node.kwargs.get("out_dtype", "int16"))
+            out_name = node.name
+            current_inputs.update({lhs_name, rhs_name})
+            lhs_value = golden.coerce_npu_input(env[lhs_name], out_dtype=in_dtype, tensor_name=lhs_name)
+            rhs_value = golden.coerce_npu_input(env[rhs_name], out_dtype=in_dtype, tensor_name=rhs_name)
+            env[lhs_name] = lhs_value
+            env[rhs_name] = rhs_value
+            if lhs_name in tensors:
+                tensors[lhs_name].dtype = in_dtype
+                if tensors[lhs_name].data is not None:
+                    tensors[lhs_name].data = np.array(lhs_value, copy=True)
+            if rhs_name in tensors:
+                tensors[rhs_name].dtype = in_dtype
+                if tensors[rhs_name].data is not None:
+                    tensors[rhs_name].data = np.array(rhs_value, copy=True)
+            expected = golden.matmul(
+                lhs_value,
+                rhs_value,
+                multiplier=multiplier,
+                shift=shift,
+                activation=activation,
+                out_dtype=out_dtype,
+            )
+            env[out_name] = expected.astype(np.int32)
+            tensors[out_name] = TensorSpec(out_name, normalize_shape(expected.shape), out_dtype, TensorKind.INTERMEDIATE)
+            current_ops.append(
+                MatMulOp(
+                    name=node.name,
+                    lhs=lhs_name,
+                    rhs=rhs_name,
+                    out=out_name,
+                    multiplier=multiplier,
+                    shift=shift,
+                    activation=activation,
+                    in_dtype=in_dtype,
+                    out_dtype=out_dtype,
+                )
+            )
             continue
 
         if node.op == "call_method" and node.target == "reshape":
