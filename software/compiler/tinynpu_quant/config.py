@@ -8,6 +8,7 @@ from typing import Mapping
 class LayerQuantConfig:
     w_bits: int = 8
     a_bits: int = 8
+    signed_activations: bool = False
 
     def weight_qmax(self) -> int:
         return (1 << (self.w_bits - 1)) - 1
@@ -15,13 +16,15 @@ class LayerQuantConfig:
     def weight_qmin(self) -> int:
         return -(1 << (self.w_bits - 1)) + 1
 
-    def activation_qmax(self, *, signed: bool = False) -> int:
-        if signed:
+    def activation_qmax(self, *, signed: bool | None = None) -> int:
+        use_signed = self.signed_activations if signed is None else signed
+        if use_signed:
             return (1 << (self.a_bits - 1)) - 1
         return (1 << self.a_bits) - 1
 
-    def activation_qmin(self, *, signed: bool = False) -> int:
-        if signed:
+    def activation_qmin(self, *, signed: bool | None = None) -> int:
+        use_signed = self.signed_activations if signed is None else signed
+        if use_signed:
             return -(1 << (self.a_bits - 1)) + 1
         return 0
 
@@ -31,7 +34,11 @@ def ensure_layer_quant_config(value: LayerQuantConfig | Mapping[str, int] | None
         return LayerQuantConfig()
     if isinstance(value, LayerQuantConfig):
         return value
-    return LayerQuantConfig(w_bits=int(value["w_bits"]), a_bits=int(value["a_bits"]))
+    return LayerQuantConfig(
+        w_bits=int(value["w_bits"]),
+        a_bits=int(value["a_bits"]),
+        signed_activations=bool(value.get("signed_activations", False)),
+    )
 
 
 def build_layer_config_map(
@@ -40,6 +47,7 @@ def build_layer_config_map(
     *,
     default_w_bits: int = 8,
     default_a_bits: int = 8,
+    default_signed_activations: bool = False,
 ) -> dict[str, LayerQuantConfig]:
     overrides = overrides or {}
     configs: dict[str, LayerQuantConfig] = {}
@@ -47,5 +55,9 @@ def build_layer_config_map(
         if name in overrides:
             configs[name] = ensure_layer_quant_config(overrides[name])
         else:
-            configs[name] = LayerQuantConfig(w_bits=default_w_bits, a_bits=default_a_bits)
+            configs[name] = LayerQuantConfig(
+                w_bits=default_w_bits,
+                a_bits=default_a_bits,
+                signed_activations=default_signed_activations,
+            )
     return configs

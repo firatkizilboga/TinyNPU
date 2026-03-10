@@ -48,6 +48,8 @@ Examples:
 - `software/workload/jit_hostop_chain.py::build_hostop_chain_artifact(...)`: mixed `NpuSegment -> HostOp(softmax) -> quantize_for_npu -> NpuSegment` workload
 - `software/workload/jit_qdq_chain.py::build_qdq_chain_artifact(...)`: PyTorch quant/dequant module chain lowered into explicit host quantize/dequantize steps plus NPU segments
 - `software/workload/jit_quantized_modules.py`: ordinary quantized `Linear` / `Conv2d` PyTorch module examples
+- `software/workload/jit_qat_compiler_ready.py`: compiler-ready QAT conversion example
+- `software/workload/mnist_tinynpu_pipeline.py`: fresh train -> QAT -> convert -> compile pipeline for MNIST
 - `software/workload/inspect_simple_chain.py`: prints the segmented plan, logical previews, and packed output vectors for the migrated simple-chain artifact
 
 PyTorch quantization toolkit:
@@ -62,13 +64,16 @@ Simulator smoke test:
 - Quant/dequant stub RTL test: `cd verification/cocotb && MODULE=test_jit_qdq_chain make -f Makefile.npu`
 - Quantized PyTorch `Linear` RTL test: `cd verification/cocotb && MODULE=test_jit_quantized_linear make -f Makefile.npu`
 - Quantized PyTorch `Conv2d` RTL test: `cd verification/cocotb && MODULE=test_jit_quantized_conv make -f Makefile.npu`
+- Compiler-ready QAT RTL test: `cd verification/cocotb && MODULE=test_jit_qat_compiler_ready make -f Makefile.npu`
 - Exported MNIST conv RTL smoke test: `cd verification/cocotb && MODULE=test_jit_mnist_conv1 make -f Makefile.npu`
 - Full exported MNIST JIT RTL chain: `cd verification/cocotb && MODULE=test_jit_mnist_full_chain make -f Makefile.npu`
+- Fresh trained MNIST pipeline RTL compare: `cd verification/cocotb && MODULE=test_jit_mnist_trained_pipeline make -f Makefile.npu`
 
 Current limitation:
 - `torch` is an optional dependency and is not bundled by this repository today
 - the simulator backend is exercised on the segmented matmul path, full exported MNIST chain, and ordinary quantized `Linear`; broader mixed-op coverage is still incomplete
 - ordinary float `nn.Linear` / `nn.Conv2d` are not yet the trusted frontend contract; current trusted direct frontend is explicit quantized `torch.ao` modules plus export-backed helpers
+- fresh trained-model host/RTL parity is validated on the new MNIST pipeline path, but compiled fidelity against the originating PyTorch QAT model is still an active bug
 - the legacy `tinynpu/` package remains in place during migration
 
 Open risks:

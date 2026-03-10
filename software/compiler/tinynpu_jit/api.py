@@ -32,6 +32,15 @@ def compile_module(module: Any, example_inputs: tuple[Any, ...], **kwargs) -> Co
                 from torch.quantization import DeQuantStub, QuantStub  # type: ignore
             except Exception:
                 QuantStub = DeQuantStub = ()
+        try:
+            from software.compiler.tinynpu_quant import (  # type: ignore
+                CompilerDequantize,
+                CompilerQuantize,
+                CompilerReadyConv2d,
+                CompilerReadyLinear,
+            )
+        except Exception:
+            CompilerQuantize = CompilerDequantize = CompilerReadyLinear = CompilerReadyConv2d = ()
     except Exception as exc:
         raise ImportError(
             "torch is required for compile_module(). Install torch to enable the PyTorch frontend."
@@ -45,7 +54,22 @@ def compile_module(module: Any, example_inputs: tuple[Any, ...], **kwargs) -> Co
             super().__init__(autowrap_functions=(mark_for_verify, quantize_for_npu, npu_matmul, im2col_for_npu))
 
         def is_leaf_module(self, m: Any, module_qualified_name: str) -> bool:
-            quant_leaf_types = tuple(t for t in (QQuantize, QDeQuantize, QuantStub, DeQuantStub, QLinear, QConv2d) if t)
+            quant_leaf_types = tuple(
+                t
+                for t in (
+                    QQuantize,
+                    QDeQuantize,
+                    QuantStub,
+                    DeQuantStub,
+                    QLinear,
+                    QConv2d,
+                    CompilerQuantize,
+                    CompilerDequantize,
+                    CompilerReadyLinear,
+                    CompilerReadyConv2d,
+                )
+                if t
+            )
             if quant_leaf_types and isinstance(m, quant_leaf_types):
                 return True
             return super().is_leaf_module(m, module_qualified_name)
@@ -56,7 +80,22 @@ def compile_module(module: Any, example_inputs: tuple[Any, ...], **kwargs) -> Co
     try:
         from torch.fx.passes.shape_prop import ShapeProp  # type: ignore
 
-        quant_leaf_types = tuple(t for t in (QQuantize, QDeQuantize, QuantStub, DeQuantStub, QLinear, QConv2d) if t)
+        quant_leaf_types = tuple(
+            t
+            for t in (
+                QQuantize,
+                QDeQuantize,
+                QuantStub,
+                DeQuantStub,
+                QLinear,
+                QConv2d,
+                CompilerQuantize,
+                CompilerDequantize,
+                CompilerReadyLinear,
+                CompilerReadyConv2d,
+            )
+            if t
+        )
         has_quant_boundaries = any(
             node.op == "call_module"
             and quant_leaf_types
