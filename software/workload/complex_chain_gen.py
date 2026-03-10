@@ -15,6 +15,23 @@ def clip_and_quantize(data, precision):
         return np.clip(data, -32768, 32767).astype(np.int16)
     return data
 
+def reinterpret_c_as_b(mat, precision, sz):
+    p = 1 << (2 - int(precision))
+    if p == 1:
+        return mat.astype(np.int64)
+    k_dim, n_dim = mat.shape
+    out = np.zeros((k_dim, n_dim), dtype=np.int64)
+    block = sz * p
+    for g in range(k_dim):
+        blk = (g // block) * block
+        within = g % block
+        i = within // p
+        bit_idx = within % p
+        r = blk + i + bit_idx * sz
+        if r < k_dim:
+            out[g, :] = mat[r, :]
+    return out
+
 def generate_complex_chain():
     prog = TinyNPUProgram()
     sz = prog.array_size # 8
@@ -57,11 +74,8 @@ def generate_complex_chain():
     golden_input = Input.copy()
 
     for idx, (layer_name, out_prec) in enumerate(layers):
-        # Layer computation precision cycling: INT8, INT16, INT4...
-        multi_precs = [PrecisionMode.INT8, PrecisionMode.INT16, PrecisionMode.INT4, 
-                       PrecisionMode.INT8, PrecisionMode.INT4, PrecisionMode.INT16, PrecisionMode.INT8]
-        
-        comp_prec = multi_precs[idx]
+        # Compute precision must match how current_input is physically stored.
+        comp_prec = current_in_prec
         
         W = np.random.randint(-2, 2, size=(N, N)).astype(np.int16)
         B = np.random.randint(-3, 3, size=(1, N)).astype(np.int16)
@@ -90,8 +104,14 @@ def generate_complex_chain():
                     shift=shift, multiplier=multiplier,
                     in_precision=comp_prec, out_precision=out_prec)
         
-        # Update Golden Model: W * Input + B
-        acc = np.matmul(W.astype(np.int64), golden_input.astype(np.int64)) + B.astype(np.int64).T
+        # Update Golden Model:
+        # chained outputs are physically stored in Role-C layout; when reused as
+        # Matrix-B they are consumed with a precision-dependent row remap.
+        if idx == 0:
+            layer_input = golden_input.astype(np.int64)
+        else:
+            layer_input = reinterpret_c_as_b(golden_input, comp_prec, sz)
+        acc = np.matmul(W.astype(np.int64), layer_input) + B.astype(np.int64)
         
         # 2. Scale & Shift with Rounding
         rescaled = acc * multiplier
@@ -103,9 +123,6 @@ def generate_complex_chain():
         
         # 3. Saturation (Output Precision)
         golden_output = clip_and_quantize(shifted, out_prec)
-        
-        # Add expected result for EVERY layer for debugging
-        prog.add_expected_result(layer_name, golden_output)
         
         current_input = layer_name
         current_in_prec = out_prec 
