@@ -14,10 +14,12 @@ This path is designed around:
 - `mark_for_verify(...)` as a host-visible verification boundary
 
 Current scope:
-- TinyNPU lowering: explicit `matmul`, exported `linear`, and exported `conv2d` lowered through host-side `im2col`
+- TinyNPU lowering: explicit `matmul`, exported `linear`, exported `conv2d` lowered through host-side `im2col`, plus ordinary quantized `torch.ao.nn.quantized.Linear`
 - PyTorch quant boundary support: `torch.ao.nn.quantized.Quantize` / `DeQuantize`, plus `QuantStub` / `DeQuantStub` when explicit qparams are attached
+- ordinary quantized `torch.ao.nn.quantized.Conv2d` lowered through host-side `im2col` in host emulation
 - host-emulation runtime for compile/run/verify validation
 - async simulator runtime entrypoint that targets the existing cocotb driver path
+- structured runtime debug tracing for host ops, NPU segments, verification, and simulator IO overlays
 - deterministic compile behavior with explicit failure if a segment exceeds UB capacity
 
 Key entry points:
@@ -33,6 +35,8 @@ from tinynpu_jit import compile_module, mark_for_verify, quantize_for_npu
 # HostOp -> NpuSegment re-entry quantization.
 # npu_matmul(...) and im2col_for_npu(...) are transitional exported-model
 # helpers, not the intended final public frontend for ordinary PyTorch models.
+# ordinary quantized torch.ao modules are now the preferred direction for
+# the real frontend contract, within the current supported quantization subset.
 ```
 
 Examples:
@@ -42,6 +46,7 @@ Examples:
 - `software/workload/jit_test_gen.py::build_simple_chain_artifact(...)`: migrated old simple-chain workload on the new JIT path
 - `software/workload/jit_hostop_chain.py::build_hostop_chain_artifact(...)`: mixed `NpuSegment -> HostOp(softmax) -> quantize_for_npu -> NpuSegment` workload
 - `software/workload/jit_qdq_chain.py::build_qdq_chain_artifact(...)`: PyTorch quant/dequant module chain lowered into explicit host quantize/dequantize steps plus NPU segments
+- `software/workload/jit_quantized_modules.py`: ordinary quantized `Linear` / `Conv2d` PyTorch module examples
 - `software/workload/inspect_simple_chain.py`: prints the segmented plan, logical previews, and packed output vectors for the migrated simple-chain artifact
 
 Simulator smoke test:
@@ -50,19 +55,24 @@ Simulator smoke test:
 - Simple-chain RTL vector inspection: `cd verification/cocotb && MODULE=test_jit_simple_chain_inspect make -f Makefile.npu`
 - Mixed host/NPU chain RTL test: `cd verification/cocotb && MODULE=test_jit_hostop_chain make -f Makefile.npu`
 - Quant/dequant stub RTL test: `cd verification/cocotb && MODULE=test_jit_qdq_chain make -f Makefile.npu`
+- Quantized PyTorch `Linear` RTL test: `cd verification/cocotb && MODULE=test_jit_quantized_linear make -f Makefile.npu`
 - Exported MNIST conv RTL smoke test: `cd verification/cocotb && MODULE=test_jit_mnist_conv1 make -f Makefile.npu`
+- Full exported MNIST JIT RTL chain: `cd verification/cocotb && MODULE=test_jit_mnist_full_chain make -f Makefile.npu`
 
 Current limitation:
 - `torch` is an optional dependency and is not bundled by this repository today
-- the simulator backend is exercised on the current narrow segmented matmul path, but broader mixed-op coverage is still incomplete
-- standard PyTorch `nn.Linear` row-major normalization is not fully hardened yet; the traced frontend is currently validated on explicit `torch.matmul`
+- the simulator backend is exercised on the segmented matmul path, full exported MNIST chain, and ordinary quantized `Linear`; broader mixed-op coverage is still incomplete
+- ordinary float `nn.Linear` / `nn.Conv2d` are not yet the trusted frontend contract; current trusted direct frontend is explicit quantized `torch.ao` modules plus export-backed helpers
 - the legacy `tinynpu/` package remains in place during migration
 
 Open risks:
-- ordinary PyTorch models still do not carry quantization metadata natively through the new path
-- exported workloads like MNIST currently use export-backed quant config through transitional helpers such as `npu_matmul(...)`
-- quant/dequant module support exists for explicit qparams, but broad FX-native quant metadata ingestion is still incomplete
-- `HostOp -> NpuSegment` re-entry quantization now has a first explicit path through `quantize_for_npu(...)`, but broader quant config ingestion is still an active gap
+- only a narrow PyTorch quantization subset is accepted for NPU segments today:
+  - signed quantized tensors
+  - symmetric `zero_point = 0`
+  - scale-derived `multiplier` / `shift`
+- exported workloads like MNIST still use export-backed quant config through transitional helpers such as `npu_matmul(...)`
+- ordinary quantized `Conv2d` lowering is validated in host emulation, not yet with a dedicated RTL smoke test
+- a reusable PyTorch-side quantization toolkit is not built yet; `quant-by-claude.py` is still a script, not the final `tinynpu_quant` package
 - old `A/B/C/BIAS` role semantics still exist in lowering as a migration bridge
 
 ## Usage

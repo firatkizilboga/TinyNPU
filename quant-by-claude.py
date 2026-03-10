@@ -24,6 +24,8 @@ import argparse
 import math
 import copy
 
+from software.compiler.tinynpu_quant import compute_fused_params
+
 # ============================================================================
 # 1. FP32 MODEL (Stage 1)
 # ============================================================================
@@ -435,25 +437,6 @@ def run_sensitivity_analysis(device, data_dir='./data',
 # ============================================================================
 # 9. EXPORT FOR NPU
 # ============================================================================
-
-def compute_fused_params(w_scale, a_scale, out_scale):
-    """Compute M0 and shift for fixed-point requantization: out = (acc * M0) >> shift."""
-    M = (w_scale * a_scale) / out_scale
-    if M == 0:
-        return 0, 0
-    n = 0
-    m_normalized = M
-    if m_normalized >= 1.0:
-        while m_normalized >= 1.0:
-            m_normalized /= 2.0
-            n -= 1
-    else:
-        while m_normalized < 0.5:
-            m_normalized *= 2.0
-            n += 1
-    M0_int = int(round(m_normalized * (2 ** 15)))
-    total_shift = n + 15
-    return M0_int, total_shift
 
 def export_for_npu(device, layer_configs, qat_checkpoint='./tinynpu_qat.pt',
                    export_dir='./mnist_mixed_export'):
