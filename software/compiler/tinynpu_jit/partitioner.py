@@ -223,6 +223,8 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
         if node.op == "call_method" and node.target == "reshape":
             source = node.args[0].name
             shape = tuple(int(dim) for dim in node.args[1:])
+            flush_segment()
+            steps.append(HostOp(name=node.name, kind="reshape", inputs=[source], outputs=[node.name], attrs={"shape": shape}))
             env[node.name] = np.reshape(env[source], shape)
             tensors[node.name] = TensorSpec(
                 name=node.name,
@@ -252,9 +254,22 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                 matmul_op = current_ops[-1]
                 matmul_op.bias = bias_name
                 matmul_op.out = node.name
-                expected = golden.matmul(env[matmul_op.lhs], env[matmul_op.rhs], bias=bias_value)
+                expected = golden.matmul(
+                    env[matmul_op.lhs],
+                    env[matmul_op.rhs],
+                    bias=bias_value,
+                    multiplier=matmul_op.multiplier,
+                    shift=matmul_op.shift,
+                    activation=matmul_op.activation,
+                    out_dtype=matmul_op.out_dtype,
+                )
                 env[node.name] = expected.astype(np.int32)
-                tensors[node.name] = TensorSpec(node.name, normalize_shape(expected.shape), DType.INT16, TensorKind.INTERMEDIATE)
+                tensors[node.name] = TensorSpec(
+                    node.name,
+                    normalize_shape(expected.shape),
+                    matmul_op.out_dtype,
+                    TensorKind.INTERMEDIATE,
+                )
                 continue
             raise NotImplementedError(
                 "Only constant bias-add immediately following a matmul is currently supported."
@@ -286,6 +301,32 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             steps.append(HostOp(name=node.name, kind="softmax", inputs=[source], outputs=[out_name], attrs={"axis": axis}))
             env[out_name] = golden.softmax(env[source], axis=axis)
             tensors[out_name] = TensorSpec(out_name, normalize_shape(env[out_name].shape), DType.FLOAT32, TensorKind.INTERMEDIATE)
+            expected_tensors[out_name] = np.array(env[out_name], copy=True)
+            continue
+
+        if node.op == "call_function" and getattr(node.target, "__name__", None) == "im2col_for_npu":
+            flush_segment()
+            source = node.args[0].name
+            kernel_size = int(node.args[1])
+            stride = int(node.args[2]) if len(node.args) > 2 else 1
+            padding = int(node.args[3]) if len(node.args) > 3 else 0
+            out_name = node.name
+            steps.append(
+                HostOp(
+                    name=node.name,
+                    kind="im2col",
+                    inputs=[source],
+                    outputs=[out_name],
+                    attrs={"kernel_size": kernel_size, "stride": stride, "padding": padding},
+                )
+            )
+            env[out_name] = golden.im2col(
+                env[source],
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=padding,
+            )
+            tensors[out_name] = TensorSpec(out_name, normalize_shape(env[out_name].shape), infer_dtype(env[out_name]), TensorKind.INTERMEDIATE)
             expected_tensors[out_name] = np.array(env[out_name], copy=True)
             continue
 

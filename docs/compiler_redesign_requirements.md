@@ -384,3 +384,9 @@ These are not soft TODOs. They are known architectural gaps that must stay visib
 6. Current simulator inspection proves packed output correctness only for the supported narrow path.
 - We can now compare expected packed vectors vs actual UB vectors on RTL for simple segmented matmul chains.
 - This does not yet cover broader op classes or host-op re-entry.
+
+7. Real PyTorch model integration will likely require quant/dequant-style semantics.
+- Most real PyTorch models will not call `npu_matmul(...)` directly.
+- The current explicit helper is a bridge for exported workloads and controlled tests, not the final frontend contract.
+- For broader model support, the compiler will likely need to consume quant/dequant stubs, fake-quant nodes, or equivalent FX-visible quantization markers.
+- That is how normal PyTorch graphs can carry quantization boundaries, activation scales, and re-entry expectations without bespoke NPU-only helper calls at every layer.

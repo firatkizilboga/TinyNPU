@@ -7,6 +7,7 @@ import math
 # Add compiler to path
 sys.path.append(os.path.join(os.getcwd(), "software/compiler"))
 from tinynpu import TinyNPUProgram, PrecisionMode
+from software.compiler.tinynpu_jit import im2col_for_npu as jit_im2col_for_npu
 from software.compiler.tinynpu_jit import npu_matmul as jit_npu_matmul
 
 
@@ -112,8 +113,9 @@ def compile_mnist_layer_jit(name, layer_info, input_data, export_dir='./mnist_mi
     Compile a supported MNIST layer through the new PyTorch-facing JIT path.
 
     Current support is intentionally narrow:
-    - linear layers only
-    - explicit matmul + bias lowering
+    - exported linear layers
+    - exported conv2d layers lowered through host-side im2col
+    - explicit quantized matmul + bias lowering
     """
     try:
         import torch
@@ -126,13 +128,6 @@ def compile_mnist_layer_jit(name, layer_info, input_data, export_dir='./mnist_mi
     a_bits = layer_info.get('a_bits', 16)
     input_hw = prepare_activation_for_hw(input_data, a_bits)
 
-    if layer_info['type'] != 'linear':
-        raise NotImplementedError(
-            f"JIT MNIST path currently supports only linear layers, got {layer_info['type']!r}."
-        )
-
-    w = np.load(os.path.join(export_dir, f"{name}_weights.npy"))
-    b = np.load(os.path.join(export_dir, f"{name}_bias.npy")).astype(np.int32)
     in_dtype_name = f"int{int(layer_info['a_bits'])}"
     if int(layer_info['w_bits']) != int(layer_info['a_bits']):
         raise ValueError(
@@ -141,31 +136,74 @@ def compile_mnist_layer_jit(name, layer_info, input_data, export_dir='./mnist_mi
         )
     if int(layer_info['a_bits']) == 8:
         input_hw = input_hw.astype(np.int8)
-        w = w.astype(np.int8)
+        weight_dtype = np.int8
     elif int(layer_info['a_bits']) == 16:
         input_hw = input_hw.astype(np.int16)
-        w = w.astype(np.int16)
+        weight_dtype = np.int16
     else:
         raise ValueError(f"Unsupported JIT MNIST activation precision a_bits={layer_info['a_bits']}.")
 
-    class ExportedLinearModule(nn.Module):
-        def __init__(self, weight, bias):
-            super().__init__()
-            self.register_buffer("weight", torch.tensor(weight))
-            self.register_buffer("bias", torch.tensor(bias))
+    if layer_info['type'] == 'linear':
+        w = np.load(os.path.join(export_dir, f"{name}_weights.npy")).astype(weight_dtype)
+        b = np.load(os.path.join(export_dir, f"{name}_bias.npy")).astype(np.int32)
 
-        def forward(self, x):
-            y = jit_npu_matmul(
-                self.weight,
-                x,
-                multiplier=int(layer_info["M0"]),
-                shift=int(layer_info["shift"]),
-                activation="none",
-                in_dtype=in_dtype_name,
-                out_dtype="int16",
-            )
-            return y + self.bias.reshape(-1, 1)
+        class ExportedLinearModule(nn.Module):
+            def __init__(self, weight, bias):
+                super().__init__()
+                self.register_buffer("weight", torch.tensor(weight))
+                self.register_buffer("bias", torch.tensor(bias))
 
-    module = ExportedLinearModule(w, b)
-    example = torch.tensor(input_hw)
-    return compile_module(module, (example,))
+            def forward(self, x):
+                y = jit_npu_matmul(
+                    self.weight,
+                    x,
+                    multiplier=int(layer_info["M0"]),
+                    shift=int(layer_info["shift"]),
+                    activation="none",
+                    in_dtype=in_dtype_name,
+                    out_dtype="int16",
+                )
+                return y + self.bias.reshape(-1, 1)
+
+        module = ExportedLinearModule(w, b)
+        example = torch.tensor(input_hw)
+        return compile_module(module, (example,))
+
+    if layer_info['type'] == 'conv2d':
+        w_gemm = np.load(os.path.join(export_dir, f"{name}_weights_gemm.npy")).astype(weight_dtype)
+        kernel_t = w_gemm.T
+        b = np.load(os.path.join(export_dir, f"{name}_bias.npy")).astype(np.int32)
+        kernel_size = int(layer_info["kernel_size"])
+        stride = int(layer_info["stride"])
+        padding = int(layer_info["padding"])
+        out_h = ((input_hw.shape[0] + 2 * padding - kernel_size) // stride) + 1
+        out_w = ((input_hw.shape[1] + 2 * padding - kernel_size) // stride) + 1
+        out_channels = int(layer_info["out_channels"])
+
+        class ExportedConvModule(nn.Module):
+            def __init__(self, kernel_t, bias):
+                super().__init__()
+                self.register_buffer("kernel_t", torch.tensor(kernel_t))
+                self.register_buffer("bias", torch.tensor(bias))
+
+            def forward(self, x):
+                cols = jit_im2col_for_npu(x, kernel_size, stride, padding)
+                y = jit_npu_matmul(
+                    cols,
+                    self.kernel_t,
+                    multiplier=int(layer_info["M0"]),
+                    shift=int(layer_info["shift"]),
+                    activation="relu",
+                    in_dtype=in_dtype_name,
+                    out_dtype=in_dtype_name,
+                )
+                y = y + self.bias.reshape(1, -1)
+                return y.reshape(out_h, out_w, out_channels)
+
+        module = ExportedConvModule(kernel_t, b)
+        example = torch.tensor(input_hw)
+        return compile_module(module, (example,))
+
+    raise NotImplementedError(
+        f"JIT MNIST path currently supports only linear and conv2d layers, got {layer_info['type']!r}."
+    )
