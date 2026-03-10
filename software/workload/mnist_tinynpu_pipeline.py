@@ -15,6 +15,7 @@ from software.compiler.tinynpu_quant import (
     QLinear,
     build_layer_config_map,
     collect_input_activation_maxes,
+    collect_tensor_percentile_scale,
     convert_qat_model_for_compiler,
     copy_state_with_mapping,
     infer_chain_output_bits,
@@ -135,30 +136,21 @@ def collect_relu3_boundary_scale(
     percentile: float = 99.9,
     max_samples: int = 256,
 ) -> float:
-    values = []
-    limit = min(int(max_samples), len(calib_dataset))
-    model = model.cpu().eval()
-    with torch.no_grad():
-        for index in range(limit):
-            sample, _ = calib_dataset[index]
-            x = sample.unsqueeze(0)
+    def extract_relu3(module: TinyMNISTQAT, x: torch.Tensor) -> torch.Tensor:
+        x1 = F.relu(module.conv1(x))
+        x2 = F.relu(module.conv2(x1))
+        x3 = F.relu(module.conv3(x2))
+        return x3
 
-            x1 = model.conv1(x)
-            x1 = F.relu(x1)
-
-            x2 = model.conv2(x1)
-            x2 = F.relu(x2)
-
-            x3 = model.conv3(x2)
-            x3 = F.relu(x3)
-            values.append(x3.reshape(-1).cpu())
-
-    if not values:
-        raise ValueError("Expected at least one calibration sample when collecting relu3 boundary scale.")
-
-    flat = torch.cat(values).abs()
-    boundary_abs = float(torch.quantile(flat, torch.tensor(float(percentile) / 100.0)).item())
-    return max(boundary_abs / 127.0, 1e-8)
+    return collect_tensor_percentile_scale(
+        model,
+        calib_dataset,
+        extractor=extract_relu3,
+        percentile=percentile,
+        max_samples=max_samples,
+        qmax=127.0,
+        floor=1e-8,
+    )
 
 
 def build_compiler_ready_mnist_model(

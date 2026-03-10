@@ -452,6 +452,7 @@ Current non-capabilities:
   - the fresh MNIST pipeline now uses a calibrated `conv3 -> mean` boundary scale instead of reusing the next NPU layer's activation scale
   - this recovered compiled-host MNIST accuracy from catastrophic loss back to near-QAT quality on the validated slice
   - the general rule is now explicit: "next layer activation scale" is only valid for direct quantized NPU-to-NPU chains, not for host-sensitive ops such as `mean`
+  - the percentile-based host-boundary scale logic is now being extracted into `tinynpu_quant.calibration` so it becomes reusable calibration infrastructure instead of MNIST-only glue
 
 ### 10.13 `tinynpu_quant` Plan
 
