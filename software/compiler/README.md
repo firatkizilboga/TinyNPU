@@ -22,12 +22,14 @@ Current scope:
 Key entry points:
 
 ```python
-from tinynpu_jit import compile_module, mark_for_verify
+from tinynpu_jit import compile_module, mark_for_verify, quantize_for_npu
 
 # compile_module(...) requires torch to be installed locally
 # mark_for_verify(...) is intended to let users request runtime-visible
 # verification points in the execution plan. In v1 it forces a segment
 # boundary so the tensor can be materialized and checked on the host.
+# quantize_for_npu(...) is the current explicit source of truth for
+# HostOp -> NpuSegment re-entry quantization.
 ```
 
 Examples:
@@ -35,16 +37,26 @@ Examples:
 - `example_torch_jit.py`: traced PyTorch module with `mark_for_verify(...)`
 - `software/workload/mnist_npu_compiler.py::compile_mnist_layer_jit(...)`: FC-layer MNIST export example on the new PyTorch JIT path
 - `software/workload/jit_test_gen.py::build_simple_chain_artifact(...)`: migrated old simple-chain workload on the new JIT path
+- `software/workload/jit_hostop_chain.py::build_hostop_chain_artifact(...)`: mixed `NpuSegment -> HostOp(softmax) -> quantize_for_npu -> NpuSegment` workload
+- `software/workload/inspect_simple_chain.py`: prints the segmented plan, logical previews, and packed output vectors for the migrated simple-chain artifact
 
 Simulator smoke test:
 - `cd verification/cocotb && MODULE=test_jit_runtime make -f Makefile.npu`
 - Migrated simple-chain RTL test: `cd verification/cocotb && MODULE=test_jit_simple_chain make -f Makefile.npu`
+- Simple-chain RTL vector inspection: `cd verification/cocotb && MODULE=test_jit_simple_chain_inspect make -f Makefile.npu`
+- Mixed host/NPU chain RTL test: `cd verification/cocotb && MODULE=test_jit_hostop_chain make -f Makefile.npu`
 
 Current limitation:
 - `torch` is an optional dependency and is not bundled by this repository today
-- the simulator backend is wired at the runtime layer but has not been exercised in this workspace yet
+- the simulator backend is exercised on the current narrow segmented matmul path, but broader mixed-op coverage is still incomplete
 - standard PyTorch `nn.Linear` row-major normalization is not fully hardened yet; the traced frontend is currently validated on explicit `torch.matmul`
 - the legacy `tinynpu/` package remains in place during migration
+
+Open risks:
+- the PyTorch frontend currently does not read quantization metadata such as `multiplier`, `shift`, or exported scale equivalents
+- quantized exported workloads like MNIST need an explicit quantization source of truth before they are considered migrated
+- `HostOp -> NpuSegment` re-entry quantization now has a first explicit path through `quantize_for_npu(...)`, but broader quant config ingestion is still an active gap
+- old `A/B/C/BIAS` role semantics still exist in lowering as a migration bridge
 
 ## Usage
 

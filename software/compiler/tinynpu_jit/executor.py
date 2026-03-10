@@ -49,8 +49,9 @@ class HostEmulationExecutor:
                         )
                     verified.append(step.label)
 
-        outputs = {name: values[name] for name in artifact.plan.outputs}
-        return ExecutionResult(tensors=outputs, verified=verified)
+        outputs = {name: np.array(values[name], copy=True) for name in artifact.plan.outputs}
+        trace_tensors = {name: np.array(value, copy=True) for name, value in values.items()}
+        return ExecutionResult(tensors=outputs, verified=verified, trace_tensors=trace_tensors)
 
     def _should_verify(self, step: VerifyTensor, verification: VerificationMode) -> bool:
         if verification == VerificationMode.OFF:
@@ -96,5 +97,16 @@ class HostEmulationExecutor:
             return
         if step.kind == "transpose":
             values[step.outputs[0]] = np.transpose(values[step.inputs[0]], axes=tuple(step.attrs.get("axes", [])) or None)
+            return
+        if step.kind == "requantize":
+            scale = float(step.attrs["scale"])
+            zero_point = int(step.attrs.get("zero_point", 0))
+            out_dtype = step.attrs.get("dtype", "int16")
+            values[step.outputs[0]] = self.golden.requantize(
+                values[step.inputs[0]],
+                scale=scale,
+                zero_point=zero_point,
+                out_dtype=out_dtype,
+            )
             return
         raise NotImplementedError(f"Unsupported host op '{step.kind}'.")

@@ -23,11 +23,11 @@ def compile_module(module: Any, example_inputs: tuple[Any, ...], **kwargs) -> Co
         ) from exc
 
     from .partitioner import partition_fx_graph
-    from .markers import mark_for_verify
+    from .markers import mark_for_verify, quantize_for_npu
 
     class TinyNPUTracer(fx.Tracer):
         def __init__(self):
-            super().__init__(autowrap_functions=(mark_for_verify,))
+            super().__init__(autowrap_functions=(mark_for_verify, quantize_for_npu))
 
     tracer = TinyNPUTracer()
     graph = tracer.trace(module)

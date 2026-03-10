@@ -29,6 +29,7 @@ class SimulatorExecutor:
         dut: Any,
         verification: VerificationMode = VerificationMode.OFF,
         reset: bool = False,
+        capture_vectors: bool = False,
     ) -> ExecutionResult:
         try:
             from verification.cocotb import npu_driver
@@ -57,6 +58,7 @@ class SimulatorExecutor:
             values[name] = np.array(inputs[name], copy=True)
 
         verified: list[str] = []
+        vector_captures: dict[str, dict[str, Any]] = {}
         for step in artifact.plan.steps:
             if isinstance(step, NpuSegment):
                 segment = artifact.segment_artifacts[step.name]
@@ -65,7 +67,15 @@ class SimulatorExecutor:
                 await self._load_im_image(dut, npu_driver, segment.binary["im"])
                 await self._run_until_halt(dut, npu_driver, RisingEdge)
                 for output_name in step.outputs:
-                    values[output_name] = await self._read_tensor(dut, npu_driver, artifact.plan.tensors[output_name], segment.symbol_table[output_name])
+                    symbol = segment.symbol_table[output_name]
+                    if capture_vectors:
+                        vector_captures[output_name] = await self._capture_tensor_vectors(
+                            dut,
+                            npu_driver,
+                            segment_name=step.name,
+                            symbol=symbol,
+                        )
+                    values[output_name] = await self._read_tensor(dut, npu_driver, artifact.plan.tensors[output_name], symbol)
             elif step.__class__.__name__ == "HostOp":
                 self.host_executor._run_host_op(step, values)
             elif isinstance(step, VerifyTensor):
@@ -80,8 +90,14 @@ class SimulatorExecutor:
                         raise AssertionError(f"Verification failed for '{step.label}' ({step.tensor_name}).")
                     verified.append(step.label)
 
-        outputs = {name: values[name] for name in artifact.plan.outputs}
-        return ExecutionResult(tensors=outputs, verified=verified)
+        outputs = {name: np.array(values[name], copy=True) for name in artifact.plan.outputs}
+        trace_tensors = {name: np.array(value, copy=True) for name, value in values.items()}
+        return ExecutionResult(
+            tensors=outputs,
+            verified=verified,
+            trace_tensors=trace_tensors,
+            vector_captures=vector_captures,
+        )
 
     async def _load_ub_image(self, dut: Any, driver: Any, ub_words: list[int]) -> None:
         for addr, word in enumerate(ub_words):
@@ -143,6 +159,25 @@ class SimulatorExecutor:
             )
         return await self._read_role_c(dut, driver, spec.shape, symbol["addr"], precision)
 
+    async def _capture_tensor_vectors(
+        self,
+        dut: Any,
+        driver: Any,
+        *,
+        segment_name: str,
+        symbol: dict[str, Any],
+    ) -> dict[str, Any]:
+        rows: list[list[int]] = []
+        for offset in range(int(symbol["word_count"])):
+            rows.append(await driver.read_ub_vector(dut, int(symbol["addr"]) + offset, self.array_size))
+        return {
+            "segment_name": segment_name,
+            "addr": int(symbol["addr"]),
+            "role": symbol["role"],
+            "precision": PrecisionMode(symbol["precision"]).name,
+            "rows": rows,
+        }
+
     def _pack_tensor(self, value: np.ndarray, symbol: dict[str, Any]) -> list[int]:
         role = symbol["role"]
         precision = PrecisionMode(symbol["precision"])
@@ -200,6 +235,7 @@ async def run_sim(
     verification: VerificationMode = VerificationMode.OFF,
     reset: bool = False,
     defines_path: str | None = None,
+    capture_vectors: bool = False,
 ):
     return await SimulatorExecutor(defines_path=defines_path).run(
         artifact,
@@ -207,4 +243,5 @@ async def run_sim(
         dut=dut,
         verification=verification,
         reset=reset,
+        capture_vectors=capture_vectors,
     )

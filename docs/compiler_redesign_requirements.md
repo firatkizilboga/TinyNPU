@@ -351,3 +351,36 @@ Open follow-on work remains for:
 - broader op coverage
 - richer fallback semantics
 - eventual direct PyTorch/backend integration if we decide to build that later
+
+### 10.11 Open Annoyances And Risks
+
+These are not soft TODOs. They are known architectural gaps that must stay visible during migration.
+
+1. PyTorch frontend quantization metadata is currently ignored.
+- The new FX path reads graph structure, weights, and constants.
+- It does not currently read per-layer or per-tensor quantization config from PyTorch.
+- In practice this means `multiplier`, `shift`, scale equivalents, and re-entry quantization policy are still compiler-owned defaults unless explicitly provided elsewhere.
+
+2. MNIST-style exported quantized workloads will need an explicit quantization source of truth.
+- When migrating MNIST or similar exported models, the compiler must read quantization parameters from the export or an explicit compiler config.
+- We must not pretend those workloads are fully supported while silently running with default `multiplier=1` and `shift=0`.
+
+3. `HostOp -> NpuSegment` re-entry quantization is only partially finished.
+- The architecture allows `NpuSegment -> HostOp -> NpuSegment`.
+- The runtime now has a first explicit path via a PyTorch-facing `quantize_for_npu(...)` helper.
+- Broader quantization config ingestion from exported workloads or PyTorch quant metadata is still missing.
+- This remains the main correctness gap for mixed host/NPU flows beyond the narrow explicit helper path.
+
+4. Old `A/B/C/BIAS` role semantics are still present in lowering.
+- The new compiler IR is logical-first.
+- The lowering bridge still maps tensors into old backend roles.
+- This is acceptable as a migration bridge, but it must remain quarantined to lowering.
+
+5. Packing/layout transforms are not yet first-class IR.
+- Current v1 correctness path is: read packed output -> materialize logical tensor -> repack for next segment.
+- That is semantically clean, but not the final optimized story.
+- We still need explicit layout-transform semantics if we want robust direct segment-to-segment reuse later.
+
+6. Current simulator inspection proves packed output correctness only for the supported narrow path.
+- We can now compare expected packed vectors vs actual UB vectors on RTL for simple segmented matmul chains.
+- This does not yet cover broader op classes or host-op re-entry.
