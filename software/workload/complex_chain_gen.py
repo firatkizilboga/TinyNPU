@@ -123,15 +123,15 @@ def generate_complex_chain():
         
         # 3. Saturation (Output Precision)
         golden_output = clip_and_quantize(shifted, out_prec)
+
+        # Verify every stage explicitly (not only final output).
+        prog.add_expected_result(layer_name, golden_output)
         
         current_input = layer_name
         current_in_prec = out_prec 
         golden_input = golden_output
 
     prog.halt()
-    
-    # Final Result
-    prog.add_expected_result("L7", golden_input)
 
     output_path = "complex_chain.npu"
     prog.save_npu(output_path)

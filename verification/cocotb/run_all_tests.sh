@@ -12,6 +12,11 @@ echo "🚀 Starting TinyNPU All-Tests Suite..."
 # Ensure clean start
 rm -f results.xml
 
+# Test 0: MMIO read->write handoff regression (issue #2)
+echo "📂 Running: test_mmio_readwrite_handoff.py"
+MODULE=test_mmio_readwrite_handoff make -f Makefile.npu > /dev/null 2>&1
+echo "✅ test_mmio_readwrite_handoff.py: PASSED"
+
 # Test 1: Simple Chain
 echo "📂 Running: simple_chain.npu"
 cd $WORKLOAD_DIR
