@@ -16,13 +16,22 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
-from torchvision import datasets, transforms
 import numpy as np
 import json
 import os
 import argparse
-import math
-import copy
+
+from software.compiler.tinynpu_quant import compute_fused_params
+from software.compiler.tinynpu_quant import (
+    QConv2d,
+    QLinear,
+    build_layer_config_map,
+    collect_input_activation_maxes,
+    copy_state_with_mapping,
+    initialize_scale_tensors,
+    rank_sensitivity,
+    single_layer_bit_drop_sensitivity,
+)
 
 # ============================================================================
 # 1. FP32 MODEL (Stage 1)
@@ -45,84 +54,15 @@ class TinyNetFP32(nn.Module):
         x = self.fc(x)
         return x
 
-# ============================================================================
-# 2. FAKE QUANTIZATION (for QAT)
-# ============================================================================
-
-class SymmetricQuantizer(torch.autograd.Function):
-    """STE-based fake quantizer."""
-    @staticmethod
-    def forward(ctx, x, scale, num_bits, is_weight):
-        if is_weight:
-            qmin = -(2 ** (num_bits - 1)) + 1
-            qmax = 2 ** (num_bits - 1) - 1
-        else:
-            qmin = 0
-            qmax = 2 ** num_bits - 1
-        x_scaled = x / scale
-        x_clamped = torch.clamp(x_scaled, qmin, qmax)
-        x_quant = torch.round(x_clamped)
-        x_dequant = x_quant * scale
-        ctx.save_for_backward(x_scaled, torch.tensor(qmin), torch.tensor(qmax))
-        return x_dequant
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        x_scaled, qmin, qmax = ctx.saved_tensors
-        mask = (x_scaled >= qmin.float()) & (x_scaled <= qmax.float())
-        return grad_output * mask.float(), None, None, None
-
-def fake_quantize(x, scale, num_bits, is_weight=False):
-    return SymmetricQuantizer.apply(x, scale, num_bits, is_weight)
-
-# ============================================================================
-# 3. QAT MODEL (Stage 3)
-# ============================================================================
-
-class QConv2d(nn.Module):
-    def __init__(self, in_ch, out_ch, kernel_size, padding=0, stride=1, w_bits=8, a_bits=8):
-        super().__init__()
-        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size, padding=padding, stride=stride, bias=True)
-        self.w_bits, self.a_bits = w_bits, a_bits
-        self.w_scale = nn.Parameter(torch.tensor(0.05))
-        self.a_scale = nn.Parameter(torch.tensor(0.05))
-
-    def forward(self, x):
-        # Update weight scale from current weights
-        with torch.no_grad():
-            w_qmax = 2 ** (self.w_bits - 1) - 1
-            self.w_scale.data.copy_((self.conv.weight.abs().max() / w_qmax).clamp(min=1e-8))
-        x_q = fake_quantize(x, self.a_scale, self.a_bits, is_weight=False)
-        w_q = fake_quantize(self.conv.weight, self.w_scale, self.w_bits, is_weight=True)
-        return F.conv2d(x_q, w_q, self.conv.bias, self.conv.stride, self.conv.padding)
-
-class QLinear(nn.Module):
-    def __init__(self, in_features, out_features, w_bits=8, a_bits=8):
-        super().__init__()
-        self.linear = nn.Linear(in_features, out_features, bias=True)
-        self.w_bits, self.a_bits = w_bits, a_bits
-        self.w_scale = nn.Parameter(torch.tensor(0.05))
-        self.a_scale = nn.Parameter(torch.tensor(0.05))
-
-    def forward(self, x):
-        with torch.no_grad():
-            w_qmax = 2 ** (self.w_bits - 1) - 1
-            self.w_scale.data.copy_((self.linear.weight.abs().max() / w_qmax).clamp(min=1e-8))
-        x_q = fake_quantize(x, self.a_scale, self.a_bits, is_weight=False)
-        w_q = fake_quantize(self.linear.weight, self.w_scale, self.w_bits, is_weight=True)
-        return F.linear(x_q, w_q, self.linear.bias)
-
 class TinyNetQAT(nn.Module):
     """Quantization-aware model, initialized from FP32 weights + calibrated scales."""
     def __init__(self, layer_configs=None):
         super().__init__()
-        if layer_configs is None:
-            layer_configs = {k: {'w_bits': 8, 'a_bits': 8} for k in ['conv1', 'conv2', 'conv3', 'fc']}
-        c = layer_configs
-        self.conv1 = QConv2d(1, 16, 3, padding=1, **c['conv1'])
-        self.conv2 = QConv2d(16, 16, 3, padding=1, **c['conv2'])
-        self.conv3 = QConv2d(16, 16, 3, padding=1, **c['conv3'])
-        self.fc = QLinear(16, 10, **c['fc'])
+        c = build_layer_config_map(['conv1', 'conv2', 'conv3', 'fc'], overrides=layer_configs)
+        self.conv1 = QConv2d(1, 16, 3, padding=1, config=c['conv1'])
+        self.conv2 = QConv2d(16, 16, 3, padding=1, config=c['conv2'])
+        self.conv3 = QConv2d(16, 16, 3, padding=1, config=c['conv3'])
+        self.fc = QLinear(16, 10, config=c['fc'])
 
     def forward(self, x):
         x = F.relu(self.conv1(x))
@@ -137,6 +77,8 @@ class TinyNetQAT(nn.Module):
 # ============================================================================
 
 def get_data_loaders(data_dir='./data', batch_size=128):
+    from torchvision import datasets, transforms
+
     transform = transforms.Compose([transforms.ToTensor()])
     train_ds = datasets.MNIST(data_dir, train=True, download=True, transform=transform)
     test_ds = datasets.MNIST(data_dir, train=False, transform=transform)
@@ -200,6 +142,9 @@ def calibrate_and_quantize(device, layer_configs, data_dir='./data',
     print("Stage 2: Post-Training Quantization (Calibration)")
     print("=" * 60)
 
+    layer_names = ['conv1', 'conv2', 'conv3', 'fc']
+    layer_configs = build_layer_config_map(layer_names, overrides=layer_configs)
+
     # Load FP32 model
     fp32_model = TinyNetFP32().to(device)
     fp32_model.load_state_dict(torch.load(fp32_checkpoint, map_location=device, weights_only=True))
@@ -215,31 +160,11 @@ def calibrate_and_quantize(device, layer_configs, data_dir='./data',
     calib_subset = Subset(train_ds, range(num_calibration_samples))
     calib_loader = DataLoader(calib_subset, batch_size=256)
 
-    act_maxes = {'conv1': 0, 'conv2': 0, 'conv3': 0, 'fc': 0}
-    hooks = []
-
-    def make_hook(name):
-        def hook_fn(module, input, output):
-            x = input[0]
-            act_maxes[name] = max(act_maxes[name], x.abs().max().item())
-        return hook_fn
-
-    hooks.append(fp32_model.conv1.register_forward_hook(make_hook('conv1')))
-    hooks.append(fp32_model.conv2.register_forward_hook(make_hook('conv2')))
-    hooks.append(fp32_model.conv3.register_forward_hook(make_hook('conv3')))
-    hooks.append(fp32_model.fc.register_forward_hook(make_hook('fc')))
-
-    with torch.no_grad():
-        for x, _ in calib_loader:
-            fp32_model(x.to(device))
-
-    for h in hooks:
-        h.remove()
+    act_maxes = collect_input_activation_maxes(fp32_model, calib_loader, layer_names, device=device)
 
     # Build QAT model with calibrated scales
     qat_model = TinyNetQAT(layer_configs).to(device)
 
-    # Copy FP32 weights into QAT model
     fp32_sd = fp32_model.state_dict()
     qat_sd = qat_model.state_dict()
     weight_map = {
@@ -248,27 +173,19 @@ def calibrate_and_quantize(device, layer_configs, data_dir='./data',
         'conv3.conv.weight': 'conv3.weight', 'conv3.conv.bias': 'conv3.bias',
         'fc.linear.weight': 'fc.weight', 'fc.linear.bias': 'fc.bias',
     }
-    for qat_key, fp32_key in weight_map.items():
-        qat_sd[qat_key] = fp32_sd[fp32_key]
-
-    # Set calibrated activation scales
-    layer_names = ['conv1', 'conv2', 'conv3', 'fc']
-    for name in layer_names:
-        a_bits = layer_configs[name]['a_bits']
-        a_qmax = 2 ** a_bits - 1
-        a_scale = act_maxes[name] / a_qmax if a_qmax > 0 else 1e-8
-        a_scale = max(a_scale, 1e-8)
-        qat_sd[f'{name}.a_scale'] = torch.tensor(a_scale)
-
-        # Set weight scales
-        w_bits = layer_configs[name]['w_bits']
-        w_qmax = 2 ** (w_bits - 1) - 1
-        if name == 'fc':
-            w = fp32_sd['fc.weight']
-        else:
-            w = fp32_sd[f'{name}.weight']
-        w_scale = (w.abs().max() / w_qmax).clamp(min=1e-8).item()
-        qat_sd[f'{name}.w_scale'] = torch.tensor(w_scale)
+    copy_state_with_mapping(dst_state_dict=qat_sd, src_state_dict=fp32_sd, key_mapping=weight_map)
+    initialize_scale_tensors(
+        qat_state_dict=qat_sd,
+        fp32_state_dict=fp32_sd,
+        layer_configs=layer_configs,
+        activation_maxes=act_maxes,
+        fp32_weight_keys={
+            'conv1': 'conv1.weight',
+            'conv2': 'conv2.weight',
+            'conv3': 'conv3.weight',
+            'fc': 'fc.weight',
+        },
+    )
 
     qat_model.load_state_dict(qat_sd)
 
@@ -367,26 +284,13 @@ def run_sensitivity_analysis(device, data_dir='./data',
     print(f"  FP32 baseline: {fp32_acc*100:.2f}%")
 
     # Evaluate INT8 baseline (all layers at W8A8)
-    all8_configs = {k: {'w_bits': 8, 'a_bits': 8} for k in ['conv1', 'conv2', 'conv3', 'fc']}
+    layers = ['conv1', 'conv2', 'conv3', 'fc']
+    all8_configs = build_layer_config_map(layers)
     # Quick calibration helper
     def calibrate_quick(configs):
         """Calibrate and return PTQ model."""
         calib_loader = DataLoader(Subset(train_ds, range(1000)), batch_size=256)
-        act_maxes = {'conv1': 0, 'conv2': 0, 'conv3': 0, 'fc': 0}
-        hooks = []
-        def make_hook(name):
-            def hook_fn(module, input, output):
-                act_maxes[name] = max(act_maxes[name], input[0].abs().max().item())
-            return hook_fn
-        hooks.append(fp32_model.conv1.register_forward_hook(make_hook('conv1')))
-        hooks.append(fp32_model.conv2.register_forward_hook(make_hook('conv2')))
-        hooks.append(fp32_model.conv3.register_forward_hook(make_hook('conv3')))
-        hooks.append(fp32_model.fc.register_forward_hook(make_hook('fc')))
-        with torch.no_grad():
-            for x, _ in calib_loader:
-                fp32_model(x.to(device))
-        for h in hooks:
-            h.remove()
+        act_maxes = collect_input_activation_maxes(fp32_model, calib_loader, layers, device=device)
 
         qat_model = TinyNetQAT(configs).to(device)
         fp32_sd = fp32_model.state_dict()
@@ -397,16 +301,19 @@ def run_sensitivity_analysis(device, data_dir='./data',
             'conv3.conv.weight': 'conv3.weight', 'conv3.conv.bias': 'conv3.bias',
             'fc.linear.weight': 'fc.weight', 'fc.linear.bias': 'fc.bias',
         }
-        for qk, fk in weight_map.items():
-            qat_sd[qk] = fp32_sd[fk]
-        for name in ['conv1', 'conv2', 'conv3', 'fc']:
-            a_bits = configs[name]['a_bits']
-            a_qmax = 2 ** a_bits - 1
-            qat_sd[f'{name}.a_scale'] = torch.tensor(max(act_maxes[name] / a_qmax, 1e-8))
-            w_bits = configs[name]['w_bits']
-            w_qmax = 2 ** (w_bits - 1) - 1
-            fk = 'fc.weight' if name == 'fc' else f'{name}.weight'
-            qat_sd[f'{name}.w_scale'] = torch.tensor(max((fp32_sd[fk].abs().max() / w_qmax).item(), 1e-8))
+        copy_state_with_mapping(dst_state_dict=qat_sd, src_state_dict=fp32_sd, key_mapping=weight_map)
+        initialize_scale_tensors(
+            qat_state_dict=qat_sd,
+            fp32_state_dict=fp32_sd,
+            layer_configs=configs,
+            activation_maxes=act_maxes,
+            fp32_weight_keys={
+                'conv1': 'conv1.weight',
+                'conv2': 'conv2.weight',
+                'conv3': 'conv3.weight',
+                'fc': 'fc.weight',
+            },
+        )
         qat_model.load_state_dict(qat_sd)
         return qat_model
 
@@ -414,19 +321,20 @@ def run_sensitivity_analysis(device, data_dir='./data',
     int8_acc = evaluate(int8_model, test_loader, device)
     print(f"  INT8 baseline (all W8A8): {int8_acc*100:.2f}%")
 
-    layers = ['conv1', 'conv2', 'conv3', 'fc']
     print(f"\n  Dropping each layer to W4A4 (others at W8A8):")
-    importances = {}
-    for layer_to_drop in layers:
-        configs = {l: {'w_bits': 4, 'a_bits': 4} if l == layer_to_drop
-                   else {'w_bits': 8, 'a_bits': 8} for l in layers}
-        test_model = calibrate_quick(configs)
-        acc = evaluate(test_model, test_loader, device)
-        loss = int8_acc - acc
-        importances[layer_to_drop] = loss
-        print(f"    {layer_to_drop:6s} -> W4A4: {acc*100:5.2f}%  (drop: {loss*100:+5.2f}%)")
+    def evaluate_configs(configs):
+        return evaluate(calibrate_quick(configs), test_loader, device)
 
-    sorted_layers = sorted(importances.items(), key=lambda x: x[1], reverse=True)
+    _, importances = single_layer_bit_drop_sensitivity(
+        layers,
+        evaluate_configs=evaluate_configs,
+        baseline_bits=(8, 8),
+        trial_bits=(4, 4),
+    )
+    for layer_to_drop, loss in importances.items():
+        print(f"    {layer_to_drop:6s} -> W4A4: {(int8_acc - loss)*100:5.2f}%  (drop: {loss*100:+5.2f}%)")
+
+    sorted_layers = rank_sensitivity(importances)
     print(f"\n  Sensitivity ranking (most sensitive first):")
     for i, (name, loss) in enumerate(sorted_layers):
         recommendation = "keep INT8" if loss > 0.01 else "safe for INT4"
@@ -435,25 +343,6 @@ def run_sensitivity_analysis(device, data_dir='./data',
 # ============================================================================
 # 9. EXPORT FOR NPU
 # ============================================================================
-
-def compute_fused_params(w_scale, a_scale, out_scale):
-    """Compute M0 and shift for fixed-point requantization: out = (acc * M0) >> shift."""
-    M = (w_scale * a_scale) / out_scale
-    if M == 0:
-        return 0, 0
-    n = 0
-    m_normalized = M
-    if m_normalized >= 1.0:
-        while m_normalized >= 1.0:
-            m_normalized /= 2.0
-            n -= 1
-    else:
-        while m_normalized < 0.5:
-            m_normalized *= 2.0
-            n += 1
-    M0_int = int(round(m_normalized * (2 ** 15)))
-    total_shift = n + 15
-    return M0_int, total_shift
 
 def export_for_npu(device, layer_configs, qat_checkpoint='./tinynpu_qat.pt',
                    export_dir='./mnist_mixed_export'):
@@ -547,12 +436,15 @@ def export_for_npu(device, layer_configs, qat_checkpoint='./tinynpu_qat.pt',
 # ============================================================================
 
 def parse_layer_configs(args):
-    return {
-        'conv1': {'w_bits': args.conv1_bits[0], 'a_bits': args.conv1_bits[1]},
-        'conv2': {'w_bits': args.conv2_bits[0], 'a_bits': args.conv2_bits[1]},
-        'conv3': {'w_bits': args.conv3_bits[0], 'a_bits': args.conv3_bits[1]},
-        'fc':    {'w_bits': args.fc_bits[0],    'a_bits': args.fc_bits[1]},
-    }
+    return build_layer_config_map(
+        ['conv1', 'conv2', 'conv3', 'fc'],
+        overrides={
+            'conv1': {'w_bits': args.conv1_bits[0], 'a_bits': args.conv1_bits[1]},
+            'conv2': {'w_bits': args.conv2_bits[0], 'a_bits': args.conv2_bits[1]},
+            'conv3': {'w_bits': args.conv3_bits[0], 'a_bits': args.conv3_bits[1]},
+            'fc': {'w_bits': args.fc_bits[0], 'a_bits': args.fc_bits[1]},
+        },
+    )
 
 def main():
     parser = argparse.ArgumentParser(description='TinyNPU: Train FP32 -> Quantize -> Fine-Tune -> Export')
