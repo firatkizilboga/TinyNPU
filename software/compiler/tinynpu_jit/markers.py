@@ -29,6 +29,8 @@ def npu_matmul(
     activation: str = "none",
     in_dtype: str = "int16",
     out_dtype: str = "int16",
+    output_scale: float | None = None,
+    output_zero_point: int = 0,
 ):
     import torch
 

@@ -17,6 +17,17 @@ def compile_plan(plan: ExecutionPlan, expected_tensors: dict[str, np.ndarray], d
 def compile_module(module: Any, example_inputs: tuple[Any, ...], **kwargs) -> CompiledArtifact:
     try:
         import torch.fx as fx  # type: ignore
+        try:
+            from torch.ao.nn.quantized import DeQuantize as QDeQuantize, Quantize as QQuantize  # type: ignore
+        except Exception:
+            QQuantize = QDeQuantize = ()
+        try:
+            from torch.ao.quantization import DeQuantStub, QuantStub  # type: ignore
+        except Exception:
+            try:
+                from torch.quantization import DeQuantStub, QuantStub  # type: ignore
+            except Exception:
+                QuantStub = DeQuantStub = ()
     except Exception as exc:
         raise ImportError(
             "torch is required for compile_module(). Install torch to enable the PyTorch frontend."
@@ -29,13 +40,27 @@ def compile_module(module: Any, example_inputs: tuple[Any, ...], **kwargs) -> Co
         def __init__(self):
             super().__init__(autowrap_functions=(mark_for_verify, quantize_for_npu, npu_matmul, im2col_for_npu))
 
+        def is_leaf_module(self, m: Any, module_qualified_name: str) -> bool:
+            quant_leaf_types = tuple(t for t in (QQuantize, QDeQuantize, QuantStub, DeQuantStub) if t)
+            if quant_leaf_types and isinstance(m, quant_leaf_types):
+                return True
+            return super().is_leaf_module(m, module_qualified_name)
+
     tracer = TinyNPUTracer()
     graph = tracer.trace(module)
     graph_module = fx.GraphModule(tracer.root, graph)
     try:
         from torch.fx.passes.shape_prop import ShapeProp  # type: ignore
 
-        ShapeProp(graph_module).propagate(*example_inputs)
+        quant_leaf_types = tuple(t for t in (QQuantize, QDeQuantize, QuantStub, DeQuantStub) if t)
+        has_quant_boundaries = any(
+            node.op == "call_module"
+            and quant_leaf_types
+            and isinstance(dict(graph_module.named_modules())[node.target], quant_leaf_types)
+            for node in graph_module.graph.nodes
+        )
+        if not has_quant_boundaries:
+            ShapeProp(graph_module).propagate(*example_inputs)
     except Exception:
         pass
 
