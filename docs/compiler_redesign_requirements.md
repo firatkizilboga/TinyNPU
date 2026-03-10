@@ -454,7 +454,33 @@ Current non-capabilities:
   - the general rule is now explicit: "next layer activation scale" is only valid for direct quantized NPU-to-NPU chains, not for host-sensitive ops such as `mean`
   - the percentile-based host-boundary scale logic is now being extracted into `tinynpu_quant.calibration` so it becomes reusable calibration infrastructure instead of MNIST-only glue
 
-### 10.13 `tinynpu_quant` Plan
+### 10.13 Current Design Decisions
+
+These are active policy decisions, not open design goals.
+
+Hardware/compiler boundary:
+- Do not change RTL architecture just to add new packing primitives at this stage.
+- Prefer software/compiler fixes first while the existing hardware remains stable and validated.
+- If future hardware changes happen, they should come only after the current software path clearly bottoms out.
+
+Packing/layout policy:
+- Keep `A/B/C/BIAS` buried as backend compatibility details only.
+- Do not let `C` semantics leak upward into frontend IR, planning, or runtime-plan meaning.
+- Repacking remains a software/runtime responsibility at boundaries for now.
+- Fusing back-to-back NPU ops is already treated as a primary way to reduce packing/repacking overhead, and should continue to be preferred where legal.
+
+Boundary precision policy:
+- `int16` boundary outputs are a valid compiler/runtime simplification strategy when UB allows them.
+- They are especially attractive for host-sensitive boundaries because they preserve information without requiring immediate requantization.
+- They are not assumed to be universally legal; UB capacity must still be checked and overflow must fail explicitly.
+- When `int16` boundary preservation is not legal, the fallback is calibrated `int8` boundary scaling rather than blindly reusing the next layer activation scale.
+
+Model/workload tradeoff policy:
+- A stricter contract such as "dynamic activations are always consumed as lhs-style inputs" is considered a valid simplifying direction for CNN/MLP-style flows.
+- That simplification is acknowledged to be hostile to transformer-like workloads, so it is not being locked in as a universal architectural rule yet.
+- Transformer-like mixed host/NPU graphs remain in scope, but they are not allowed to force premature RTL architectural changes before the software path is better understood.
+
+### 10.14 `tinynpu_quant` Plan
 
 The next major layer should be a PyTorch-side quantization toolkit living alongside the compiler, not inside a single script.
 
@@ -482,7 +508,7 @@ Progress against that plan today:
   - sensitivity helpers
 - the remaining gap is turning those extracted pieces into a compiler-prepared-model pipeline instead of just a cleaner script foundation
 
-### 10.14 Transformer Constraint
+### 10.15 Transformer Constraint
 
 Transformer-style models should stay in design scope even while near-term validation is CNN/MLP-heavy.
 
@@ -493,7 +519,7 @@ Implications:
 - sensitivity analysis must eventually reason about mixed placement, not just per-layer bit width
 - debug tooling must expose boundary tensors clearly because attention failures are numerically subtle
 
-### 10.15 Immediate Next Steps
+### 10.16 Immediate Next Steps
 
 This section is here so the project can survive context compaction without losing the real sequence.
 
