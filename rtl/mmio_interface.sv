@@ -56,9 +56,13 @@ module mmio_interface (
         end
       end
 
-      // Internal override (TPU writes to Host)
-      // If both write in same cycle, Internal wins for MMVR
-      if (mmvr_wr_en) begin
+      // Internal MMVR update (READ_MEM result).
+      // Host writes to MMVR must take precedence, otherwise the first WRITE_MEM
+      // issued from READ_WAIT can be overwritten by stale readback data.
+      if (mmvr_wr_en &&
+          !(host_wr_en &&
+            host_addr >= `REG_MMVR &&
+            host_addr < (`REG_MMVR + (`BUFFER_WIDTH / 8)))) begin
         mmvr_reg <= mmvr_in;
       end
     end
