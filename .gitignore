@@ -12,6 +12,7 @@ verification/cocotb/tinynpu_trace.vcd
 verification/cocotb/*.log
 verification/cocotb/buffer_init_*.hex
 verification/cocotb/buffer_init_*.json
+verification/cocotb/ub_dump_rtl.hex
 
 # Docs (local only)
 docs/sv_guide.pdf
