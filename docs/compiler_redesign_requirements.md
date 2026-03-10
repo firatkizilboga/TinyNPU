@@ -356,37 +356,129 @@ Open follow-on work remains for:
 
 These are not soft TODOs. They are known architectural gaps that must stay visible during migration.
 
-1. PyTorch frontend quantization metadata is currently ignored.
-- The new FX path reads graph structure, weights, and constants.
-- It does not currently read per-layer or per-tensor quantization config from PyTorch.
-- In practice this means `multiplier`, `shift`, scale equivalents, and re-entry quantization policy are still compiler-owned defaults unless explicitly provided elsewhere.
+1. PyTorch quantization metadata ingestion now exists, but only for a narrow supported set.
+- The new FX path can lower explicit quant/dequant boundaries and standard `torch.ao.nn.quantized.Linear` / `Conv2d` modules.
+- It now reads scale metadata and synthesizes TinyNPU `multiplier` / `shift` for those supported modules.
+- This is not broad quantization support. It does not mean arbitrary PyTorch quantized graphs are now compiler-ready.
 
-2. MNIST-style exported quantized workloads will need an explicit quantization source of truth.
-- When migrating MNIST or similar exported models, the compiler must read quantization parameters from the export or an explicit compiler config.
-- We must not pretend those workloads are fully supported while silently running with default `multiplier=1` and `shift=0`.
+2. TinyNPU NPU segments currently require symmetric zero-point-free quantization.
+- Current NPU lowering is intentionally strict:
+  - signed integer activations / weights
+  - `zero_point = 0`
+  - scale-driven integer rescale lowered into `multiplier` / `shift`
+- If a PyTorch model uses asymmetric quantization or nonzero zero-points in a would-be NPU segment, the compiler must fail closed.
+- We must not fake support for a quant scheme the hardware cannot actually implement.
 
-3. `HostOp -> NpuSegment` re-entry quantization is only partially finished.
+3. `quant-by-claude.py` export is aligned with the new runtime direction, but the QAT model objects are not yet a native compiler frontend.
+- The export stage computes `M0` / `shift` and produces weights/biases/manifests that the new JIT path can already run.
+- The training-time custom modules (`QConv2d`, `QLinear`) are still not directly lowered by `compile_module(...)`.
+- This means the export-backed bridge is real, but the training graph itself is not yet the compiler contract.
+
+4. `HostOp -> NpuSegment` re-entry quantization is only partially generalized.
 - The architecture allows `NpuSegment -> HostOp -> NpuSegment`.
-- The runtime now has a first explicit path via a PyTorch-facing `quantize_for_npu(...)` helper.
-- Broader quantization config ingestion from exported workloads or PyTorch quant metadata is still missing.
-- This remains the main correctness gap for mixed host/NPU flows beyond the narrow explicit helper path.
+- Explicit helper-based re-entry exists and PyTorch quant/dequant module boundaries exist.
+- The remaining gap is broad, automatic boundary quantization policy for larger mixed graphs.
+- This is especially relevant for attention-style models where `softmax` and normalization stay on host.
 
-4. Old `A/B/C/BIAS` role semantics are still present in lowering.
+5. Old `A/B/C/BIAS` role semantics are still present in lowering.
 - The new compiler IR is logical-first.
 - The lowering bridge still maps tensors into old backend roles.
 - This is acceptable as a migration bridge, but it must remain quarantined to lowering.
 
-5. Packing/layout transforms are not yet first-class IR.
+6. Packing/layout transforms are not yet first-class IR.
 - Current v1 correctness path is: read packed output -> materialize logical tensor -> repack for next segment.
 - That is semantically clean, but not the final optimized story.
 - We still need explicit layout-transform semantics if we want robust direct segment-to-segment reuse later.
 
-6. Current simulator inspection proves packed output correctness only for the supported narrow path.
+7. Current simulator inspection proves packed output correctness only for the supported narrow path.
 - We can now compare expected packed vectors vs actual UB vectors on RTL for simple segmented matmul chains.
 - This does not yet cover broader op classes or host-op re-entry.
 
-7. Real PyTorch model integration will likely require quant/dequant-style semantics.
-- Most real PyTorch models will not call `npu_matmul(...)` directly.
-- The current explicit helper is a bridge for exported workloads and controlled tests, not the final frontend contract.
-- For broader model support, the compiler will likely need to consume quant/dequant stubs, fake-quant nodes, or equivalent FX-visible quantization markers.
-- That is how normal PyTorch graphs can carry quantization boundaries, activation scales, and re-entry expectations without bespoke NPU-only helper calls at every layer.
+8. Real PyTorch model integration still needs a dedicated quantization toolkit layer.
+- Most real PyTorch models will not call `npu_matmul(...)` directly, and they should not need to.
+- We need a PyTorch-side preparation pipeline that owns:
+  - PTQ / QAT setup
+  - calibration
+  - sensitivity analysis
+  - conversion into a compiler-supported quantized inference graph
+- That toolkit should become `tinynpu_quant`, not stay trapped in a monolithic MNIST script.
+
+### 10.12 True Capabilities Right Now
+
+The document should reflect what is actually proven, not just what is planned.
+
+Current proven JIT/compiler/runtime capabilities:
+- segmented runtime-plan IR (`NpuSegment`, `HostOp`, `VerifyTensor`)
+- compiler-owned expected tensors and runtime-owned verification
+- host-emulation backend
+- simulator backend with packed vector capture
+- explicit verification boundaries via `mark_for_verify(...)`
+- explicit host quant/dequant boundaries
+- export-backed MNIST conv/fc execution on the new path
+- full exported MNIST chain on RTL matching the old path
+- ordinary quantized `torch.ao.nn.quantized.Linear` lowered to TinyNPU and validated on RTL
+- ordinary quantized `torch.ao.nn.quantized.Conv2d` lowered through host `im2col` and validated in host emulation
+- structured runtime debug trace showing:
+  - host quantize / dequantize
+  - host im2col / layout restore
+  - NPU segment inputs / outputs
+  - verification points
+
+Current non-capabilities:
+- arbitrary PyTorch float models are not automatically prepared for TinyNPU
+- arbitrary FX quantization forms are not supported
+- asymmetric zero-point NPU segments are not supported
+- transformer attention is not a first-class supported workload yet
+- attention-softmax / normalization / residual-style mixed graphs will still rely on explicit host fallback boundaries
+
+### 10.13 `tinynpu_quant` Plan
+
+The next major layer should be a PyTorch-side quantization toolkit living alongside the compiler, not inside a single script.
+
+Target responsibilities:
+- define TinyNPU-supported quantization contracts
+- prepare PyTorch models for PTQ or QAT
+- run calibration
+- run sensitivity analysis
+- convert a trained/prepared model into a compiler-supported quantized inference graph
+- share fused-parameter math with the compiler/runtime (`multiplier` / `shift` synthesis)
+
+Near-term migration path from `quant-by-claude.py`:
+1. move shared fused-parameter math into `tinynpu_quant`
+2. extract reusable QAT/PTQ utilities from the script into package modules
+3. keep model-specific MNIST code thin and outside the shared quant toolkit
+4. converge the toolkit output with what `compile_module(...)` expects
+
+### 10.14 Transformer Constraint
+
+Transformer-style models should stay in design scope even while near-term validation is CNN/MLP-heavy.
+
+Implications:
+- `softmax` and normalization are host-fallback-critical ops unless hardware changes later
+- quantize -> dequantize -> host op -> requantize boundaries must be first-class and inspectable
+- QKV projections and FFN matmuls are natural TinyNPU segment candidates
+- sensitivity analysis must eventually reason about mixed placement, not just per-layer bit width
+- debug tooling must expose boundary tensors clearly because attention failures are numerically subtle
+
+### 10.15 Immediate Next Steps
+
+This section is here so the project can survive context compaction without losing the real sequence.
+
+Short-term execution order:
+1. Continue extracting `quant-by-claude.py` into `tinynpu_quant`.
+   - next concrete extraction targets:
+     - fake-quant utilities
+     - layer quant-config objects
+     - calibration helpers
+     - sensitivity-analysis helpers
+2. Keep `quant-by-claude.py` as a thin model-specific workflow script that imports shared logic from `tinynpu_quant`.
+3. Define one compiler-supported prepared-model contract for PyTorch quantization.
+   - near-term target: standard quantized `torch.ao` modules plus explicit quant/dequant boundaries
+   - training-time custom modules are not the compiler contract unless we explicitly choose to support them
+4. Add a dedicated RTL smoke test for the ordinary quantized `Conv2d` frontend path.
+5. After the quant toolkit is more complete, teach `compile_module(...)` to accept the prepared output of that toolkit directly.
+
+Guardrails for the next steps:
+- do not claim support for asymmetric zero-point NPU segments unless the hardware path is real
+- keep transformer-like mixed host/NPU graphs in scope while designing the quant toolkit APIs
+- do not duplicate fused-parameter math in scripts again; shared quant math must stay in `tinynpu_quant`
