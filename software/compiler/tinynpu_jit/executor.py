@@ -164,18 +164,15 @@ class HostEmulationExecutor:
             dims = step.attrs.get("dim")
             axis = None if dims is None else tuple(int(dim) for dim in dims)
             keepdim = bool(step.attrs.get("keepdim", False))
-            quant = step.attrs.get("quantization")
-            if quant is not None:
-                values[step.outputs[0]] = self.golden.quantized_mean(
+            input_quant = step.attrs.get("input_quantization")
+            if input_quant is not None:
+                source = self.golden.dequantize(
                     source,
-                    axis=axis,
-                    keepdims=keepdim,
-                    zero_point=int(quant.get("zero_point", 0)),
-                    out_dtype=quant["dtype"],
+                    scale=float(input_quant["scale"]),
+                    zero_point=int(input_quant.get("zero_point", 0)),
                 )
-            else:
-                mean_value = np.mean(source.astype(np.float32), axis=axis, keepdims=keepdim)
-                values[step.outputs[0]] = mean_value.astype(np.float32)
+            mean_value = np.mean(source.astype(np.float32), axis=axis, keepdims=keepdim)
+            values[step.outputs[0]] = mean_value.astype(np.float32)
             return
         if step.kind == "alias":
             values[step.outputs[0]] = np.array(values[step.inputs[0]], copy=True)

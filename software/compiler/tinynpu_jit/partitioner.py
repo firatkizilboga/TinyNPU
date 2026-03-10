@@ -152,6 +152,63 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             if tensors[name].data is not None:
                 tensors[name].data = np.array(value, copy=True)
 
+    def ensure_quantized_input(
+        source_name: str,
+        *,
+        target_name: str,
+        scale: float,
+        zero_point: int,
+        dtype: DType,
+    ) -> str:
+        quant = tensors[source_name].metadata.get("quantization")
+        if quant is not None:
+            require_symmetric_quantization(quant, tensor_name=source_name)
+            source_dtype = parse_dtype(quant["dtype"])
+            if (
+                source_dtype == dtype
+                and int(quant.get("zero_point", 0)) == int(zero_point)
+                and abs(float(quant["scale"]) - float(scale)) <= 1e-12
+            ):
+                return source_name
+
+        flush_segment()
+        quant_name = target_name
+        quantized = golden.quantize(
+            env[source_name],
+            scale=float(scale),
+            zero_point=int(zero_point),
+            out_dtype=dtype,
+        )
+        steps.append(
+            HostOp(
+                name=quant_name,
+                kind="quantize",
+                inputs=[source_name],
+                outputs=[quant_name],
+                attrs={
+                    "scale": float(scale),
+                    "zero_point": int(zero_point),
+                    "dtype": dtype,
+                },
+            )
+        )
+        env[quant_name] = np.array(quantized, copy=True)
+        tensors[quant_name] = TensorSpec(
+            name=quant_name,
+            shape=normalize_shape(env[quant_name].shape),
+            dtype=dtype,
+            kind=TensorKind.INTERMEDIATE,
+            metadata={
+                "quantization": {
+                    "scale": float(scale),
+                    "zero_point": int(zero_point),
+                    "dtype": dtype.value,
+                }
+            },
+        )
+        expected_tensors[quant_name] = np.array(env[quant_name], copy=True)
+        return quant_name
+
     def quantized_weight_params(module_name: str, weight_qtensor: Any) -> tuple[np.ndarray, DType, float]:
         qscheme = weight_qtensor.qscheme()
         if qscheme not in {torch.per_tensor_affine, torch.per_tensor_symmetric}:
@@ -543,6 +600,13 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
         expected_tensors[out_name] = np.array(final_value, copy=True)
 
     def lower_compiler_ready_linear(module_name: str, module: Any, source_name: str, out_name: str) -> None:
+        source_name = ensure_quantized_input(
+            source_name,
+            target_name=f"{out_name}_quant_in",
+            scale=float(module.input_scale),
+            zero_point=0,
+            dtype=parse_dtype(module.in_dtype),
+        )
         input_quant = quant_metadata(source_name)
         input_dtype = parse_dtype(input_quant["dtype"])
         module_in_dtype = parse_dtype(module.in_dtype)
@@ -698,6 +762,13 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             expected_tensors[out_name] = np.array(restored, copy=True)
 
     def lower_compiler_ready_conv2d(module_name: str, module: Any, source_name: str, out_name: str) -> None:
+        source_name = ensure_quantized_input(
+            source_name,
+            target_name=f"{out_name}_quant_in",
+            scale=float(module.input_scale),
+            zero_point=0,
+            dtype=parse_dtype(module.in_dtype),
+        )
         input_quant = quant_metadata(source_name)
         input_dtype = parse_dtype(input_quant["dtype"])
         module_in_dtype = parse_dtype(module.in_dtype)
@@ -1261,37 +1332,32 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                 dims = [int(dim) for dim in dims]
             keepdim = bool(node.kwargs.get("keepdim", False))
             quant = tensors[source].metadata.get("quantization")
+            source_value = np.array(env[source], dtype=np.float32)
+            attrs = {"dim": dims, "keepdim": keepdim}
+            if quant is not None:
+                require_symmetric_quantization(quant, tensor_name=source)
+                attrs["input_quantization"] = {
+                    "scale": float(quant["scale"]),
+                    "zero_point": int(quant.get("zero_point", 0)),
+                    "dtype": str(quant["dtype"]),
+                }
+                source_value = golden.dequantize(
+                    env[source],
+                    scale=float(quant["scale"]),
+                    zero_point=int(quant.get("zero_point", 0)),
+                )
             mean_value = np.mean(
-                np.array(env[source], dtype=np.float32),
+                source_value,
                 axis=None if dims is None else tuple(dims),
                 keepdims=keepdim,
             )
-            out_dtype = DType.FLOAT32
-            metadata = {}
-            attrs = {"dim": dims, "keepdim": keepdim}
-            if quant is not None:
-                out_dtype = parse_dtype(quant["dtype"])
-                attrs["quantization"] = {
-                    "scale": float(quant["scale"]),
-                    "zero_point": int(quant.get("zero_point", 0)),
-                    "dtype": out_dtype,
-                }
-                mean_value = golden.quantized_mean(
-                    env[source],
-                    axis=None if dims is None else tuple(dims),
-                    keepdims=keepdim,
-                    zero_point=int(quant.get("zero_point", 0)),
-                    out_dtype=out_dtype,
-                )
-                metadata = {"quantization": dict(quant)}
             steps.append(HostOp(name=node.name, kind="mean", inputs=[source], outputs=[node.name], attrs=attrs))
             env[node.name] = np.array(mean_value, copy=True)
             tensors[node.name] = TensorSpec(
                 name=node.name,
                 shape=normalize_shape(env[node.name].shape),
-                dtype=out_dtype,
+                dtype=DType.FLOAT32,
                 kind=TensorKind.INTERMEDIATE,
-                metadata=metadata,
             )
             expected_tensors[node.name] = np.array(env[node.name], copy=True)
             continue

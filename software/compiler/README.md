@@ -73,7 +73,8 @@ Current limitation:
 - `torch` is an optional dependency and is not bundled by this repository today
 - the simulator backend is exercised on the segmented matmul path, full exported MNIST chain, and ordinary quantized `Linear`; broader mixed-op coverage is still incomplete
 - ordinary float `nn.Linear` / `nn.Conv2d` are not yet the trusted frontend contract; current trusted direct frontend is explicit quantized `torch.ao` modules plus export-backed helpers
-- fresh trained-model host/RTL parity is validated on the new MNIST pipeline path, but compiled fidelity against the originating PyTorch QAT model is still an active bug
+- fresh trained-model host/RTL parity is validated on the new MNIST pipeline path
+- the fresh MNIST pipeline now calibrates the `conv3 -> mean` host boundary instead of blindly reusing the FC input scale; this restores compiled-host accuracy to near-QAT quality on the validated slice
 - the legacy `tinynpu/` package remains in place during migration
 
 Open risks:
