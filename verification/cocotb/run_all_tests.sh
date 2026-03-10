@@ -84,6 +84,15 @@ cd $COCOTB_DIR
 NPU_FILE=complex_chain.npu make -f Makefile.npu > /dev/null 2>&1
 echo "✅ complex_chain.npu: PASSED"
 
+# Test 9: MNIST Full Pipeline (Layer-by-layer compile+run+verify)
+if [ -f "../../npu_export/manifest.json" ] && [ -f "../../mnist_sample.npy" ]; then
+echo "📂 Running: test_mnist.py"
+MODULE=test_mnist make -f Makefile.npu > /dev/null 2>&1
+echo "✅ test_mnist.py: PASSED"
+else
+echo "ℹ️ Skipping test_mnist.py (missing npu_export/manifest.json or mnist_sample.npy)"
+fi
+
 echo "--------------------------------------------------------"
 echo "🎉 ALL TESTS PASSED SUCCESSFULLY!"
 echo "--------------------------------------------------------"
