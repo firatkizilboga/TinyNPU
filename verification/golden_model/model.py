@@ -89,7 +89,7 @@ class GoldenModel:
             for n in range(N):
                 # Logical PPU emulation (ignoring packing for logical output)
                 # We reuse the logic but return the clipped value directly
-                val = self._logical_ppu(acc_matrix[m, n], bias[m], multiplier, shift, activation, out_precision)
+                val = self._logical_ppu(acc_matrix[m, n], bias[n], multiplier, shift, activation, out_precision)
                 output[m, n] = val
                 
         return output
