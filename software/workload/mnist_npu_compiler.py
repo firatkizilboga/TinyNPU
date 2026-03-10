@@ -104,3 +104,45 @@ def compile_mnist_layer(name, layer_info, input_data, export_dir='./mnist_mixed_
     prog.halt()
     prog.compile()
     return prog
+
+
+def compile_mnist_layer_jit(name, layer_info, input_data, export_dir='./mnist_mixed_export'):
+    """
+    Compile a supported MNIST layer through the new PyTorch-facing JIT path.
+
+    Current support is intentionally narrow:
+    - linear layers only
+    - explicit matmul + bias lowering
+    """
+    try:
+        import torch
+        import torch.nn as nn
+    except Exception as exc:
+        raise ImportError("torch is required for compile_mnist_layer_jit().") from exc
+
+    from tinynpu_jit import compile_module
+
+    a_bits = layer_info.get('a_bits', 16)
+    input_hw = prepare_activation_for_hw(input_data, a_bits)
+
+    if layer_info['type'] != 'linear':
+        raise NotImplementedError(
+            f"JIT MNIST path currently supports only linear layers, got {layer_info['type']!r}."
+        )
+
+    w = np.load(os.path.join(export_dir, f"{name}_weights.npy")).astype(np.int16)
+    b = np.load(os.path.join(export_dir, f"{name}_bias.npy")).astype(np.int32)
+
+    class ExportedLinearModule(nn.Module):
+        def __init__(self, weight, bias):
+            super().__init__()
+            self.weight = nn.Parameter(torch.tensor(weight.astype(np.float32)), requires_grad=False)
+            self.bias = nn.Parameter(torch.tensor(bias.astype(np.float32)), requires_grad=False)
+
+        def forward(self, x):
+            y = torch.matmul(self.weight, x)
+            return y + self.bias.reshape(-1, 1)
+
+    module = ExportedLinearModule(w, b)
+    example = torch.tensor(input_hw.astype(np.float32))
+    return compile_module(module, (example,))

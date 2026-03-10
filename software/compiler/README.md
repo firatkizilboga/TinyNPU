@@ -2,6 +2,48 @@
 
 A Python-based compiler for the TinyNPU architecture.
 
+## New Segmented JIT Path
+
+The repository now also contains a new experimental compiler/runtime path under `tinynpu_jit/`.
+
+This path is designed around:
+- PyTorch/FX as the frontend
+- segmented execution plans instead of whole-program lowering
+- explicit `HostOp(...)` boundaries for unsupported ops
+- compiler-owned expected tensors for runtime verification
+- `mark_for_verify(...)` as a host-visible verification boundary
+
+Current scope:
+- TinyNPU lowering: explicit `matmul`, with early `nn.Linear` frontend scaffolding
+- host-emulation runtime for compile/run/verify validation
+- async simulator runtime entrypoint that targets the existing cocotb driver path
+- deterministic compile behavior with explicit failure if a segment exceeds UB capacity
+
+Key entry points:
+
+```python
+from tinynpu_jit import compile_module, mark_for_verify
+
+# compile_module(...) requires torch to be installed locally
+# mark_for_verify(...) is intended to let users request runtime-visible
+# verification points in the execution plan. In v1 it forces a segment
+# boundary so the tensor can be materialized and checked on the host.
+```
+
+Examples:
+- `example_segmented_jit.py`: manual execution-plan construction
+- `example_torch_jit.py`: traced PyTorch module with `mark_for_verify(...)`
+- `software/workload/mnist_npu_compiler.py::compile_mnist_layer_jit(...)`: FC-layer MNIST export example on the new PyTorch JIT path
+
+Simulator smoke test:
+- `cd verification/cocotb && MODULE=test_jit_runtime make -f Makefile.npu`
+
+Current limitation:
+- `torch` is an optional dependency and is not bundled by this repository today
+- the simulator backend is wired at the runtime layer but has not been exercised in this workspace yet
+- standard PyTorch `nn.Linear` row-major normalization is not fully hardened yet; the traced frontend is currently validated on explicit `torch.matmul`
+- the legacy `tinynpu/` package remains in place during migration
+
 ## Usage
 
 ```python

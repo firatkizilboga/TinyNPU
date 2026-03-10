@@ -12,6 +12,12 @@ echo "🚀 Starting TinyNPU All-Tests Suite..."
 # Ensure clean start
 rm -f results.xml
 
+# Test 0: Segmented JIT Runtime (two NPU segments with runtime repack between them)
+echo "📂 Running: test_jit_runtime.py"
+cd $COCOTB_DIR
+MODULE=test_jit_runtime make -f Makefile.npu > /dev/null 2>&1
+echo "✅ test_jit_runtime.py: PASSED"
+
 # Test 1: Simple Chain
 echo "📂 Running: simple_chain.npu"
 cd $WORKLOAD_DIR

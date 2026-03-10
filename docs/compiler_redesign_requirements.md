@@ -210,3 +210,144 @@ Phase 3:
 6. Memory planning default: prioritize deterministic addresses or compact footprint?
 7. PyTorch integration depth for v1: exporter-only or include graph capture helpers?
 8. Should we make a strict "supported invocation matrix" and fail closed outside it, or attempt best-effort execution?
+
+## 10. Decision Log (2026-03-10)
+
+### 10.1 Initial Execution Model: Segmented Compile/Run
+
+We will start with a segmented execution model because it is materially easier to implement and validate than a full whole-program compiler, while still creating the right long-term architecture.
+
+Concretely, the compiler will:
+- trace a PyTorch module or subgraph
+- identify which operations are supported by TinyNPU
+- group consecutive supported operations into explicit TinyNPU execution segments
+- represent unsupported operations as explicit host-executed steps in the runtime plan
+
+Example:
+- PyTorch graph: `linear1 -> relu -> softmax -> linear2`
+- Compiled runtime plan: `NpuSegment([linear1, relu]) -> HostOp(softmax) -> NpuSegment([linear2])`
+
+This is what was previously referred to in planning discussion as `Option A`.
+
+Why we are starting here:
+- avoids solving full-program allocation/scheduling first
+- allows a usable PyTorch frontend sooner
+- enables explicit host/NPU boundaries for unsupported ops
+- keeps the path open to whole-program compilation later
+
+This does not mean the architecture will be throwaway. The plan/IR should still be designed so that multiple segments can later be merged into a larger whole-program flow.
+
+### 10.2 Frontend Direction: PyTorch-First, Not a Device Backend
+
+PyTorch is the authoring and tracing frontend. The first implementation is not a `torch.device("tinynpu")` backend.
+
+Instead, the compiler/runtime flow will be:
+- `compile_module(model, example_inputs)`
+- produce a compiled execution plan
+- runtime executes that plan on host-emulation or simulator backends
+
+So PyTorch defines the program, but execution still goes through TinyNPU software/runtime artifacts, not through direct PyTorch device dispatch.
+
+### 10.3 Initial NPU Lowering Scope
+
+The first TinyNPU lowering pass will support only:
+- `linear`
+- `matmul`
+
+Other operations, including `conv2d`, will be deferred until the segmented compiler/runtime path is stable end-to-end.
+
+### 10.4 Unsupported Ops Become Explicit Runtime Plan Nodes
+
+Unsupported ops such as `softmax` and `sigmoid` will not be handled implicitly.
+
+Instead, the partitioner will generate explicit runtime plan nodes such as:
+- `HostOp(kind="softmax")`
+- `HostOp(kind="sigmoid")`
+
+Runtime behavior for such a boundary will be:
+- run preceding TinyNPU segment
+- read the segment output tensor back into logical form
+- execute the host op on CPU
+- quantize/re-encode the result for the next TinyNPU segment
+- continue execution
+
+Fallback must always be explicit in the plan, never silent.
+
+### 10.5 Memory Planning Policy
+
+For v1, memory planning will be deterministic only.
+
+Compiler behavior must be:
+- produce a legal deterministic plan for the target UB/IM limits, or
+- fail compilation explicitly
+
+Forbidden behavior:
+- silent overflow
+- wraparound
+- accidental address aliasing
+- best-effort remapping that changes semantics without surfacing it
+
+### 10.6 Verification Architecture
+
+Verification is part of the runtime/execution-plan layer, not the RTL ISA layer.
+
+There are two instruction layers:
+- hardware ISA instructions executed by TinyNPU (`MATMUL`, `MOVE`, `HALT`)
+- runtime-plan instructions executed by the host/runtime (`RunNpuSegment`, `RunHostOp`, `VerifyTensor`, etc.)
+
+Compiler responsibilities:
+- compute expected tensors using a shared golden-model API
+- store those expected tensors in the compiled artifact
+- emit verify points in the runtime plan
+
+Runtime responsibilities:
+- execute NPU and host steps in order
+- execute verification steps when verification is enabled
+- use the compiler-produced expected tensors for comparisons
+
+### 10.7 Verification Policy
+
+Normal runtime mode:
+- verify nothing by default
+- runtime trusts the NPU unless verification is explicitly enabled
+
+Debug verification mode:
+- verify final outputs
+- verify any tensors explicitly flagged by the user for checking
+
+Verification points must therefore be user-annotatable.
+
+### 10.8 Verification Targeting Semantic
+
+Users need a semantic way to flag tensors/vectors for verification.
+
+Current direction:
+- expose a PyTorch-facing helper such as `mark_for_verify(tensor, "label")`
+- compiler preserves that intent into the execution plan
+- in v1, `mark_for_verify(...)` forces a segment boundary so the tensor is materialized at the host/runtime layer
+- runtime verifies flagged tensors when debug verification is enabled
+
+Compiler should reject impossible verification requests clearly if a flagged tensor cannot be materialized at the requested point.
+
+### 10.9 Scope Constraints
+
+This work is intentionally scoped to software only:
+- no RTL edits
+- compiler/runtime/orchestration changes only
+- focus area is `software/compiler` and related software-side integration
+
+### 10.10 Planned Implementation Order
+
+1. Document the new segmented compiler/runtime design in-repo.
+2. Add a new PyTorch-facing compiler path alongside the current compiler.
+3. Implement FX capture, logical plan types, capability checker, and partitioner.
+4. Implement host-emulation execution first for validation.
+5. Add simulator runtime integration using the same execution plan.
+6. Extend op coverage after `linear` / `matmul` is stable.
+
+Open follow-on work remains for:
+- whole-program compilation
+- more advanced memory planning
+- broader op coverage
+- richer fallback semantics
+- eventual direct PyTorch/backend integration if we decide to build that later
