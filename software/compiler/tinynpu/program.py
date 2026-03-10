@@ -91,6 +91,9 @@ class TinyNPUProgram:
         if a_name not in self.symbols: raise ValueError(f"Symbol '{a_name}' not found.")
         if b_name not in self.symbols: raise ValueError(f"Symbol '{b_name}' not found.")
         A, B = self.symbols[a_name], self.symbols[b_name]
+        # Ensure correct storage roles for hardware packing
+        A.storage_role = 'A'
+        B.storage_role = 'B'
         if A.shape[1] != B.shape[0]: raise ValueError(f"Dimension mismatch: {A.shape} and {B.shape}")
         if out_name not in self.symbols:
             out_shape = (A.shape[0], B.shape[1])
@@ -99,9 +102,12 @@ class TinyNPUProgram:
             # Update existing symbol to reflect it's now a MATMUL output
             self.symbols[out_name].storage_role = 'C'
             self.symbols[out_name].precision = out_precision
-        if bias_name and bias_name not in self.symbols:
-            bias_shape = (1, B.shape[1])
-            self.symbols[bias_name] = Symbol(bias_name, bias_shape, PrecisionMode.INT16, role='BIAS')
+        if bias_name:
+            if bias_name not in self.symbols:
+                bias_shape = (1, B.shape[1])
+                self.symbols[bias_name] = Symbol(bias_name, bias_shape, PrecisionMode.INT16, role='BIAS')
+            else:
+                self.symbols[bias_name].storage_role = 'BIAS'
         instr = MatMul(a_name, b_name, out_name, bias_name, shift, multiplier, activation, in_precision, out_precision, write_offset)
         p_in = 1 << (2 - in_precision)
         instr.m = (A.shape[0] + self.array_size - 1) // self.array_size
