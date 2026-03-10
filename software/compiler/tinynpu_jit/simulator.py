@@ -23,6 +23,9 @@ class SimulatorExecutor:
         # Weight-persistence state: id() of the artifact whose static weights
         # are currently resident in the hardware UB.  None = nothing preloaded.
         self._preloaded_artifact_id: int | None = None
+        # Cumulative count of UB word writes issued to hardware.
+        # Compare before/after to measure weight-persistence savings.
+        self.ub_words_written: int = 0
 
     def _resolve_handle(self, root: Any, path: tuple[str, ...]) -> Any | None:
         current = root
@@ -96,6 +99,8 @@ class SimulatorExecutor:
             dut.rst_n.value = 0
             await ClockCycles(dut.clk, 5)
             dut.rst_n.value = 1
+            # Hardware reset wipes UB state — must reload static weights.
+            self._preloaded_artifact_id = None
         self._configure_ppu_capture(dut, enabled=ppu_capture, Force=Force, Release=Release)
 
         # Auto-preload static weights on first run with this artifact.
@@ -233,6 +238,7 @@ class SimulatorExecutor:
             await driver.write_reg(dut, driver.REG_ADDR, addr, 16)
             await driver.write_reg(dut, driver.REG_CMD, 0x01, 8)
             await driver.write_reg(dut, driver.REG_MMVR, word, self.buffer_width)
+            self.ub_words_written += 1
 
     async def _overlay_runtime_inputs(
         self,
@@ -269,6 +275,7 @@ class SimulatorExecutor:
                 await driver.write_reg(dut, driver.REG_ADDR, symbol["addr"] + offset, 16)
                 await driver.write_reg(dut, driver.REG_CMD, 0x01, 8)
                 await driver.write_reg(dut, driver.REG_MMVR, int(word), self.buffer_width)
+                self.ub_words_written += 1
         return writes
 
     async def _load_im_image(self, dut: Any, driver: Any, instructions: list[int]) -> None:

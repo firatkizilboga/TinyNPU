@@ -404,6 +404,8 @@ def plan_program_memory(
     # global address, so it's loaded once and accessed from any segment.
 
     roles_by_seg: dict[str, dict[str, str]] = {}
+    # tensor_name -> {seg_name -> role}  — used for cross-segment role validation
+    const_roles_by_seg: dict[str, dict[str, str]] = defaultdict(dict)
     first_role: dict[str, tuple[str, str]] = {}   # tensor_name -> (seg_name, role)
 
     for seg in segments:
@@ -411,8 +413,25 @@ def plan_program_memory(
         roles_by_seg[seg.name] = roles
         for name, role in roles.items():
             spec = plan.tensors.get(name)
-            if spec is not None and spec.kind == TensorKind.CONSTANT and name not in first_role:
-                first_role[name] = (seg.name, role)
+            if spec is not None and spec.kind == TensorKind.CONSTANT:
+                const_roles_by_seg[name][seg.name] = role
+                if name not in first_role:
+                    first_role[name] = (seg.name, role)
+
+    # A constant tensor packed for role B (weight matrix) has a completely
+    # different physical layout than the same data packed for role A.  If
+    # two segments consume the same constant with different roles the single
+    # static_ub_image would serve the wrong layout to at least one of them.
+    # Fail early with a clear diagnostic rather than producing wrong results.
+    for name, seg_roles in const_roles_by_seg.items():
+        distinct = set(seg_roles.values())
+        if len(distinct) > 1:
+            detail = ", ".join(f"{seg}→{role}" for seg, role in sorted(seg_roles.items()))
+            raise ValueError(
+                f"Constant tensor '{name}' is used with different hardware roles "
+                f"across segments ({detail}).  Each constant must have the same "
+                f"role in every segment for static weight persistence to be valid."
+            )
 
     static_entries: dict[str, MemoryPlanEntry] = {}
     static_addr = 0
