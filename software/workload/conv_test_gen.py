@@ -3,7 +3,8 @@ import sys
 import os
 
 # Add compiler to path
-sys.path.append(os.path.join(os.getcwd(), "software/compiler"))
+script_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(os.path.join(script_dir, "../compiler"))
 from tinynpu import TinyNPUProgram, PrecisionMode
 
 def generate_conv_test():
@@ -41,9 +42,9 @@ def generate_conv_test():
                 val = np.sum(patch.astype(np.int64) * kernel.astype(np.int64)) + bias_data[0, oc]
                 expected_output[y, x, oc] = val
 
-    # Flatten expected output to match Matrix C format (OC, OH*OW)
-    # The matmul produces Output(OC, OH*OW)
-    expected_matrix = expected_output.transpose(2, 0, 1).reshape(OC, -1).astype(np.int16)
+    # Matmul output layout is (OH*OW, OC): each row is one spatial position,
+    # each column is one output channel.
+    expected_matrix = expected_output.reshape(-1, OC).astype(np.int16)
     prog.add_expected_result("Output", expected_matrix)
 
     output_path = "conv_test.npu"

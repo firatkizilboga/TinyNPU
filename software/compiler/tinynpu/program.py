@@ -65,7 +65,13 @@ class TinyNPUProgram:
     def declare_data(self, name, data, precision=PrecisionMode.INT16, role='A'):
         if name in self.symbols:
             raise ValueError(f"Symbol '{name}' already declared.")
-        arr = np.array(data, dtype=np.int16)
+        if role == 'BIAS':
+            arr = np.array(data)
+            if np.any(arr > np.int64(0x7FFFFFFF)) or np.any(arr < np.int64(-0x80000000)):
+                raise ValueError(f"Bias symbol '{name}' contains values outside signed 32-bit range.")
+            arr = arr.astype(np.int32)
+        else:
+            arr = np.array(data, dtype=np.int16)
         if len(arr.shape) != 2:
             raise ValueError(f"Symbol '{name}' must be a 2D matrix.")
         self.symbols[name] = Symbol(name, arr.shape, precision, role=role, data=arr)
@@ -91,9 +97,12 @@ class TinyNPUProgram:
         if a_name not in self.symbols: raise ValueError(f"Symbol '{a_name}' not found.")
         if b_name not in self.symbols: raise ValueError(f"Symbol '{b_name}' not found.")
         A, B = self.symbols[a_name], self.symbols[b_name]
-        # Ensure correct storage roles for hardware packing
-        A.storage_role = 'A'
-        B.storage_role = 'B'
+        # Keep generated/output tensors in Role C to preserve verification semantics.
+        # Only coerce source tensors that are not Role C.
+        if A.storage_role != 'C':
+            A.storage_role = 'A'
+        if B.storage_role != 'C':
+            B.storage_role = 'B'
         if A.shape[1] != B.shape[0]: raise ValueError(f"Dimension mismatch: {A.shape} and {B.shape}")
         if out_name not in self.symbols:
             out_shape = (A.shape[0], B.shape[1])
@@ -130,12 +139,12 @@ class TinyNPUProgram:
             for x in range(0, W + 2*padding - KW + 1, stride):
                 patch = img_data[y:y+KH, x:x+KW, :]
                 col_matrix.append(patch.transpose(2, 0, 1).flatten())
-        col_matrix = np.array(col_matrix, dtype=np.int16).T # (K, HW)
-        kernel_matrix = ker_sym.data.reshape(-1, OC).T # (OC, K)
+        col_matrix = np.array(col_matrix, dtype=np.int16) # (HW, K)
+        kernel_matrix = ker_sym.data.reshape(-1, OC) # (K, OC)
         col_sym_name, ker_flat_name = f"_{image_name}_im2col", f"_{kernel_name}_flat"
-        self.declare_data(ker_flat_name, kernel_matrix, precision=in_precision, role='A')
-        self.declare_data(col_sym_name, col_matrix, precision=in_precision, role='B')
-        self.matmul(ker_flat_name, col_sym_name, out_name, bias_name=bias_name, shift=shift, multiplier=multiplier, activation=activation, in_precision=in_precision, out_precision=out_precision)
+        self.declare_data(col_sym_name, col_matrix, precision=in_precision, role='A')
+        self.declare_data(ker_flat_name, kernel_matrix, precision=in_precision, role='B')
+        self.matmul(col_sym_name, ker_flat_name, out_name, bias_name=bias_name, shift=shift, multiplier=multiplier, activation=activation, in_precision=in_precision, out_precision=out_precision)
         self.symbols[out_name].dims = (OH, OW, OC)
 
     def move(self, src_name, dest_name):

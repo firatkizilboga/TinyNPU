@@ -55,11 +55,15 @@ def generate_precision_chain_test():
     # --- Golden Model ---
     def layer_op(a, w, b, shift, mult, out_prec):
         acc = np.matmul(a.astype(np.int64), w.astype(np.int64)) + b.astype(np.int64)
-        val = (acc * mult) >> shift
+        rescaled = acc * mult
+        if shift > 0:
+            rounding_offset = 1 << (shift - 1)
+            val = (rescaled + rounding_offset) >> shift
+        else:
+            val = rescaled
         
         if out_prec == PrecisionMode.INT16:
-            # Wrap to 16-bit
-            return (val & 0xFFFF).astype(np.uint16)
+            return np.clip(val, -32768, 32767).astype(np.int16)
         elif out_prec == PrecisionMode.INT8:
             val = np.clip(val, -128, 127)
             return val.astype(np.int16)
