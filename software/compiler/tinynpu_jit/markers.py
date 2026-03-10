@@ -11,9 +11,19 @@ def mark_for_verify(tensor, label: str | None = None):
     return tensor
 
 
+def quantize_for_npu(
+    tensor,
+    scale: float,
+    zero_point: int = 0,
+    dtype: str = "int16",
+):
+    return tensor
+
+
 try:
     import torch.fx  # type: ignore
 
     torch.fx.wrap("mark_for_verify")
+    torch.fx.wrap("quantize_for_npu")
 except Exception:
     pass

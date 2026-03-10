@@ -21,6 +21,8 @@ class SegmentArtifact:
 class ExecutionResult:
     tensors: dict[str, np.ndarray]
     verified: list[str] = field(default_factory=list)
+    trace_tensors: dict[str, np.ndarray] = field(default_factory=dict)
+    vector_captures: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -39,3 +41,8 @@ class CompiledArtifact:
         from .runtime import run
 
         return run(self, inputs, verification=verification, **kwargs)
+
+    def inspect(self, inputs: dict[str, np.ndarray], **kwargs) -> str:
+        from .inspect import inspect_artifact
+
+        return inspect_artifact(self, inputs, **kwargs)

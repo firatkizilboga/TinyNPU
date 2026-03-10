@@ -47,6 +47,37 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             value = value.numpy()
         return np.array(value)
 
+    def parse_dtype(name: str) -> DType:
+        normalized = str(name).lower()
+        mapping = {
+            "int4": DType.INT4,
+            "int8": DType.INT8,
+            "int16": DType.INT16,
+            "int32": DType.INT32,
+            "float32": DType.FLOAT32,
+        }
+        if normalized not in mapping:
+            raise ValueError(f"Unsupported dtype annotation {name!r}.")
+        return mapping[normalized]
+
+    def coerce_npu_tensor(name: str) -> np.ndarray:
+        value = np.array(env[name], copy=False)
+        if np.issubdtype(value.dtype, np.integer):
+            return value.astype(np.int16, copy=False)
+        rounded = np.rint(value)
+        if np.allclose(value, rounded, rtol=0.0, atol=1e-6):
+            coerced = rounded.astype(np.int16)
+            env[name] = coerced
+            if name in tensors and tensors[name].dtype == DType.FLOAT32:
+                tensors[name].dtype = DType.INT16
+                if tensors[name].data is not None:
+                    tensors[name].data = np.array(coerced, copy=True)
+            return coerced
+        raise NotImplementedError(
+            f"Tensor '{name}' is floating-point at an NPU boundary. "
+            "Insert quantize_for_npu(...) before feeding it into a TinyNPU segment."
+        )
+
     modules = dict(graph_module.named_modules())
 
     def flush_segment() -> None:
@@ -107,7 +138,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                 bias_name = f"{node.name}_bias"
                 tensors[bias_name] = TensorSpec(bias_name, normalize_shape(bias.shape), DType.INT32, TensorKind.CONSTANT, data=bias)
                 current_inputs.add(bias_name)
-            rhs = env[rhs_name].astype(np.int64)
+            rhs = coerce_npu_tensor(rhs_name)
             expected = golden.matmul(weight, rhs, bias=tensors[bias_name].data if bias_name else None)
             env[out_name] = expected.astype(np.int32)
             tensors[out_name] = TensorSpec(out_name, normalize_shape(expected.shape), DType.INT16, TensorKind.INTERMEDIATE)
@@ -124,7 +155,9 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             rhs_name = rhs_node.name
             out_name = node.name
             current_inputs.update({lhs_name, rhs_name})
-            expected = golden.matmul(env[lhs_name], env[rhs_name])
+            lhs_value = coerce_npu_tensor(lhs_name)
+            rhs_value = coerce_npu_tensor(rhs_name)
+            expected = golden.matmul(lhs_value, rhs_value)
             env[out_name] = expected.astype(np.int32)
             tensors[out_name] = TensorSpec(out_name, normalize_shape(expected.shape), DType.INT16, TensorKind.INTERMEDIATE)
             current_ops.append(MatMulOp(name=node.name, lhs=lhs_name, rhs=rhs_name, out=out_name))
@@ -199,6 +232,33 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             exp = np.exp(shifted)
             env[out_name] = exp / np.sum(exp, axis=axis, keepdims=True)
             tensors[out_name] = TensorSpec(out_name, normalize_shape(env[out_name].shape), DType.FLOAT32, TensorKind.INTERMEDIATE)
+            expected_tensors[out_name] = np.array(env[out_name], copy=True)
+            continue
+
+        if node.op == "call_function" and getattr(node.target, "__name__", None) == "quantize_for_npu":
+            flush_segment()
+            source = node.args[0].name
+            scale = float(node.args[1])
+            zero_point = int(node.args[2]) if len(node.args) > 2 else 0
+            dtype = parse_dtype(node.args[3] if len(node.args) > 3 else "int16")
+            out_name = node.name
+            steps.append(
+                HostOp(
+                    name=node.name,
+                    kind="requantize",
+                    inputs=[source],
+                    outputs=[out_name],
+                    attrs={"scale": scale, "zero_point": zero_point, "dtype": dtype},
+                )
+            )
+            env[out_name] = golden.requantize(env[source], scale=scale, zero_point=zero_point, out_dtype=dtype)
+            tensors[out_name] = TensorSpec(
+                out_name,
+                normalize_shape(env[out_name].shape),
+                dtype,
+                TensorKind.INTERMEDIATE,
+                metadata={"quantization": {"scale": scale, "zero_point": zero_point, "dtype": dtype.value}},
+            )
             expected_tensors[out_name] = np.array(env[out_name], copy=True)
             continue
 

@@ -6,6 +6,24 @@ from .ir import DType
 
 
 class GoldenModel:
+    def requantize(
+        self,
+        value,
+        *,
+        scale: float,
+        zero_point: int = 0,
+        out_dtype: DType = DType.INT16,
+    ) -> np.ndarray:
+        source = np.array(value, dtype=np.float32)
+        quantized = np.rint(source * np.float32(scale)).astype(np.int64) + np.int64(zero_point)
+        if out_dtype == DType.INT4:
+            return np.clip(quantized, -8, 7).astype(np.int16)
+        if out_dtype == DType.INT8:
+            return np.clip(quantized, -128, 127).astype(np.int16)
+        if out_dtype == DType.INT16:
+            return np.clip(quantized, -32768, 32767).astype(np.int16)
+        raise ValueError(f"Unsupported requantize dtype {out_dtype}.")
+
     def matmul(
         self,
         lhs,
