@@ -1,14 +1,17 @@
 from __future__ import annotations
 
-from collections import defaultdict
-
 import numpy as np
 
 from tinynpu import TinyNPUProgram
-from tinynpu.isa import PrecisionMode
 
 from .artifact import CompiledArtifact, SegmentArtifact
-from .ir import DType, ExecutionPlan, MatMulOp, NpuSegment, TensorKind, TensorSpec, to_precision_mode
+from .ir import DType, ExecutionPlan, NpuSegment, TensorKind, to_precision_mode
+from .memory_planner import (
+    MemoryPlanEntry,
+    SegmentMemoryPlan,
+    infer_roles,
+    plan_program_memory,
+)
 
 
 class SegmentCompiler:
@@ -16,20 +19,48 @@ class SegmentCompiler:
         self.defines_path = defines_path
 
     def compile(self, plan: ExecutionPlan, expected_tensors: dict[str, np.ndarray]) -> CompiledArtifact:
+        # Read UB capacity from hardware config
+        _tmp = TinyNPUProgram(defines_path=self.defines_path)
+        ub_capacity = int(_tmp.hw.params.get("BUFFER_DEPTH", 0))
+        if ub_capacity <= 0:
+            ub_capacity = int(_tmp.hw.params.get("IM_BASE_ADDR", 0x8000))
+
+        # Global memory plan: static weights get unique addresses, dynamic tensors
+        # share a zone with within-segment liveness reuse.
+        memory_report = plan_program_memory(plan, ub_capacity)
+
+        # Build per-segment lookup: tensor_name -> MemoryPlanEntry
+        addr_maps: dict[str, dict[str, MemoryPlanEntry]] = {}
+        seg_plan_map: dict[str, SegmentMemoryPlan] = {}
+        for sp in memory_report.segments:
+            addr_maps[sp.segment_name] = {e.name: e for e in sp.entries}
+            seg_plan_map[sp.segment_name] = sp
+
         artifacts: dict[str, SegmentArtifact] = {}
         for step in plan.steps:
             if isinstance(step, NpuSegment):
-                artifacts[step.name] = self._compile_npu_segment(plan, step)
+                addr_map = addr_maps.get(step.name, {})
+                seg_plan = seg_plan_map.get(step.name)
+                artifacts[step.name] = self._compile_npu_segment(plan, step, addr_map, seg_plan)
+
         return CompiledArtifact(
             plan=plan,
             expected_tensors=expected_tensors,
             segment_artifacts=artifacts,
             metadata={"compiler": "tinynpu_jit", "segment_count": len(artifacts)},
+            memory_report=memory_report,
+            static_ub_image=memory_report.static_ub_image,
         )
 
-    def _compile_npu_segment(self, plan: ExecutionPlan, segment: NpuSegment) -> SegmentArtifact:
+    def _compile_npu_segment(
+        self,
+        plan: ExecutionPlan,
+        segment: NpuSegment,
+        addr_map: dict[str, MemoryPlanEntry],
+        seg_plan: SegmentMemoryPlan | None,
+    ) -> SegmentArtifact:
         program = TinyNPUProgram(defines_path=self.defines_path)
-        roles = self._infer_roles(segment)
+        roles = infer_roles(segment)
 
         referenced = set(segment.inputs + segment.outputs)
         for op in segment.ops:
@@ -67,6 +98,12 @@ class SegmentCompiler:
                 out_precision=to_precision_mode(op.out_dtype),
             )
 
+        # Pre-assign globally planned addresses before compile() runs so that
+        # program.compile() respects the planner layout instead of bump-allocating.
+        for name, sym in program.symbols.items():
+            if name in addr_map:
+                sym.addr = addr_map[name].address
+
         program.halt()
         binary = program.compile()
         ub_capacity = int(program.hw.params.get("BUFFER_DEPTH", 0))
@@ -91,27 +128,5 @@ class SegmentCompiler:
             symbol_table=symbol_table,
             ub_words=len(binary["ub"]),
             im_words=len(binary["im"]),
+            memory_plan=seg_plan,
         )
-
-    def _infer_roles(self, segment: NpuSegment) -> dict[str, str]:
-        uses: dict[str, set[str]] = defaultdict(set)
-        for op in segment.ops:
-            uses[op.lhs].add("lhs")
-            uses[op.rhs].add("rhs")
-            if op.bias:
-                uses[op.bias].add("bias")
-            uses[op.out].add("out")
-
-        roles = {}
-        for name, kinds in uses.items():
-            if "bias" in kinds:
-                roles[name] = "BIAS"
-            elif kinds == {"rhs"}:
-                roles[name] = "B"
-            elif kinds == {"lhs"}:
-                roles[name] = "A"
-            elif "out" in kinds:
-                roles[name] = "C"
-            else:
-                roles[name] = "C"
-        return roles
