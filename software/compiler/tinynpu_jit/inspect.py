@@ -26,6 +26,26 @@ class TensorVectorView:
     rows_match: bool | None = None
 
 
+def format_debug_trace(execution_result: Any) -> str:
+    lines: list[str] = []
+    for index, event in enumerate(getattr(execution_result, "debug_trace", [])):
+        lines.append(f"[{index}] {event['kind']} {event['step']}")
+        attrs = event.get("attrs") or {}
+        if attrs:
+            lines.append(f"  attrs: {attrs}")
+        for section in ("inputs", "outputs"):
+            tensors = event.get(section) or {}
+            if not tensors:
+                continue
+            lines.append(f"  {section}:")
+            for name, summary in tensors.items():
+                lines.append(
+                    f"    {name}: shape={summary['shape']} dtype={summary['dtype']} "
+                    f"min={summary.get('min')} max={summary.get('max')} preview={summary['preview']}"
+                )
+    return "\n".join(lines).rstrip() + ("\n" if lines else "")
+
+
 def inspect_artifact(
     artifact: CompiledArtifact,
     inputs: dict[str, np.ndarray],

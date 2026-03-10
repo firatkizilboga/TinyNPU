@@ -16,10 +16,11 @@ def run(
     *,
     backend: str = "host-emulation",
     verification: VerificationMode = VerificationMode.OFF,
+    debug: bool = False,
     **backend_kwargs: Any,
 ):
     if backend == "host-emulation":
-        return HostEmulationExecutor().run(artifact, inputs, verification)
+        return HostEmulationExecutor().run(artifact, inputs, verification, debug=debug)
     if backend == "sim":
-        return run_sim(artifact, inputs, verification=verification, **backend_kwargs)
+        return run_sim(artifact, inputs, verification=verification, debug=debug, **backend_kwargs)
     raise ValueError(f"Unknown backend '{backend}'.")

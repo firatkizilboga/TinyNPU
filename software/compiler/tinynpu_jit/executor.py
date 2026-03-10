@@ -18,6 +18,7 @@ class HostEmulationExecutor:
         artifact: CompiledArtifact,
         inputs: dict[str, np.ndarray],
         verification: VerificationMode = VerificationMode.OFF,
+        debug: bool = False,
     ) -> ExecutionResult:
         values: dict[str, np.ndarray] = {}
         for name, spec in artifact.plan.tensors.items():
@@ -30,11 +31,48 @@ class HostEmulationExecutor:
             values[name] = np.array(inputs[name], copy=True)
 
         verified: list[str] = []
+        debug_trace: list[dict[str, np.ndarray | str | dict[str, object] | list[str] | bool]] = []
         for step in artifact.plan.steps:
             if isinstance(step, NpuSegment):
                 self._run_npu_segment(step, values)
+                if debug:
+                    debug_trace.append(
+                        self._debug_event(
+                            step=step.name,
+                            kind="npu_segment",
+                            inputs={name: values[name] for name in step.inputs if name in values},
+                            outputs={name: values[name] for name in step.outputs if name in values},
+                            attrs={
+                                "ops": [
+                                    {
+                                        "name": op.name,
+                                        "lhs": op.lhs,
+                                        "rhs": op.rhs,
+                                        "out": op.out,
+                                        "bias": op.bias,
+                                        "multiplier": op.multiplier,
+                                        "shift": op.shift,
+                                        "activation": op.activation,
+                                        "in_dtype": op.in_dtype.value,
+                                        "out_dtype": op.out_dtype.value,
+                                    }
+                                    for op in step.ops
+                                ]
+                            },
+                        )
+                    )
             elif isinstance(step, HostOp):
                 self._run_host_op(step, values)
+                if debug:
+                    debug_trace.append(
+                        self._debug_event(
+                            step=step.name,
+                            kind=f"host_{step.kind}",
+                            inputs={name: values[name] for name in step.inputs if name in values},
+                            outputs={name: values[name] for name in step.outputs if name in values},
+                            attrs=step.attrs,
+                        )
+                    )
             elif isinstance(step, VerifyTensor):
                 if self._should_verify(step, verification):
                     expected = artifact.expected_tensors[step.tensor_name]
@@ -48,10 +86,25 @@ class HostEmulationExecutor:
                             f"Verification failed for '{step.label}' ({step.tensor_name})."
                         )
                     verified.append(step.label)
+                    if debug:
+                        debug_trace.append(
+                            self._debug_event(
+                                step=step.label,
+                                kind="verify",
+                                inputs={step.tensor_name: actual},
+                                outputs={},
+                                attrs={"tensor_name": step.tensor_name, "is_final_output": step.is_final_output},
+                            )
+                        )
 
         outputs = {name: np.array(values[name], copy=True) for name in artifact.plan.outputs}
         trace_tensors = {name: np.array(value, copy=True) for name, value in values.items()}
-        return ExecutionResult(tensors=outputs, verified=verified, trace_tensors=trace_tensors)
+        return ExecutionResult(
+            tensors=outputs,
+            verified=verified,
+            trace_tensors=trace_tensors,
+            debug_trace=debug_trace,
+        )
 
     def _should_verify(self, step: VerifyTensor, verification: VerificationMode) -> bool:
         if verification == VerificationMode.OFF:
@@ -110,8 +163,18 @@ class HostEmulationExecutor:
             values[step.outputs[0]] = np.array(values[step.inputs[0]], copy=True)
             return
         if step.kind == "im2col":
+            image = np.array(values[step.inputs[0]], copy=False)
+            layout = step.attrs.get("input_layout", "hwc")
+            if layout == "chw":
+                if image.ndim == 4:
+                    if image.shape[0] != 1:
+                        raise NotImplementedError(
+                            f"im2col host op only supports batch size 1 for CHW input, got shape {image.shape}."
+                        )
+                    image = image[0]
+                image = np.transpose(image, (1, 2, 0))
             values[step.outputs[0]] = self.golden.im2col(
-                values[step.inputs[0]],
+                image,
                 kernel_size=int(step.attrs["kernel_size"]),
                 stride=int(step.attrs.get("stride", 1)),
                 padding=int(step.attrs.get("padding", 0)),
@@ -123,6 +186,24 @@ class HostEmulationExecutor:
         if step.kind == "transpose":
             values[step.outputs[0]] = np.transpose(values[step.inputs[0]], axes=tuple(step.attrs.get("axes", [])) or None)
             return
+        if step.kind == "layout_restore":
+            source = np.array(values[step.inputs[0]], copy=False)
+            hwc = source.reshape(
+                int(step.attrs["out_h"]),
+                int(step.attrs["out_w"]),
+                int(step.attrs["out_channels"]),
+            )
+            if step.attrs["layout"] == "chw":
+                restored = np.transpose(hwc, (2, 0, 1))
+                original_shape = tuple(step.attrs["original_shape"])
+                if len(original_shape) == 4:
+                    restored = np.expand_dims(restored, axis=0)
+                values[step.outputs[0]] = restored
+                return
+            if step.attrs["layout"] == "hwc":
+                values[step.outputs[0]] = hwc
+                return
+            raise ValueError(f"Unsupported layout_restore layout {step.attrs['layout']!r}.")
         if step.kind == "requantize":
             scale = float(step.attrs["scale"])
             zero_point = int(step.attrs.get("zero_point", 0))
@@ -135,3 +216,34 @@ class HostEmulationExecutor:
             )
             return
         raise NotImplementedError(f"Unsupported host op '{step.kind}'.")
+
+    def _debug_event(
+        self,
+        *,
+        step: str,
+        kind: str,
+        inputs: dict[str, np.ndarray],
+        outputs: dict[str, np.ndarray],
+        attrs: dict[str, object],
+    ) -> dict[str, object]:
+        return {
+            "step": step,
+            "kind": kind,
+            "inputs": {name: self._tensor_summary(value) for name, value in inputs.items()},
+            "outputs": {name: self._tensor_summary(value) for name, value in outputs.items()},
+            "attrs": dict(attrs),
+        }
+
+    def _tensor_summary(self, value: np.ndarray) -> dict[str, object]:
+        arr = np.array(value)
+        flat = arr.reshape(-1)
+        preview = flat[: min(8, flat.size)].tolist()
+        summary: dict[str, object] = {
+            "shape": tuple(int(dim) for dim in arr.shape),
+            "dtype": str(arr.dtype),
+            "preview": preview,
+        }
+        if flat.size:
+            summary["min"] = float(arr.min()) if np.issubdtype(arr.dtype, np.floating) else int(arr.min())
+            summary["max"] = float(arr.max()) if np.issubdtype(arr.dtype, np.floating) else int(arr.max())
+        return summary

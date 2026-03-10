@@ -23,6 +23,7 @@ class ExecutionResult:
     verified: list[str] = field(default_factory=list)
     trace_tensors: dict[str, np.ndarray] = field(default_factory=dict)
     vector_captures: dict[str, dict[str, Any]] = field(default_factory=dict)
+    debug_trace: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -32,10 +33,16 @@ class CompiledArtifact:
     segment_artifacts: dict[str, SegmentArtifact]
     metadata: dict[str, Any] = field(default_factory=dict)
 
-    def run_host_emulation(self, inputs: dict[str, np.ndarray], verification: VerificationMode = VerificationMode.OFF):
+    def run_host_emulation(
+        self,
+        inputs: dict[str, np.ndarray],
+        verification: VerificationMode = VerificationMode.OFF,
+        *,
+        debug: bool = False,
+    ):
         from .executor import HostEmulationExecutor
 
-        return HostEmulationExecutor().run(self, inputs, verification)
+        return HostEmulationExecutor().run(self, inputs, verification, debug=debug)
 
     def run(self, inputs: dict[str, np.ndarray], verification: VerificationMode = VerificationMode.OFF, **kwargs):
         from .runtime import run
@@ -46,3 +53,8 @@ class CompiledArtifact:
         from .inspect import inspect_artifact
 
         return inspect_artifact(self, inputs, **kwargs)
+
+    def format_debug_trace(self, execution_result: "ExecutionResult") -> str:
+        from .inspect import format_debug_trace
+
+        return format_debug_trace(execution_result)
