@@ -21,6 +21,30 @@ class SimulatorExecutor:
         self.im_base_addr = self.program.im_base_addr
         self.packer = self.program.packer
 
+    def _resolve_handle(self, root: Any, path: tuple[str, ...]) -> Any | None:
+        current = root
+        for part in path:
+            if not hasattr(current, part):
+                return None
+            current = getattr(current, part)
+        return current
+
+    def _configure_ppu_capture(self, dut: Any, *, enabled: bool, Force: Any, Release: Any) -> None:
+        candidates = [
+            ("ppu_capture_en",),
+            ("u_brain", "ppu_capture_en"),
+            ("u_brain", "u_cu", "ppu_capture_en"),
+            ("u_muscle", "ppu_capture_en"),
+            ("u_muscle", "u_ppu", "capture_en"),
+        ]
+        seen: set[int] = set()
+        for path in candidates:
+            handle = self._resolve_handle(dut, path)
+            if handle is None or id(handle) in seen:
+                continue
+            seen.add(id(handle))
+            handle.value = Release() if enabled else Force(0)
+
     async def run(
         self,
         artifact: CompiledArtifact,
@@ -30,11 +54,13 @@ class SimulatorExecutor:
         verification: VerificationMode = VerificationMode.OFF,
         reset: bool = False,
         capture_vectors: bool = False,
+        ppu_capture: bool = False,
         debug: bool = False,
     ) -> ExecutionResult:
         try:
             from verification.cocotb import npu_driver
             from cocotb.clock import Clock
+            from cocotb.handle import Force, Release
             from cocotb.triggers import ClockCycles, RisingEdge
             import cocotb
         except Exception as exc:
@@ -48,6 +74,7 @@ class SimulatorExecutor:
             dut.rst_n.value = 0
             await ClockCycles(dut.clk, 5)
             dut.rst_n.value = 1
+        self._configure_ppu_capture(dut, enabled=ppu_capture, Force=Force, Release=Release)
 
         values: dict[str, np.ndarray] = {}
         for name, spec in artifact.plan.tensors.items():
@@ -334,6 +361,7 @@ async def run_sim(
     reset: bool = False,
     defines_path: str | None = None,
     capture_vectors: bool = False,
+    ppu_capture: bool = False,
     debug: bool = False,
 ):
     return await SimulatorExecutor(defines_path=defines_path).run(
@@ -343,5 +371,6 @@ async def run_sim(
         verification=verification,
         reset=reset,
         capture_vectors=capture_vectors,
+        ppu_capture=ppu_capture,
         debug=debug,
     )

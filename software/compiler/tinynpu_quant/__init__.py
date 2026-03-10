@@ -1,4 +1,9 @@
-from .calibration import collect_input_activation_maxes, copy_state_with_mapping, initialize_scale_tensors
+from .calibration import (
+    collect_input_activation_maxes,
+    collect_tensor_percentile_scale,
+    copy_state_with_mapping,
+    initialize_scale_tensors,
+)
 from .config import LayerQuantConfig, build_layer_config_map, ensure_layer_quant_config
 from .conversion import (
     CompilerDequantize,
@@ -25,6 +30,7 @@ __all__ = [
     "build_layer_config_map",
     "bits_to_dtype_name",
     "collect_input_activation_maxes",
+    "collect_tensor_percentile_scale",
     "collect_qat_layer_names",
     "CompilerDequantize",
     "CompilerQuantize",

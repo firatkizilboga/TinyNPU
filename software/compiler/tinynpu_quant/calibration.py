@@ -43,6 +43,38 @@ def collect_input_activation_maxes(
     return act_maxes
 
 
+def collect_tensor_percentile_scale(
+    model: torch.nn.Module,
+    dataset: Iterable,
+    *,
+    extractor,
+    percentile: float = 99.9,
+    max_samples: int = 256,
+    qmax: float = 127.0,
+    floor: float = 1e-8,
+) -> float:
+    values = []
+    limit = min(int(max_samples), len(dataset))
+    if limit <= 0:
+        raise ValueError("Expected at least one calibration sample when collecting a percentile scale.")
+
+    model = model.cpu().eval()
+    with torch.no_grad():
+        for index in range(limit):
+            sample = dataset[index]
+            x = sample[0] if isinstance(sample, (tuple, list)) else sample
+            tensor = extractor(model, x.unsqueeze(0))
+            values.append(tensor.reshape(-1).cpu())
+
+    if not values:
+        raise ValueError("Expected at least one tensor value when collecting a percentile scale.")
+
+    flat = torch.cat(values).abs()
+    percentile_q = torch.tensor(float(percentile) / 100.0)
+    boundary_abs = float(torch.quantile(flat, percentile_q).item())
+    return max(boundary_abs / float(qmax), float(floor))
+
+
 def initialize_scale_tensors(
     *,
     qat_state_dict: dict[str, torch.Tensor],

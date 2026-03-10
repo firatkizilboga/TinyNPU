@@ -51,6 +51,7 @@ Examples:
 - `software/workload/jit_qat_compiler_ready.py`: compiler-ready QAT conversion example
 - `software/workload/mnist_tinynpu_pipeline.py`: fresh train -> QAT -> convert -> compile pipeline for MNIST
 - `software/workload/inspect_simple_chain.py`: prints the segmented plan, logical previews, and packed output vectors for the migrated simple-chain artifact
+- `tinynpu_quant.calibration.collect_tensor_percentile_scale(...)`: reusable percentile-based host-boundary calibration helper
 
 PyTorch quantization toolkit:
 - `software/compiler/tinynpu_quant/`: extracted reusable quantization utilities
@@ -75,6 +76,7 @@ Current limitation:
 - ordinary float `nn.Linear` / `nn.Conv2d` are not yet the trusted frontend contract; current trusted direct frontend is explicit quantized `torch.ao` modules plus export-backed helpers
 - fresh trained-model host/RTL parity is validated on the new MNIST pipeline path
 - the fresh MNIST pipeline now calibrates the `conv3 -> mean` host boundary instead of blindly reusing the FC input scale; this restores compiled-host accuracy to near-QAT quality on the validated slice
+- that host-boundary calibration helper now lives in `tinynpu_quant` instead of remaining MNIST-specific code
 - the legacy `tinynpu/` package remains in place during migration
 
 Open risks:
