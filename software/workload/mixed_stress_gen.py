@@ -37,7 +37,8 @@ def generate_mixed_stress_test():
     # Golden model
     acc = np.matmul(W.astype(np.int64), X.astype(np.int64)) + B.astype(np.int64)
     rescaled = acc * multiplier
-    shifted = rescaled >> shift
+    rounding_offset = 1 << (shift - 1)
+    shifted = (rescaled + rounding_offset) >> shift
     Y = np.clip(shifted, -128, 127).astype(np.int8)
 
     prog.add_expected_result("PackedOutput", Y)
