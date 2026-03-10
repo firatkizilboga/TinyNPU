@@ -23,6 +23,17 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
     try:
         import torch
         import torch.nn as nn
+        try:
+            from torch.ao.nn.quantized import DeQuantize as QDeQuantize, Quantize as QQuantize
+        except Exception:
+            QQuantize = QDeQuantize = ()
+        try:
+            from torch.ao.quantization import DeQuantStub, QuantStub
+        except Exception:
+            try:
+                from torch.quantization import DeQuantStub, QuantStub
+            except Exception:
+                QuantStub = DeQuantStub = ()
     except Exception as exc:
         raise ImportError("torch is required for FX partitioning.") from exc
 
@@ -60,6 +71,16 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             raise ValueError(f"Unsupported dtype annotation {name!r}.")
         return mapping[normalized]
 
+    def parse_torch_quant_dtype(dtype: Any) -> DType:
+        if dtype in {getattr(torch, "qint8", None), getattr(torch, "int8", None)}:
+            return DType.INT8
+        if dtype in {getattr(torch, "qint32", None), getattr(torch, "int32", None)}:
+            return DType.INT32
+        raise ValueError(
+            f"Unsupported torch quantized dtype {dtype!r}. "
+            "Current TinyNPU quant-stub support accepts qint8 and qint32 only."
+        )
+
     def infer_dtype(value: np.ndarray) -> DType:
         if np.issubdtype(value.dtype, np.floating):
             return DType.FLOAT32
@@ -89,6 +110,20 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
         return coerced
 
     modules = dict(graph_module.named_modules())
+    quantize_module_types = tuple(t for t in (QQuantize, QuantStub) if t)
+    dequantize_module_types = tuple(t for t in (QDeQuantize, DeQuantStub) if t)
+
+    def quant_params_from_module(module: Any) -> tuple[float, int, DType]:
+        scale = getattr(module, "scale", None)
+        zero_point = getattr(module, "zero_point", None)
+        dtype = getattr(module, "dtype", None)
+        if scale is None or zero_point is None or dtype is None:
+            raise NotImplementedError(
+                "QuantStub/Quantize nodes require explicit quantization parameters. "
+                "Use a converted torch.ao.nn.quantized.Quantize module or attach "
+                "`scale`, `zero_point`, and `dtype` attributes to the stub before compile."
+            )
+        return float(scale), int(zero_point), parse_torch_quant_dtype(dtype)
 
     def flush_segment() -> None:
         nonlocal current_ops, current_inputs
@@ -155,6 +190,63 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             current_ops.append(MatMulOp(name=node.name, lhs=lhs_name, rhs=rhs_name, out=out_name, bias=bias_name))
             continue
 
+        if node.op == "call_module" and quantize_module_types and isinstance(modules[node.target], quantize_module_types):
+            flush_segment()
+            source = node.args[0].name
+            scale, zero_point, dtype = quant_params_from_module(modules[node.target])
+            out_name = node.name
+            steps.append(
+                HostOp(
+                    name=node.name,
+                    kind="quantize",
+                    inputs=[source],
+                    outputs=[out_name],
+                    attrs={"scale": scale, "zero_point": zero_point, "dtype": dtype},
+                )
+            )
+            env[out_name] = golden.quantize(env[source], scale=scale, zero_point=zero_point, out_dtype=dtype)
+            tensors[out_name] = TensorSpec(
+                out_name,
+                normalize_shape(env[out_name].shape),
+                dtype,
+                TensorKind.INTERMEDIATE,
+                metadata={"quantization": {"scale": scale, "zero_point": zero_point, "dtype": dtype.value}},
+            )
+            expected_tensors[out_name] = np.array(env[out_name], copy=True)
+            continue
+
+        if node.op == "call_module" and dequantize_module_types and isinstance(modules[node.target], dequantize_module_types):
+            flush_segment()
+            source = node.args[0].name
+            quant = tensors[source].metadata.get("quantization")
+            if quant is None:
+                raise NotImplementedError(
+                    f"DeQuantStub/DeQuantize on tensor {source!r} requires upstream quantization metadata."
+                )
+            out_name = node.name
+            steps.append(
+                HostOp(
+                    name=node.name,
+                    kind="dequantize",
+                    inputs=[source],
+                    outputs=[out_name],
+                    attrs={"scale": float(quant["scale"]), "zero_point": int(quant.get("zero_point", 0))},
+                )
+            )
+            env[out_name] = golden.dequantize(
+                env[source],
+                scale=float(quant["scale"]),
+                zero_point=int(quant.get("zero_point", 0)),
+            )
+            tensors[out_name] = TensorSpec(
+                out_name,
+                normalize_shape(env[out_name].shape),
+                DType.FLOAT32,
+                TensorKind.INTERMEDIATE,
+            )
+            expected_tensors[out_name] = np.array(env[out_name], copy=True)
+            continue
+
         if (
             node.op == "call_function"
             and node.target in {operator.matmul, getattr(torch, "matmul", None)}
@@ -181,6 +273,8 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             activation = str(node.kwargs.get("activation", "none"))
             in_dtype = parse_dtype(node.kwargs.get("in_dtype", "int16"))
             out_dtype = parse_dtype(node.kwargs.get("out_dtype", "int16"))
+            output_scale = node.kwargs.get("output_scale")
+            output_zero_point = int(node.kwargs.get("output_zero_point", 0))
             out_name = node.name
             current_inputs.update({lhs_name, rhs_name})
             lhs_value = golden.coerce_npu_input(env[lhs_name], out_dtype=in_dtype, tensor_name=lhs_name)
@@ -204,7 +298,14 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                 out_dtype=out_dtype,
             )
             env[out_name] = expected.astype(np.int32)
-            tensors[out_name] = TensorSpec(out_name, normalize_shape(expected.shape), out_dtype, TensorKind.INTERMEDIATE)
+            metadata = {}
+            if output_scale is not None:
+                metadata["quantization"] = {
+                    "scale": float(output_scale),
+                    "zero_point": output_zero_point,
+                    "dtype": out_dtype.value,
+                }
+            tensors[out_name] = TensorSpec(out_name, normalize_shape(expected.shape), out_dtype, TensorKind.INTERMEDIATE, metadata=metadata)
             current_ops.append(
                 MatMulOp(
                     name=node.name,

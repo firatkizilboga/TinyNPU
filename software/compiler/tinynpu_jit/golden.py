@@ -6,6 +6,40 @@ from .ir import DType
 
 
 class GoldenModel:
+    def quantize(
+        self,
+        value,
+        *,
+        scale: float,
+        zero_point: int = 0,
+        out_dtype: DType = DType.INT8,
+    ) -> np.ndarray:
+        if scale <= 0:
+            raise ValueError(f"Quantization scale must be positive, got {scale}.")
+        source = np.array(value, dtype=np.float32)
+        quantized = np.rint(source / np.float32(scale)).astype(np.int64) + np.int64(zero_point)
+        if out_dtype == DType.INT4:
+            return np.clip(quantized, -8, 7).astype(np.int16)
+        if out_dtype == DType.INT8:
+            return np.clip(quantized, -128, 127).astype(np.int16)
+        if out_dtype == DType.INT16:
+            return np.clip(quantized, -32768, 32767).astype(np.int16)
+        if out_dtype == DType.INT32:
+            return np.clip(quantized, np.iinfo(np.int32).min, np.iinfo(np.int32).max).astype(np.int32)
+        raise ValueError(f"Unsupported quantize dtype {out_dtype}.")
+
+    def dequantize(
+        self,
+        value,
+        *,
+        scale: float,
+        zero_point: int = 0,
+    ) -> np.ndarray:
+        if scale <= 0:
+            raise ValueError(f"Quantization scale must be positive, got {scale}.")
+        source = np.array(value, dtype=np.float32)
+        return (source - np.float32(zero_point)) * np.float32(scale)
+
     def im2col(
         self,
         image,

@@ -79,6 +79,26 @@ class HostEmulationExecutor:
             axis = int(step.attrs.get("axis", -1))
             values[step.outputs[0]] = self.golden.softmax(values[step.inputs[0]], axis=axis)
             return
+        if step.kind == "quantize":
+            scale = float(step.attrs["scale"])
+            zero_point = int(step.attrs.get("zero_point", 0))
+            out_dtype = step.attrs.get("dtype", "int8")
+            values[step.outputs[0]] = self.golden.quantize(
+                values[step.inputs[0]],
+                scale=scale,
+                zero_point=zero_point,
+                out_dtype=out_dtype,
+            )
+            return
+        if step.kind == "dequantize":
+            scale = float(step.attrs["scale"])
+            zero_point = int(step.attrs.get("zero_point", 0))
+            values[step.outputs[0]] = self.golden.dequantize(
+                values[step.inputs[0]],
+                scale=scale,
+                zero_point=zero_point,
+            )
+            return
         if step.kind == "sigmoid":
             source = np.array(values[step.inputs[0]], dtype=np.float32)
             values[step.outputs[0]] = 1.0 / (1.0 + np.exp(-source))

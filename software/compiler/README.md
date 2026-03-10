@@ -15,6 +15,7 @@ This path is designed around:
 
 Current scope:
 - TinyNPU lowering: explicit `matmul`, exported `linear`, and exported `conv2d` lowered through host-side `im2col`
+- PyTorch quant boundary support: `torch.ao.nn.quantized.Quantize` / `DeQuantize`, plus `QuantStub` / `DeQuantStub` when explicit qparams are attached
 - host-emulation runtime for compile/run/verify validation
 - async simulator runtime entrypoint that targets the existing cocotb driver path
 - deterministic compile behavior with explicit failure if a segment exceeds UB capacity
@@ -40,6 +41,7 @@ Examples:
 - `software/workload/mnist_npu_compiler.py::compile_mnist_layer_jit(...)`: exported MNIST `linear` and `conv2d` layer examples on the new PyTorch JIT path
 - `software/workload/jit_test_gen.py::build_simple_chain_artifact(...)`: migrated old simple-chain workload on the new JIT path
 - `software/workload/jit_hostop_chain.py::build_hostop_chain_artifact(...)`: mixed `NpuSegment -> HostOp(softmax) -> quantize_for_npu -> NpuSegment` workload
+- `software/workload/jit_qdq_chain.py::build_qdq_chain_artifact(...)`: PyTorch quant/dequant module chain lowered into explicit host quantize/dequantize steps plus NPU segments
 - `software/workload/inspect_simple_chain.py`: prints the segmented plan, logical previews, and packed output vectors for the migrated simple-chain artifact
 
 Simulator smoke test:
@@ -47,6 +49,7 @@ Simulator smoke test:
 - Migrated simple-chain RTL test: `cd verification/cocotb && MODULE=test_jit_simple_chain make -f Makefile.npu`
 - Simple-chain RTL vector inspection: `cd verification/cocotb && MODULE=test_jit_simple_chain_inspect make -f Makefile.npu`
 - Mixed host/NPU chain RTL test: `cd verification/cocotb && MODULE=test_jit_hostop_chain make -f Makefile.npu`
+- Quant/dequant stub RTL test: `cd verification/cocotb && MODULE=test_jit_qdq_chain make -f Makefile.npu`
 - Exported MNIST conv RTL smoke test: `cd verification/cocotb && MODULE=test_jit_mnist_conv1 make -f Makefile.npu`
 
 Current limitation:
@@ -58,6 +61,7 @@ Current limitation:
 Open risks:
 - ordinary PyTorch models still do not carry quantization metadata natively through the new path
 - exported workloads like MNIST currently use export-backed quant config through transitional helpers such as `npu_matmul(...)`
+- quant/dequant module support exists for explicit qparams, but broad FX-native quant metadata ingestion is still incomplete
 - `HostOp -> NpuSegment` re-entry quantization now has a first explicit path through `quantize_for_npu(...)`, but broader quant config ingestion is still an active gap
 - old `A/B/C/BIAS` role semantics still exist in lowering as a migration bridge
 
