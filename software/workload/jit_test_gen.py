@@ -26,14 +26,14 @@ def build_simple_chain_artifact(seed: int = 7, dim: int = 16):
 
     module = SimpleChainModule(w1, w2)
     artifact = compile_module(module, (torch.tensor(a.astype(np.float32)),))
-
-    a1_expected = np.matmul(w1.astype(np.int64), a.astype(np.int64))
-    a1_expected = np.clip(a1_expected, -32768, 32767).astype(np.int32)
-    a2_expected = np.matmul(w2.astype(np.int64), a1_expected.astype(np.int64))
-    a2_expected = np.clip(a2_expected, -32768, 32767).astype(np.int32)
+    verify_names = {spec.verify_label: name for name, spec in artifact.plan.tensors.items() if spec.verify_label}
+    expected = {
+        "A1": np.array(artifact.expected_tensors[verify_names["A1"]], copy=True),
+        artifact.plan.outputs[0]: np.array(artifact.expected_tensors[artifact.plan.outputs[0]], copy=True),
+    }
 
     return {
         "artifact": artifact,
         "inputs": {"x": a},
-        "expected": {"A1": a1_expected, artifact.plan.outputs[0]: a2_expected},
+        "expected": expected,
     }

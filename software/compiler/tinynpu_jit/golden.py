@@ -6,6 +6,41 @@ from .ir import DType
 
 
 class GoldenModel:
+    def coerce_npu_input(
+        self,
+        value,
+        *,
+        out_dtype: DType = DType.INT16,
+        tensor_name: str | None = None,
+    ) -> np.ndarray:
+        source = np.array(value, copy=False)
+        if np.issubdtype(source.dtype, np.integer):
+            if out_dtype == DType.INT16:
+                return source.astype(np.int16, copy=False)
+            if out_dtype == DType.INT32:
+                return source.astype(np.int32, copy=False)
+            raise ValueError(f"Unsupported NPU input dtype {out_dtype}.")
+
+        rounded = np.rint(source)
+        if not np.allclose(source, rounded, rtol=0.0, atol=1e-6):
+            name = f" '{tensor_name}'" if tensor_name else ""
+            raise NotImplementedError(
+                f"Tensor{name} is floating-point at an NPU boundary. "
+                "Insert quantize_for_npu(...) before feeding it into a TinyNPU segment."
+            )
+
+        if out_dtype == DType.INT16:
+            return rounded.astype(np.int16)
+        if out_dtype == DType.INT32:
+            return rounded.astype(np.int32)
+        raise ValueError(f"Unsupported NPU input dtype {out_dtype}.")
+
+    def softmax(self, value, *, axis: int = -1) -> np.ndarray:
+        source = np.array(value, dtype=np.float32)
+        shifted = source - np.max(source, axis=axis, keepdims=True)
+        exp = np.exp(shifted)
+        return exp / np.sum(exp, axis=axis, keepdims=True)
+
     def requantize(
         self,
         value,

@@ -76,11 +76,8 @@ class HostEmulationExecutor:
 
     def _run_host_op(self, step: HostOp, values: dict[str, np.ndarray]) -> None:
         if step.kind == "softmax":
-            source = np.array(values[step.inputs[0]], dtype=np.float32)
             axis = int(step.attrs.get("axis", -1))
-            shifted = source - np.max(source, axis=axis, keepdims=True)
-            exp = np.exp(shifted)
-            values[step.outputs[0]] = exp / np.sum(exp, axis=axis, keepdims=True)
+            values[step.outputs[0]] = self.golden.softmax(values[step.inputs[0]], axis=axis)
             return
         if step.kind == "sigmoid":
             source = np.array(values[step.inputs[0]], dtype=np.float32)
