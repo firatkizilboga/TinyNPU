@@ -120,7 +120,7 @@ def compile_mnist_layer_jit(name, layer_info, input_data, export_dir='./mnist_mi
     except Exception as exc:
         raise ImportError("torch is required for compile_mnist_layer_jit().") from exc
 
-    from tinynpu_jit import compile_module
+    from software.compiler.tinynpu_jit import compile_module
 
     a_bits = layer_info.get('a_bits', 16)
     input_hw = prepare_activation_for_hw(input_data, a_bits)
