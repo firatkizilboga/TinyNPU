@@ -105,6 +105,28 @@ class GoldenModel:
         exp = np.exp(shifted)
         return exp / np.sum(exp, axis=axis, keepdims=True)
 
+    def quantized_mean(
+        self,
+        value,
+        *,
+        axis=None,
+        keepdims: bool = False,
+        zero_point: int = 0,
+        out_dtype: DType = DType.INT16,
+    ) -> np.ndarray:
+        source = np.array(value, dtype=np.float32)
+        averaged = np.mean(source - np.float32(zero_point), axis=axis, keepdims=keepdims)
+        requantized = np.rint(averaged).astype(np.int64) + np.int64(zero_point)
+        if out_dtype == DType.INT4:
+            return np.clip(requantized, -8, 7).astype(np.int16)
+        if out_dtype == DType.INT8:
+            return np.clip(requantized, -128, 127).astype(np.int16)
+        if out_dtype == DType.INT16:
+            return np.clip(requantized, -32768, 32767).astype(np.int16)
+        if out_dtype == DType.INT32:
+            return np.clip(requantized, np.iinfo(np.int32).min, np.iinfo(np.int32).max).astype(np.int32)
+        raise ValueError(f"Unsupported quantized_mean dtype {out_dtype}.")
+
     def requantize(
         self,
         value,

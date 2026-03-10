@@ -371,8 +371,9 @@ These are not soft TODOs. They are known architectural gaps that must stay visib
 
 3. `quant-by-claude.py` export is aligned with the new runtime direction, but the QAT model objects are not yet a native compiler frontend.
 - The export stage computes `M0` / `shift` and produces weights/biases/manifests that the new JIT path can already run.
-- The training-time custom modules (`QConv2d`, `QLinear`) are still not directly lowered by `compile_module(...)`.
-- This means the export-backed bridge is real, but the training graph itself is not yet the compiler contract.
+- The old training-time custom modules (`QConv2d`, `QLinear`) started as an export-only bridge.
+- They are now convertible into compiler-ready modules via `tinynpu_quant.conversion`, so a trained PyTorch QAT model can be compiled without going through the old manifest/export path.
+- This is still a narrow contract, not broad support for arbitrary QAT graphs.
 
 4. `HostOp -> NpuSegment` re-entry quantization is only partially generalized.
 - The architecture allows `NpuSegment -> HostOp -> NpuSegment`.
@@ -429,6 +430,17 @@ Current proven JIT/compiler/runtime capabilities:
   - reusable QAT layer modules
   - calibration helpers
   - sensitivity-analysis helpers
+- compiler-ready QAT conversion exists:
+  - `QConv2d` / `QLinear` -> `CompilerReadyConv2d` / `CompilerReadyLinear`
+  - mixed precision has been validated on the narrow path (`W4A4` + `W16A16`)
+- a fresh pure-PyTorch MNIST pipeline exists in `software/workload/mnist_tinynpu_pipeline.py`:
+  - train FP32
+  - initialize/fine-tune QAT
+  - convert to compiler-ready model
+  - compile with `compile_module(...)`
+- trained-model host/RTL parity now exists for the new MNIST pipeline:
+  - fresh trained checkpoint path matches host and RTL across multiple deterministic real MNIST samples
+  - full tensor-by-tensor comparison is exercised in `verification/cocotb/test_jit_mnist_trained_pipeline.py`
 
 Current non-capabilities:
 - arbitrary PyTorch float models are not automatically prepared for TinyNPU
@@ -436,6 +448,9 @@ Current non-capabilities:
 - asymmetric zero-point NPU segments are not supported
 - transformer attention is not a first-class supported workload yet
 - attention-softmax / normalization / residual-style mixed graphs will still rely on explicit host fallback boundaries
+- compiled fidelity against the originating PyTorch QAT model is still incomplete for the fresh MNIST flow
+  - the host/RTL path is now correct
+  - the remaining gap is compiler/model-semantics accuracy, not simulator mismatch
 
 ### 10.13 `tinynpu_quant` Plan
 
@@ -493,6 +508,10 @@ Short-term execution order:
 4. Add a dedicated RTL smoke test for the ordinary quantized `Conv2d` frontend path.
    - done for the current narrow quantized `Conv2d` path
 5. After the quant toolkit is more complete, teach `compile_module(...)` to accept the prepared output of that toolkit directly.
+6. Use the fresh trained MNIST pipeline as the main fidelity-debug target.
+   - host and RTL are now aligned on the trained checkpoint path
+   - next bug is the accuracy gap between PyTorch QAT and compiled execution
+   - debug should proceed by comparing PyTorch QAT vs compiled host layer-by-layer on deterministic sample batches
 
 Guardrails for the next steps:
 - do not claim support for asymmetric zero-point NPU segments unless the hardware path is real

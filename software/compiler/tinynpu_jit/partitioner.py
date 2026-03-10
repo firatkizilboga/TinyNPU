@@ -39,6 +39,15 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                 from torch.quantization import DeQuantStub, QuantStub
             except Exception:
                 QuantStub = DeQuantStub = ()
+        try:
+            from software.compiler.tinynpu_quant import (
+                CompilerDequantize,
+                CompilerQuantize,
+                CompilerReadyConv2d,
+                CompilerReadyLinear,
+            )
+        except Exception:
+            CompilerQuantize = CompilerDequantize = CompilerReadyLinear = CompilerReadyConv2d = ()
     except Exception as exc:
         raise ImportError("torch is required for FX partitioning.") from exc
 
@@ -225,7 +234,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             TensorKind.CONSTANT,
             data=np.array(weight_int, copy=True),
         )
-        current_inputs.update({lhs_name, source_name})
+        current_inputs.add(lhs_name)
         if bias_value is not None:
             bias_name = f"{out_name}_bias"
             tensors[bias_name] = TensorSpec(
@@ -311,6 +320,39 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
         if layout == "hwc":
             return value
         raise ValueError(f"Unsupported conv layout tag {layout!r}.")
+
+    def normalize_linear_input(
+        module_name: str,
+        value: np.ndarray,
+        *,
+        in_features: int,
+    ) -> tuple[np.ndarray, tuple[int, ...], str]:
+        arr = np.array(value, copy=False)
+        original_shape = normalize_shape(arr.shape)
+        if arr.ndim == 1:
+            if arr.shape[0] != in_features:
+                raise NotImplementedError(
+                    f"Module {module_name!r} expects {in_features} input features, got shape {original_shape}."
+                )
+            return arr.reshape(1, in_features), original_shape, "vector"
+        if arr.ndim == 2:
+            if arr.shape == (1, in_features):
+                return arr, original_shape, "row_batch1"
+            if arr.shape == (in_features, 1):
+                return arr.T, original_shape, "column"
+        raise NotImplementedError(
+            f"Module {module_name!r} currently supports 1D vectors, (features,1), or batch-1 row vectors only. "
+            f"Got shape {original_shape} for in_features={in_features}."
+        )
+
+    def restore_linear_output_layout(value: np.ndarray, layout: str, original_shape: tuple[int, ...]) -> np.ndarray:
+        if layout == "vector":
+            return value.reshape(value.shape[1])
+        if layout == "row_batch1":
+            return value
+        if layout == "column":
+            return value.T.reshape(value.shape[1], 1)
+        raise ValueError(f"Unsupported linear layout tag {layout!r} for original shape {original_shape}.")
 
     def lower_quantized_conv2d(module_name: str, module: Any, source_name: str, out_name: str) -> None:
         input_quant = quant_metadata(source_name)
@@ -500,11 +542,328 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
         expected_tensors[matmul_name] = np.array(expected_matrix, copy=True)
         expected_tensors[out_name] = np.array(final_value, copy=True)
 
+    def lower_compiler_ready_linear(module_name: str, module: Any, source_name: str, out_name: str) -> None:
+        input_quant = quant_metadata(source_name)
+        input_dtype = parse_dtype(input_quant["dtype"])
+        module_in_dtype = parse_dtype(module.in_dtype)
+        module_out_dtype = parse_dtype(module.out_dtype)
+        if input_dtype != module_in_dtype:
+            raise NotImplementedError(
+                f"Module {module_name!r} expects activation dtype {module_in_dtype.value}, "
+                f"but source tensor {source_name!r} is {input_dtype.value}."
+            )
+
+        weight_int = to_numpy(module.weight_int).astype(np.int16)
+        weight_t = weight_int.T
+        weight_dtype = parse_dtype(module.in_dtype)
+        if module_in_dtype != weight_dtype:
+            raise NotImplementedError(
+                f"Module {module_name!r} uses activation dtype {module_in_dtype.value} and weight dtype {weight_dtype.value}. "
+                "TinyNPU matmul currently requires matching input/weight precision."
+            )
+        output_zero_point = 0
+        multiplier = int(module.multiplier)
+        shift = int(module.shift)
+        bias_name = None
+        rhs_name = f"{out_name}_weight_t"
+        tensors[rhs_name] = TensorSpec(
+            rhs_name,
+            normalize_shape(weight_t.shape),
+            weight_dtype,
+            TensorKind.CONSTANT,
+            data=np.array(weight_t, copy=True),
+        )
+        current_inputs.add(rhs_name)
+
+        bias_tensor = getattr(module, "bias_int32", None)
+        bias_value = None
+        if bias_tensor is not None:
+            bias_value = to_numpy(bias_tensor).astype(np.int32).reshape(1, -1)
+            bias_name = f"{out_name}_bias"
+            tensors[bias_name] = TensorSpec(
+                bias_name,
+                normalize_shape(bias_value.shape),
+                DType.INT32,
+                TensorKind.CONSTANT,
+                data=np.array(bias_value, copy=True),
+            )
+            current_inputs.add(bias_name)
+
+        lhs_value, original_shape, layout = normalize_linear_input(
+            module_name,
+            env[source_name],
+            in_features=int(weight_int.shape[1]),
+        )
+        lhs_name = source_name
+        if layout != "row_batch1":
+            flush_segment()
+            lhs_name = f"{out_name}_input_row"
+            transform_kind = "reshape" if layout == "vector" else "transpose"
+            transform_attrs = {"shape": tuple(lhs_value.shape)} if layout == "vector" else {"axes": (1, 0)}
+            steps.append(
+                HostOp(
+                    name=lhs_name,
+                    kind=transform_kind,
+                    inputs=[source_name],
+                    outputs=[lhs_name],
+                    attrs=transform_attrs,
+                )
+            )
+            tensors[lhs_name] = TensorSpec(
+                lhs_name,
+                normalize_shape(lhs_value.shape),
+                input_dtype,
+                TensorKind.INTERMEDIATE,
+                metadata=dict(tensors[source_name].metadata),
+            )
+            expected_tensors[lhs_name] = np.array(lhs_value, copy=True)
+            current_inputs.add(lhs_name)
+        else:
+            current_inputs.add(source_name)
+        env[lhs_name] = golden.coerce_npu_input(lhs_value, out_dtype=input_dtype, tensor_name=lhs_name)
+        set_tensor_dtype(lhs_name, input_dtype, env[lhs_name])
+
+        expected_matrix = golden.matmul(
+            env[lhs_name],
+            weight_t,
+            bias=bias_value,
+            multiplier=multiplier,
+            shift=shift,
+            activation="none",
+            out_dtype=module_out_dtype,
+        )
+        internal_out_name = out_name if layout == "row_batch1" else f"{out_name}_matmul"
+        env[internal_out_name] = expected_matrix.astype(np.int32)
+        tensors[internal_out_name] = TensorSpec(
+            internal_out_name,
+            normalize_shape(expected_matrix.shape),
+            module_out_dtype,
+            TensorKind.INTERMEDIATE,
+            metadata={
+                "quantization": {
+                    "scale": float(module.output_scale),
+                    "zero_point": output_zero_point,
+                    "dtype": module_out_dtype.value,
+                    "source": "compiler_ready_linear",
+                    "module_name": module_name,
+                }
+            },
+        )
+        current_ops.append(
+            MatMulOp(
+                name=internal_out_name,
+                lhs=lhs_name,
+                rhs=rhs_name,
+                out=internal_out_name,
+                bias=bias_name,
+                multiplier=multiplier,
+                shift=shift,
+                activation="none",
+                in_dtype=module_in_dtype,
+                out_dtype=module_out_dtype,
+            )
+        )
+        if layout != "row_batch1":
+            flush_segment()
+            restored = restore_linear_output_layout(expected_matrix, layout, original_shape)
+            if layout == "column":
+                steps.append(
+                    HostOp(
+                        name=out_name,
+                        kind="transpose",
+                        inputs=[internal_out_name],
+                        outputs=[out_name],
+                        attrs={"axes": (1, 0)},
+                    )
+                )
+            else:
+                steps.append(
+                    HostOp(
+                        name=out_name,
+                        kind="reshape",
+                        inputs=[internal_out_name],
+                        outputs=[out_name],
+                        attrs={"shape": tuple(restored.shape)},
+                    )
+                )
+            env[out_name] = restored
+            tensors[out_name] = TensorSpec(
+                out_name,
+                normalize_shape(restored.shape),
+                module_out_dtype,
+                TensorKind.INTERMEDIATE,
+                metadata=dict(tensors[internal_out_name].metadata),
+            )
+            expected_tensors[internal_out_name] = np.array(expected_matrix, copy=True)
+            expected_tensors[out_name] = np.array(restored, copy=True)
+
+    def lower_compiler_ready_conv2d(module_name: str, module: Any, source_name: str, out_name: str) -> None:
+        input_quant = quant_metadata(source_name)
+        input_dtype = parse_dtype(input_quant["dtype"])
+        module_in_dtype = parse_dtype(module.in_dtype)
+        module_out_dtype = parse_dtype(module.out_dtype)
+        if input_dtype != module_in_dtype:
+            raise NotImplementedError(
+                f"Module {module_name!r} expects activation dtype {module_in_dtype.value}, "
+                f"but source tensor {source_name!r} is {input_dtype.value}."
+            )
+
+        image_hwc, original_shape, layout = normalize_conv_input(
+            module_name,
+            env[source_name],
+            in_channels=int(module.in_channels),
+        )
+        cols_name = f"{out_name}_im2col"
+        flush_segment()
+        steps.append(
+            HostOp(
+                name=cols_name,
+                kind="im2col",
+                inputs=[source_name],
+                outputs=[cols_name],
+                attrs={
+                    "kernel_size": int(module.kernel_size),
+                    "stride": int(module.stride),
+                    "padding": int(module.padding),
+                    "input_layout": layout,
+                    "input_channels": int(module.in_channels),
+                },
+            )
+        )
+        cols_value = golden.im2col(
+            image_hwc,
+            kernel_size=int(module.kernel_size),
+            stride=int(module.stride),
+            padding=int(module.padding),
+        )
+        env[cols_name] = cols_value
+        tensors[cols_name] = TensorSpec(
+            cols_name,
+            normalize_shape(cols_value.shape),
+            module_in_dtype,
+            TensorKind.INTERMEDIATE,
+        )
+        current_inputs.update({cols_name})
+
+        kernel_t_name = f"{out_name}_kernel_t"
+        weight_int = to_numpy(module.weight_int).astype(np.int16)
+        kernel_t = weight_int.reshape(weight_int.shape[0], -1).T
+        tensors[kernel_t_name] = TensorSpec(
+            kernel_t_name,
+            normalize_shape(kernel_t.shape),
+            module_in_dtype,
+            TensorKind.CONSTANT,
+            data=np.array(kernel_t, copy=True),
+        )
+        current_inputs.add(kernel_t_name)
+
+        bias_name = None
+        bias_tensor = getattr(module, "bias_int32", None)
+        bias_value = None
+        if bias_tensor is not None:
+            bias_value = to_numpy(bias_tensor).astype(np.int32).reshape(1, -1)
+            bias_name = f"{out_name}_bias"
+            tensors[bias_name] = TensorSpec(
+                bias_name,
+                normalize_shape(bias_value.shape),
+                DType.INT32,
+                TensorKind.CONSTANT,
+                data=np.array(bias_value, copy=True),
+            )
+            current_inputs.add(bias_name)
+
+        multiplier = int(module.multiplier)
+        shift = int(module.shift)
+        expected_cols = golden.coerce_npu_input(cols_value, out_dtype=module_in_dtype, tensor_name=cols_name)
+        env[cols_name] = expected_cols
+        expected_matrix = golden.matmul(
+            expected_cols,
+            kernel_t,
+            bias=bias_value,
+            multiplier=multiplier,
+            shift=shift,
+            activation="none",
+            out_dtype=module_out_dtype,
+        )
+        matmul_name = f"{out_name}_matmul"
+        tensors[matmul_name] = TensorSpec(
+            matmul_name,
+            normalize_shape(expected_matrix.shape),
+            module_out_dtype,
+            TensorKind.INTERMEDIATE,
+            metadata={
+                "quantization": {
+                    "scale": float(module.output_scale),
+                    "zero_point": 0,
+                    "dtype": module_out_dtype.value,
+                    "source": "compiler_ready_conv2d_matrix",
+                    "module_name": module_name,
+                }
+            },
+        )
+        env[matmul_name] = expected_matrix.astype(np.int32)
+        current_ops.append(
+            MatMulOp(
+                name=matmul_name,
+                lhs=cols_name,
+                rhs=kernel_t_name,
+                out=matmul_name,
+                bias=bias_name,
+                multiplier=multiplier,
+                shift=shift,
+                activation="none",
+                in_dtype=module_in_dtype,
+                out_dtype=module_out_dtype,
+            )
+        )
+        flush_segment()
+
+        out_h = ((image_hwc.shape[0] + (2 * int(module.padding)) - int(module.kernel_size)) // int(module.stride)) + 1
+        out_w = ((image_hwc.shape[1] + (2 * int(module.padding)) - int(module.kernel_size)) // int(module.stride)) + 1
+        hwc_out = expected_matrix.reshape(out_h, out_w, int(module.out_channels))
+        final_value = restore_conv_output_layout(hwc_out, layout, original_shape)
+        steps.append(
+            HostOp(
+                name=f"{out_name}_layout_restore",
+                kind="layout_restore",
+                inputs=[matmul_name],
+                outputs=[out_name],
+                attrs={
+                    "layout": layout,
+                    "original_shape": original_shape,
+                    "out_h": out_h,
+                    "out_w": out_w,
+                    "out_channels": int(module.out_channels),
+                },
+            )
+        )
+        env[out_name] = final_value
+        tensors[out_name] = TensorSpec(
+            out_name,
+            normalize_shape(final_value.shape),
+            module_out_dtype,
+            TensorKind.INTERMEDIATE,
+            metadata={
+                "quantization": {
+                    "scale": float(module.output_scale),
+                    "zero_point": 0,
+                    "dtype": module_out_dtype.value,
+                    "source": "compiler_ready_conv2d",
+                    "module_name": module_name,
+                }
+            },
+        )
+        expected_tensors[cols_name] = np.array(env[cols_name], copy=True)
+        expected_tensors[matmul_name] = np.array(expected_matrix, copy=True)
+        expected_tensors[out_name] = np.array(final_value, copy=True)
+
     modules = dict(graph_module.named_modules())
-    quantize_module_types = tuple(t for t in (QQuantize, QuantStub) if t)
-    dequantize_module_types = tuple(t for t in (QDeQuantize, DeQuantStub) if t)
+    quantize_module_types = tuple(t for t in (QQuantize, QuantStub, CompilerQuantize) if t)
+    dequantize_module_types = tuple(t for t in (QDeQuantize, DeQuantStub, CompilerDequantize) if t)
     quantized_linear_types = tuple(t for t in (QLinear,) if t)
     quantized_conv2d_types = tuple(t for t in (QConv2d,) if t)
+    compiler_ready_linear_types = tuple(t for t in (CompilerReadyLinear,) if t)
+    compiler_ready_conv2d_types = tuple(t for t in (CompilerReadyConv2d,) if t)
 
     def quant_params_from_module(module: Any) -> tuple[float, int, DType]:
         scale = getattr(module, "scale", None)
@@ -516,6 +875,8 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                 "Use a converted torch.ao.nn.quantized.Quantize module or attach "
                 "`scale`, `zero_point`, and `dtype` attributes to the stub before compile."
             )
+        if isinstance(dtype, str):
+            return float(scale), int(zero_point), parse_dtype(dtype)
         return float(scale), int(zero_point), parse_torch_quant_dtype(dtype)
 
     def flush_segment() -> None:
@@ -589,6 +950,14 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
 
         if node.op == "call_module" and quantized_conv2d_types and isinstance(modules[node.target], quantized_conv2d_types):
             lower_quantized_conv2d(node.target, modules[node.target], node.args[0].name, node.name)
+            continue
+
+        if node.op == "call_module" and compiler_ready_linear_types and isinstance(modules[node.target], compiler_ready_linear_types):
+            lower_compiler_ready_linear(node.target, modules[node.target], node.args[0].name, node.name)
+            continue
+
+        if node.op == "call_module" and compiler_ready_conv2d_types and isinstance(modules[node.target], compiler_ready_conv2d_types):
+            lower_compiler_ready_conv2d(node.target, modules[node.target], node.args[0].name, node.name)
             continue
 
         if node.op == "call_module" and quantize_module_types and isinstance(modules[node.target], quantize_module_types):
@@ -722,6 +1091,48 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             )
             continue
 
+        if node.op == "call_function" and node.target in {
+            getattr(torch, "relu", None),
+            getattr(nn.functional, "relu", None),
+        }:
+            source = node.args[0].name
+            if current_ops and current_ops[-1].out == source and current_ops[-1].activation == "none":
+                matmul_op = current_ops[-1]
+                matmul_op.activation = "relu"
+                matmul_op.out = node.name
+                bias_value = tensors[matmul_op.bias].data if matmul_op.bias else None
+                expected = golden.matmul(
+                    env[matmul_op.lhs],
+                    env[matmul_op.rhs],
+                    bias=bias_value,
+                    multiplier=matmul_op.multiplier,
+                    shift=matmul_op.shift,
+                    activation="relu",
+                    out_dtype=matmul_op.out_dtype,
+                )
+                env[node.name] = expected.astype(np.int32)
+                tensors[node.name] = TensorSpec(
+                    node.name,
+                    normalize_shape(expected.shape),
+                    matmul_op.out_dtype,
+                    TensorKind.INTERMEDIATE,
+                    metadata=dict(tensors[source].metadata),
+                )
+                continue
+
+            flush_segment()
+            steps.append(HostOp(name=node.name, kind="relu", inputs=[source], outputs=[node.name]))
+            env[node.name] = np.maximum(env[source], 0)
+            tensors[node.name] = TensorSpec(
+                name=node.name,
+                shape=normalize_shape(env[node.name].shape),
+                dtype=tensors[source].dtype,
+                kind=TensorKind.INTERMEDIATE,
+                metadata=dict(tensors[source].metadata),
+            )
+            expected_tensors[node.name] = np.array(env[node.name], copy=True)
+            continue
+
         if node.op == "call_method" and node.target == "reshape":
             source = node.args[0].name
             shape = tuple(int(dim) for dim in node.args[1:])
@@ -830,6 +1241,59 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             )
             tensors[out_name] = TensorSpec(out_name, normalize_shape(env[out_name].shape), infer_dtype(env[out_name]), TensorKind.INTERMEDIATE)
             expected_tensors[out_name] = np.array(env[out_name], copy=True)
+            continue
+
+        if (
+            node.op == "call_method"
+            and node.target == "mean"
+        ) or (
+            node.op == "call_function"
+            and node.target in {getattr(torch, "mean", None), np.mean}
+        ):
+            flush_segment()
+            source = node.args[0].name
+            dims = node.kwargs.get("dim")
+            if dims is None and len(node.args) > 1:
+                dims = node.args[1]
+            if isinstance(dims, int):
+                dims = [dims]
+            elif dims is not None:
+                dims = [int(dim) for dim in dims]
+            keepdim = bool(node.kwargs.get("keepdim", False))
+            quant = tensors[source].metadata.get("quantization")
+            mean_value = np.mean(
+                np.array(env[source], dtype=np.float32),
+                axis=None if dims is None else tuple(dims),
+                keepdims=keepdim,
+            )
+            out_dtype = DType.FLOAT32
+            metadata = {}
+            attrs = {"dim": dims, "keepdim": keepdim}
+            if quant is not None:
+                out_dtype = parse_dtype(quant["dtype"])
+                attrs["quantization"] = {
+                    "scale": float(quant["scale"]),
+                    "zero_point": int(quant.get("zero_point", 0)),
+                    "dtype": out_dtype,
+                }
+                mean_value = golden.quantized_mean(
+                    env[source],
+                    axis=None if dims is None else tuple(dims),
+                    keepdims=keepdim,
+                    zero_point=int(quant.get("zero_point", 0)),
+                    out_dtype=out_dtype,
+                )
+                metadata = {"quantization": dict(quant)}
+            steps.append(HostOp(name=node.name, kind="mean", inputs=[source], outputs=[node.name], attrs=attrs))
+            env[node.name] = np.array(mean_value, copy=True)
+            tensors[node.name] = TensorSpec(
+                name=node.name,
+                shape=normalize_shape(env[node.name].shape),
+                dtype=out_dtype,
+                kind=TensorKind.INTERMEDIATE,
+                metadata=metadata,
+            )
+            expected_tensors[node.name] = np.array(env[node.name], copy=True)
             continue
 
         if node.op == "call_function" and getattr(node.target, "__name__", None) == "quantize_for_npu":

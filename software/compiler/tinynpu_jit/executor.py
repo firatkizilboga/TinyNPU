@@ -159,6 +159,24 @@ class HostEmulationExecutor:
         if step.kind == "relu":
             values[step.outputs[0]] = np.maximum(values[step.inputs[0]], 0)
             return
+        if step.kind == "mean":
+            source = np.array(values[step.inputs[0]], copy=False)
+            dims = step.attrs.get("dim")
+            axis = None if dims is None else tuple(int(dim) for dim in dims)
+            keepdim = bool(step.attrs.get("keepdim", False))
+            quant = step.attrs.get("quantization")
+            if quant is not None:
+                values[step.outputs[0]] = self.golden.quantized_mean(
+                    source,
+                    axis=axis,
+                    keepdims=keepdim,
+                    zero_point=int(quant.get("zero_point", 0)),
+                    out_dtype=quant["dtype"],
+                )
+            else:
+                mean_value = np.mean(source.astype(np.float32), axis=axis, keepdims=keepdim)
+                values[step.outputs[0]] = mean_value.astype(np.float32)
+            return
         if step.kind == "alias":
             values[step.outputs[0]] = np.array(values[step.inputs[0]], copy=True)
             return

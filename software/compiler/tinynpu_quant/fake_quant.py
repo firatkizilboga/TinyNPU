@@ -12,13 +12,17 @@ class SymmetricQuantizer(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, scale, num_bits, is_weight):
+    def forward(ctx, x, scale, num_bits, is_weight, signed_activations):
         if is_weight:
             qmin = -(2 ** (num_bits - 1)) + 1
             qmax = 2 ** (num_bits - 1) - 1
         else:
-            qmin = 0
-            qmax = 2 ** num_bits - 1
+            if signed_activations:
+                qmin = -(2 ** (num_bits - 1)) + 1
+                qmax = 2 ** (num_bits - 1) - 1
+            else:
+                qmin = 0
+                qmax = 2 ** num_bits - 1
         x_scaled = x / scale
         x_clamped = torch.clamp(x_scaled, qmin, qmax)
         x_quant = torch.round(x_clamped)
@@ -34,8 +38,8 @@ class SymmetricQuantizer(torch.autograd.Function):
     def backward(ctx, grad_output):
         x_scaled, qmin, qmax = ctx.saved_tensors
         mask = (x_scaled >= qmin) & (x_scaled <= qmax)
-        return grad_output * mask.float(), None, None, None
+        return grad_output * mask.float(), None, None, None, None
 
 
-def fake_quantize(x, scale, num_bits, is_weight: bool = False):
-    return SymmetricQuantizer.apply(x, scale, num_bits, is_weight)
+def fake_quantize(x, scale, num_bits, is_weight: bool = False, signed_activations: bool = False):
+    return SymmetricQuantizer.apply(x, scale, num_bits, is_weight, signed_activations)

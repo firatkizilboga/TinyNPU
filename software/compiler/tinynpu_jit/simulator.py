@@ -74,6 +74,7 @@ class SimulatorExecutor:
                     values,
                     capture_debug=debug,
                 )
+                await self._reload_bias_payload(dut, npu_driver, segment.binary["ub"], segment.symbol_table)
                 await self._load_im_image(dut, npu_driver, segment.binary["im"])
                 await self._run_until_halt(dut, npu_driver, RisingEdge)
                 for output_name in step.outputs:
@@ -215,6 +216,25 @@ class SimulatorExecutor:
                 await driver.write_reg(dut, driver.REG_ADDR, addr, 16)
                 await driver.write_reg(dut, driver.REG_CMD, 0x01, 8)
                 await driver.write_reg(dut, driver.REG_MMVR, chunk, self.buffer_width)
+
+    async def _reload_bias_payload(
+        self,
+        dut: Any,
+        driver: Any,
+        ub_words: list[int],
+        symbol_table: dict[str, dict[str, Any]],
+    ) -> None:
+        # Legacy MNIST RTL flow observed sporadic UB corruption on long chained runs.
+        # Re-writing the bias window immediately before RUN keeps execution deterministic.
+        for symbol in symbol_table.values():
+            if symbol["role"] != "BIAS":
+                continue
+            addr = int(symbol["addr"])
+            count = int(symbol["word_count"])
+            for offset in range(count):
+                await driver.write_reg(dut, driver.REG_ADDR, addr + offset, 16)
+                await driver.write_reg(dut, driver.REG_CMD, 0x01, 8)
+                await driver.write_reg(dut, driver.REG_MMVR, int(ub_words[addr + offset]), self.buffer_width)
 
     async def _run_until_halt(self, dut: Any, driver: Any, RisingEdge: Any) -> None:
         doorbell_addr = driver.REG_MMVR + (self.buffer_width // 8) - 1
