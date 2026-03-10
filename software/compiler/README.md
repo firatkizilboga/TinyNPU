@@ -89,6 +89,12 @@ Open risks:
 - a reusable PyTorch-side quantization toolkit is not built yet; `quant-by-claude.py` is still a script, not the final `tinynpu_quant` package
 - old `A/B/C/BIAS` role semantics still exist in lowering as a migration bridge
 
+Current working policy:
+- do not change RTL architecture just to add new packing primitives at this stage
+- prefer fused NPU segments first to reduce repacking overhead in software
+- prefer `int16` boundary preservation when UB allows it, especially for host-sensitive boundaries
+- otherwise use calibrated boundary `int8` scales instead of blindly reusing the next layer activation scale
+
 ## Usage
 
 ```python
