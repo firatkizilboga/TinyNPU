@@ -20,10 +20,29 @@ def quantize_for_npu(
     return tensor
 
 
+def npu_matmul(
+    lhs,
+    rhs,
+    *,
+    multiplier: int = 1,
+    shift: int = 0,
+    activation: str = "none",
+    in_dtype: str = "int16",
+    out_dtype: str = "int16",
+):
+    import torch
+
+    result = torch.matmul(lhs, rhs)
+    if activation == "relu":
+        return torch.relu(result)
+    return result
+
+
 try:
     import torch.fx  # type: ignore
 
     torch.fx.wrap("mark_for_verify")
     torch.fx.wrap("quantize_for_npu")
+    torch.fx.wrap("npu_matmul")
 except Exception:
     pass

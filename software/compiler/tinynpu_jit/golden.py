@@ -15,6 +15,10 @@ class GoldenModel:
     ) -> np.ndarray:
         source = np.array(value, copy=False)
         if np.issubdtype(source.dtype, np.integer):
+            if out_dtype == DType.INT4:
+                return np.clip(source, -8, 7).astype(np.int16, copy=False)
+            if out_dtype == DType.INT8:
+                return np.clip(source, -128, 127).astype(np.int16, copy=False)
             if out_dtype == DType.INT16:
                 return source.astype(np.int16, copy=False)
             if out_dtype == DType.INT32:
@@ -29,6 +33,10 @@ class GoldenModel:
                 "Insert quantize_for_npu(...) before feeding it into a TinyNPU segment."
             )
 
+        if out_dtype == DType.INT4:
+            return np.clip(rounded, -8, 7).astype(np.int16)
+        if out_dtype == DType.INT8:
+            return np.clip(rounded, -128, 127).astype(np.int16)
         if out_dtype == DType.INT16:
             return rounded.astype(np.int16)
         if out_dtype == DType.INT32:
