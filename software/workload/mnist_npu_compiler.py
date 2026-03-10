@@ -39,6 +39,14 @@ def prepare_activation_for_hw(data, a_bits):
     wrapped = ((arr + half) % mod) - half
     return wrapped.astype(np.int16)
 
+
+def global_average_pool_for_fc_input(data):
+    arr = np.array(data, dtype=np.int32)
+    if arr.ndim != 3:
+        raise ValueError(f"global_average_pool_for_fc_input expects HWC tensor, got shape {arr.shape}.")
+    gap = np.mean(arr, axis=(0, 1))
+    return gap.reshape(-1, 1).astype(np.int16)
+
 def get_im2col_matrix(img_data, kh, kw, stride, padding):
     H, W, C = img_data.shape
     if padding > 0:
