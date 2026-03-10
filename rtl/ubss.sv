@@ -89,9 +89,39 @@ module ubss #(
     
     // Wire up the Skewer ports
     logic [`BUFFER_WIDTH-1:0] skewer_input_data;
+    logic [`BUFFER_WIDTH-1:0] skewer_input_data_comb;
     logic [`BUFFER_WIDTH-1:0] skewer_weight_data;
     logic                     skewer_input_first, skewer_input_last;
     logic                     skewer_weight_first, skewer_weight_last;
+    logic [`ADDR_WIDTH-1:0]   ub_port_a_addr;
+    logic                     ub_port_a_first_in, ub_port_a_last_in;
+    logic [`ADDR_WIDTH-1:0]   ub_port_b_addr;
+    logic                     ub_port_b_first_in, ub_port_b_last_in;
+
+    // Read-port arbiter:
+    // - Port A is shared between SA input stream and CU random reads.
+    // - Port B serves SA weight stream.
+    // This keeps UB read addressing to 2 ports total.
+    always_comb begin
+        if (compute_enable) begin
+            ub_port_a_addr     = sa_input_addr;
+            ub_port_a_first_in = sa_input_first;
+            ub_port_a_last_in  = sa_input_last;
+            ub_port_b_addr     = sa_weight_addr;
+            ub_port_b_first_in = sa_weight_first;
+            ub_port_b_last_in  = sa_weight_last;
+        end else begin
+            ub_port_a_addr     = cu_addr;
+            ub_port_a_first_in = 1'b0;
+            ub_port_a_last_in  = 1'b0;
+            ub_port_b_addr     = '0;
+            ub_port_b_first_in = 1'b0;
+            ub_port_b_last_in  = 1'b0;
+        end
+    end
+
+    // CU reads observe Port A combinational tap when arbiter routes CU onto Port A.
+    assign cu_rdata = cu_req && !cu_wr_en ? skewer_input_data_comb : '0;
 
     unified_buffer #(
         .INIT_FILE(UB_INIT_FILE)
@@ -103,25 +133,22 @@ module ubss #(
         .wr_addr         (cu_addr),
         .wr_data         (ub_final_wdata),
         
-        // Port A: Input Matrix Stream
-        .input_first_in  (sa_input_first),
-        .input_last_in   (sa_input_last),
-        .input_addr      (sa_input_addr),
+        // Port A: SA Input Stream or CU Read (arbiter selected)
+        .input_first_in  (ub_port_a_first_in),
+        .input_last_in   (ub_port_a_last_in),
+        .input_addr      (ub_port_a_addr),
         .input_first_out (skewer_input_first),
         .input_last_out  (skewer_input_last),
         .input_data      (skewer_input_data),
+        .input_data_comb (skewer_input_data_comb),
         
         // Port B: Weight Matrix Stream
-        .weight_first_in (sa_weight_first),
-        .weight_last_in  (sa_weight_last),
-        .weight_addr     (sa_weight_addr),
+        .weight_first_in (ub_port_b_first_in),
+        .weight_last_in  (ub_port_b_last_in),
+        .weight_addr     (ub_port_b_addr),
         .weight_first_out(skewer_weight_first),
         .weight_last_out (skewer_weight_last),
-        .weight_data     (skewer_weight_data),
-
-        // CU Random Access
-        .cu_rd_addr      (cu_addr),
-        .cu_rd_data      (cu_rdata)
+        .weight_data     (skewer_weight_data)
     );
     
     // ========================================================================

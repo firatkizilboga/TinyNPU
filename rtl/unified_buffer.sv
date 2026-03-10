@@ -19,6 +19,7 @@ module unified_buffer #(
     output logic                     input_first_out,  // Delayed to match data
     output logic                     input_last_out,
     output logic [`BUFFER_WIDTH-1:0] input_data,
+    output logic [`BUFFER_WIDTH-1:0] input_data_comb,
 
     // Read interface for weights (feeds systolic array vertically)
     input  logic                     weight_first_in,
@@ -26,18 +27,14 @@ module unified_buffer #(
     input  logic [  `ADDR_WIDTH-1:0] weight_addr,
     output logic                     weight_first_out,
     output logic                     weight_last_out,
-    output logic [`BUFFER_WIDTH-1:0] weight_data,
-
-    // NEW: Dedicated Read Port for Control Unit / MMIO
-    input  logic [`ADDR_WIDTH-1:0]   cu_rd_addr,
-    output logic [`BUFFER_WIDTH-1:0] cu_rd_data
+    output logic [`BUFFER_WIDTH-1:0] weight_data
 );
 
   // Memory: BUFFER_DEPTH rows × BUFFER_WIDTH bits per row
   logic [`BUFFER_WIDTH-1:0] memory[`BUFFER_DEPTH-1:0];
 
-  // Random access read (combinational for simplicity in this CU)
-  assign cu_rd_data = memory[cu_rd_addr];
+  // Port A combinational read tap (used by CU when arbiter maps CU onto Port A).
+  assign input_data_comb = memory[input_addr];
 
   // Write logic (negedge for timing hygiene)
   always_ff @(negedge clk) begin
