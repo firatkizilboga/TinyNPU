@@ -89,6 +89,14 @@ class HostEmulationExecutor:
         if step.kind == "alias":
             values[step.outputs[0]] = np.array(values[step.inputs[0]], copy=True)
             return
+        if step.kind == "im2col":
+            values[step.outputs[0]] = self.golden.im2col(
+                values[step.inputs[0]],
+                kernel_size=int(step.attrs["kernel_size"]),
+                stride=int(step.attrs.get("stride", 1)),
+                padding=int(step.attrs.get("padding", 0)),
+            )
+            return
         if step.kind == "reshape":
             values[step.outputs[0]] = np.reshape(values[step.inputs[0]], tuple(step.attrs["shape"]))
             return

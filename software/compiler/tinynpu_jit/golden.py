@@ -6,6 +6,28 @@ from .ir import DType
 
 
 class GoldenModel:
+    def im2col(
+        self,
+        image,
+        *,
+        kernel_size: int,
+        stride: int = 1,
+        padding: int = 0,
+    ) -> np.ndarray:
+        img = np.array(image, copy=False)
+        if img.ndim != 3:
+            raise ValueError(f"im2col expects HWC image input, got shape {img.shape}.")
+        h, w, c = img.shape
+        if padding > 0:
+            img = np.pad(img, ((padding, padding), (padding, padding), (0, 0)), mode="constant")
+
+        patches = []
+        for y in range(0, h + 2 * padding - kernel_size + 1, stride):
+            for x in range(0, w + 2 * padding - kernel_size + 1, stride):
+                patch = img[y : y + kernel_size, x : x + kernel_size, :]
+                patches.append(patch.transpose(2, 0, 1).reshape(-1))
+        return np.array(patches, dtype=img.dtype)
+
     def coerce_npu_input(
         self,
         value,

@@ -14,7 +14,7 @@ This path is designed around:
 - `mark_for_verify(...)` as a host-visible verification boundary
 
 Current scope:
-- TinyNPU lowering: explicit `matmul`, with early `nn.Linear` frontend scaffolding
+- TinyNPU lowering: explicit `matmul`, exported `linear`, and exported `conv2d` lowered through host-side `im2col`
 - host-emulation runtime for compile/run/verify validation
 - async simulator runtime entrypoint that targets the existing cocotb driver path
 - deterministic compile behavior with explicit failure if a segment exceeds UB capacity
@@ -30,12 +30,14 @@ from tinynpu_jit import compile_module, mark_for_verify, quantize_for_npu
 # boundary so the tensor can be materialized and checked on the host.
 # quantize_for_npu(...) is the current explicit source of truth for
 # HostOp -> NpuSegment re-entry quantization.
+# npu_matmul(...) and im2col_for_npu(...) are transitional exported-model
+# helpers, not the intended final public frontend for ordinary PyTorch models.
 ```
 
 Examples:
 - `example_segmented_jit.py`: manual execution-plan construction
 - `example_torch_jit.py`: traced PyTorch module with `mark_for_verify(...)`
-- `software/workload/mnist_npu_compiler.py::compile_mnist_layer_jit(...)`: FC-layer MNIST export example on the new PyTorch JIT path
+- `software/workload/mnist_npu_compiler.py::compile_mnist_layer_jit(...)`: exported MNIST `linear` and `conv2d` layer examples on the new PyTorch JIT path
 - `software/workload/jit_test_gen.py::build_simple_chain_artifact(...)`: migrated old simple-chain workload on the new JIT path
 - `software/workload/jit_hostop_chain.py::build_hostop_chain_artifact(...)`: mixed `NpuSegment -> HostOp(softmax) -> quantize_for_npu -> NpuSegment` workload
 - `software/workload/inspect_simple_chain.py`: prints the segmented plan, logical previews, and packed output vectors for the migrated simple-chain artifact
@@ -45,6 +47,7 @@ Simulator smoke test:
 - Migrated simple-chain RTL test: `cd verification/cocotb && MODULE=test_jit_simple_chain make -f Makefile.npu`
 - Simple-chain RTL vector inspection: `cd verification/cocotb && MODULE=test_jit_simple_chain_inspect make -f Makefile.npu`
 - Mixed host/NPU chain RTL test: `cd verification/cocotb && MODULE=test_jit_hostop_chain make -f Makefile.npu`
+- Exported MNIST conv RTL smoke test: `cd verification/cocotb && MODULE=test_jit_mnist_conv1 make -f Makefile.npu`
 
 Current limitation:
 - `torch` is an optional dependency and is not bundled by this repository today
@@ -53,8 +56,8 @@ Current limitation:
 - the legacy `tinynpu/` package remains in place during migration
 
 Open risks:
-- the PyTorch frontend currently does not read quantization metadata such as `multiplier`, `shift`, or exported scale equivalents
-- quantized exported workloads like MNIST need an explicit quantization source of truth before they are considered migrated
+- ordinary PyTorch models still do not carry quantization metadata natively through the new path
+- exported workloads like MNIST currently use export-backed quant config through transitional helpers such as `npu_matmul(...)`
 - `HostOp -> NpuSegment` re-entry quantization now has a first explicit path through `quantize_for_npu(...)`, but broader quant config ingestion is still an active gap
 - old `A/B/C/BIAS` role semantics still exist in lowering as a migration bridge
 
