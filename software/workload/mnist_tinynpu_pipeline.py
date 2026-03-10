@@ -17,6 +17,8 @@ from software.compiler.tinynpu_quant import (
     collect_input_activation_maxes,
     convert_qat_model_for_compiler,
     copy_state_with_mapping,
+    infer_chain_output_bits,
+    infer_chain_output_scales,
     initialize_scale_tensors,
 )
 
@@ -123,6 +125,58 @@ def build_signed_w8a8_configs():
         default_w_bits=8,
         default_a_bits=8,
         default_signed_activations=True,
+    )
+
+
+def collect_relu3_boundary_scale(
+    model: TinyMNISTQAT,
+    calib_dataset,
+    *,
+    percentile: float = 99.9,
+    max_samples: int = 256,
+) -> float:
+    values = []
+    limit = min(int(max_samples), len(calib_dataset))
+    model = model.cpu().eval()
+    with torch.no_grad():
+        for index in range(limit):
+            sample, _ = calib_dataset[index]
+            x = sample.unsqueeze(0)
+
+            x1 = model.conv1(x)
+            x1 = F.relu(x1)
+
+            x2 = model.conv2(x1)
+            x2 = F.relu(x2)
+
+            x3 = model.conv3(x2)
+            x3 = F.relu(x3)
+            values.append(x3.reshape(-1).cpu())
+
+    if not values:
+        raise ValueError("Expected at least one calibration sample when collecting relu3 boundary scale.")
+
+    flat = torch.cat(values).abs()
+    boundary_abs = float(torch.quantile(flat, torch.tensor(float(percentile) / 100.0)).item())
+    return max(boundary_abs / 127.0, 1e-8)
+
+
+def build_compiler_ready_mnist_model(
+    qat_model: TinyMNISTQAT,
+    *,
+    calib_dataset,
+    dequantize_output: bool = True,
+):
+    output_scales = infer_chain_output_scales(qat_model, LAYER_NAMES)
+    output_bits = infer_chain_output_bits(qat_model, LAYER_NAMES)
+    output_scales["conv3"] = collect_relu3_boundary_scale(qat_model, calib_dataset)
+    output_bits["conv3"] = 8
+    return convert_qat_model_for_compiler(
+        qat_model.cpu().eval(),
+        layer_order=LAYER_NAMES,
+        output_scales=output_scales,
+        output_bits=output_bits,
+        dequantize_output=dequantize_output,
     )
 
 
@@ -289,7 +343,10 @@ def run_pipeline(
     torch.save(qat_model.state_dict(), run_path / "qat.pt")
     qat_acc = evaluate_model(qat_model, test_loader, device)
 
-    compiler_ready = convert_qat_model_for_compiler(qat_model.cpu().eval(), layer_order=LAYER_NAMES)
+    compiler_ready = build_compiler_ready_mnist_model(
+        qat_model,
+        calib_dataset=test_ds,
+    )
     example = test_ds[0][0].unsqueeze(0)
     artifact = compile_module(compiler_ready, (example,))
 
@@ -352,9 +409,9 @@ def build_compiled_artifact_from_run(
 ):
     _, _, _, _, test_ds = get_mnist_loaders(data_dir)
     qat_model = load_qat_model_from_run(run_dir, device="cpu")
-    compiler_ready = convert_qat_model_for_compiler(
-        qat_model.cpu().eval(),
-        layer_order=LAYER_NAMES,
+    compiler_ready = build_compiler_ready_mnist_model(
+        qat_model,
+        calib_dataset=test_ds,
         dequantize_output=dequantize_output,
     )
     sample_image, sample_label = test_ds[int(sample_index)]

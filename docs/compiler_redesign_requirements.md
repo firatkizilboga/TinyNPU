@@ -448,9 +448,10 @@ Current non-capabilities:
 - asymmetric zero-point NPU segments are not supported
 - transformer attention is not a first-class supported workload yet
 - attention-softmax / normalization / residual-style mixed graphs will still rely on explicit host fallback boundaries
-- compiled fidelity against the originating PyTorch QAT model is still incomplete for the fresh MNIST flow
-  - the host/RTL path is now correct
-  - the remaining gap is compiler/model-semantics accuracy, not simulator mismatch
+- broad automatic host-boundary scale inference is not solved generally yet
+  - the fresh MNIST pipeline now uses a calibrated `conv3 -> mean` boundary scale instead of reusing the next NPU layer's activation scale
+  - this recovered compiled-host MNIST accuracy from catastrophic loss back to near-QAT quality on the validated slice
+  - the general rule is now explicit: "next layer activation scale" is only valid for direct quantized NPU-to-NPU chains, not for host-sensitive ops such as `mean`
 
 ### 10.13 `tinynpu_quant` Plan
 
@@ -509,9 +510,9 @@ Short-term execution order:
    - done for the current narrow quantized `Conv2d` path
 5. After the quant toolkit is more complete, teach `compile_module(...)` to accept the prepared output of that toolkit directly.
 6. Use the fresh trained MNIST pipeline as the main fidelity-debug target.
-   - host and RTL are now aligned on the trained checkpoint path
-   - next bug is the accuracy gap between PyTorch QAT and compiled execution
-   - debug should proceed by comparing PyTorch QAT vs compiled host layer-by-layer on deterministic sample batches
+   - host and RTL are aligned on the trained checkpoint path
+   - a calibrated `conv3 -> mean` boundary scale fixed the largest remaining MNIST fidelity loss
+   - remaining work should generalize this host-boundary handling beyond the current MNIST-specific pipeline
 
 Guardrails for the next steps:
 - do not claim support for asymmetric zero-point NPU segments unless the hardware path is real
