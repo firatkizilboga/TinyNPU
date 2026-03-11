@@ -89,3 +89,52 @@ def test_unknown_host_op_fails_closed():
 
     with pytest.raises(NotImplementedError, match="Unsupported host op 'mystery'"):
         compile_plan(plan, expected_tensors={})
+
+
+def test_quantize_validation_fails_on_non_positive_scale():
+    step = HostOp(name="q0", kind="quantize", inputs=["x"], outputs=["y"], attrs={"scale": 0.0})
+    plan = _artifact_for_host_op(step).plan
+
+    with pytest.raises(ValueError, match="scale > 0"):
+        compile_plan(plan, expected_tensors={})
+
+
+def test_mean_validation_requires_input_quantization_scale():
+    step = HostOp(
+        name="mean0",
+        kind="mean",
+        inputs=["x"],
+        outputs=["y"],
+        attrs={"input_quantization": {"zero_point": 0}},
+    )
+    plan = _artifact_for_host_op(step).plan
+
+    with pytest.raises(ValueError, match="missing required attr 'scale'"):
+        compile_plan(plan, expected_tensors={})
+
+
+def test_transpose_validation_rejects_duplicate_axes():
+    step = HostOp(name="t0", kind="transpose", inputs=["x"], outputs=["y"], attrs={"axes": (0, 0)})
+    plan = _artifact_for_host_op(step).plan
+
+    with pytest.raises(ValueError, match="axes must be unique"):
+        compile_plan(plan, expected_tensors={})
+
+
+def test_mean_benchmark_counts_embedded_dequantization_work():
+    step = HostOp(
+        name="mean0",
+        kind="mean",
+        inputs=["x"],
+        outputs=["y"],
+        attrs={"dim": [0], "input_quantization": {"scale": 0.25, "zero_point": 3}},
+    )
+    source = np.array([[1, 2], [3, 4]], dtype=np.int8)
+    output = np.array([1.5, 2.5], dtype=np.float32)
+
+    bucket, counts = estimate_host_op_counts(step, {"x": source, "y": output})
+
+    assert bucket == "host_intrinsic"
+    assert counts.reads == source.size * 2
+    assert counts.muls == source.size
+    assert counts.adds == source.size * 3
