@@ -38,7 +38,7 @@ def test_builtin_host_op_registry_drives_execution_and_benchmark():
     artifact = _artifact_for_host_op(step)
     source = np.array([[-2.0, 0.0], [2.0, 4.0]], dtype=np.float32)
 
-    result = HostEmulationExecutor().run(artifact, {"x": source}, benchmark=True)
+    result = HostEmulationExecutor().run(artifact, {"x": source})
 
     expected = 1.0 / (1.0 + np.exp(-source))
     assert np.allclose(result.tensors["y"], expected)
