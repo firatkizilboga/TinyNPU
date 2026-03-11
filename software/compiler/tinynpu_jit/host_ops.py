@@ -22,6 +22,7 @@ class HostOpSpec:
     output_arity: int | None = 1
     required_attrs: tuple[str, ...] = field(default_factory=tuple)
     quant_boundary_policy: str = "passthrough"
+    semantic_validator: Callable[[HostOp], None] | None = None
 
     def validate(self, step: HostOp) -> None:
         if self.input_arity is not None and len(step.inputs) != self.input_arity:
@@ -35,6 +36,8 @@ class HostOpSpec:
         missing = tuple(attr for attr in self.required_attrs if attr not in step.attrs)
         if missing:
             raise ValueError(f"Host op {self.kind!r} is missing required attrs: {', '.join(missing)}.")
+        if self.semantic_validator is not None:
+            self.semantic_validator(step)
 
 
 _HOST_OP_REGISTRY: dict[str, HostOpSpec] = {}
@@ -50,6 +53,81 @@ def _dtype_attr(value: Any) -> DType:
     if isinstance(value, DType):
         return value
     return DType(str(value))
+
+
+def _require_positive_scale(step: HostOp) -> None:
+    scale = float(step.attrs["scale"])
+    if scale <= 0.0:
+        raise ValueError(f"Host op {step.kind!r} requires scale > 0, got {scale}.")
+
+
+def _validate_mean(step: HostOp) -> None:
+    dims = step.attrs.get("dim")
+    if dims is not None:
+        if not isinstance(dims, (list, tuple)):
+            raise ValueError(f"Host op 'mean' expects 'dim' to be a list/tuple, got {type(dims).__name__}.")
+        for dim in dims:
+            if not isinstance(dim, int):
+                raise ValueError(f"Host op 'mean' expects integer dims, got {dim!r}.")
+    input_quant = step.attrs.get("input_quantization")
+    if input_quant is not None:
+        if not isinstance(input_quant, dict):
+            raise ValueError("Host op 'mean' expects input_quantization to be a dict when provided.")
+        if "scale" not in input_quant:
+            raise ValueError("Host op 'mean' input_quantization is missing required attr 'scale'.")
+        scale = float(input_quant["scale"])
+        if scale <= 0.0:
+            raise ValueError(f"Host op 'mean' requires input_quantization.scale > 0, got {scale}.")
+
+
+def _validate_im2col(step: HostOp) -> None:
+    kernel_size = int(step.attrs["kernel_size"])
+    stride = int(step.attrs.get("stride", 1))
+    padding = int(step.attrs.get("padding", 0))
+    layout = str(step.attrs.get("input_layout", "hwc"))
+    if kernel_size <= 0:
+        raise ValueError(f"Host op 'im2col' requires kernel_size > 0, got {kernel_size}.")
+    if stride <= 0:
+        raise ValueError(f"Host op 'im2col' requires stride > 0, got {stride}.")
+    if padding < 0:
+        raise ValueError(f"Host op 'im2col' requires padding >= 0, got {padding}.")
+    if layout not in {"hwc", "chw"}:
+        raise ValueError(f"Host op 'im2col' does not support input_layout={layout!r}.")
+
+
+def _validate_layout_restore(step: HostOp) -> None:
+    layout = str(step.attrs["layout"])
+    original_shape = tuple(step.attrs["original_shape"])
+    out_h = int(step.attrs["out_h"])
+    out_w = int(step.attrs["out_w"])
+    out_channels = int(step.attrs["out_channels"])
+    if layout not in {"chw", "hwc"}:
+        raise ValueError(f"Host op 'layout_restore' does not support layout={layout!r}.")
+    if len(original_shape) not in {3, 4}:
+        raise ValueError(
+            f"Host op 'layout_restore' expects original_shape rank 3 or 4, got rank {len(original_shape)}."
+        )
+    if out_h <= 0 or out_w <= 0 or out_channels <= 0:
+        raise ValueError("Host op 'layout_restore' requires positive out_h/out_w/out_channels.")
+
+
+def _validate_reshape(step: HostOp) -> None:
+    shape = tuple(step.attrs["shape"])
+    if not shape:
+        raise ValueError("Host op 'reshape' requires a non-empty shape.")
+    if any(int(dim) <= 0 for dim in shape):
+        raise ValueError(f"Host op 'reshape' requires all dimensions > 0, got {shape}.")
+
+
+def _validate_transpose(step: HostOp) -> None:
+    axes = step.attrs.get("axes")
+    if axes is None:
+        return
+    if not isinstance(axes, (list, tuple)):
+        raise ValueError(f"Host op 'transpose' expects 'axes' to be a list/tuple, got {type(axes).__name__}.")
+    normalized = tuple(int(axis) for axis in axes)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(f"Host op 'transpose' axes must be unique, got {normalized}.")
 
 
 def _softmax_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
@@ -165,13 +243,20 @@ def _mean_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel)
 def _mean_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
     source_elements = int(np.array(values[step.inputs[0]], copy=False).size)
     out_elems = int(np.array(values[step.outputs[0]], copy=False).size)
-    return "host_intrinsic", _counts(
+    counts = _counts(
         reads=source_elements,
         adds=source_elements,
         divs=out_elems,
         writes=out_elems,
         branches=source_elements + out_elems,
     )
+    input_quant = step.attrs.get("input_quantization")
+    if input_quant is not None:
+        counts.reads += source_elements
+        counts.adds += source_elements * (2 if int(input_quant.get("zero_point", 0)) != 0 else 1)
+        counts.muls += source_elements
+        counts.branches += source_elements
+    return "host_intrinsic", counts
 
 
 def _alias_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
@@ -299,22 +384,51 @@ def benchmark_host_op(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str,
 
 for _spec in (
     HostOpSpec("alias", _alias_eval, _movement_benchmark),
-    HostOpSpec("dequantize", _dequantize_eval, _dequantize_benchmark, required_attrs=("scale",), quant_boundary_policy="npu_to_host"),
-    HostOpSpec("im2col", _im2col_eval, _im2col_benchmark, required_attrs=("kernel_size",), quant_boundary_policy="layout_transform"),
+    HostOpSpec(
+        "dequantize",
+        _dequantize_eval,
+        _dequantize_benchmark,
+        required_attrs=("scale",),
+        quant_boundary_policy="npu_to_host",
+        semantic_validator=_require_positive_scale,
+    ),
+    HostOpSpec(
+        "im2col",
+        _im2col_eval,
+        _im2col_benchmark,
+        required_attrs=("kernel_size",),
+        quant_boundary_policy="layout_transform",
+        semantic_validator=_validate_im2col,
+    ),
     HostOpSpec(
         "layout_restore",
         _layout_restore_eval,
         _movement_benchmark,
         required_attrs=("layout", "original_shape", "out_h", "out_w", "out_channels"),
         quant_boundary_policy="layout_transform",
+        semantic_validator=_validate_layout_restore,
     ),
-    HostOpSpec("mean", _mean_eval, _mean_benchmark),
-    HostOpSpec("quantize", _quantize_eval, _quantize_benchmark, required_attrs=("scale",), quant_boundary_policy="host_to_npu"),
+    HostOpSpec("mean", _mean_eval, _mean_benchmark, semantic_validator=_validate_mean),
+    HostOpSpec(
+        "quantize",
+        _quantize_eval,
+        _quantize_benchmark,
+        required_attrs=("scale",),
+        quant_boundary_policy="host_to_npu",
+        semantic_validator=_require_positive_scale,
+    ),
     HostOpSpec("relu", _relu_eval, _relu_benchmark),
-    HostOpSpec("requantize", _requantize_eval, _requantize_benchmark, required_attrs=("scale",), quant_boundary_policy="host_to_npu"),
-    HostOpSpec("reshape", _reshape_eval, _movement_benchmark, required_attrs=("shape",)),
+    HostOpSpec(
+        "requantize",
+        _requantize_eval,
+        _requantize_benchmark,
+        required_attrs=("scale",),
+        quant_boundary_policy="host_to_npu",
+        semantic_validator=_require_positive_scale,
+    ),
+    HostOpSpec("reshape", _reshape_eval, _movement_benchmark, required_attrs=("shape",), semantic_validator=_validate_reshape),
     HostOpSpec("sigmoid", _sigmoid_eval, _sigmoid_benchmark),
     HostOpSpec("softmax", _softmax_eval, _softmax_benchmark),
-    HostOpSpec("transpose", _transpose_eval, _movement_benchmark),
+    HostOpSpec("transpose", _transpose_eval, _movement_benchmark, semantic_validator=_validate_transpose),
 ):
     register_host_op(_spec)
