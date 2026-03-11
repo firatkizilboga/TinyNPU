@@ -5,6 +5,7 @@ import math
 import numpy as np
 
 from .artifact import CompiledArtifact, ExecutionResult
+from .benchmark import BenchmarkReport, CostModel, estimate_host_op_counts, estimate_npu_segment_cpu_counts
 from .golden import GoldenModel
 from .ir import HostOp, NpuSegment, TensorKind, VerificationMode, VerifyTensor
 
@@ -19,6 +20,8 @@ class HostEmulationExecutor:
         inputs: dict[str, np.ndarray],
         verification: VerificationMode = VerificationMode.OFF,
         debug: bool = False,
+        benchmark: bool = False,
+        cost_model: CostModel | None = None,
     ) -> ExecutionResult:
         values: dict[str, np.ndarray] = {}
         for name, spec in artifact.plan.tensors.items():
@@ -32,9 +35,17 @@ class HostEmulationExecutor:
 
         verified: list[str] = []
         debug_trace: list[dict[str, np.ndarray | str | dict[str, object] | list[str] | bool]] = []
+        benchmark_report = BenchmarkReport(cost_model=cost_model or CostModel()) if benchmark else None
         for step in artifact.plan.steps:
             if isinstance(step, NpuSegment):
                 self._run_npu_segment(step, values)
+                if benchmark_report is not None:
+                    benchmark_report.add_entry(
+                        step=step.name,
+                        bucket="cpu_replaced",
+                        counts=estimate_npu_segment_cpu_counts(step, artifact.plan.tensors),
+                        attrs={"kind": "npu_segment", "op_count": len(step.ops)},
+                    )
                 if debug:
                     debug_trace.append(
                         self._debug_event(
@@ -63,6 +74,14 @@ class HostEmulationExecutor:
                     )
             elif isinstance(step, HostOp):
                 self._run_host_op(step, values)
+                if benchmark_report is not None:
+                    bucket, counts = estimate_host_op_counts(step, values)
+                    benchmark_report.add_entry(
+                        step=step.name,
+                        bucket=bucket,
+                        counts=counts,
+                        attrs={"kind": step.kind},
+                    )
                 if debug:
                     debug_trace.append(
                         self._debug_event(
@@ -104,6 +123,7 @@ class HostEmulationExecutor:
             verified=verified,
             trace_tensors=trace_tensors,
             debug_trace=debug_trace,
+            benchmark=benchmark_report,
         )
 
     def _should_verify(self, step: VerifyTensor, verification: VerificationMode) -> bool:
