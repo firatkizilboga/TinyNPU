@@ -9,15 +9,15 @@ from .golden import GoldenModel
 from .ir import DType, HostOp
 
 
-HostOpEvaluator = Callable[[HostOp, dict[str, np.ndarray], GoldenModel], None]
-HostOpBenchmark = Callable[[HostOp, dict[str, np.ndarray]], tuple[str, Any]]
+HostOpEvaluatorFn = Callable[[HostOp, dict[str, np.ndarray], GoldenModel], None]
+HostOpBenchmarkFn = Callable[[HostOp, dict[str, np.ndarray]], tuple[str, Any]]
 
 
 @dataclass(frozen=True)
 class HostOpSpec:
     kind: str
-    evaluator: HostOpEvaluator
-    benchmark: HostOpBenchmark
+    evaluator: HostOpEvaluatorFn
+    benchmark: HostOpBenchmarkFn
     input_arity: int | None = 1
     output_arity: int | None = 1
     required_attrs: tuple[str, ...] = field(default_factory=tuple)
