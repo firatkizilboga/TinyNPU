@@ -16,7 +16,8 @@ The script supports two modes:
 
 2. `full-ram`
 - keeps the real datapath, control logic, and current UB/IM RTL
-- useful for seeing how much additional FPGA-style cost the current memory implementation introduces
+- useful for seeing the whole current RTL design cost, including the existing UB/IM implementation
+- in the measured flow, Yosys maps the memory RTL into RAM primitives rather than leaving it as generic logic
 
 In both modes the script stages a synthesis-only copy of the RTL and strips simulation-only constructs that break synthesis frontends:
 - top-level trace `$test$plusargs(...)` block in `tinynpu_top.sv`
@@ -73,4 +74,5 @@ Using the local Yosys `v0.58` + `yosys-slang` flow on March 11, 2026:
 
 - The datapath remains the dominant compute cost; DSP usage is unchanged across both modes.
 - Including the current UB/IM RTL adds about `8527` LUT-equivalent cells, roughly `34%` over the memory-abstracted run.
-- These are FPGA-style synthesis proxies from `synth_xilinx`, not ASIC area or final silicon numbers.
+- Because Yosys inferred RAM primitives in `full-ram` mode, that number is a valid whole-design FPGA-style proxy for the current RTL, not just a pessimistic LUT-only fallback.
+- These are still FPGA-style synthesis proxies from `synth_xilinx`, not ASIC area or final silicon numbers.
