@@ -6,6 +6,7 @@ import numpy as np
 
 from .artifact import CompiledArtifact, ExecutionResult
 from .golden import GoldenModel
+from .host_ops import execute_host_op
 from .ir import HostOp, NpuSegment, TensorKind, VerificationMode, VerifyTensor
 
 
@@ -128,109 +129,7 @@ class HostEmulationExecutor:
             )
 
     def _run_host_op(self, step: HostOp, values: dict[str, np.ndarray]) -> None:
-        if step.kind == "softmax":
-            axis = int(step.attrs.get("axis", -1))
-            values[step.outputs[0]] = self.golden.softmax(values[step.inputs[0]], axis=axis)
-            return
-        if step.kind == "quantize":
-            scale = float(step.attrs["scale"])
-            zero_point = int(step.attrs.get("zero_point", 0))
-            out_dtype = step.attrs.get("dtype", "int8")
-            values[step.outputs[0]] = self.golden.quantize(
-                values[step.inputs[0]],
-                scale=scale,
-                zero_point=zero_point,
-                out_dtype=out_dtype,
-            )
-            return
-        if step.kind == "dequantize":
-            scale = float(step.attrs["scale"])
-            zero_point = int(step.attrs.get("zero_point", 0))
-            values[step.outputs[0]] = self.golden.dequantize(
-                values[step.inputs[0]],
-                scale=scale,
-                zero_point=zero_point,
-            )
-            return
-        if step.kind == "sigmoid":
-            source = np.array(values[step.inputs[0]], dtype=np.float32)
-            values[step.outputs[0]] = 1.0 / (1.0 + np.exp(-source))
-            return
-        if step.kind == "relu":
-            values[step.outputs[0]] = np.maximum(values[step.inputs[0]], 0)
-            return
-        if step.kind == "mean":
-            source = np.array(values[step.inputs[0]], copy=False)
-            dims = step.attrs.get("dim")
-            axis = None if dims is None else tuple(int(dim) for dim in dims)
-            keepdim = bool(step.attrs.get("keepdim", False))
-            input_quant = step.attrs.get("input_quantization")
-            if input_quant is not None:
-                source = self.golden.dequantize(
-                    source,
-                    scale=float(input_quant["scale"]),
-                    zero_point=int(input_quant.get("zero_point", 0)),
-                )
-            mean_value = np.mean(source.astype(np.float32), axis=axis, keepdims=keepdim)
-            values[step.outputs[0]] = mean_value.astype(np.float32)
-            return
-        if step.kind == "alias":
-            values[step.outputs[0]] = np.array(values[step.inputs[0]], copy=True)
-            return
-        if step.kind == "im2col":
-            image = np.array(values[step.inputs[0]], copy=False)
-            layout = step.attrs.get("input_layout", "hwc")
-            if layout == "chw":
-                if image.ndim == 4:
-                    if image.shape[0] != 1:
-                        raise NotImplementedError(
-                            f"im2col host op only supports batch size 1 for CHW input, got shape {image.shape}."
-                        )
-                    image = image[0]
-                image = np.transpose(image, (1, 2, 0))
-            values[step.outputs[0]] = self.golden.im2col(
-                image,
-                kernel_size=int(step.attrs["kernel_size"]),
-                stride=int(step.attrs.get("stride", 1)),
-                padding=int(step.attrs.get("padding", 0)),
-            )
-            return
-        if step.kind == "reshape":
-            values[step.outputs[0]] = np.reshape(values[step.inputs[0]], tuple(step.attrs["shape"]))
-            return
-        if step.kind == "transpose":
-            values[step.outputs[0]] = np.transpose(values[step.inputs[0]], axes=tuple(step.attrs.get("axes", [])) or None)
-            return
-        if step.kind == "layout_restore":
-            source = np.array(values[step.inputs[0]], copy=False)
-            hwc = source.reshape(
-                int(step.attrs["out_h"]),
-                int(step.attrs["out_w"]),
-                int(step.attrs["out_channels"]),
-            )
-            if step.attrs["layout"] == "chw":
-                restored = np.transpose(hwc, (2, 0, 1))
-                original_shape = tuple(step.attrs["original_shape"])
-                if len(original_shape) == 4:
-                    restored = np.expand_dims(restored, axis=0)
-                values[step.outputs[0]] = restored
-                return
-            if step.attrs["layout"] == "hwc":
-                values[step.outputs[0]] = hwc
-                return
-            raise ValueError(f"Unsupported layout_restore layout {step.attrs['layout']!r}.")
-        if step.kind == "requantize":
-            scale = float(step.attrs["scale"])
-            zero_point = int(step.attrs.get("zero_point", 0))
-            out_dtype = step.attrs.get("dtype", "int16")
-            values[step.outputs[0]] = self.golden.requantize(
-                values[step.inputs[0]],
-                scale=scale,
-                zero_point=zero_point,
-                out_dtype=out_dtype,
-            )
-            return
-        raise NotImplementedError(f"Unsupported host op '{step.kind}'.")
+        execute_host_op(step, values, golden=self.golden)
 
     def _debug_event(
         self,
