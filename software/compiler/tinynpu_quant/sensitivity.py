@@ -6,6 +6,7 @@ from math import ceil
 
 import torch.nn as nn
 
+from .calibration import collect_input_activation_maxes
 from .config import LayerQuantConfig, build_layer_config_map
 from .conversion import (
     collect_qat_layer_names,
@@ -116,6 +117,42 @@ def apply_layer_quant_configs(
     return target
 
 
+def recalibrate_qat_scales(
+    model: nn.Module,
+    *,
+    layer_names: list[str] | tuple[str, ...] | None,
+    calib_loader,
+    device: str,
+    inplace: bool = False,
+) -> nn.Module:
+    target = model if inplace else copy.deepcopy(model)
+    resolved_layer_names = list(layer_names or collect_qat_layer_names(target))
+    modules = dict(target.named_modules())
+    activation_maxes = collect_input_activation_maxes(target.eval(), calib_loader, resolved_layer_names, device=device)
+
+    for layer_name in resolved_layer_names:
+        layer = modules.get(layer_name)
+        if not isinstance(layer, (QConv2d, QLinear)):
+            raise TypeError(f"Layer {layer_name!r} is not a supported QAT layer.")
+        weight_qmax = (1 << (int(layer.w_bits) - 1)) - 1
+        if weight_qmax <= 0:
+            raise ValueError(f"Layer {layer_name!r} has unsupported w_bits={layer.w_bits}.")
+        activation_qmax = (
+            (1 << (int(layer.a_bits) - 1)) - 1 if bool(layer.signed_activations) else (1 << int(layer.a_bits)) - 1
+        )
+        if activation_qmax <= 0:
+            raise ValueError(f"Layer {layer_name!r} has unsupported a_bits={layer.a_bits}.")
+
+        weight = layer.conv.weight if isinstance(layer, QConv2d) else layer.linear.weight
+        weight_scale = max(float(weight.detach().abs().max().item()) / float(weight_qmax), 1e-8)
+        activation_scale = max(float(activation_maxes[layer_name]) / float(activation_qmax), 1e-8)
+
+        layer.w_scale.data.copy_(layer.w_scale.data.new_tensor(weight_scale))
+        layer.a_scale.data.copy_(layer.a_scale.data.new_tensor(activation_scale))
+
+    return target
+
+
 def build_mixed_precision_sensitivity_report(
     layer_names: list[str] | tuple[str, ...],
     *,
@@ -124,6 +161,7 @@ def build_mixed_precision_sensitivity_report(
     candidate_bits: tuple[tuple[int, int], ...] = ((16, 16), (8, 8), (4, 4)),
     max_acceptable_drop: float = 0.01,
     parameter_counts: Mapping[str, Mapping[str, int]] | None = None,
+    prepare_configs: Callable[[dict[str, LayerQuantConfig]], Any] | None = None,
 ) -> dict[str, object]:
     """
     Evaluate one layer at a time across candidate precisions and return a stable
@@ -161,7 +199,12 @@ def build_mixed_precision_sensitivity_report(
                 a_bits=int(a_bits),
                 signed_activations=bool(baseline_config.signed_activations),
             )
-            score = baseline_score if (w_bits, a_bits) == (baseline_config.w_bits, baseline_config.a_bits) else float(evaluate_configs(configs))
+            prepared_configs = prepare_configs(configs) if prepare_configs is not None else configs
+            score = (
+                baseline_score
+                if (w_bits, a_bits) == (baseline_config.w_bits, baseline_config.a_bits) and prepare_configs is None
+                else float(evaluate_configs(prepared_configs))
+            )
             delta = float(baseline_score - score)
             candidate_weight_bytes = _estimate_weight_bytes(parameter_counts.get(layer_name), w_bits) if parameter_counts else None
             trial = {
@@ -258,8 +301,11 @@ def convert_mixed_precision_qat_model_for_compiler(
     `layer_configs_or_report` may be either a direct layer-config mapping or a
     full sensitivity report containing `selected_layer_configs`.
     """
-    layer_configs = _coerce_layer_configs_from_report(layer_configs_or_report)
-    prepared_model = apply_layer_quant_configs(model, layer_configs, inplace=False)
+    if isinstance(layer_configs_or_report, Mapping) and "selected_layer_configs" in layer_configs_or_report:
+        layer_configs = _coerce_layer_configs_from_report(layer_configs_or_report)
+        prepared_model = apply_layer_quant_configs(model, layer_configs, inplace=False)
+    else:
+        prepared_model = apply_layer_quant_configs(model, layer_configs_or_report, inplace=False)
     resolved_layer_order = layer_order or collect_qat_layer_names(prepared_model)
     resolved_output_bits = output_bits or infer_chain_output_bits(prepared_model, resolved_layer_order)
     return convert_qat_model_for_compiler(
@@ -367,7 +413,7 @@ def _coerce_layer_configs_from_report(
             signed_activations=(
                 bool(config.signed_activations)
                 if isinstance(config, LayerQuantConfig)
-                else bool(config.get("signed_activations", False))
+                else bool(config["signed_activations"])
             ),
         )
         for layer_name, config in raw_configs.items()

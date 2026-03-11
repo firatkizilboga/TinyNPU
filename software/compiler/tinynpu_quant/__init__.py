@@ -25,6 +25,7 @@ from .sensitivity import (
     collect_layer_parameter_counts,
     collect_layer_quant_configs,
     convert_mixed_precision_qat_model_for_compiler,
+    recalibrate_qat_scales,
     rank_sensitivity,
     single_layer_bit_drop_sensitivity,
 )
@@ -57,6 +58,7 @@ __all__ = [
     "infer_chain_output_bits",
     "infer_chain_output_scales",
     "initialize_scale_tensors",
+    "recalibrate_qat_scales",
     "rank_sensitivity",
     "single_layer_bit_drop_sensitivity",
     "synthesize_rescale",

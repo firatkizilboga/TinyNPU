@@ -21,6 +21,7 @@ from tinynpu_quant import (
     apply_layer_quant_configs,
     build_mixed_precision_sensitivity_report,
     convert_mixed_precision_qat_model_for_compiler,
+    recalibrate_qat_scales,
 )
 
 
@@ -157,6 +158,63 @@ class SensitivityPipelineTests(unittest.TestCase):
         self.assertIn(artifact.plan.outputs[0], result.tensors)
         self.assertGreater(output.size, 0)
         self.assertTrue(torch.isfinite(torch.from_numpy(output)).all().item())
+
+    def test_report_uses_prepare_hook_for_candidate_evaluation(self):
+        layer_names = ["conv1", "conv2"]
+        prepared_calls = []
+
+        def prepare_configs(configs):
+            prepared_calls.append({name: (cfg.w_bits, cfg.a_bits) for name, cfg in configs.items()})
+            return configs
+
+        def evaluate_configs(configs):
+            return 1.0
+
+        report = build_mixed_precision_sensitivity_report(
+            layer_names,
+            evaluate_configs=evaluate_configs,
+            candidate_bits=((8, 8), (4, 4)),
+            prepare_configs=prepare_configs,
+        )
+
+        self.assertEqual(report["baseline_score"], 1.0)
+        self.assertGreaterEqual(len(prepared_calls), len(layer_names) * 2)
+
+    def test_raw_layer_config_conversion_preserves_signed_activations_from_model(self):
+        model = TinyMixedPrecisionModel().eval()
+        self.assertTrue(model.conv.signed_activations)
+        self.assertTrue(model.fc.signed_activations)
+
+        compiler_ready = convert_mixed_precision_qat_model_for_compiler(
+            model,
+            {
+                "conv": {"w_bits": 4, "a_bits": 4},
+                "fc": {"w_bits": 16, "a_bits": 16},
+            },
+            layer_order=["conv", "fc"],
+        )
+
+        self.assertEqual(compiler_ready.inner.conv.in_dtype, "int4")
+        self.assertEqual(compiler_ready.inner.fc.in_dtype, "int16")
+
+    def test_recalibrate_qat_scales_updates_for_new_precision(self):
+        model = TinyMixedPrecisionModel().eval()
+        updated = apply_layer_quant_configs(
+            model,
+            {"conv": LayerQuantConfig(w_bits=4, a_bits=4, signed_activations=True)},
+            inplace=False,
+        )
+        dataset = [
+            (torch.tensor([[[[0.25, -0.5, 0.75], [0.125, -0.25, 0.5], [0.0, 0.375, -0.125]]]], dtype=torch.float32), 0),
+            (torch.tensor([[[[0.5, -0.25, 0.125], [0.75, -0.5, 0.25], [0.125, 0.0, -0.125]]]], dtype=torch.float32), 1),
+        ]
+
+        before = float(updated.conv.a_scale.item())
+        recalibrate_qat_scales(updated, layer_names=["conv", "fc"], calib_loader=dataset, device="cpu", inplace=True)
+        after = float(updated.conv.a_scale.item())
+
+        self.assertGreater(after, 0.0)
+        self.assertNotEqual(before, after)
 
 
 if __name__ == "__main__":
