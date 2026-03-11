@@ -80,6 +80,7 @@ Current limitation:
 - the fresh MNIST pipeline now calibrates the `conv3 -> mean` host boundary instead of blindly reusing the FC input scale; this restores compiled-host accuracy to near-QAT quality on the validated slice
 - that host-boundary calibration helper now lives in `tinynpu_quant` instead of remaining MNIST-specific code
 - the legacy `tinynpu/` package remains in place during migration
+- reproducible synthesis characterization script: `scripts/synth_tinynpu_yosys.py`
 - the new benchmark path is an architectural model:
   - `cpu_replaced_cycles` counts only work the NPU replaces
   - `npu_overhead_cycles` counts only accelerator-induced packing/interface overhead
