@@ -125,6 +125,16 @@ def build_mixed_precision_sensitivity_report(
     max_acceptable_drop: float = 0.01,
     parameter_counts: Mapping[str, Mapping[str, int]] | None = None,
 ) -> dict[str, object]:
+    """
+    Evaluate one layer at a time across candidate precisions and return a stable
+    mixed-precision selection report.
+
+    `evaluate_configs` must return a higher-is-better score for the supplied
+    per-layer `LayerQuantConfig` map. The returned report contains the baseline
+    score, per-layer trial results, a sensitivity ranking based on the lowest
+    candidate precision, selected layer configs, and estimated static parameter
+    bytes when `parameter_counts` are available.
+    """
     if not layer_names:
         raise ValueError("layer_names must contain at least one layer.")
     baseline_configs = build_layer_config_map(layer_names, overrides=baseline_configs)
@@ -242,6 +252,12 @@ def convert_mixed_precision_qat_model_for_compiler(
     output_bits: dict[str, int] | None = None,
     dequantize_output: bool = True,
 ) -> nn.Module:
+    """
+    Convert a QAT model after applying selected mixed-precision layer configs.
+
+    `layer_configs_or_report` may be either a direct layer-config mapping or a
+    full sensitivity report containing `selected_layer_configs`.
+    """
     layer_configs = _coerce_layer_configs_from_report(layer_configs_or_report)
     prepared_model = apply_layer_quant_configs(model, layer_configs, inplace=False)
     resolved_layer_order = layer_order or collect_qat_layer_names(prepared_model)
@@ -336,6 +352,7 @@ def _estimate_weight_bytes(counts: Mapping[str, int] | None, w_bits: int) -> int
 def _coerce_layer_configs_from_report(
     layer_configs_or_report: Mapping[str, object],
 ) -> dict[str, LayerQuantConfig]:
+    """Accept either a report dict or a raw config mapping and normalize both."""
     raw_configs = (
         layer_configs_or_report["selected_layer_configs"]
         if "selected_layer_configs" in layer_configs_or_report
