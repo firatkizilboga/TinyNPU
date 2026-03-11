@@ -463,11 +463,9 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
         )
         steps.append(step)
         evaluate_host_step(step)
-        cols_value = env[cols_name]
-        env[cols_name] = cols_value
         tensors[cols_name] = TensorSpec(
             cols_name,
-            normalize_shape(cols_value.shape),
+            normalize_shape(env[cols_name].shape),
             input_dtype,
             TensorKind.INTERMEDIATE,
         )
@@ -508,7 +506,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             weight_scale=weight_scale,
             output_scale=output_scale,
         )
-        expected_cols = golden.coerce_npu_input(cols_value, out_dtype=input_dtype, tensor_name=cols_name)
+        expected_cols = golden.coerce_npu_input(env[cols_name], out_dtype=input_dtype, tensor_name=cols_name)
         env[cols_name] = expected_cols
         expected_matrix = golden.matmul(
             expected_cols,
@@ -573,7 +571,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
         evaluate_host_step(step)
         tensors[out_name] = TensorSpec(
             out_name,
-            normalize_shape(final_value.shape),
+            normalize_shape(env[out_name].shape),
             DType.INT8,
             TensorKind.INTERMEDIATE,
             metadata={
@@ -588,7 +586,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
         )
         expected_tensors[cols_name] = np.array(env[cols_name], copy=True)
         expected_tensors[matmul_name] = np.array(expected_matrix, copy=True)
-        expected_tensors[out_name] = np.array(final_value, copy=True)
+        expected_tensors[out_name] = np.array(env[out_name], copy=True)
 
     def lower_compiler_ready_linear(module_name: str, module: Any, source_name: str, out_name: str) -> None:
         source_name = ensure_quantized_input(
@@ -741,13 +739,13 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             evaluate_host_step(step)
             tensors[out_name] = TensorSpec(
                 out_name,
-                normalize_shape(restored.shape),
+                normalize_shape(env[out_name].shape),
                 module_out_dtype,
                 TensorKind.INTERMEDIATE,
                 metadata=dict(tensors[internal_out_name].metadata),
             )
             expected_tensors[internal_out_name] = np.array(expected_matrix, copy=True)
-            expected_tensors[out_name] = np.array(restored, copy=True)
+            expected_tensors[out_name] = np.array(env[out_name], copy=True)
 
     def lower_compiler_ready_conv2d(module_name: str, module: Any, source_name: str, out_name: str) -> None:
         source_name = ensure_quantized_input(
@@ -789,11 +787,9 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
         )
         steps.append(step)
         evaluate_host_step(step)
-        cols_value = env[cols_name]
-        env[cols_name] = cols_value
         tensors[cols_name] = TensorSpec(
             cols_name,
-            normalize_shape(cols_value.shape),
+            normalize_shape(env[cols_name].shape),
             module_in_dtype,
             TensorKind.INTERMEDIATE,
         )
@@ -828,7 +824,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
 
         multiplier = int(module.multiplier)
         shift = int(module.shift)
-        expected_cols = golden.coerce_npu_input(cols_value, out_dtype=module_in_dtype, tensor_name=cols_name)
+        expected_cols = golden.coerce_npu_input(env[cols_name], out_dtype=module_in_dtype, tensor_name=cols_name)
         env[cols_name] = expected_cols
         expected_matrix = golden.matmul(
             expected_cols,
@@ -893,7 +889,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
         evaluate_host_step(step)
         tensors[out_name] = TensorSpec(
             out_name,
-            normalize_shape(final_value.shape),
+            normalize_shape(env[out_name].shape),
             module_out_dtype,
             TensorKind.INTERMEDIATE,
             metadata={
@@ -908,7 +904,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
         )
         expected_tensors[cols_name] = np.array(env[cols_name], copy=True)
         expected_tensors[matmul_name] = np.array(expected_matrix, copy=True)
-        expected_tensors[out_name] = np.array(final_value, copy=True)
+        expected_tensors[out_name] = np.array(env[out_name], copy=True)
 
     modules = dict(graph_module.named_modules())
     quantize_module_types = tuple(t for t in (QQuantize, QuantStub, CompilerQuantize) if t)
