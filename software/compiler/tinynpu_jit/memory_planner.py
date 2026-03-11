@@ -400,13 +400,13 @@ def plan_program_memory(
     # ------------------------------------------------------------------
     # Phase 1: globally unique addresses for all static tensors
     # ------------------------------------------------------------------
-    # A static tensor that appears in multiple segments always has the same
-    # global address, so it's loaded once and accessed from any segment.
+    # A static tensor can appear in multiple segments with different hardware
+    # roles. The logical tensor is the same, but the packed physical image is
+    # not. Plan and preload one static copy per (tensor_name, role) pair.
 
     roles_by_seg: dict[str, dict[str, str]] = {}
-    # tensor_name -> {seg_name -> role}  — used for cross-segment role validation
-    const_roles_by_seg: dict[str, dict[str, str]] = defaultdict(dict)
-    first_role: dict[str, tuple[str, str]] = {}   # tensor_name -> (seg_name, role)
+    static_keys_by_seg: dict[str, dict[str, tuple[str, str]]] = defaultdict(dict)
+    static_specs: dict[tuple[str, str], TensorSpec] = {}
 
     for seg in segments:
         roles = infer_roles(seg)
@@ -414,41 +414,28 @@ def plan_program_memory(
         for name, role in roles.items():
             spec = plan.tensors.get(name)
             if spec is not None and spec.kind == TensorKind.CONSTANT:
-                const_roles_by_seg[name][seg.name] = role
-                if name not in first_role:
-                    first_role[name] = (seg.name, role)
-
-    # A constant tensor packed for role B (weight matrix) has a completely
-    # different physical layout than the same data packed for role A.  If
-    # two segments consume the same constant with different roles the single
-    # static_ub_image would serve the wrong layout to at least one of them.
-    # Fail early with a clear diagnostic rather than producing wrong results.
-    for name, seg_roles in const_roles_by_seg.items():
-        distinct = set(seg_roles.values())
-        if len(distinct) > 1:
-            detail = ", ".join(f"{seg}→{role}" for seg, role in sorted(seg_roles.items()))
-            raise ValueError(
-                f"Constant tensor '{name}' is used with different hardware roles "
-                f"across segments ({detail}).  Each constant must have the same "
-                f"role in every segment for static weight persistence to be valid."
-            )
+                static_key = (name, role)
+                static_keys_by_seg[seg.name][name] = static_key
+                static_specs[static_key] = spec
 
     static_entries: dict[str, MemoryPlanEntry] = {}
     static_addr = 0
-    for name in sorted(first_role):
-        _, role = first_role[name]
-        spec = plan.tensors[name]
+    static_entries_by_key: dict[tuple[str, str], MemoryPlanEntry] = {}
+    for static_key in sorted(static_specs):
+        name, role = static_key
+        spec = static_specs[static_key]
         wc = _compute_word_count(spec, role, packer, array_size)
-        static_entries[name] = MemoryPlanEntry(name=name, address=static_addr, word_count=wc)
+        entry = MemoryPlanEntry(name=name, address=static_addr, word_count=wc)
+        static_entries_by_key[static_key] = entry
         static_addr += wc
 
     static_zone_end = static_addr
 
     # Build the static UB image (covers [0, static_zone_end))
     static_ub_image: list[int] = [0] * static_zone_end
-    for name, entry in static_entries.items():
-        _, role = first_role[name]
-        spec = plan.tensors[name]
+    for static_key, entry in static_entries_by_key.items():
+        name, role = static_key
+        spec = static_specs[static_key]
         packed = _pack_data(spec, role, packer, array_size)
         for i, word in enumerate(packed):
             static_ub_image[entry.address + i] = word
@@ -467,7 +454,11 @@ def plan_program_memory(
         )
 
         # Collect static entries that are referenced by this segment
-        seg_static = [static_entries[name] for name in roles if name in static_entries]
+        seg_static = [
+            static_entries_by_key[static_keys_by_seg[seg.name][name]]
+            for name in roles
+            if name in static_keys_by_seg[seg.name]
+        ]
         all_entries = seg_static + list(dynamic_entries.values())
 
         total_words = max((e.address + e.word_count for e in all_entries), default=0)

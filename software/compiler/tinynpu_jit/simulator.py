@@ -20,9 +20,10 @@ class SimulatorExecutor:
         self.buffer_width = self.program.buffer_width
         self.im_base_addr = self.program.im_base_addr
         self.packer = self.program.packer
-        # Weight-persistence state: id() of the artifact whose static weights
-        # are currently resident in the hardware UB.  None = nothing preloaded.
-        self._preloaded_artifact_id: int | None = None
+        # Weight-persistence state: stable key of the artifact whose static
+        # weights are currently resident in the hardware UB. None = nothing
+        # preloaded.
+        self._preloaded_artifact_key: str | None = None
         # Cumulative count of UB word writes issued to hardware.
         # Compare before/after to measure weight-persistence savings.
         self.ub_words_written: int = 0
@@ -68,7 +69,7 @@ class SimulatorExecutor:
                 "Simulator execution requires the cocotb driver modules from verification/cocotb."
             ) from exc
         await self._load_ub_image(dut, npu_driver, artifact.static_ub_image)
-        self._preloaded_artifact_id = id(artifact)
+        self._preloaded_artifact_key = artifact.preload_key
 
     async def run(
         self,
@@ -100,7 +101,7 @@ class SimulatorExecutor:
             await ClockCycles(dut.clk, 5)
             dut.rst_n.value = 1
             # Hardware reset wipes UB state — must reload static weights.
-            self._preloaded_artifact_id = None
+            self._preloaded_artifact_key = None
         self._configure_ppu_capture(dut, enabled=ppu_capture, Force=Force, Release=Release)
 
         # Auto-preload static weights on first run with this artifact.
@@ -109,11 +110,11 @@ class SimulatorExecutor:
         # optimisation that avoids reloading weights on every inference.
         weights_preloaded = (
             artifact.static_ub_image is not None
-            and self._preloaded_artifact_id == id(artifact)
+            and self._preloaded_artifact_key == artifact.preload_key
         )
         if artifact.static_ub_image and not weights_preloaded:
             await self._load_ub_image(dut, npu_driver, artifact.static_ub_image)
-            self._preloaded_artifact_id = id(artifact)
+            self._preloaded_artifact_key = artifact.preload_key
             weights_preloaded = True
 
         values: dict[str, np.ndarray] = {}

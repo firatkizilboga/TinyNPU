@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+import uuid
 
 import numpy as np
 
@@ -38,6 +39,7 @@ class CompiledArtifact:
     metadata: dict[str, Any] = field(default_factory=dict)
     memory_report: "GlobalMemoryReport | None" = None
     static_ub_image: list[int] | None = None
+    preload_key: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     def run_host_emulation(
         self,
