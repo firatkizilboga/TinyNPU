@@ -30,6 +30,7 @@ class SimulatorExecutor:
         self.array_size = self.program.array_size
         self.buffer_width = self.program.buffer_width
         self.im_base_addr = self.program.im_base_addr
+        self.im_size = int(self.program.hw.params.get("IM_SIZE", 0))
         self.packer = self.program.packer
         # Weight-persistence state: stable key of the artifact whose static
         # weights are currently resident in the hardware UB. None = nothing
@@ -38,6 +39,11 @@ class SimulatorExecutor:
         # Cumulative count of UB word writes issued to hardware.
         # Compare before/after to measure weight-persistence savings.
         self.ub_words_written: int = 0
+        # IM residency is tracked per artifact. Each artifact can preload all of
+        # its segment instruction images into distinct IM address ranges, and
+        # each segment launch then jumps to its own start address via REG_ARG.
+        self._loaded_im_artifact_key: str | None = None
+        self._im_start_addrs: dict[tuple[str, str], int] = {}
 
     def _resolve_handle(self, root: Any, path: tuple[str, ...]) -> Any | None:
         current = root
@@ -82,6 +88,9 @@ class SimulatorExecutor:
         await self._load_ub_image(dut, npu_driver, artifact.static_ub_image)
         self._preloaded_artifact_key = artifact.preload_key
 
+    def _im_key(self, artifact: CompiledArtifact, segment_name: str) -> tuple[str, str]:
+        return (artifact.preload_key, segment_name)
+
     async def run(
         self,
         artifact: CompiledArtifact,
@@ -115,6 +124,8 @@ class SimulatorExecutor:
             dut.rst_n.value = 1
             # Hardware reset wipes UB state — must reload static weights.
             self._preloaded_artifact_key = None
+            self._loaded_im_artifact_key = None
+            self._im_start_addrs.clear()
         self._configure_ppu_capture(dut, enabled=ppu_capture, Force=Force, Release=Release)
 
         # Auto-preload static weights on first run with this artifact.
@@ -129,6 +140,8 @@ class SimulatorExecutor:
             await self._load_ub_image(dut, npu_driver, artifact.static_ub_image)
             self._preloaded_artifact_key = artifact.preload_key
             weights_preloaded = True
+
+        im_load_counts = await self._ensure_im_images(dut, npu_driver, artifact)
 
         values: dict[str, np.ndarray] = {}
         for name, spec in artifact.plan.tensors.items():
@@ -150,7 +163,12 @@ class SimulatorExecutor:
         for step in artifact.plan.steps:
             if isinstance(step, NpuSegment):
                 segment = artifact.segment_artifacts[step.name]
-                ub_load_counts = await self._load_ub_image(dut, npu_driver, segment.binary["ub"])
+                if not weights_preloaded:
+                    # Legacy path (no planner / no static image): full UB load every time.
+                    ub_load_counts = await self._load_ub_image(dut, npu_driver, segment.binary["ub"])
+                else:
+                    ub_load_counts = PrimitiveCounts()
+                # else: static weights already in UB; only runtime inputs need writing.
                 input_writes, overlay_counts = await self._overlay_runtime_inputs(
                     dut,
                     npu_driver,
@@ -161,9 +179,11 @@ class SimulatorExecutor:
                     capture_debug=debug,
                 )
                 bias_counts = await self._reload_bias_payload(dut, npu_driver, segment.binary["ub"], segment.symbol_table)
-                im_counts = await self._load_im_image(dut, npu_driver, segment.binary["im"])
+                im_key = self._im_key(artifact, step.name)
+                im_counts = im_load_counts.get(step.name, PrimitiveCounts())
+                im_start_addr = self._im_start_addrs[im_key]
                 perf_before = self._read_perf_snapshot(dut) if benchmark_report is not None else None
-                launch_counts = await self._run_until_halt(dut, npu_driver, RisingEdge)
+                launch_counts = await self._run_until_halt(dut, npu_driver, RisingEdge, start_addr=im_start_addr)
                 perf_after = self._read_perf_snapshot(dut) if perf_before is not None else None
                 for output_name in step.outputs:
                     symbol = segment.symbol_table[output_name]
@@ -335,6 +355,7 @@ class SimulatorExecutor:
             bytes_written += 1
             await driver.write_reg(dut, driver.REG_MMVR, word, self.buffer_width)
             bytes_written += self.buffer_width // 8
+            self.ub_words_written += 1
         return estimate_interface_write_counts(bytes_written)
 
     async def _overlay_runtime_inputs(
@@ -374,17 +395,18 @@ class SimulatorExecutor:
                 await driver.write_reg(dut, driver.REG_ADDR, symbol["addr"] + offset, 16)
                 await driver.write_reg(dut, driver.REG_CMD, 0x01, 8)
                 await driver.write_reg(dut, driver.REG_MMVR, int(word), self.buffer_width)
+                self.ub_words_written += 1
             counts += estimate_interface_write_counts(len(packed) * (2 + 1 + (self.buffer_width // 8)))
         return writes, counts
 
-    async def _load_im_image(self, dut: Any, driver: Any, instructions: list[int]) -> PrimitiveCounts:
+    async def _load_im_image(self, dut: Any, driver: Any, instructions: list[int], *, base_addr: int) -> PrimitiveCounts:
         inst_width = 256
         num_chunks = max(1, inst_width // self.buffer_width)
         bytes_written = 0
         for index, inst in enumerate(instructions):
             for chunk_idx in range(num_chunks):
                 chunk = (inst >> (chunk_idx * self.buffer_width)) & ((1 << self.buffer_width) - 1)
-                addr = self.im_base_addr + (index * num_chunks) + chunk_idx
+                addr = base_addr + (index * num_chunks) + chunk_idx
                 await driver.write_reg(dut, driver.REG_ADDR, addr, 16)
                 bytes_written += 2
                 await driver.write_reg(dut, driver.REG_CMD, 0x01, 8)
@@ -392,6 +414,44 @@ class SimulatorExecutor:
                 await driver.write_reg(dut, driver.REG_MMVR, chunk, self.buffer_width)
                 bytes_written += self.buffer_width // 8
         return estimate_interface_write_counts(bytes_written)
+
+    async def _ensure_im_images(
+        self,
+        dut: Any,
+        driver: Any,
+        artifact: CompiledArtifact,
+    ) -> dict[str, PrimitiveCounts]:
+        if self._loaded_im_artifact_key == artifact.preload_key:
+            return {segment_name: PrimitiveCounts() for segment_name in artifact.segment_artifacts}
+
+        inst_width = 256
+        num_chunks = max(1, inst_width // self.buffer_width)
+        next_addr = self.im_base_addr
+        end_addr = self.im_base_addr + (self.im_size * num_chunks if self.im_size > 0 else 0)
+        counts_by_segment: dict[str, PrimitiveCounts] = {}
+        start_addrs: dict[tuple[str, str], int] = {}
+        for step in artifact.plan.steps:
+            if not isinstance(step, NpuSegment):
+                continue
+            segment = artifact.segment_artifacts[step.name]
+            segment_words = len(segment.binary["im"]) * num_chunks
+            if self.im_size > 0 and next_addr + segment_words > end_addr:
+                raise MemoryError(
+                    f"Artifact '{artifact.preload_key}' requires IM address range up to "
+                    f"{next_addr + segment_words:#x}, but hardware ends at {end_addr:#x}."
+                )
+            start_addrs[(artifact.preload_key, step.name)] = next_addr
+            counts_by_segment[step.name] = await self._load_im_image(
+                dut,
+                driver,
+                segment.binary["im"],
+                base_addr=next_addr,
+            )
+            next_addr += segment_words
+
+        self._loaded_im_artifact_key = artifact.preload_key
+        self._im_start_addrs = start_addrs
+        return counts_by_segment
 
     async def _reload_bias_payload(
         self,
@@ -417,15 +477,19 @@ class SimulatorExecutor:
                 bytes_written += self.buffer_width // 8
         return estimate_interface_write_counts(bytes_written)
 
-    async def _run_until_halt(self, dut: Any, driver: Any, RisingEdge: Any) -> PrimitiveCounts:
+    async def _run_until_halt(self, dut: Any, driver: Any, RisingEdge: Any, *, start_addr: int) -> PrimitiveCounts:
         doorbell_addr = driver.REG_MMVR + (self.buffer_width // 8) - 1
-        await driver.write_reg(dut, driver.REG_ARG, self.im_base_addr, 32)
+        await driver.write_reg(dut, driver.REG_ARG, start_addr, 32)
         await driver.write_reg(dut, driver.REG_CMD, 0x03, 8)
         await driver.write_reg(dut, doorbell_addr, 0, 8)
+        saw_busy = False
         for _ in range(100000):
             dut.host_addr.value = driver.REG_STATUS
             await RisingEdge(dut.clk)
-            if int(dut.host_rd_data.value) == 0xFF:
+            status = int(dut.host_rd_data.value)
+            if status == 0x01:
+                saw_busy = True
+            if saw_busy and status == 0xFF:
                 return estimate_interface_write_counts(4 + 1 + 1)
         raise AssertionError("Timeout waiting for HALT.")
 
