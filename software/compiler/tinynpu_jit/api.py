@@ -6,11 +6,15 @@ import numpy as np
 
 from .artifact import CompiledArtifact
 from .executor import HostEmulationExecutor
-from .ir import ExecutionPlan, VerificationMode
+from .host_ops import get_host_op_spec
+from .ir import ExecutionPlan, HostOp, VerificationMode
 from .lowering import SegmentCompiler
 
 
 def compile_plan(plan: ExecutionPlan, expected_tensors: dict[str, np.ndarray], defines_path: str | None = None) -> CompiledArtifact:
+    for step in plan.steps:
+        if isinstance(step, HostOp):
+            get_host_op_spec(step.kind).validate(step)
     return SegmentCompiler(defines_path=defines_path).compile(plan, expected_tensors)
 
 
