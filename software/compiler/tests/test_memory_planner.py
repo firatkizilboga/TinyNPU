@@ -6,13 +6,13 @@ Coverage:
   2. Cross-segment static zone — weights get globally unique, non-overlapping addresses
   3. static_ub_image is correct — unpacking the image reproduces the original weights
   4. Repeated host-emulation invocations produce identical correct results
-  5. Role mismatch for cross-segment constant raises ValueError (correctness guard)
-  6. reset=True clears _preloaded_artifact_id so weights are re-loaded after a reset
-  7. print_memory_report includes reuse annotation for recycled slots
-  8. UB traffic metric: ub_words_written tracks write volume
+  5. Cross-segment constant with different roles gets two static packed copies
+  6. reset=True clears preload state so weights are re-loaded after a reset
+  7. preload state uses a stable artifact key rather than raw id()
+  8. print_memory_report includes reuse annotation for recycled slots
+  9. UB traffic metric: ub_words_written tracks write volume
 """
 import numpy as np
-import pytest
 
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -223,13 +223,14 @@ def test_repeated_invocations_multi_segment():
 
 
 # ---------------------------------------------------------------------------
-# 5. Role mismatch raises ValueError — fail-closed correctness guard
+# 5. Role mismatch across segments duplicates static packed copies
 # ---------------------------------------------------------------------------
 
-def test_cross_segment_role_mismatch_raises():
+def test_cross_segment_role_mismatch_gets_distinct_static_entries():
     """
     Constant W used as rhs (role B) in seg0 and as lhs (role A) in seg1.
-    The two packings are physically incompatible; planner must reject this.
+    The two packings are physically incompatible, so the planner must allocate
+    separate static packed copies rather than reusing one address.
     """
     W = np.ones((8, 8), dtype=np.int16)
     tensors = {
@@ -244,8 +245,15 @@ def test_cross_segment_role_mismatch_raises():
     seg1 = NpuSegment("seg1", [MatMulOp("op1", "W", "h", "y")], inputs=["W", "h"], outputs=["y"])
     plan = ExecutionPlan(tensors=tensors, steps=[seg0, seg1], inputs=["x"], outputs=["y"])
 
-    with pytest.raises(ValueError, match="different hardware roles"):
-        plan_program_memory(plan, ub_capacity=0x8000)
+    report = plan_program_memory(plan, ub_capacity=0x8000)
+
+    e0 = {e.name: e for e in report.segments[0].entries}
+    e1 = {e.name: e for e in report.segments[1].entries}
+    assert e0["W"].address != e1["W"].address, (
+        "A constant used with different roles across segments must receive "
+        "distinct packed static entries"
+    )
+    assert len(report.static_ub_image) == report.static_zone_end
 
 
 def test_consistent_role_across_segments_accepted():
@@ -275,12 +283,12 @@ def test_consistent_role_across_segments_accepted():
 
 
 # ---------------------------------------------------------------------------
-# 6. reset=True clears _preloaded_artifact_id
+# 6. reset=True clears preload state
 # ---------------------------------------------------------------------------
 
-def test_executor_preloaded_id_cleared_on_reset():
+def test_executor_preloaded_key_cleared_on_reset():
     """
-    SimulatorExecutor._preloaded_artifact_id must be set to None when
+    SimulatorExecutor preload state must be set to None when
     reset=True is passed, because the hardware reset wipes UB contents.
 
     We can't invoke run() without hardware, but the state variable itself
@@ -289,17 +297,37 @@ def test_executor_preloaded_id_cleared_on_reset():
     executor = SimulatorExecutor()
 
     # Simulate the executor believing weights are already loaded
-    executor._preloaded_artifact_id = 999
+    executor._preloaded_artifact_key = "artifact-key"
 
     # Replicate the reset branch logic (hardware-agnostic check)
     reset = True
     if reset:
-        executor._preloaded_artifact_id = None  # this is what run() does
+        executor._preloaded_artifact_key = None  # this is what run() does
 
-    assert executor._preloaded_artifact_id is None, (
-        "reset=True must invalidate _preloaded_artifact_id so static "
+    assert executor._preloaded_artifact_key is None, (
+        "reset=True must invalidate preload state so static "
         "weights are reloaded on the next run"
     )
+
+
+def test_executor_preload_uses_stable_artifact_key():
+    """
+    Preload tracking must use the artifact's stable key, not id(artifact),
+    so reuse decisions do not depend on Python object-id recycling.
+    """
+    W = np.ones((8, 8), dtype=np.int16)
+    tensors = {
+        "x": _inp("x", (8, 8)),
+        "W": _const("W", (8, 8), W),
+        "y": _out("y", (8, 8)),
+    }
+    seg = NpuSegment("s0", [MatMulOp("op0", "x", "W", "y")], inputs=["x", "W"], outputs=["y"])
+    plan = ExecutionPlan(tensors=tensors, steps=[seg], inputs=["x"], outputs=["y"])
+    art = compile_plan(plan, {"x": np.zeros((8, 8), dtype=np.int16)})
+    executor = SimulatorExecutor()
+
+    executor._preloaded_artifact_key = art.preload_key
+    assert executor._preloaded_artifact_key == art.preload_key
 
 
 # ---------------------------------------------------------------------------
