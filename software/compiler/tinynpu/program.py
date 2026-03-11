@@ -173,13 +173,15 @@ class TinyNPUProgram:
             else: # C
                 m, n, k = (sym.shape[0] + sz - 1) // sz, (sym.shape[1] + sz - 1) // sz, 1
             sym.word_count = self.packer.get_physical_word_count(sym.storage_role, sym.precision, m, k, n)
-            sym.addr = self.memory.allocate(name, sym.word_count)
+            if sym.addr is None:  # respect pre-assigned addresses from the memory planner
+                sym.addr = self.memory.allocate(name, sym.word_count)
         for instr in self.instructions:
             if isinstance(instr, Move): instr.count = self.symbols[instr.src].word_count
-        ub_image = []
         symbol_to_addr = {name: sym.addr for name, sym in self.symbols.items()}
-        for name in sorted(self.symbols.keys()):
-            sym = self.symbols[name]
+        # Build UB image indexed by address so pre-assigned (non-sequential) addresses work.
+        total_ub_words = max((sym.addr + sym.word_count for sym in self.symbols.values()), default=0)
+        ub_image = [0] * total_ub_words
+        for name, sym in self.symbols.items():
             p = 1 << (2 - sym.precision)
             sz = self.array_size
             m = (sym.shape[0] + sz - 1) // sz
@@ -192,7 +194,8 @@ class TinyNPUProgram:
             else: # C
                 m, n, k = (sym.shape[0] + sz - 1) // sz, (sym.shape[1] + sz - 1) // sz, 1
             packed_words = self.packer.pack(sym.data, sym.storage_role, sym.precision, m, k, n)
-            ub_image.extend(packed_words)
+            for i, word in enumerate(packed_words):
+                ub_image[sym.addr + i] = word
         binary_im = [instr.encode(symbol_to_addr) for instr in self.instructions]
         self.last_compiled = {"im": binary_im, "ub": ub_image}
         return self.last_compiled
