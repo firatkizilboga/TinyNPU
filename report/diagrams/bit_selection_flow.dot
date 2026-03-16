@@ -1,0 +1,57 @@
+digraph TinyNPUBitSelectionFlow {
+    graph [
+        rankdir=TB,
+        splines=true,
+        pad=0.10,
+        nodesep=0.26,
+        ranksep=0.38,
+        bgcolor="white",
+        fontname="Helvetica",
+        fontsize=18
+    ];
+
+    node [
+        shape=box,
+        style="filled",
+        fontname="Helvetica",
+        fontsize=13,
+        penwidth=1.8,
+        margin="0.16,0.10"
+    ];
+
+    edge [
+        fontname="Helvetica",
+        fontsize=10,
+        color="#2f2f2f",
+        penwidth=1.6,
+        arrowsize=0.8
+    ];
+
+    Start [shape=ellipse, label="QAT model + layer list", fillcolor="#F4F7FB", color="#6F8FB3", fontcolor="#233142"];
+    Baseline [label="collect baseline layer configs\ncollect parameter counts", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
+    Candidates [label="define candidate bit pairs\n(16,16), (8,8), (4,4)", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
+    Loop [shape=diamond, label="for each layer\nand candidate?", fillcolor="#F4F7FB", color="#6F8FB3", fontcolor="#233142"];
+
+    Apply [label="apply one trial config\nto one layer", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
+    Recal [label="recalibrate QAT scales\nwith calibration data", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
+    Eval [label="evaluate validation score", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
+    Record [label="record score delta\nand estimated weight bytes", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
+
+    Rank [label="rank layers by sensitivity\nusing low-precision score drop", fillcolor="#FFF4E8", color="#C98A43", fontcolor="#4A3520"];
+    Select [label="select lowest accepted precision\nunder max acceptable drop", fillcolor="#FFF4E8", color="#C98A43", fontcolor="#4A3520"];
+    FineTune [label="flag fine-tuning if selected\nconfig causes nonzero drop", fillcolor="#FFF4E8", color="#C98A43", fontcolor="#4A3520"];
+
+    Convert [label="convert selected policy to\ncompiler-ready model", fillcolor="#EFE8FF", color="#8B74BD", fontcolor="#2C2236"];
+    Compile [label="compile and validate on\nTinyNPU flow", fillcolor="#EFE8FF", color="#8B74BD", fontcolor="#2C2236"];
+    Done [shape=ellipse, label="mixed-precision result", fillcolor="#F4F7FB", color="#6F8FB3", fontcolor="#233142"];
+
+    Note [shape=note, label="Heuristic helper only:\none-layer-at-a-time trials\nnot a global bit-allocation solver", fillcolor="#FFF7D9", color="#C9A227", fontcolor="#4A3A00"];
+
+    Start -> Baseline -> Candidates -> Loop;
+    Loop -> Apply [label="yes"];
+    Apply -> Recal -> Eval -> Record -> Loop [label="next trial"];
+    Loop -> Rank [label="done"];
+    Rank -> Select -> FineTune -> Convert -> Compile -> Done;
+
+    Note -> Rank [style=dashed, arrowhead=none];
+}

@@ -1,0 +1,75 @@
+{
+  "title": "Representative perf-observability run",
+  "subtitle": "Captured from verification/cocotb/test_perf_observability.py with PERF_ENABLE=1",
+  "workload": "simple_chain.npu",
+  "total_cycles": 428,
+  "states": [
+    {
+      "name": "CTRL_IDLE",
+      "cycles": 7,
+      "entries": 1,
+      "group": "host"
+    },
+    {
+      "name": "CTRL_HOST_WRITE",
+      "cycles": 1,
+      "entries": 0,
+      "group": "host"
+    },
+    {
+      "name": "CTRL_FETCH",
+      "cycles": 3,
+      "entries": 3,
+      "group": "sequencing"
+    },
+    {
+      "name": "CTRL_DECODE",
+      "cycles": 3,
+      "entries": 3,
+      "group": "sequencing"
+    },
+    {
+      "name": "CTRL_EXEC_MATMUL",
+      "cycles": 14,
+      "entries": 10,
+      "group": "matmul"
+    },
+    {
+      "name": "CTRL_MM_CLEAR",
+      "cycles": 8,
+      "entries": 8,
+      "group": "matmul"
+    },
+    {
+      "name": "CTRL_MM_FEED",
+      "cycles": 128,
+      "entries": 8,
+      "group": "matmul"
+    },
+    {
+      "name": "CTRL_MM_WAIT",
+      "cycles": 136,
+      "entries": 8,
+      "group": "matmul"
+    },
+    {
+      "name": "CTRL_MM_DRAIN_SA",
+      "cycles": 64,
+      "entries": 8,
+      "group": "matmul"
+    },
+    {
+      "name": "CTRL_MM_WRITEBACK",
+      "cycles": 64,
+      "entries": 8,
+      "group": "matmul"
+    }
+  ],
+  "omitted_zero_states": [
+    "CTRL_HOST_READ",
+    "CTRL_READ_WAIT",
+    "CTRL_EXEC_MOVE",
+    "CTRL_MM_LOAD_BIAS",
+    "CTRL_HALT"
+  ]
+}

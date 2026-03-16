@@ -1,0 +1,10 @@
+*.aux
+*.log
+*.out
+*.toc
+*.bbl
+*.blg
+
+diagrams/render/node_modules/
+diagrams/generated/
+diagrams/tikz/
