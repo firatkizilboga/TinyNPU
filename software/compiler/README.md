@@ -11,6 +11,7 @@ This path is designed around:
 - PyTorch/FX as the frontend
 - segmented execution plans instead of whole-program lowering
 - explicit `HostOp(...)` boundaries for unsupported ops
+- registry-backed host-op dispatch in `tinynpu_jit.host_ops` so execution and benchmark accounting share one contract
 - compiler-owned expected tensors for runtime verification
 - `mark_for_verify(...)` as a host-visible verification boundary
 
