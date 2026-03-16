@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 
 from .golden import GoldenModel
+from .host_ops import execute_host_op
 from .ir import DType, ExecutionPlan, HostOp, MatMulOp, NpuSegment, TensorKind, TensorSpec, VerifyTensor, normalize_shape
 from .quantization import synthesize_rescale
 
@@ -62,6 +63,9 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
     env: dict[str, np.ndarray] = {}
     example_iter = iter(example_inputs)
     golden = GoldenModel()
+
+    def evaluate_host_step(step: HostOp) -> None:
+        execute_host_op(step, env, golden=golden)
 
     def to_numpy(value: Any) -> np.ndarray:
         if hasattr(value, "detach"):
@@ -173,26 +177,19 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
 
         flush_segment()
         quant_name = target_name
-        quantized = golden.quantize(
-            env[source_name],
-            scale=float(scale),
-            zero_point=int(zero_point),
-            out_dtype=dtype,
+        step = HostOp(
+            name=quant_name,
+            kind="quantize",
+            inputs=[source_name],
+            outputs=[quant_name],
+            attrs={
+                "scale": float(scale),
+                "zero_point": int(zero_point),
+                "dtype": dtype,
+            },
         )
-        steps.append(
-            HostOp(
-                name=quant_name,
-                kind="quantize",
-                inputs=[source_name],
-                outputs=[quant_name],
-                attrs={
-                    "scale": float(scale),
-                    "zero_point": int(zero_point),
-                    "dtype": dtype,
-                },
-            )
-        )
-        env[quant_name] = np.array(quantized, copy=True)
+        steps.append(step)
+        evaluate_host_step(step)
         tensors[quant_name] = TensorSpec(
             name=quant_name,
             shape=normalize_shape(env[quant_name].shape),
@@ -451,31 +448,24 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
         )
         cols_name = f"{out_name}_im2col"
         flush_segment()
-        steps.append(
-            HostOp(
-                name=cols_name,
-                kind="im2col",
-                inputs=[source_name],
-                outputs=[cols_name],
-                attrs={
-                    "kernel_size": int(kernel_h),
-                    "stride": int(module.stride[0]),
-                    "padding": int(module.padding[0]),
-                    "input_layout": layout,
-                    "input_channels": int(module.in_channels),
-                },
-            )
+        step = HostOp(
+            name=cols_name,
+            kind="im2col",
+            inputs=[source_name],
+            outputs=[cols_name],
+            attrs={
+                "kernel_size": int(kernel_h),
+                "stride": int(module.stride[0]),
+                "padding": int(module.padding[0]),
+                "input_layout": layout,
+                "input_channels": int(module.in_channels),
+            },
         )
-        cols_value = golden.im2col(
-            image_hwc,
-            kernel_size=int(kernel_h),
-            stride=int(module.stride[0]),
-            padding=int(module.padding[0]),
-        )
-        env[cols_name] = cols_value
+        steps.append(step)
+        evaluate_host_step(step)
         tensors[cols_name] = TensorSpec(
             cols_name,
-            normalize_shape(cols_value.shape),
+            normalize_shape(env[cols_name].shape),
             input_dtype,
             TensorKind.INTERMEDIATE,
         )
@@ -516,7 +506,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             weight_scale=weight_scale,
             output_scale=output_scale,
         )
-        expected_cols = golden.coerce_npu_input(cols_value, out_dtype=input_dtype, tensor_name=cols_name)
+        expected_cols = golden.coerce_npu_input(env[cols_name], out_dtype=input_dtype, tensor_name=cols_name)
         env[cols_name] = expected_cols
         expected_matrix = golden.matmul(
             expected_cols,
@@ -564,25 +554,24 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
         out_w = ((image_hwc.shape[1] + (2 * int(module.padding[1])) - int(kernel_w)) // int(module.stride[1])) + 1
         hwc_out = expected_matrix.reshape(out_h, out_w, int(module.out_channels))
         final_value = restore_conv_output_layout(hwc_out, layout, original_shape)
-        steps.append(
-            HostOp(
-                name=f"{out_name}_layout_restore",
-                kind="layout_restore",
-                inputs=[matmul_name],
-                outputs=[out_name],
-                attrs={
-                    "layout": layout,
-                    "original_shape": original_shape,
-                    "out_h": out_h,
-                    "out_w": out_w,
-                    "out_channels": int(module.out_channels),
-                },
-            )
+        step = HostOp(
+            name=f"{out_name}_layout_restore",
+            kind="layout_restore",
+            inputs=[matmul_name],
+            outputs=[out_name],
+            attrs={
+                "layout": layout,
+                "original_shape": original_shape,
+                "out_h": out_h,
+                "out_w": out_w,
+                "out_channels": int(module.out_channels),
+            },
         )
-        env[out_name] = final_value
+        steps.append(step)
+        evaluate_host_step(step)
         tensors[out_name] = TensorSpec(
             out_name,
-            normalize_shape(final_value.shape),
+            normalize_shape(env[out_name].shape),
             DType.INT8,
             TensorKind.INTERMEDIATE,
             metadata={
@@ -597,7 +586,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
         )
         expected_tensors[cols_name] = np.array(env[cols_name], copy=True)
         expected_tensors[matmul_name] = np.array(expected_matrix, copy=True)
-        expected_tensors[out_name] = np.array(final_value, copy=True)
+        expected_tensors[out_name] = np.array(env[out_name], copy=True)
 
     def lower_compiler_ready_linear(module_name: str, module: Any, source_name: str, out_name: str) -> None:
         source_name = ensure_quantized_input(
@@ -664,15 +653,15 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             lhs_name = f"{out_name}_input_row"
             transform_kind = "reshape" if layout == "vector" else "transpose"
             transform_attrs = {"shape": tuple(lhs_value.shape)} if layout == "vector" else {"axes": (1, 0)}
-            steps.append(
-                HostOp(
-                    name=lhs_name,
-                    kind=transform_kind,
-                    inputs=[source_name],
-                    outputs=[lhs_name],
-                    attrs=transform_attrs,
-                )
+            step = HostOp(
+                name=lhs_name,
+                kind=transform_kind,
+                inputs=[source_name],
+                outputs=[lhs_name],
+                attrs=transform_attrs,
             )
+            steps.append(step)
+            evaluate_host_step(step)
             tensors[lhs_name] = TensorSpec(
                 lhs_name,
                 normalize_shape(lhs_value.shape),
@@ -731,35 +720,32 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             flush_segment()
             restored = restore_linear_output_layout(expected_matrix, layout, original_shape)
             if layout == "column":
-                steps.append(
-                    HostOp(
-                        name=out_name,
-                        kind="transpose",
-                        inputs=[internal_out_name],
-                        outputs=[out_name],
-                        attrs={"axes": (1, 0)},
-                    )
+                step = HostOp(
+                    name=out_name,
+                    kind="transpose",
+                    inputs=[internal_out_name],
+                    outputs=[out_name],
+                    attrs={"axes": (1, 0)},
                 )
             else:
-                steps.append(
-                    HostOp(
-                        name=out_name,
-                        kind="reshape",
-                        inputs=[internal_out_name],
-                        outputs=[out_name],
-                        attrs={"shape": tuple(restored.shape)},
-                    )
+                step = HostOp(
+                    name=out_name,
+                    kind="reshape",
+                    inputs=[internal_out_name],
+                    outputs=[out_name],
+                    attrs={"shape": tuple(restored.shape)},
                 )
-            env[out_name] = restored
+            steps.append(step)
+            evaluate_host_step(step)
             tensors[out_name] = TensorSpec(
                 out_name,
-                normalize_shape(restored.shape),
+                normalize_shape(env[out_name].shape),
                 module_out_dtype,
                 TensorKind.INTERMEDIATE,
                 metadata=dict(tensors[internal_out_name].metadata),
             )
             expected_tensors[internal_out_name] = np.array(expected_matrix, copy=True)
-            expected_tensors[out_name] = np.array(restored, copy=True)
+            expected_tensors[out_name] = np.array(env[out_name], copy=True)
 
     def lower_compiler_ready_conv2d(module_name: str, module: Any, source_name: str, out_name: str) -> None:
         source_name = ensure_quantized_input(
@@ -786,31 +772,24 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
         )
         cols_name = f"{out_name}_im2col"
         flush_segment()
-        steps.append(
-            HostOp(
-                name=cols_name,
-                kind="im2col",
-                inputs=[source_name],
-                outputs=[cols_name],
-                attrs={
-                    "kernel_size": int(module.kernel_size),
-                    "stride": int(module.stride),
-                    "padding": int(module.padding),
-                    "input_layout": layout,
-                    "input_channels": int(module.in_channels),
-                },
-            )
+        step = HostOp(
+            name=cols_name,
+            kind="im2col",
+            inputs=[source_name],
+            outputs=[cols_name],
+            attrs={
+                "kernel_size": int(module.kernel_size),
+                "stride": int(module.stride),
+                "padding": int(module.padding),
+                "input_layout": layout,
+                "input_channels": int(module.in_channels),
+            },
         )
-        cols_value = golden.im2col(
-            image_hwc,
-            kernel_size=int(module.kernel_size),
-            stride=int(module.stride),
-            padding=int(module.padding),
-        )
-        env[cols_name] = cols_value
+        steps.append(step)
+        evaluate_host_step(step)
         tensors[cols_name] = TensorSpec(
             cols_name,
-            normalize_shape(cols_value.shape),
+            normalize_shape(env[cols_name].shape),
             module_in_dtype,
             TensorKind.INTERMEDIATE,
         )
@@ -845,7 +824,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
 
         multiplier = int(module.multiplier)
         shift = int(module.shift)
-        expected_cols = golden.coerce_npu_input(cols_value, out_dtype=module_in_dtype, tensor_name=cols_name)
+        expected_cols = golden.coerce_npu_input(env[cols_name], out_dtype=module_in_dtype, tensor_name=cols_name)
         env[cols_name] = expected_cols
         expected_matrix = golden.matmul(
             expected_cols,
@@ -893,25 +872,24 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
         out_w = ((image_hwc.shape[1] + (2 * int(module.padding)) - int(module.kernel_size)) // int(module.stride)) + 1
         hwc_out = expected_matrix.reshape(out_h, out_w, int(module.out_channels))
         final_value = restore_conv_output_layout(hwc_out, layout, original_shape)
-        steps.append(
-            HostOp(
-                name=f"{out_name}_layout_restore",
-                kind="layout_restore",
-                inputs=[matmul_name],
-                outputs=[out_name],
-                attrs={
-                    "layout": layout,
-                    "original_shape": original_shape,
-                    "out_h": out_h,
-                    "out_w": out_w,
-                    "out_channels": int(module.out_channels),
-                },
-            )
+        step = HostOp(
+            name=f"{out_name}_layout_restore",
+            kind="layout_restore",
+            inputs=[matmul_name],
+            outputs=[out_name],
+            attrs={
+                "layout": layout,
+                "original_shape": original_shape,
+                "out_h": out_h,
+                "out_w": out_w,
+                "out_channels": int(module.out_channels),
+            },
         )
-        env[out_name] = final_value
+        steps.append(step)
+        evaluate_host_step(step)
         tensors[out_name] = TensorSpec(
             out_name,
-            normalize_shape(final_value.shape),
+            normalize_shape(env[out_name].shape),
             module_out_dtype,
             TensorKind.INTERMEDIATE,
             metadata={
@@ -926,7 +904,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
         )
         expected_tensors[cols_name] = np.array(env[cols_name], copy=True)
         expected_tensors[matmul_name] = np.array(expected_matrix, copy=True)
-        expected_tensors[out_name] = np.array(final_value, copy=True)
+        expected_tensors[out_name] = np.array(env[out_name], copy=True)
 
     modules = dict(graph_module.named_modules())
     quantize_module_types = tuple(t for t in (QQuantize, QuantStub, CompilerQuantize) if t)
@@ -1036,16 +1014,15 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             source = node.args[0].name
             scale, zero_point, dtype = quant_params_from_module(modules[node.target])
             out_name = node.name
-            steps.append(
-                HostOp(
-                    name=node.name,
-                    kind="quantize",
-                    inputs=[source],
-                    outputs=[out_name],
-                    attrs={"scale": scale, "zero_point": zero_point, "dtype": dtype},
-                )
+            step = HostOp(
+                name=node.name,
+                kind="quantize",
+                inputs=[source],
+                outputs=[out_name],
+                attrs={"scale": scale, "zero_point": zero_point, "dtype": dtype},
             )
-            env[out_name] = golden.quantize(env[source], scale=scale, zero_point=zero_point, out_dtype=dtype)
+            steps.append(step)
+            evaluate_host_step(step)
             tensors[out_name] = TensorSpec(
                 out_name,
                 normalize_shape(env[out_name].shape),
@@ -1065,20 +1042,15 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                     f"DeQuantStub/DeQuantize on tensor {source!r} requires upstream quantization metadata."
                 )
             out_name = node.name
-            steps.append(
-                HostOp(
-                    name=node.name,
-                    kind="dequantize",
-                    inputs=[source],
-                    outputs=[out_name],
-                    attrs={"scale": float(quant["scale"]), "zero_point": int(quant.get("zero_point", 0))},
-                )
+            step = HostOp(
+                name=node.name,
+                kind="dequantize",
+                inputs=[source],
+                outputs=[out_name],
+                attrs={"scale": float(quant["scale"]), "zero_point": int(quant.get("zero_point", 0))},
             )
-            env[out_name] = golden.dequantize(
-                env[source],
-                scale=float(quant["scale"]),
-                zero_point=int(quant.get("zero_point", 0)),
-            )
+            steps.append(step)
+            evaluate_host_step(step)
             tensors[out_name] = TensorSpec(
                 out_name,
                 normalize_shape(env[out_name].shape),
@@ -1192,8 +1164,9 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                 continue
 
             flush_segment()
-            steps.append(HostOp(name=node.name, kind="relu", inputs=[source], outputs=[node.name]))
-            env[node.name] = np.maximum(env[source], 0)
+            step = HostOp(name=node.name, kind="relu", inputs=[source], outputs=[node.name])
+            steps.append(step)
+            evaluate_host_step(step)
             tensors[node.name] = TensorSpec(
                 name=node.name,
                 shape=normalize_shape(env[node.name].shape),
@@ -1208,8 +1181,9 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             source = node.args[0].name
             shape = tuple(int(dim) for dim in node.args[1:])
             flush_segment()
-            steps.append(HostOp(name=node.name, kind="reshape", inputs=[source], outputs=[node.name], attrs={"shape": shape}))
-            env[node.name] = np.reshape(env[source], shape)
+            step = HostOp(name=node.name, kind="reshape", inputs=[source], outputs=[node.name], attrs={"shape": shape})
+            steps.append(step)
+            evaluate_host_step(step)
             tensors[node.name] = TensorSpec(
                 name=node.name,
                 shape=normalize_shape(env[node.name].shape),
@@ -1266,7 +1240,9 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             env[node.name] = env[source]
             tensors[node.name] = tensors[source].clone_without_data(name=node.name)
             tensors[node.name].verify_label = label or node.name
-            steps.append(HostOp(name=f"{node.name}_alias", kind="alias", inputs=[source], outputs=[node.name]))
+            step = HostOp(name=f"{node.name}_alias", kind="alias", inputs=[source], outputs=[node.name])
+            steps.append(step)
+            evaluate_host_step(step)
             steps.append(
                 VerifyTensor(
                     tensor_name=node.name,
@@ -1282,8 +1258,9 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             source = node.args[0].name
             axis = int(node.kwargs.get("dim", -1))
             out_name = node.name
-            steps.append(HostOp(name=node.name, kind="softmax", inputs=[source], outputs=[out_name], attrs={"axis": axis}))
-            env[out_name] = golden.softmax(env[source], axis=axis)
+            step = HostOp(name=node.name, kind="softmax", inputs=[source], outputs=[out_name], attrs={"axis": axis})
+            steps.append(step)
+            evaluate_host_step(step)
             tensors[out_name] = TensorSpec(out_name, normalize_shape(env[out_name].shape), DType.FLOAT32, TensorKind.INTERMEDIATE)
             expected_tensors[out_name] = np.array(env[out_name], copy=True)
             continue
@@ -1295,21 +1272,15 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             stride = int(node.args[2]) if len(node.args) > 2 else 1
             padding = int(node.args[3]) if len(node.args) > 3 else 0
             out_name = node.name
-            steps.append(
-                HostOp(
-                    name=node.name,
-                    kind="im2col",
-                    inputs=[source],
-                    outputs=[out_name],
-                    attrs={"kernel_size": kernel_size, "stride": stride, "padding": padding},
-                )
+            step = HostOp(
+                name=node.name,
+                kind="im2col",
+                inputs=[source],
+                outputs=[out_name],
+                attrs={"kernel_size": kernel_size, "stride": stride, "padding": padding},
             )
-            env[out_name] = golden.im2col(
-                env[source],
-                kernel_size=kernel_size,
-                stride=stride,
-                padding=padding,
-            )
+            steps.append(step)
+            evaluate_host_step(step)
             tensors[out_name] = TensorSpec(out_name, normalize_shape(env[out_name].shape), infer_dtype(env[out_name]), TensorKind.INTERMEDIATE)
             expected_tensors[out_name] = np.array(env[out_name], copy=True)
             continue
@@ -1332,7 +1303,6 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                 dims = [int(dim) for dim in dims]
             keepdim = bool(node.kwargs.get("keepdim", False))
             quant = tensors[source].metadata.get("quantization")
-            source_value = np.array(env[source], dtype=np.float32)
             attrs = {"dim": dims, "keepdim": keepdim}
             if quant is not None:
                 require_symmetric_quantization(quant, tensor_name=source)
@@ -1341,18 +1311,9 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                     "zero_point": int(quant.get("zero_point", 0)),
                     "dtype": str(quant["dtype"]),
                 }
-                source_value = golden.dequantize(
-                    env[source],
-                    scale=float(quant["scale"]),
-                    zero_point=int(quant.get("zero_point", 0)),
-                )
-            mean_value = np.mean(
-                source_value,
-                axis=None if dims is None else tuple(dims),
-                keepdims=keepdim,
-            )
-            steps.append(HostOp(name=node.name, kind="mean", inputs=[source], outputs=[node.name], attrs=attrs))
-            env[node.name] = np.array(mean_value, copy=True)
+            step = HostOp(name=node.name, kind="mean", inputs=[source], outputs=[node.name], attrs=attrs)
+            steps.append(step)
+            evaluate_host_step(step)
             tensors[node.name] = TensorSpec(
                 name=node.name,
                 shape=normalize_shape(env[node.name].shape),
@@ -1369,16 +1330,15 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             zero_point = int(node.args[2]) if len(node.args) > 2 else 0
             dtype = parse_dtype(node.args[3] if len(node.args) > 3 else "int16")
             out_name = node.name
-            steps.append(
-                HostOp(
-                    name=node.name,
-                    kind="requantize",
-                    inputs=[source],
-                    outputs=[out_name],
-                    attrs={"scale": scale, "zero_point": zero_point, "dtype": dtype},
-                )
+            step = HostOp(
+                name=node.name,
+                kind="requantize",
+                inputs=[source],
+                outputs=[out_name],
+                attrs={"scale": scale, "zero_point": zero_point, "dtype": dtype},
             )
-            env[out_name] = golden.requantize(env[source], scale=scale, zero_point=zero_point, out_dtype=dtype)
+            steps.append(step)
+            evaluate_host_step(step)
             tensors[out_name] = TensorSpec(
                 out_name,
                 normalize_shape(env[out_name].shape),

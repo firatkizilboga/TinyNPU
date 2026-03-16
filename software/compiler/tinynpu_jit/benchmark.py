@@ -5,6 +5,7 @@ from typing import Any
 
 import numpy as np
 
+from .host_ops import benchmark_host_op
 from .ir import DType, HostOp, MatMulOp, NpuSegment, TensorSpec
 
 
@@ -326,127 +327,10 @@ def estimate_matmul_cpu_counts(op: MatMulOp, tensors: dict[str, TensorSpec]) -> 
 
 
 def estimate_host_op_counts(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, PrimitiveCounts]:
-    # Host-op accounting uses the same reference scalar machine idea, but keeps
-    # categories separate:
-    # - compiler-lowering helpers like im2col/layout reshapes count as
-    #   cpu_replaced work when they are part of the lowered compute path
-    # - model-intrinsic host ops like softmax/mean/quantize stay in
-    #   host_intrinsic so they do not inflate accelerator speedup claims
-    source = np.array(values[step.inputs[0]], copy=False) if step.inputs else np.array([], dtype=np.int16)
-    source_elements = int(source.size)
-    output_elements = int(np.prod(step.attrs.get("shape", values[step.outputs[0]].shape))) if step.outputs and step.outputs[0] in values and "shape" in step.attrs else None
-
-    if step.kind == "im2col":
-        output = np.array(values[step.outputs[0]], copy=False)
-        elements = int(output.size)
-        return "cpu_replaced", PrimitiveCounts(
-            reads=elements,
-            writes=elements,
-            adds=elements * 3,
-            branches=elements,
-        )
-
-    if step.kind in {"layout_restore", "reshape", "transpose", "alias"}:
-        output = np.array(values[step.outputs[0]], copy=False)
-        elements = int(output.size)
-        return "cpu_replaced", PrimitiveCounts(
-            reads=elements,
-            writes=elements,
-            adds=elements,
-            branches=elements,
-        )
-
-    if step.kind == "mean":
-        output = np.array(values[step.outputs[0]], copy=False)
-        out_elems = int(output.size)
-        return "host_intrinsic", PrimitiveCounts(
-            reads=source_elements,
-            adds=source_elements,
-            divs=out_elems,
-            writes=out_elems,
-            branches=source_elements + out_elems,
-        )
-
-    if step.kind == "softmax":
-        output = np.array(values[step.outputs[0]], copy=False)
-        elems = int(output.size)
-        return "host_intrinsic", PrimitiveCounts(
-            reads=source_elements * 2,
-            adds=elems * 3,
-            divs=elems,
-            nonlinear=elems,
-            writes=elems,
-            branches=elems * 2,
-        )
-
-    if step.kind == "quantize":
-        out = np.array(values[step.outputs[0]], copy=False)
-        elems = int(out.size)
-        return "host_intrinsic", PrimitiveCounts(
-            reads=source_elements,
-            divs=elems,
-            adds=elems * 2,
-            clamps=elems,
-            writes=elems,
-            branches=elems,
-        )
-
-    if step.kind == "dequantize":
-        out = np.array(values[step.outputs[0]], copy=False)
-        elems = int(out.size)
-        adds = elems * 2 if int(step.attrs.get("zero_point", 0)) != 0 else elems
-        return "host_intrinsic", PrimitiveCounts(
-            reads=source_elements,
-            adds=adds,
-            muls=elems,
-            writes=elems,
-            branches=elems,
-        )
-
-    if step.kind == "requantize":
-        out = np.array(values[step.outputs[0]], copy=False)
-        elems = int(out.size)
-        return "host_intrinsic", PrimitiveCounts(
-            reads=source_elements,
-            muls=elems,
-            adds=elems * 2,
-            clamps=elems,
-            writes=elems,
-            branches=elems,
-        )
-
-    if step.kind == "relu":
-        out = np.array(values[step.outputs[0]], copy=False)
-        elems = int(out.size)
-        return "host_intrinsic", PrimitiveCounts(
-            reads=source_elements,
-            clamps=elems,
-            writes=elems,
-            branches=elems,
-        )
-
-    if step.kind == "sigmoid":
-        out = np.array(values[step.outputs[0]], copy=False)
-        elems = int(out.size)
-        return "host_intrinsic", PrimitiveCounts(
-            reads=source_elements,
-            adds=elems * 2,
-            divs=elems,
-            nonlinear=elems,
-            writes=elems,
-            branches=elems,
-        )
-
-    if output_elements is None and step.outputs and step.outputs[0] in values:
-        output_elements = int(np.array(values[step.outputs[0]], copy=False).size)
-    if output_elements is None:
-        output_elements = 0
-    return "host_intrinsic", PrimitiveCounts(
-        reads=source_elements,
-        writes=output_elements,
-        adds=output_elements,
-        branches=max(source_elements, output_elements),
-    )
+    # Host-op accounting is routed through the registry so evaluation semantics,
+    # validation, and benchmark categorization stay in one place.
+    bucket, counts = benchmark_host_op(step, values)
+    return bucket, counts
 
 
 def estimate_pack_counts(value: np.ndarray, packed_words: int) -> PrimitiveCounts:
