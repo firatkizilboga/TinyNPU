@@ -1,0 +1,87 @@
+digraph TinyNPUArchitecture {
+    graph [
+        rankdir=LR,
+        newrank=true,
+        splines=true,
+        pad=0.2,
+        nodesep=0.45,
+        ranksep=0.7,
+        bgcolor="white",
+        fontname="Helvetica",
+        fontsize=20
+    ];
+
+    node [
+        shape=box,
+        style="filled",
+        fontname="Helvetica",
+        fontsize=16,
+        penwidth=2.2,
+        margin="0.24,0.16"
+    ];
+
+    edge [
+        fontname="Helvetica",
+        fontsize=12,
+        color="#2f2f2f",
+        penwidth=2.0,
+        arrowsize=0.9,
+        labeldistance=2.0
+    ];
+
+    subgraph cluster_hostcpu {
+        label="Host CPU";
+        color="#557aab";
+        penwidth=2.0;
+        style="rounded,dashed";
+        fillcolor="white";
+        fontcolor="#355c7d";
+        fontsize=18;
+        margin="18,30";
+
+        Runtime [label="Runtime", fillcolor="#e8f0fe", color="#557aab", fontcolor="#1f2d3d", width=2.0, height=1.0];
+    }
+    MMIO [label="MMIO Interface", fillcolor="#e8f0fe", color="#557aab", fontcolor="#1f2d3d"];
+    IM [label="Instruction Memory", fillcolor="#efe8ff", color="#8b74bd", fontcolor="#2c2236"];
+    RuntimeMMIOSpacer [label="", shape=point, width=0.18, height=0.01, style=invis];
+
+    subgraph cluster_pipeline {
+        label="Pipelined Compute Path";
+        color="#6ab285";
+        penwidth=2.2;
+        style="filled";
+        fillcolor="#f7fcf8";
+        fontcolor="#2d6a4f";
+        fontsize=20;
+
+        UB [label="Unified Buffer", fillcolor="#efe8ff", color="#8b74bd", fontcolor="#2c2236", width=2.2, height=1.1];
+        InStream [label="Input\nStreamer", shape=parallelogram, skew=0.4, fillcolor="#e7f6ec", color="#4f9a6c", fontcolor="#1f3328", width=2.0, height=1.1];
+        WtStream [label="Weight\nStreamer", shape=parallelogram, skew=0.4, fillcolor="#e7f6ec", color="#4f9a6c", fontcolor="#1f3328", width=2.0, height=1.1];
+        SA [label="N x N\nSystolic\nArray", shape=box, width=2.1, height=2.1, fixedsize=true, fillcolor="#e7f6ec", color="#4f9a6c", fontcolor="#1f3328"];
+
+        UB -> InStream:w [label="activations"];
+        UB -> WtStream:w [label="weights"];
+        InStream -> SA:w [label="horizontal feed"];
+        WtStream -> SA:n [label="vertical feed"];
+    }
+
+    PPU [label="Post-Processing Unit", fillcolor="#ffe8db", color="#d18a66", fontcolor="#40261d", width=2.4, height=1.1];
+
+    { rank=min; Runtime; }
+    { rank=same; Runtime; RuntimeMMIOSpacer; MMIO; }
+    { rank=same; IM; UB; }
+    { rank=same; SA; PPU; }
+
+    Runtime:e -> MMIO:s [minlen=2, label="host commands"];
+    MMIO:s -> Runtime:w [minlen=2, label="status / data"];
+    MMIO -> IM [label="instruction load"];
+    MMIO -> UB [dir=both, label="buffer load / readback"];
+    SA -> PPU [label="drain / capture", minlen=1];
+    UB -> PPU [constraint=false, style=dashed, label="bias", fontcolor="#6e6e6e", color="#7a7a7a"];
+    PPU -> UB [constraint=false, label="packed writeback"];
+
+    Runtime -> RuntimeMMIOSpacer [style=invis, minlen=2];
+    RuntimeMMIOSpacer -> MMIO [style=invis, minlen=2];
+    MMIO -> IM [style=invis, weight=40];
+    IM -> UB [style=invis, weight=20];
+}

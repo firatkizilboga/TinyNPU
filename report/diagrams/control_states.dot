@@ -1,0 +1,133 @@
+digraph TinyNPUControlStates {
+    graph [
+        rankdir=LR,
+        newrank=true,
+        splines=true,
+        pad=0.2,
+        nodesep=0.45,
+        ranksep=0.8,
+        bgcolor="white",
+        fontname="Helvetica",
+        fontsize=20,
+        labelloc=t,
+        label="TinyNPU Control Unit State Machine"
+    ];
+
+    node [
+        shape=box,
+        style="rounded,filled",
+        fontname="Helvetica",
+        fontsize=14,
+        penwidth=2.0,
+        margin="0.18,0.12"
+    ];
+
+    edge [
+        fontname="Helvetica",
+        fontsize=10,
+        color="#2f2f2f",
+        penwidth=1.8,
+        arrowsize=0.8
+    ];
+
+    subgraph cluster_host {
+        label="Host / MMIO Service";
+        color="#D18A66";
+        penwidth=2.0;
+        style="rounded,dashed";
+        fillcolor="white";
+        fontcolor="#8F4F32";
+        fontsize=17;
+
+        IDLE [label="CTRL_IDLE", fillcolor="#FFE8DB", color="#D18A66", fontcolor="#40261d"];
+        HOST_WRITE [label="CTRL_HOST_WRITE", fillcolor="#FFE8DB", color="#D18A66", fontcolor="#40261d"];
+        HOST_READ [label="CTRL_HOST_READ", fillcolor="#FFE8DB", color="#D18A66", fontcolor="#40261d"];
+        READ_WAIT [label="CTRL_READ_WAIT", fillcolor="#FFE8DB", color="#D18A66", fontcolor="#40261d"];
+        HALT [label="CTRL_HALT", fillcolor="#FFE8DB", color="#D18A66", fontcolor="#40261d"];
+    }
+
+    subgraph cluster_issue {
+        label="Instruction Sequencing";
+        color="#8B74BD";
+        penwidth=2.0;
+        style="rounded,dashed";
+        fillcolor="white";
+        fontcolor="#6C5B7B";
+        fontsize=17;
+
+        FETCH [label="CTRL_FETCH", fillcolor="#EFE8FF", color="#8B74BD", fontcolor="#2c2236"];
+        DECODE [label="CTRL_DECODE", fillcolor="#EFE8FF", color="#8B74BD", fontcolor="#2c2236"];
+        EXEC_MOVE [label="CTRL_EXEC_MOVE", fillcolor="#EFE8FF", color="#8B74BD", fontcolor="#2c2236"];
+        EXEC_MATMUL [label="CTRL_EXEC_MATMUL", fillcolor="#EFE8FF", color="#8B74BD", fontcolor="#2c2236"];
+    }
+
+    subgraph cluster_matmul {
+        label="MatMul Micro-Sequence";
+        color="#557AAB";
+        penwidth=2.0;
+        style="filled";
+        fillcolor="#F5F9FF";
+        fontcolor="#355C7D";
+        fontsize=17;
+
+        MM_CLEAR [label="CTRL_MM_CLEAR", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
+        MM_LOAD_BIAS [label="CTRL_MM_LOAD_BIAS", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
+        MM_FEED [label="CTRL_MM_FEED", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
+        MM_WAIT [label="CTRL_MM_WAIT", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
+        MM_DRAIN_SA [label="CTRL_MM_DRAIN_SA", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
+        MM_WRITEBACK [label="CTRL_MM_WRITEBACK", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
+    }
+
+    { rank=same; IDLE; FETCH; }
+    { rank=same; DECODE; EXEC_MOVE; EXEC_MATMUL; }
+
+    IDLE -> HOST_WRITE [label="doorbell + CMD_WRITE_MEM"];
+    IDLE -> HOST_READ [label="doorbell + CMD_READ_MEM"];
+    IDLE -> FETCH [label="doorbell + CMD_RUN"];
+
+    HOST_WRITE -> IDLE [label="host write complete"];
+    HOST_READ -> READ_WAIT [label="issue memory read"];
+
+    READ_WAIT -> READ_WAIT [label="hold data valid"];
+    READ_WAIT -> HOST_WRITE [label="new CMD_WRITE_MEM"];
+    READ_WAIT -> HOST_READ [label="new CMD_READ_MEM"];
+    READ_WAIT -> FETCH [label="new CMD_RUN"];
+    READ_WAIT -> IDLE [label="other / clear"];
+
+    FETCH -> DECODE [label="read IM[pc]"];
+    DECODE -> FETCH [label="NOP"];
+    DECODE -> EXEC_MOVE [label="MOVE"];
+    DECODE -> EXEC_MATMUL [label="MATMUL"];
+    DECODE -> HALT [label="HALT / invalid opcode"];
+
+    EXEC_MOVE -> EXEC_MOVE [label="read then write copied word"];
+    EXEC_MOVE -> FETCH [label="move_count == 0"];
+
+    EXEC_MATMUL -> FETCH [label="all M tiles done"];
+    EXEC_MATMUL -> EXEC_MATMUL [label="advance M/N tile indices"];
+    EXEC_MATMUL -> MM_CLEAR [label="start next output tile"];
+
+    MM_CLEAR -> MM_LOAD_BIAS [label="bias present"];
+    MM_CLEAR -> MM_FEED [label="no bias"];
+
+    MM_LOAD_BIAS -> MM_LOAD_BIAS [label="load first bias word"];
+    MM_LOAD_BIAS -> MM_FEED [label="load second bias word"];
+
+    MM_FEED -> MM_FEED [label="stream A/B words and markers"];
+    MM_FEED -> MM_WAIT [label="last K tile fed"];
+
+    MM_WAIT -> MM_WAIT [label="flush skewers until all_done"];
+    MM_WAIT -> MM_DRAIN_SA [label="all_done_in"];
+
+    MM_DRAIN_SA -> MM_DRAIN_SA [label="capture one drained row"];
+    MM_DRAIN_SA -> MM_WRITEBACK [label="all rows captured"];
+
+    MM_WRITEBACK -> MM_WRITEBACK [label="write packed row to UB"];
+    MM_WRITEBACK -> EXEC_MATMUL [label="advance N tile"];
+
+    HALT -> HALT [label="stay halted"];
+    HALT -> HOST_WRITE [label="doorbell + CMD_WRITE_MEM"];
+    HALT -> HOST_READ [label="doorbell + CMD_READ_MEM"];
+    HALT -> FETCH [label="doorbell + CMD_RUN"];
+    HALT -> IDLE [label="other / clear"];
+}

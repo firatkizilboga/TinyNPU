@@ -1,0 +1,74 @@
+digraph TinyNPURuntimeState {
+    graph [
+        rankdir=TB,
+        splines=true,
+        pad=0.10,
+        nodesep=0.26,
+        ranksep=0.40,
+        bgcolor="white",
+        fontname="Helvetica",
+        fontsize=18
+    ];
+
+    node [
+        shape=box,
+        style="filled",
+        fontname="Helvetica",
+        fontsize=13,
+        penwidth=1.8,
+        margin="0.16,0.10"
+    ];
+
+    edge [
+        fontname="Helvetica",
+        fontsize=10,
+        color="#2f2f2f",
+        penwidth=1.6,
+        arrowsize=0.8
+    ];
+
+    Start [shape=ellipse, label="Start runtime call", fillcolor="#F4F7FB", color="#6F8FB3", fontcolor="#233142"];
+    Init [label="materialize constants\nbind runtime inputs", fillcolor="#EFE8FF", color="#8B74BD", fontcolor="#2C2236"];
+    Session [label="optional reset\nreuse session state\npreload static UB / IM", fillcolor="#FFE8DB", color="#D18A66", fontcolor="#40261d"];
+    Dispatch [shape=diamond, label="next plan step?", fillcolor="#F4F7FB", color="#6F8FB3", fontcolor="#233142"];
+    Kind [shape=diamond, label="step kind?", fillcolor="#F4F7FB", color="#6F8FB3", fontcolor="#233142"];
+
+    subgraph cluster_npu {
+        label="Host-side NPU Segment Handling";
+        color="#557AAB";
+        penwidth=2.0;
+        style="filled";
+        fillcolor="#F5F9FF";
+        fontcolor="#355C7D";
+        fontsize=16;
+
+        Pack [label="pack runtime tensors\ninto role-specific layout", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
+        WriteUB [label="write vectors to UB\noverlay inputs / reload bias", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
+        Launch [label="issue RUN through MMIO\nset start address", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
+        Wait [label="poll status until HALT", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
+        ReadUB [label="read output vectors\nfrom UB", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
+        Unpack [label="unpack vectors into\nlogical output tensors", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
+    }
+
+    HostOp [label="HostOp execution\ndequantize / requantize /\nsoftmax / mean / reshape", fillcolor="#FFF4E8", color="#C98A43", fontcolor="#4A3520"];
+    Verify [label="optional verification\ncompare against expected tensor", fillcolor="#FFF7D9", color="#C9A227", fontcolor="#4A3A00"];
+    Finalize [label="collect final outputs\ntrace tensors / benchmark", fillcolor="#EFE8FF", color="#8B74BD", fontcolor="#2C2236"];
+    Done [shape=ellipse, label="ExecutionResult", fillcolor="#F4F7FB", color="#6F8FB3", fontcolor="#233142"];
+
+    { rank=same; HostOp; Verify; }
+
+    Start -> Init;
+    Init -> Session;
+    Session -> Dispatch;
+    Dispatch -> Finalize [label="plan exhausted"];
+    Dispatch -> Kind [label="step available"];
+
+    Kind -> Pack [label="NpuSegment"];
+    Kind -> HostOp [label="HostOp"];
+    Kind -> Verify [label="VerifyTensor"];
+
+    Pack -> WriteUB -> Launch -> Wait -> ReadUB -> Unpack -> Dispatch [label="continue"];
+    HostOp -> Dispatch [label="continue"];
+    Verify -> Dispatch [label="continue"];
+    Finalize -> Done;
+}

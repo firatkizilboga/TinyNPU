@@ -1,0 +1,108 @@
+digraph TinyNPUCompilerStack {
+    graph [
+        rankdir=TB,
+        newrank=true,
+        splines=true,
+        pad=0.1,
+        nodesep=0.22,
+        ranksep=0.4,
+        bgcolor="white",
+        fontname="Helvetica",
+        fontsize=18
+    ];
+
+    node [
+        shape=box,
+        style="filled",
+        fontname="Helvetica",
+        fontsize=13,
+        penwidth=1.8,
+        margin="0.14,0.10"
+    ];
+
+    edge [
+        fontname="Helvetica",
+        fontsize=10,
+        color="#2f2f2f",
+        penwidth=1.7,
+        arrowsize=0.8
+    ];
+
+    Model [label="PyTorch / QAT Model", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
+    Quant [label="tinynpu_quant\ncompiler-ready conversion", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
+    FX [label="FX tracing\ncompile_module()", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
+
+    subgraph cluster_partition {
+        label="";
+        color="#6F8FB3";
+        penwidth=2.0;
+        style="rounded,dashed";
+        fillcolor="white";
+        fontcolor="#355C7D";
+        fontsize=16;
+        margin="10,12";
+
+        Partition [label="partition_fx_graph()", fillcolor="#F4F7FB", color="#6F8FB3", fontcolor="#233142"];
+        Plan [label="ExecutionPlan\nNpuSegment + HostOp + VerifyTensor", fillcolor="#F4F7FB", color="#6F8FB3", fontcolor="#233142", width=2.7];
+        Expected [label="Expected tensors\nfor verification", fillcolor="#F4F7FB", color="#6F8FB3", fontcolor="#233142"];
+    }
+
+    Validate [label="HostOp\nvalidation", fillcolor="#FFF4E8", color="#C98A43", fontcolor="#4A3520"];
+
+    subgraph cluster_lowering {
+        label="Lowering and Packaging";
+        color="#4F9A6C";
+        penwidth=2.1;
+        style="filled";
+        fillcolor="#F7FCF8";
+        fontcolor="#2D6A4F";
+        fontsize=16;
+
+        Planner [label="Memory planner", fillcolor="#E7F6EC", color="#4F9A6C", fontcolor="#1f3328"];
+        Compiler [label="SegmentCompiler", fillcolor="#E7F6EC", color="#4F9A6C", fontcolor="#1f3328"];
+        Program [label="TinyNPUProgram\nemit + compile", fillcolor="#E7F6EC", color="#4F9A6C", fontcolor="#1f3328", width=2.2];
+        Segment [label="Segment binaries\nIM + UB + symbols", fillcolor="#E7F6EC", color="#4F9A6C", fontcolor="#1f3328", width=2.2];
+    }
+
+    Artifact [label="CompiledArtifact\nplan + binaries + memory report", fillcolor="#EFE8FF", color="#8B74BD", fontcolor="#2C2236", width=2.4];
+
+    subgraph cluster_runtime {
+        label="Execution Backends";
+        color="#D18A66";
+        penwidth=2.0;
+        style="rounded,dashed";
+        fillcolor="white";
+        fontcolor="#8F4F32";
+        fontsize=16;
+
+        HostExec [label="HostEmulationExecutor", fillcolor="#FFE8DB", color="#D18A66", fontcolor="#40261d", width=2.2];
+        SimExec [label="Simulator runtime\nrun_sim() / session", fillcolor="#FFE8DB", color="#D18A66", fontcolor="#40261d", width=2.2];
+    }
+
+    Result [label="ExecutionResult\noutputs + verification + benchmark", fillcolor="#FFF7D9", color="#C9A227", fontcolor="#4A3A00", width=2.2];
+
+    { rank=same; HostExec; SimExec; }
+
+    Model -> Quant [label="optional QAT conversion"];
+    Quant -> FX [label="compiler-ready module"];
+    Model -> FX [label="direct quantized module path"];
+
+    FX -> Partition [label="GraphModule + example inputs"];
+    Partition -> Plan [label="mixed execution plan"];
+    Partition -> Expected [label="golden values"];
+
+    Plan -> Validate [label="compile_plan()"];
+    Validate -> Planner [label="validated plan"];
+    Planner -> Compiler [label="segment layouts"];
+    Plan -> Compiler [label="NPU segments"];
+    Compiler -> Program [label="declare data / emit ISA"];
+    Program -> Segment [label="compiled binaries"];
+    Segment -> Artifact [label="per-segment artifacts"];
+    Expected -> Artifact [label="verification reference"];
+    Planner -> Artifact [label="global memory report"];
+
+    Artifact -> HostExec [label="backend=host-emulation"];
+    Artifact -> SimExec [label="backend=sim"];
+    HostExec -> Result [label="execute plan"];
+    SimExec -> Result [label="execute + perf counters"];
+}
