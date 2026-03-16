@@ -11,6 +11,10 @@ from torchvision import datasets, transforms
 
 from software.compiler.tinynpu_jit import VerificationMode, compile_module, run_host_emulation
 from software.compiler.tinynpu_quant import (
+    apply_layer_quant_configs,
+    build_mixed_precision_sensitivity_report,
+    collect_layer_parameter_counts,
+    collect_layer_quant_configs,
     QConv2d,
     QLinear,
     build_layer_config_map,
@@ -21,6 +25,7 @@ from software.compiler.tinynpu_quant import (
     infer_chain_output_bits,
     infer_chain_output_scales,
     initialize_scale_tensors,
+    recalibrate_qat_scales,
 )
 
 
@@ -157,8 +162,11 @@ def build_compiler_ready_mnist_model(
     qat_model: TinyMNISTQAT,
     *,
     calib_dataset,
+    mixed_precision_configs=None,
     dequantize_output: bool = True,
 ):
+    if mixed_precision_configs is not None:
+        qat_model = apply_layer_quant_configs(qat_model, mixed_precision_configs, inplace=False)
     output_scales = infer_chain_output_scales(qat_model, LAYER_NAMES)
     output_bits = infer_chain_output_bits(qat_model, LAYER_NAMES)
     output_scales["conv3"] = collect_relu3_boundary_scale(qat_model, calib_dataset)
@@ -169,6 +177,38 @@ def build_compiler_ready_mnist_model(
         output_scales=output_scales,
         output_bits=output_bits,
         dequantize_output=dequantize_output,
+    )
+
+
+def build_mnist_mixed_precision_report(
+    qat_model: TinyMNISTQAT,
+    *,
+    calibration_loader: DataLoader,
+    validation_loader: DataLoader,
+    device: str,
+    candidate_bits: tuple[tuple[int, int], ...] = ((16, 16), (8, 8), (4, 4)),
+    max_acceptable_drop: float = 0.01,
+):
+    baseline_configs = collect_layer_quant_configs(qat_model, LAYER_NAMES)
+    parameter_counts = collect_layer_parameter_counts(qat_model, LAYER_NAMES)
+
+    def evaluate_configs(configs):
+        candidate_model = recalibrate_qat_scales(
+            apply_layer_quant_configs(qat_model, configs, inplace=False),
+            layer_names=LAYER_NAMES,
+            calib_loader=calibration_loader,
+            device=device,
+            inplace=True,
+        ).to(device).eval()
+        return evaluate_model(candidate_model, validation_loader, device)
+
+    return build_mixed_precision_sensitivity_report(
+        LAYER_NAMES,
+        evaluate_configs=evaluate_configs,
+        baseline_configs=baseline_configs,
+        candidate_bits=candidate_bits,
+        max_acceptable_drop=max_acceptable_drop,
+        parameter_counts=parameter_counts,
     )
 
 
