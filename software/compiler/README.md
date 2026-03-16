@@ -51,6 +51,7 @@ Examples:
 - `software/workload/jit_quantized_modules.py`: ordinary quantized `Linear` / `Conv2d` PyTorch module examples
 - `software/workload/jit_qat_compiler_ready.py`: compiler-ready QAT conversion example
 - `software/workload/mnist_tinynpu_pipeline.py`: fresh train -> QAT -> convert -> compile pipeline for MNIST
+- `software/workload/benchmark_jit_multitile_matmul.py`: host-side benchmark accounting report for the new multi-tile JIT matmul
 - `software/workload/inspect_simple_chain.py`: prints the segmented plan, logical previews, and packed output vectors for the migrated simple-chain artifact
 - `tinynpu_quant.calibration.collect_tensor_percentile_scale(...)`: reusable percentile-based host-boundary calibration helper
 
@@ -70,6 +71,7 @@ Simulator smoke test:
 - Exported MNIST conv RTL smoke test: `cd verification/cocotb && MODULE=test_jit_mnist_conv1 make -f Makefile.npu`
 - Full exported MNIST JIT RTL chain: `cd verification/cocotb && MODULE=test_jit_mnist_full_chain make -f Makefile.npu`
 - Fresh trained MNIST pipeline RTL compare: `cd verification/cocotb && MODULE=test_jit_mnist_trained_pipeline make -f Makefile.npu`
+- Perf-enabled JIT benchmark RTL test: `cd verification/cocotb && SIM_BUILD=sim_build_perf USER_EXTRA_ARGS=-GPERF_ENABLE=1 MODULE=test_jit_benchmark_multitile_matmul make -f Makefile.npu`
 
 Current limitation:
 - `torch` is an optional dependency and is not bundled by this repository today
@@ -79,6 +81,11 @@ Current limitation:
 - the fresh MNIST pipeline now calibrates the `conv3 -> mean` host boundary instead of blindly reusing the FC input scale; this restores compiled-host accuracy to near-QAT quality on the validated slice
 - that host-boundary calibration helper now lives in `tinynpu_quant` instead of remaining MNIST-specific code
 - the legacy `tinynpu/` package remains in place during migration
+- reproducible synthesis characterization script: `scripts/synth_tinynpu_yosys.py`
+- the new benchmark path is an architectural model:
+  - `cpu_replaced_cycles` counts only work the NPU replaces
+  - `npu_overhead_cycles` counts only accelerator-induced packing/interface overhead
+  - `npu_compute_cycles` comes from RTL perf counters and requires `PERF_ENABLE=1`
 
 Open risks:
 - only a narrow PyTorch quantization subset is accepted for NPU segments today:
