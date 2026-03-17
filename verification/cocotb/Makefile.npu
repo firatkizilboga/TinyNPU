@@ -5,6 +5,7 @@ VERILOG_SOURCES += $(PWD)/../../rtl/unified_buffer.sv
 VERILOG_SOURCES += $(PWD)/../../rtl/skewer.sv
 VERILOG_SOURCES += $(PWD)/../../rtl/pe.sv
 VERILOG_SOURCES += $(PWD)/../../rtl/systolic_array.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/ppu.sv
 VERILOG_SOURCES += $(PWD)/../../rtl/ubss.sv
 VERILOG_SOURCES += $(PWD)/../../rtl/mmio_interface.sv
 VERILOG_SOURCES += $(PWD)/../../rtl/instruction_memory.sv

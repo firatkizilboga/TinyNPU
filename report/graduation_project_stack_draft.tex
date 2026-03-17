@@ -228,7 +228,7 @@ Modern deep neural networks demand substantial compute and memory bandwidth even
 However, quantization is not a single fixed target. Mixed-precision work has shown that different layers or kernels inside the same model can tolerate different bit-widths \cite{wu2018mixedprecision}. This creates a hardware opportunity and a software problem at the same time. Hardware should benefit from narrower arithmetic when it is safe to do so, but the software stack must still prepare the model, preserve numerical intent, and decide where accelerator execution ends and host execution begins.
 
 \subsection{Problem Definition}
-The main problem addressed by TinyNPU is therefore not only how to build a small systolic-array accelerator, but how to make mixed-precision quantized computation usable from a realistic model flow. Fixed-precision accelerators leave throughput on the table when different parts of a model have different precision needs. At the other end of the spectrum, CPU-centric approaches based on ISA extensions or soft SIMD can support low-bit computation, but they still pay substantial software-side cost for packing, unpacking, and orchestrating the data movement around those operations \cite{garofalo2021xpulpnn, armeniakos2024mixedprecision, fornt2025mixgemm}.
+The main problem addressed by TinyNPU is therefore not only how to build a small systolic-array accelerator, but how to make mixed-precision quantized computation usable from a realistic model flow. Fixed-precision accelerators leave throughput on the table when different parts of a model have different precision needs. At the other end of the spectrum, CPU-centric approaches based on ISA extensions or soft SIMD can support low-bit computation, but they still pay substantial software-side cost for packing, unpacking, and orchestrating the data movement around those operations \cite{garofalo2021xpulpnn, armeniakos2024mixedprecision, reggiani2023mixgemm}.
 
 This project treats the problem as a co-design task. The hardware must expose a regular datapath that benefits from packed low-precision arithmetic. The compiler and runtime must make tensor layout, quantization boundaries, and host fallbacks explicit rather than implicit. The result should be a system that can be measured honestly: accelerator compute, runtime overhead, and host-side work should not be conflated.
 
@@ -392,6 +392,28 @@ Second, the performance tooling reveals a clear separation between core compute 
 \end{table}
 
 For the same workload, the measured accelerator run window was 369 cycles. Table~\ref{tab:matmul-benchmark} makes the key point visible: the compute core itself is strong, but integration-adjusted speedup is much lower than pure compute speedup because runtime and interface costs are still substantial.
+
+To connect this kernel benchmark to related low-bit GEMM work, Table~\ref{tab:mixgemm-kernel-scaling} reports the TinyNPU quantities that overlap with the comparison boundary used for Mix-GEMM \cite{reggiani2023mixgemm}. The shared boundary is precision scaling in tiled GEMM kernels, not end-to-end software-stack latency. TinyNPU therefore reports RTL-measured GEMM throughput and a region-level speedup under one fixed TinyNPU host model, while Mix-GEMM reports performance and speedups against OpenBLAS on a SiFive U740. The absolute speedup values are not interchangeable, but the precision-scaling trend is.
+
+\begin{table}[H]
+    \centering
+    \footnotesize
+    \caption{Kernel-level TinyNPU GEMM scaling used for the Mix-GEMM comparison boundary. Region-level speedup uses the ideal issue-1 reference model from Appendix~\ref{app:benchmark-model}.}
+    \label{tab:mixgemm-kernel-scaling}
+    \begin{tabularx}{\textwidth}{|l|Y|Y|Y|Y|Y|Y|}
+        \hline
+        \textbf{Workload} & \makecell{\textbf{INT16}\\\textbf{MAC/cycle}} & \makecell{\textbf{INT8}\\\textbf{MAC/cycle}} & \makecell{\textbf{INT4}\\\textbf{MAC/cycle}} & \makecell{\textbf{INT8/16}\\\textbf{gain}} & \makecell{\textbf{INT4/8}\\\textbf{gain}} & \makecell{\textbf{INT4}\\\textbf{speedup}} \\
+        \hline
+        $64^3$ & 41.24 & 60.84 & 79.80 & 1.48$\times$ & 1.31$\times$ & 32.19$\times$ \\
+        \hline
+        $96 \times 64 \times 96$ & 41.30 & 60.98 & 80.04 & 1.48$\times$ & 1.31$\times$ & 37.18$\times$ \\
+        \hline
+        $128^3$ & 50.22 & 82.65 & 122.06 & 1.65$\times$ & 1.48$\times$ & 62.99$\times$ \\
+        \hline
+    \end{tabularx}
+\end{table}
+
+Table~\ref{tab:mixgemm-kernel-scaling} also makes one important limitation visible. The ideal scaling for lane packing is 2$\times$ for INT16$\rightarrow$INT8 and again 2$\times$ for INT8$\rightarrow$INT4. In the present GEMM set, TinyNPU achieves 1.48--1.65$\times$ for INT8/INT16 (74--83\% of ideal) and 1.31--1.48$\times$ for INT4/INT8 (66--74\% of ideal). Mix-GEMM reports closer-to-ideal scaling in the same broad sense; for example, their a5-w5 configuration is reported as a 60\% improvement over a8-w8 (1.6$\times$), which matches the ideal 8/5 scaling in that step \cite{reggiani2023mixgemm}. The gap in TinyNPU scaling is expected for small-to-medium tiles because fixed per-tile costs (feed/drain/control) and host-visible packing overhead do not shrink with bitwidth, while the number of logical MACs does.
 
 Third, repeated-run runtime work is already justified by measured behavior. On a small repeated-run benchmark, static persistence reduced the modeled NPU-side overhead from 3036 to 1744 units, which corresponds to roughly a 42.6\% reduction. On trained MNIST, where the workload is more activation-heavy, the same idea still reduced repeated-run unified-buffer traffic from 17608 words to 14920 words, which is about a 15.3\% reduction. These numbers do not claim that the whole problem is solved; they show that repeated-run state reuse is a real and measurable optimization direction.
 
