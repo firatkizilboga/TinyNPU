@@ -96,11 +96,13 @@ module ppu (
 
   always_ff @(posedge clk) begin
     if (rst_n && capture_en) begin
+`ifdef PPU_DEBUG_CAPTURE
         $display("PPU CAPTURE: cycle=%d | B0=%d B1=%d B2=%d B3=%d B4=%d B5=%d B6=%d B7=%d | Lane0: acc=%d, res=%x", 
             ppu_cycle_idx, bias_reg[0], bias_reg[1], bias_reg[2], bias_reg[3],
             bias_reg[4], bias_reg[5], bias_reg[6], bias_reg[7],
             acc_in[0], quantized_row[0]);
         $fflush();
+`endif
     end
   end
 

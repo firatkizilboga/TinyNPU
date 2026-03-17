@@ -1,0 +1,4 @@
+workload,int16_macs_per_cycle,int8_macs_per_cycle,int4_macs_per_cycle,int8_over_int16_gain,int4_over_int8_gain,int4_region_speedup_ideal_issue_1
+64x64x64,41.24,60.84,79.80,1.48,1.31,32.19
+96x64x96,41.30,60.98,80.04,1.48,1.31,37.18
+128x128x128,50.22,82.65,122.06,1.65,1.48,62.99
