@@ -57,7 +57,7 @@ def run_gelu_experiment(
         use_h_gelu_approx=True,
         layer_configs=layer_configs,
     )
-    summary["int16_only"] = bool(int16_only)
+    summary["cli_int16_only"] = bool(int16_only)
     summary["compiled_vs_qat_drop"] = summary["qat_acc"] - summary["compiled_host_acc"]
 
     run_path = Path(run_dir)
@@ -161,13 +161,22 @@ def run_gelu_experiment_from_fp32(
         debug=True,
     )
     sample_logits = sample_result.tensors[artifact.plan.outputs[0]].reshape(-1).tolist()
+    layer_bits = {
+        "conv1": {"w_bits": int(qat_model.conv1.w_bits), "a_bits": int(qat_model.conv1.a_bits)},
+        "conv2": {"w_bits": int(qat_model.conv2.w_bits), "a_bits": int(qat_model.conv2.a_bits)},
+        "conv3": {"w_bits": int(qat_model.conv3.w_bits), "a_bits": int(qat_model.conv3.a_bits)},
+        "fc": {"w_bits": int(qat_model.fc.w_bits), "a_bits": int(qat_model.fc.a_bits)},
+    }
 
     summary = {
         "device": device,
         "activation": "gelu",
         "output_activation": "none",
         "use_h_gelu_approx": True,
-        "int16_only": bool(int16_only),
+        "cli_int16_only": bool(int16_only),
+        "gelu_forces_int16_boundaries": True,
+        "int16_only": all(bits["w_bits"] == 16 and bits["a_bits"] == 16 for bits in layer_bits.values()),
+        "layer_bits": layer_bits,
         "fp32_checkpoint": str(fp32_ckpt),
         "fp32_acc": fp32_acc,
         "ptq_acc": ptq_acc,

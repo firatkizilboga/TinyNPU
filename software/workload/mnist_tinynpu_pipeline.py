@@ -17,6 +17,7 @@ from software.compiler.tinynpu_quant import (
     build_mixed_precision_sensitivity_report,
     collect_layer_parameter_counts,
     collect_layer_quant_configs,
+    LayerQuantConfig,
     QConv2d,
     QLinear,
     build_layer_config_map,
@@ -24,6 +25,7 @@ from software.compiler.tinynpu_quant import (
     collect_tensor_percentile_scale,
     convert_qat_model_for_compiler,
     copy_state_with_mapping,
+    ensure_layer_quant_config,
     infer_chain_output_bits,
     infer_chain_output_scales,
     initialize_scale_tensors,
@@ -41,6 +43,7 @@ HGELU_SCALE_SHIFT = 7
 HGELU_MIN_SHIFT = 4
 HGELU_MAX_SHIFT = 12
 HGELU_OUTPUT_SCALE = 1.0 / float(1 << HGELU_SCALE_SHIFT)
+HGELU_FORCED_BITS = 16
 
 
 class _DiSigmoidSTE(torch.autograd.Function):
@@ -83,6 +86,49 @@ def _scale_to_h_gelu_shift(scale: float) -> int:
 
 def _h_gelu_output_scale_from_shift(shift: int) -> float:
     return 1.0 / float(1 << int(shift))
+
+
+def resolve_mnist_layer_configs(
+    layer_configs=None,
+    *,
+    activation: str = "relu",
+    output_activation: str = "none",
+) -> dict[str, LayerQuantConfig]:
+    configs = build_layer_config_map(
+        LAYER_NAMES,
+        overrides=layer_configs,
+        default_signed_activations=True,
+    )
+    forced_layers: tuple[str, ...] = ()
+    if str(activation) == "gelu":
+        # In the current TinyNPU stack, h_gelu should only be used with INT16
+        # boundaries. Because compiler-ready conversion currently requires
+        # matching activation/weight precision inside each NPU layer, that means
+        # the downstream GELU-bearing path must be upgraded to W16A16.
+        forced_layers = tuple(LAYER_NAMES)
+    elif str(output_activation) == "gelu":
+        forced_layers = ("fc",)
+    for name in forced_layers:
+        cfg = ensure_layer_quant_config(configs[name])
+        configs[name] = LayerQuantConfig(
+            w_bits=HGELU_FORCED_BITS,
+            a_bits=HGELU_FORCED_BITS,
+            signed_activations=bool(cfg.signed_activations),
+        )
+    return configs
+
+
+def collect_model_layer_bits(model: nn.Module) -> dict[str, dict[str, int]]:
+    modules = dict(model.named_modules())
+    layer_bits: dict[str, dict[str, int]] = {}
+    for name in LAYER_NAMES:
+        layer = modules.get(name)
+        if isinstance(layer, (QConv2d, QLinear)):
+            layer_bits[name] = {
+                "w_bits": int(layer.w_bits),
+                "a_bits": int(layer.a_bits),
+            }
+    return layer_bits
 
 
 def _apply_di_sigmoid_qat(x: torch.Tensor, *, layer: QLinear, output_scale: float = SIGMOID_OUTPUT_SCALE) -> torch.Tensor:
@@ -224,11 +270,12 @@ class TinyMNISTQAT(nn.Module):
                 "fc": nn.Parameter(torch.tensor(float(HGELU_SCALE_SHIFT))),
             }
         )
-        configs = build_layer_config_map(
-            LAYER_NAMES,
-            overrides=layer_configs,
-            default_signed_activations=True,
+        configs = resolve_mnist_layer_configs(
+            layer_configs,
+            activation=self.activation,
+            output_activation=self.output_activation,
         )
+        self.layer_configs = configs
         self.conv1 = QConv2d(1, 16, 3, padding=1, config=configs["conv1"])
         self.conv2 = QConv2d(16, 16, 3, padding=1, config=configs["conv2"])
         self.conv3 = QConv2d(16, 16, 3, padding=1, config=configs["conv3"])
@@ -256,14 +303,8 @@ class TinyMNISTQAT(nn.Module):
 
     def get_h_gelu_output_bits(self, site: str) -> int:
         site = str(site)
-        if site == "conv1":
-            return int(self.conv2.a_bits)
-        if site == "conv2":
-            return int(self.conv3.a_bits)
-        if site == "conv3":
-            return int(self.fc.a_bits)
-        if site == "fc":
-            return 16
+        if site in {"conv1", "conv2", "conv3", "fc"}:
+            return HGELU_FORCED_BITS
         raise KeyError(f"Unknown h_gelu site {site!r}.")
 
     def _qat_h_gelu_shift_arg(self, site: str, activation_name: str) -> int | torch.Tensor:
@@ -603,6 +644,11 @@ def initialize_qat_from_fp32(
     use_h_gelu_approx: bool = False,
 ) -> TinyMNISTQAT:
     fp32_model.eval()
+    layer_configs = resolve_mnist_layer_configs(
+        layer_configs,
+        activation=activation,
+        output_activation=output_activation,
+    )
     act_maxes = collect_input_activation_maxes(fp32_model, calib_loader, LAYER_NAMES, device=device)
     qat_model = TinyMNISTQAT(
         layer_configs,
@@ -761,7 +807,11 @@ def run_pipeline(
     print(f"device={device}", flush=True)
 
     train_loader, test_loader, test_loader_single, train_ds, test_ds = get_mnist_loaders(data_dir)
-    layer_configs = layer_configs or build_signed_w8a8_configs()
+    layer_configs = resolve_mnist_layer_configs(
+        layer_configs or build_signed_w8a8_configs(),
+        activation=activation,
+        output_activation=output_activation,
+    )
 
     print("stage=fp32_train", flush=True)
     fp32_model = train_fp32(
@@ -845,13 +895,16 @@ def run_pipeline(
     sample_logits = sample_result.tensors[artifact.plan.outputs[0]].reshape(-1).tolist()
     sample_pred = int(torch.tensor(sample_logits).argmax().item())
 
+    layer_bits = collect_model_layer_bits(qat_model)
     summary = {
         "device": device,
         "activation": activation,
         "output_activation": output_activation,
         "use_di_sigmoid_approx": use_di_sigmoid_approx,
         "use_h_gelu_approx": use_h_gelu_approx,
-        "int16_only": all(int(cfg.w_bits) == 16 and int(cfg.a_bits) == 16 for cfg in layer_configs.values()),
+        "gelu_forces_int16_boundaries": activation == "gelu" or output_activation == "gelu",
+        "int16_only": all(bits["w_bits"] == 16 and bits["a_bits"] == 16 for bits in layer_bits.values()),
+        "layer_bits": layer_bits,
         "fp32_acc": fp32_acc,
         "ptq_acc": ptq_acc,
         "qat_acc": qat_acc,
@@ -882,6 +935,7 @@ def load_qat_model_from_run(
     if not qat_path.exists():
         raise FileNotFoundError(f"Expected trained QAT checkpoint at {qat_path}.")
     if layer_configs is None:
+        layer_bits = None
         int16_only = False
         for summary_name in ("gelu_summary.json", "summary.json"):
             summary_path = run_path / summary_name
@@ -891,9 +945,22 @@ def load_qat_model_from_run(
                 summary = json.loads(summary_path.read_text())
             except Exception:
                 continue
+            layer_bits = summary.get("layer_bits")
             int16_only = bool(summary.get("int16_only", False))
             break
-        layer_configs = build_signed_w16a16_configs() if int16_only else build_signed_w8a8_configs()
+        if isinstance(layer_bits, dict) and layer_bits:
+            layer_configs = build_layer_config_map(
+                LAYER_NAMES,
+                overrides=layer_bits,
+                default_signed_activations=True,
+            )
+        else:
+            layer_configs = build_signed_w16a16_configs() if int16_only else build_signed_w8a8_configs()
+    layer_configs = resolve_mnist_layer_configs(
+        layer_configs,
+        activation=activation,
+        output_activation=output_activation,
+    )
     model = TinyMNISTQAT(
         layer_configs,
         activation=activation,
