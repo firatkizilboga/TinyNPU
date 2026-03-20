@@ -84,6 +84,53 @@ def di_sigmoid(x_in: int, *, m_i: int, k_i: int, p_out: int = 8, alpha_smooth: i
     return _int_div_prob(numer, denom, p_out=p_out)
 
 
+def _round_shift_signed(value: int, shift: int) -> int:
+    if shift <= 0:
+        return int(value)
+    rounder = 1 << (shift - 1)
+    if value >= 0:
+        return int((value + rounder) >> shift)
+    return -int(((-value) + rounder) >> shift)
+
+
+def _round_div_signed(numer: int, denom: int) -> int:
+    if denom <= 0:
+        raise ValueError(f"denom must be positive, got {denom}.")
+    half = denom // 2
+    if numer >= 0:
+        return int((numer + half) // denom)
+    return -int(((-numer) + half) // denom)
+
+
+def h_gelu(x_in: int, *, x_scale_shift: int = 7, slope_num: int = 218, slope_shift: int = 7) -> int:
+    """
+    Integer hard-GELU approximation using
+
+        h_gelu(x) = x * ReLU6(1.702x + 3) / 6
+
+    with ``x_in`` and the output represented in the same fixed-point domain:
+
+        x_real ~= x_in / 2^x_scale_shift
+
+    The default ``slope_num / 2^slope_shift`` approximates 1.702 as 218 / 128.
+    """
+    if x_scale_shift < 0:
+        raise ValueError(f"x_scale_shift must be non-negative, got {x_scale_shift}.")
+    if slope_num <= 0:
+        raise ValueError(f"slope_num must be positive, got {slope_num}.")
+    if slope_shift < 0:
+        raise ValueError(f"slope_shift must be non-negative, got {slope_shift}.")
+
+    scale_denom = 1 << x_scale_shift
+    three_int = 3 * scale_denom
+    six_int = 6 * scale_denom
+
+    slope_term = _round_shift_signed(int(x_in) * int(slope_num), slope_shift)
+    gate_int = min(max(slope_term + three_int, 0), six_int)
+
+    return _round_div_signed(int(x_in) * gate_int, six_int)
+
+
 class GoldenModel:
     def quantize(
         self,
@@ -190,6 +237,9 @@ class GoldenModel:
     def di_sigmoid(self, x_in: int, *, m_i: int, k_i: int, p_out: int = 8, alpha_smooth: int = 1) -> int:
         return di_sigmoid(x_in, m_i=m_i, k_i=k_i, p_out=p_out, alpha_smooth=alpha_smooth)
 
+    def h_gelu(self, x_in: int, *, x_scale_shift: int = 7, slope_num: int = 218, slope_shift: int = 7) -> int:
+        return h_gelu(x_in, x_scale_shift=x_scale_shift, slope_num=slope_num, slope_shift=slope_shift)
+
     def quantized_mean(
         self,
         value,
@@ -278,6 +328,9 @@ class GoldenModel:
                 p_out = 16
             clamped = int(np.clip(value, -32768, 32767))
             value = np.int64(di_sigmoid(clamped, m_i=int(multiplier & 0xFFFF), k_i=int(shift), p_out=p_out))
+        elif activation == "h_gelu":
+            clamped = int(np.clip(value, -32768, 32767))
+            value = np.int64(h_gelu(clamped))
         if out_dtype == DType.INT4:
             return int(np.clip(value, -8, 7))
         if out_dtype == DType.INT8:

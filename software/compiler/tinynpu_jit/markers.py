@@ -39,6 +39,8 @@ def npu_matmul(
         return torch.relu(result)
     if activation == "sigmoid":
         return torch.sigmoid(result)
+    if activation == "h_gelu":
+        return torch.nn.functional.gelu(result)
     return result
 
 

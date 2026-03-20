@@ -1,5 +1,6 @@
 import os
 import sys
+import math
 
 import numpy as np
 import pytest
@@ -49,6 +50,24 @@ def test_builtin_host_op_registry_drives_execution_and_benchmark():
     assert bucket == "host_intrinsic"
     assert counts.nonlinear == source.size
     assert counts.divs == source.size
+
+
+def test_gelu_host_op_executes_and_is_registered():
+    step = HostOp(name="gelu0", kind="gelu", inputs=["x"], outputs=["y"])
+    artifact = _artifact_for_host_op(step)
+    source = np.array([[-2.0, 0.0], [2.0, 4.0]], dtype=np.float32)
+
+    result = HostEmulationExecutor().run(artifact, {"x": source})
+
+    expected = 0.5 * source * (1.0 + np.vectorize(math.erf)(source / np.sqrt(2.0)))
+    assert np.allclose(result.tensors["y"], expected, atol=1e-6)
+    assert "gelu" in registered_host_op_kinds()
+    assert get_host_op_spec("gelu").quant_boundary_policy == "passthrough"
+
+    bucket, counts = estimate_host_op_counts(step, {"x": source, "y": result.tensors["y"]})
+    assert bucket == "host_intrinsic"
+    assert counts.nonlinear == source.size
+    assert counts.muls == source.size * 2
 
 
 def test_register_host_op_extends_dispatch():

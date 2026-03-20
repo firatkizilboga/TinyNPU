@@ -31,12 +31,14 @@ from software.compiler.tinynpu_quant import (
     compute_fused_params,
     fake_quantize,
 )
-from software.compiler.tinynpu_jit.golden import di_sigmoid as di_sigmoid_int
+from software.compiler.tinynpu_jit.golden import di_sigmoid as di_sigmoid_int, h_gelu as h_gelu_int
 
 
 LAYER_NAMES = ["conv1", "conv2", "conv3", "fc"]
 SIGMOID_P_OUT = 8
 SIGMOID_OUTPUT_SCALE = 1.0 / 127.0
+HGELU_SCALE_SHIFT = 7
+HGELU_OUTPUT_SCALE = 1.0 / float(1 << HGELU_SCALE_SHIFT)
 
 
 class _DiSigmoidSTE(torch.autograd.Function):
@@ -59,6 +61,23 @@ class _DiSigmoidSTE(torch.autograd.Function):
         return grad_output, None, None, None, None
 
 
+class _HGELUSTE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, x_scale_shift: int):
+        scale = float(1 << int(x_scale_shift))
+        x_int = torch.round(x.detach() * scale).clamp(-32768, 32767).to(torch.int32).cpu().numpy()
+        y_int = np.array(
+            [h_gelu_int(int(v), x_scale_shift=int(x_scale_shift)) for v in x_int.reshape(-1)],
+            dtype=np.float32,
+        ).reshape(x_int.shape)
+        y = torch.from_numpy(y_int).to(device=x.device, dtype=x.dtype)
+        return y / scale
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output, None
+
+
 def _apply_di_sigmoid_qat(x: torch.Tensor, *, layer: QLinear, output_scale: float = SIGMOID_OUTPUT_SCALE) -> torch.Tensor:
     multiplier, shift = compute_fused_params(float(layer.w_scale.item()), float(layer.a_scale.item()), float(output_scale))
     return _DiSigmoidSTE.apply(x, float(output_scale), int(multiplier), int(shift), int(SIGMOID_P_OUT))
@@ -79,13 +98,21 @@ def _apply_qlinear_with_input_scale(layer: QLinear, x: torch.Tensor, input_scale
     return F.linear(x_q, w_q, layer.linear.bias)
 
 
-def _apply_activation(x: torch.Tensor, activation: str) -> torch.Tensor:
+def _apply_h_gelu_qat(x: torch.Tensor, *, x_scale_shift: int = HGELU_SCALE_SHIFT) -> torch.Tensor:
+    return _HGELUSTE.apply(x, int(x_scale_shift))
+
+
+def _apply_activation(x: torch.Tensor, activation: str, *, use_h_gelu_approx: bool = False) -> torch.Tensor:
     if activation == "none":
         return x
     if activation == "relu":
         return F.relu(x)
     if activation == "sigmoid":
         return torch.sigmoid(x)
+    if activation == "gelu":
+        if use_h_gelu_approx:
+            return _apply_h_gelu_qat(x)
+        return F.gelu(x)
     raise ValueError(f"Unsupported activation {activation!r}.")
 
 
@@ -117,11 +144,13 @@ class TinyMNISTQAT(nn.Module):
         activation: str = "relu",
         output_activation: str = "none",
         use_di_sigmoid_approx: bool = False,
+        use_h_gelu_approx: bool = False,
     ):
         super().__init__()
         self.activation = str(activation)
         self.output_activation = str(output_activation)
         self.use_di_sigmoid_approx = bool(use_di_sigmoid_approx)
+        self.use_h_gelu_approx = bool(use_h_gelu_approx)
         self.fc_input_scale_override: float | None = None
         configs = build_layer_config_map(
             LAYER_NAMES,
@@ -134,9 +163,9 @@ class TinyMNISTQAT(nn.Module):
         self.fc = QLinear(16, 10, config=configs["fc"])
 
     def forward(self, x):
-        x = _apply_activation(self.conv1(x), self.activation)
-        x = _apply_activation(self.conv2(x), self.activation)
-        x = _apply_activation(self.conv3(x), self.activation)
+        x = _apply_activation(self.conv1(x), self.activation, use_h_gelu_approx=self.use_h_gelu_approx)
+        x = _apply_activation(self.conv2(x), self.activation, use_h_gelu_approx=self.use_h_gelu_approx)
+        x = _apply_activation(self.conv3(x), self.activation, use_h_gelu_approx=self.use_h_gelu_approx)
         x = x.mean(dim=[2, 3])
         if self.fc_input_scale_override is None:
             x = self.fc(x)
@@ -145,7 +174,7 @@ class TinyMNISTQAT(nn.Module):
         if self.output_activation == "sigmoid" and self.use_di_sigmoid_approx:
             x = _apply_di_sigmoid_qat(x, layer=self.fc, output_scale=SIGMOID_OUTPUT_SCALE)
         else:
-            x = _apply_activation(x, self.output_activation)
+            x = _apply_activation(x, self.output_activation, use_h_gelu_approx=self.use_h_gelu_approx)
         return x
 
 
@@ -250,11 +279,14 @@ def apply_compiler_boundary_overrides(
     calib_dataset,
     activation: str = "relu",
 ) -> TinyMNISTQAT:
-    model.fc_input_scale_override = collect_activation3_boundary_scale(
-        model,
-        calib_dataset,
-        activation=activation,
-    )
+    if activation == "gelu":
+        model.fc_input_scale_override = HGELU_OUTPUT_SCALE
+    else:
+        model.fc_input_scale_override = collect_activation3_boundary_scale(
+            model,
+            calib_dataset,
+            activation=activation,
+        )
     return model
 
 
@@ -270,15 +302,25 @@ def build_compiler_ready_mnist_model(
     qat_model = copy.deepcopy(qat_model)
     if hasattr(qat_model, "use_di_sigmoid_approx"):
         qat_model.use_di_sigmoid_approx = False
+    if hasattr(qat_model, "use_h_gelu_approx"):
+        qat_model.use_h_gelu_approx = False
     if mixed_precision_configs is not None:
         qat_model = apply_layer_quant_configs(qat_model, mixed_precision_configs, inplace=False)
     output_scales = infer_chain_output_scales(qat_model, LAYER_NAMES)
     output_bits = infer_chain_output_bits(qat_model, LAYER_NAMES)
-    output_scales["conv3"] = collect_activation3_boundary_scale(qat_model, calib_dataset, activation=activation)
-    output_bits["conv3"] = 8
+    if activation == "gelu":
+        for layer_name in ("conv1", "conv2", "conv3"):
+            output_scales[layer_name] = HGELU_OUTPUT_SCALE
+            output_bits[layer_name] = 8
+    else:
+        output_scales["conv3"] = collect_activation3_boundary_scale(qat_model, calib_dataset, activation=activation)
+        output_bits["conv3"] = 8
     if output_activation == "sigmoid":
         output_scales["fc"] = SIGMOID_OUTPUT_SCALE
         output_bits["fc"] = SIGMOID_P_OUT
+    elif output_activation == "gelu":
+        output_scales["fc"] = HGELU_OUTPUT_SCALE
+        output_bits["fc"] = 8
     return convert_qat_model_for_compiler(
         qat_model.cpu().eval(),
         layer_order=LAYER_NAMES,
@@ -329,6 +371,7 @@ def initialize_qat_from_fp32(
     activation: str = "relu",
     output_activation: str = "none",
     use_di_sigmoid_approx: bool = False,
+    use_h_gelu_approx: bool = False,
 ) -> TinyMNISTQAT:
     fp32_model.eval()
     act_maxes = collect_input_activation_maxes(fp32_model, calib_loader, LAYER_NAMES, device=device)
@@ -337,6 +380,7 @@ def initialize_qat_from_fp32(
         activation=activation,
         output_activation=output_activation,
         use_di_sigmoid_approx=use_di_sigmoid_approx,
+        use_h_gelu_approx=use_h_gelu_approx,
     ).to(device)
 
     fp32_sd = fp32_model.state_dict()
@@ -462,6 +506,7 @@ def run_pipeline(
     activation: str = "relu",
     output_activation: str = "none",
     use_di_sigmoid_approx: bool = False,
+    use_h_gelu_approx: bool = False,
 ):
     run_path = Path(run_dir)
     run_path.mkdir(parents=True, exist_ok=True)
@@ -492,6 +537,7 @@ def run_pipeline(
         activation=activation,
         output_activation=output_activation,
         use_di_sigmoid_approx=use_di_sigmoid_approx,
+        use_h_gelu_approx=use_h_gelu_approx,
     )
     apply_compiler_boundary_overrides(
         qat_model,
@@ -567,6 +613,7 @@ def load_qat_model_from_run(
     activation: str = "relu",
     output_activation: str = "none",
     use_di_sigmoid_approx: bool = False,
+    use_h_gelu_approx: bool = False,
 ) -> TinyMNISTQAT:
     run_path = Path(run_dir)
     qat_path = run_path / "qat.pt"
@@ -578,6 +625,7 @@ def load_qat_model_from_run(
         activation=activation,
         output_activation=output_activation,
         use_di_sigmoid_approx=use_di_sigmoid_approx,
+        use_h_gelu_approx=use_h_gelu_approx,
     ).to(device)
     state_dict = torch.load(qat_path, map_location=device)
     model.load_state_dict(state_dict)

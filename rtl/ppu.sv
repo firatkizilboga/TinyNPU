@@ -39,6 +39,8 @@ module ppu (
   logic signed [81:0] pre_activation_row[`ARRAY_SIZE-1:0];
   logic signed [15:0] sigmoid_in_row[`ARRAY_SIZE-1:0];
   logic [15:0] sigmoid_out_row[`ARRAY_SIZE-1:0];
+  logic signed [15:0] h_gelu_in_row[`ARRAY_SIZE-1:0];
+  logic signed [15:0] h_gelu_out_row[`ARRAY_SIZE-1:0];
   logic [7:0] sigmoid_p_out;
 
   always_comb begin
@@ -68,10 +70,13 @@ module ppu (
 
       if (shifted > 32767) begin
         sigmoid_in_row[i] = 16'sd32767;
+        h_gelu_in_row[i] = 16'sd32767;
       end else if (shifted < -32768) begin
         sigmoid_in_row[i] = -16'sd32768;
+        h_gelu_in_row[i] = -16'sd32768;
       end else begin
         sigmoid_in_row[i] = shifted[15:0];
+        h_gelu_in_row[i] = shifted[15:0];
       end
     end
   end
@@ -89,6 +94,17 @@ module ppu (
           .alpha_smooth(8'd1),
           .y_out(sigmoid_out_row[i])
       );
+
+      h_gelu #(
+          .INPUT_WIDTH(16),
+          .OUTPUT_WIDTH(16)
+      ) u_h_gelu (
+          .x_in(h_gelu_in_row[i]),
+          .x_scale_shift(8'd7),
+          .slope_num(16'd218),
+          .slope_shift(8'd7),
+          .y_out(h_gelu_out_row[i])
+      );
     end
   endgenerate
 
@@ -102,11 +118,13 @@ module ppu (
 
       activated = pre_activation_row[i];
 
-      // Activation stage: 0 = none, 1 = ReLU, 2 = sigmoid.
+      // Activation stage: 0 = none, 1 = ReLU, 2 = sigmoid, 3 = hard-GELU.
       if (activation == 8'd1) begin
         if (activated < 0) activated = 0;
       end else if (activation == 8'd2) begin
         activated = 82'(signed'({1'b0, sigmoid_out_row[i]}));
+      end else if (activation == 8'd3) begin
+        activated = 82'(signed'(h_gelu_out_row[i]));
       end
 
       // Precision saturation and packed writeback.

@@ -16,6 +16,7 @@ class ActivationMode(IntEnum):
     NONE = 0
     RELU = 1
     SIGMOID = 2
+    H_GELU = 3
 
 class Instruction:
     def encode(self, symbol_to_addr):

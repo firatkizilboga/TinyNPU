@@ -92,6 +92,8 @@ class SegmentCompiler:
                 activation = ActivationMode.RELU
             elif op.activation == "sigmoid":
                 activation = ActivationMode.SIGMOID
+            elif op.activation == "h_gelu":
+                activation = ActivationMode.H_GELU
             program.matmul(
                 op.lhs,
                 op.rhs,

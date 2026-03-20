@@ -53,3 +53,27 @@ def test_qat_sigmoid_head_can_use_di_sigmoid_approximation():
     assert y.shape == (1, 10)
     assert torch.all(y >= 0)
     assert torch.all(y <= 1)
+
+
+def test_gelu_mnist_model_lowers_to_h_gelu_backend_activation():
+    layer_configs = build_signed_w8a8_configs()
+    model = TinyMNISTQAT(layer_configs, activation="gelu", output_activation="gelu").eval()
+
+    calib_dataset = [(torch.zeros(1, 28, 28), 0) for _ in range(4)]
+    compiler_ready = build_compiler_ready_mnist_model(
+        model,
+        calib_dataset=calib_dataset,
+        activation="gelu",
+        output_activation="gelu",
+    )
+
+    example = torch.zeros(1, 1, 28, 28)
+    artifact = compile_module(compiler_ready, (example,))
+
+    activations = []
+    for step in artifact.plan.steps:
+        if hasattr(step, "ops"):
+            activations.extend(op.activation for op in step.ops)
+
+    assert "h_gelu" in activations
+    assert "gelu" not in activations

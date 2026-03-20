@@ -950,6 +950,55 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
         )
         current_ops = []
         current_inputs = set()
+
+    def try_fuse_post_layout_activation(source_name: str, out_name: str, activation_kind: str) -> bool:
+        if len(steps) < 2:
+            return False
+        layout_step = steps[-1]
+        segment_step = steps[-2]
+        if not isinstance(layout_step, HostOp) or layout_step.kind != "layout_restore":
+            return False
+        if not isinstance(segment_step, NpuSegment):
+            return False
+        if not layout_step.outputs or layout_step.outputs[0] != source_name:
+            return False
+        if not layout_step.inputs or segment_step.outputs != [layout_step.inputs[0]]:
+            return False
+        if not segment_step.ops or segment_step.ops[-1].activation != "none":
+            return False
+
+        fused_op = segment_step.ops[-1]
+        bias_value = tensors[fused_op.bias].data if fused_op.bias else None
+        expected_matrix = golden.matmul(
+            materialized_value(fused_op.lhs),
+            materialized_value(fused_op.rhs),
+            bias=bias_value,
+            multiplier=fused_op.multiplier,
+            shift=fused_op.shift,
+            activation=activation_kind,
+            out_dtype=fused_op.out_dtype,
+        )
+        env[fused_op.out] = expected_matrix.astype(np.int32)
+        expected_tensors[fused_op.out] = np.array(env[fused_op.out], copy=True)
+
+        restored = restore_conv_output_layout(
+            expected_matrix.reshape(
+                int(layout_step.attrs["out_h"]),
+                int(layout_step.attrs["out_w"]),
+                int(layout_step.attrs["out_channels"]),
+            ),
+            str(layout_step.attrs["layout"]),
+            tuple(int(dim) for dim in layout_step.attrs["original_shape"]),
+        )
+        env[out_name] = restored
+        tensors[out_name] = tensors[source_name].clone_without_data(name=out_name)
+        expected_tensors[out_name] = np.array(restored, copy=True)
+
+        fused_op.activation = activation_kind
+        layout_step.name = out_name
+        layout_step.outputs[0] = out_name
+        return True
+
     for node in graph_module.graph.nodes:
         if node.op == "placeholder":
             value = to_numpy(next(example_iter))
@@ -1141,14 +1190,9 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             )
             continue
 
-        if node.op == "call_function" and node.target in {
-            getattr(torch, "relu", None),
-            getattr(nn.functional, "relu", None),
-            getattr(torch, "sigmoid", None),
-            getattr(nn.functional, "sigmoid", None),
-        }:
+        if node.op == "call_module" and isinstance(modules[node.target], nn.GELU):
             source = node.args[0].name
-            activation_kind = "sigmoid" if "sigmoid" in str(node.target) else "relu"
+            activation_kind = "h_gelu"
             if current_ops and current_ops[-1].out == source and current_ops[-1].activation == "none":
                 matmul_op = current_ops[-1]
                 matmul_op.activation = activation_kind
@@ -1173,8 +1217,11 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                 )
                 continue
 
+            if try_fuse_post_layout_activation(source, node.name, activation_kind):
+                continue
+
             flush_segment()
-            step = HostOp(name=node.name, kind=activation_kind, inputs=[source], outputs=[node.name])
+            step = HostOp(name=node.name, kind="gelu", inputs=[source], outputs=[node.name])
             steps.append(step)
             evaluate_host_step(step)
             tensors[node.name] = TensorSpec(
@@ -1187,9 +1234,73 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             expected_tensors[node.name] = np.array(env[node.name], copy=True)
             continue
 
-        if node.op == "call_method" and node.target in {"sigmoid"}:
+        if node.op == "call_function":
             source = node.args[0].name
-            activation_kind = "sigmoid"
+            target_name = str(node.target)
+            if "sigmoid" in target_name:
+                activation_kind = "sigmoid"
+                host_kind = "sigmoid"
+            elif "gelu" in target_name:
+                activation_kind = "h_gelu"
+                host_kind = "gelu"
+            elif "relu" in target_name:
+                activation_kind = "relu"
+                host_kind = "relu"
+            else:
+                activation_kind = None
+                host_kind = None
+            if activation_kind is None:
+                pass
+            elif current_ops and current_ops[-1].out == source and current_ops[-1].activation == "none":
+                matmul_op = current_ops[-1]
+                matmul_op.activation = activation_kind
+                matmul_op.out = node.name
+                bias_value = tensors[matmul_op.bias].data if matmul_op.bias else None
+                expected = golden.matmul(
+                    materialized_value(matmul_op.lhs),
+                    materialized_value(matmul_op.rhs),
+                    bias=bias_value,
+                    multiplier=matmul_op.multiplier,
+                    shift=matmul_op.shift,
+                    activation=activation_kind,
+                    out_dtype=matmul_op.out_dtype,
+                )
+                env[node.name] = expected.astype(np.int32)
+                tensors[node.name] = TensorSpec(
+                    node.name,
+                    normalize_shape(expected.shape),
+                    matmul_op.out_dtype,
+                    TensorKind.INTERMEDIATE,
+                    metadata=dict(tensors[source].metadata),
+                )
+                continue
+
+            elif activation_kind is not None and try_fuse_post_layout_activation(source, node.name, activation_kind):
+                continue
+
+            elif activation_kind is not None:
+                flush_segment()
+                step = HostOp(name=node.name, kind=host_kind, inputs=[source], outputs=[node.name])
+                steps.append(step)
+                evaluate_host_step(step)
+                tensors[node.name] = TensorSpec(
+                    name=node.name,
+                    shape=normalize_shape(env[node.name].shape),
+                    dtype=tensors[source].dtype,
+                    kind=TensorKind.INTERMEDIATE,
+                    metadata=dict(tensors[source].metadata),
+                )
+                expected_tensors[node.name] = np.array(env[node.name], copy=True)
+                continue
+
+        if node.op == "call_method" and node.target in {"sigmoid", "gelu"}:
+            source = node.args[0].name
+            if node.target == "gelu":
+                activation_kind = "h_gelu"
+                host_kind = "gelu"
+            else:
+                activation_kind = "sigmoid"
+                host_kind = "sigmoid"
             if current_ops and current_ops[-1].out == source and current_ops[-1].activation == "none":
                 matmul_op = current_ops[-1]
                 matmul_op.activation = activation_kind
@@ -1214,8 +1325,11 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                 )
                 continue
 
+            if try_fuse_post_layout_activation(source, node.name, activation_kind):
+                continue
+
             flush_segment()
-            step = HostOp(name=node.name, kind=activation_kind, inputs=[source], outputs=[node.name])
+            step = HostOp(name=node.name, kind=host_kind, inputs=[source], outputs=[node.name])
             steps.append(step)
             evaluate_host_step(step)
             tensors[node.name] = TensorSpec(
