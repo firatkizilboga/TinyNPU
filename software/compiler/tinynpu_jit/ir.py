@@ -64,6 +64,7 @@ class MatMulOp:
     multiplier: int = 1
     shift: int = 0
     activation: str = "none"
+    h_gelu_x_scale_shift: int = 7
     in_dtype: DType = DType.INT16
     out_dtype: DType = DType.INT16
 

@@ -1,0 +1,16 @@
+SIM ?= verilator
+TOPLEVEL_LANG ?= verilog
+SIM_BUILD = sim_build_h_gelu
+
+VERILOG_SOURCES += $(PWD)/../../rtl/h_gelu.sv
+
+TOPLEVEL = h_gelu
+MODULE = test_h_gelu
+
+ifeq ($(SIM),verilator)
+EXTRA_ARGS += --trace --trace-structs -Wno-fatal
+endif
+
+export PYTHONPATH := $(PWD)/../..:$(PWD)/../../software/compiler:$(PYTHONPATH)
+
+include $(shell cocotb-config --makefiles)/Makefile.sim

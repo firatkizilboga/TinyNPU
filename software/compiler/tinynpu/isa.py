@@ -11,12 +11,32 @@ class PrecisionMode(IntEnum):
     INT8 = 1
     INT16 = 2
 
+
+class ActivationMode(IntEnum):
+    NONE = 0
+    RELU = 1
+    SIGMOID = 2
+    H_GELU = 3
+
 class Instruction:
     def encode(self, symbol_to_addr):
         raise NotImplementedError()
 
 class MatMul(Instruction):
-    def __init__(self, a, b, c, bias=None, shift=0, multiplier=1, activation=0, in_prec=PrecisionMode.INT16, out_prec=PrecisionMode.INT16, write_offset=0):
+    def __init__(
+        self,
+        a,
+        b,
+        c,
+        bias=None,
+        shift=0,
+        multiplier=1,
+        activation=0,
+        in_prec=PrecisionMode.INT16,
+        out_prec=PrecisionMode.INT16,
+        write_offset=0,
+        h_gelu_x_scale_shift=7,
+    ):
         self.a = a
         self.b = b
         self.c = c
@@ -27,6 +47,7 @@ class MatMul(Instruction):
         self.in_prec = in_prec
         self.out_prec = out_prec
         self.write_offset = write_offset
+        self.h_gelu_x_scale_shift = h_gelu_x_scale_shift
         
         # Tile dimensions (logical) will be set by the compiler during inference
         self.m = 0
@@ -54,6 +75,7 @@ class MatMul(Instruction):
         instr |= (self.out_prec & 0x3) << 86
         instr |= (self.write_offset & 0x3) << 84
         instr |= (self.in_prec & 0x3) << 82
+        instr |= (self.h_gelu_x_scale_shift & 0xFF) << 74
         return instr
 
 class Move(Instruction):
@@ -80,7 +102,23 @@ class Halt(Instruction):
         return instr
 
 # --- Legacy Functions for compatibility if needed ---
-def pack_matmul(opcode, a_addr, b_addr, c_addr, m, k, n, bias_addr=0xFFFF, shift=0, multiplier=1, activation=0, in_precision=PrecisionMode.INT16, out_precision=PrecisionMode.INT16, write_offset=0):
+def pack_matmul(
+    opcode,
+    a_addr,
+    b_addr,
+    c_addr,
+    m,
+    k,
+    n,
+    bias_addr=0xFFFF,
+    shift=0,
+    multiplier=1,
+    activation=0,
+    in_precision=PrecisionMode.INT16,
+    out_precision=PrecisionMode.INT16,
+    write_offset=0,
+    h_gelu_x_scale_shift=7,
+):
     instr = 0
     instr |= (opcode & 0xF) << 252
     instr |= (a_addr & 0xFFFF) << 232
@@ -96,6 +134,7 @@ def pack_matmul(opcode, a_addr, b_addr, c_addr, m, k, n, bias_addr=0xFFFF, shift
     instr |= (out_precision & 0x3) << 86
     instr |= (write_offset & 0x3) << 84
     instr |= (in_precision & 0x3) << 82
+    instr |= (h_gelu_x_scale_shift & 0xFF) << 74
     return instr
 
 def pack_move(opcode, src, dest, count):

@@ -65,6 +65,7 @@ class HostEmulationExecutor:
                                         "multiplier": op.multiplier,
                                         "shift": op.shift,
                                         "activation": op.activation,
+                                        "h_gelu_x_scale_shift": op.h_gelu_x_scale_shift,
                                         "in_dtype": op.in_dtype.value,
                                         "out_dtype": op.out_dtype.value,
                                     }
@@ -137,14 +138,14 @@ class HostEmulationExecutor:
     def _run_npu_segment(self, step: NpuSegment, values: dict[str, np.ndarray]) -> None:
         for op in step.ops:
             bias = values.get(op.bias) if op.bias else None
-            activation = "relu" if op.activation == "relu" else "none"
             values[op.out] = self.golden.matmul(
                 values[op.lhs],
                 values[op.rhs],
                 bias=bias,
                 multiplier=op.multiplier,
                 shift=op.shift,
-                activation=activation,
+                activation=op.activation,
+                h_gelu_x_scale_shift=op.h_gelu_x_scale_shift,
                 out_dtype=op.out_dtype,
             )
 

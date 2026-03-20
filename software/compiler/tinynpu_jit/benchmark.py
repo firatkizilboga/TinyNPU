@@ -318,6 +318,16 @@ def estimate_matmul_cpu_counts(op: MatMulOp, tensors: dict[str, TensorSpec]) -> 
         counts.shifts += out_elements
     if op.activation == "relu":
         counts.clamps += out_elements
+    elif op.activation == "sigmoid":
+        counts.divs += out_elements
+        counts.shifts += out_elements * 2
+        counts.adds += out_elements * 2
+    elif op.activation == "h_gelu":
+        counts.muls += out_elements * 2
+        counts.shifts += out_elements
+        counts.adds += out_elements
+        counts.divs += out_elements
+        counts.clamps += out_elements
     if op.out_dtype in (DType.INT4, DType.INT8, DType.INT16):
         counts.clamps += out_elements
     counts.adds += out_elements * 2

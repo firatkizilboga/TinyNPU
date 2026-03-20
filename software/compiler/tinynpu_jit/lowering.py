@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from tinynpu import TinyNPUProgram
+from tinynpu.isa import ActivationMode
 
 from .artifact import CompiledArtifact, SegmentArtifact
 from .ir import DType, ExecutionPlan, NpuSegment, TensorKind, to_precision_mode
@@ -86,6 +87,13 @@ class SegmentCompiler:
             program.declare_data(name, data, precision=precision, role=role)
 
         for op in segment.ops:
+            activation = ActivationMode.NONE
+            if op.activation == "relu":
+                activation = ActivationMode.RELU
+            elif op.activation == "sigmoid":
+                activation = ActivationMode.SIGMOID
+            elif op.activation == "h_gelu":
+                activation = ActivationMode.H_GELU
             program.matmul(
                 op.lhs,
                 op.rhs,
@@ -93,9 +101,10 @@ class SegmentCompiler:
                 bias_name=op.bias,
                 shift=op.shift,
                 multiplier=op.multiplier,
-                activation=1 if op.activation == "relu" else 0,
+                activation=int(activation),
                 in_precision=to_precision_mode(op.in_dtype),
                 out_precision=to_precision_mode(op.out_dtype),
+                h_gelu_x_scale_shift=int(op.h_gelu_x_scale_shift),
             )
 
         # Pre-assign globally planned addresses before compile() runs so that
