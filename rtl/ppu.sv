@@ -12,6 +12,7 @@ module ppu (
     input logic [                    7:0] shift,
     input logic [                   15:0] multiplier,
     input logic [                    7:0] activation,
+    input logic [                    7:0] h_gelu_x_scale_shift,
     input logic [                    1:0] precision,
     input logic [                    1:0] write_offset,
 
@@ -100,7 +101,7 @@ module ppu (
           .OUTPUT_WIDTH(16)
       ) u_h_gelu (
           .x_in(h_gelu_in_row[i]),
-          .x_scale_shift(8'd7),
+          .x_scale_shift(h_gelu_x_scale_shift),
           .slope_num(16'd218),
           .slope_shift(8'd7),
           .y_out(h_gelu_out_row[i])

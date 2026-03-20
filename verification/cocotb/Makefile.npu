@@ -18,7 +18,12 @@ MODULE ?= test_npu
 
 export PYTHONPATH := $(PWD)/../..:$(PWD)/../../software/compiler:$(PYTHONPATH)
 
-EXTRA_ARGS += --trace --trace-structs -Wno-fatal -I$(PWD)/../../rtl
+TRACE ?= 0
+
+EXTRA_ARGS += -Wno-fatal -I$(PWD)/../../rtl
+ifeq ($(TRACE),1)
+EXTRA_ARGS += --trace --trace-structs
+endif
 EXTRA_ARGS += -Wno-PINMISSING -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-SELRANGE -Wno-UNOPTFLAT -Wno-CASEINCOMPLETE
 EXTRA_ARGS += $(USER_EXTRA_ARGS)
 

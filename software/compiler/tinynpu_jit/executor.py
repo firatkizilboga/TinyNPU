@@ -65,6 +65,7 @@ class HostEmulationExecutor:
                                         "multiplier": op.multiplier,
                                         "shift": op.shift,
                                         "activation": op.activation,
+                                        "h_gelu_x_scale_shift": op.h_gelu_x_scale_shift,
                                         "in_dtype": op.in_dtype.value,
                                         "out_dtype": op.out_dtype.value,
                                     }
@@ -144,6 +145,7 @@ class HostEmulationExecutor:
                 multiplier=op.multiplier,
                 shift=op.shift,
                 activation=op.activation,
+                h_gelu_x_scale_shift=op.h_gelu_x_scale_shift,
                 out_dtype=op.out_dtype,
             )
 

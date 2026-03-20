@@ -1,5 +1,6 @@
 import os
 import sys
+from pathlib import Path
 
 import cocotb
 from cocotb.clock import Clock
@@ -25,6 +26,59 @@ def _choose_run_dir() -> str:
     return smoke_dir
 
 
+def _choose_activation() -> str:
+    return os.environ.get("TINYNPU_MNIST_ACTIVATION", "relu")
+
+
+def _choose_output_activation() -> str:
+    return os.environ.get("TINYNPU_MNIST_OUTPUT_ACTIVATION", "none")
+
+
+def _choose_data_dir() -> str:
+    env_data_dir = os.environ.get("TINYNPU_MNIST_DATA_DIR")
+    candidates = []
+    if env_data_dir:
+        candidates.append(Path(env_data_dir))
+    candidates.append(Path(project_root) / "data")
+    candidates.append(Path.home() / "compiler-optimization" / "data")
+
+    required = [
+        "train-images-idx3-ubyte",
+        "train-labels-idx1-ubyte",
+        "t10k-images-idx3-ubyte",
+        "t10k-labels-idx1-ubyte",
+    ]
+    for candidate in candidates:
+        raw_dir = candidate / "MNIST" / "raw"
+        if all((raw_dir / name).exists() for name in required):
+            return str(candidate)
+    return str(candidates[0])
+
+
+def _choose_sample_indices(test_ds, sample_count: int) -> list[int]:
+    labels = [int(label) for label in test_ds.targets.tolist()]
+    by_class: dict[int, list[int]] = {}
+    for index, label in enumerate(labels):
+        by_class.setdefault(label, []).append(index)
+
+    ordered_classes = sorted(by_class)
+    selected: list[int] = []
+    offset = 0
+    while len(selected) < sample_count:
+        made_progress = False
+        for label in ordered_classes:
+            class_indices = by_class[label]
+            if offset < len(class_indices):
+                selected.append(class_indices[offset])
+                made_progress = True
+                if len(selected) >= sample_count:
+                    break
+        if not made_progress:
+            break
+        offset += 1
+    return selected
+
+
 async def _reset(dut):
     clock = Clock(dut.clk, 10, units="ns")
     cocotb.start_soon(clock.start())
@@ -37,25 +91,35 @@ async def _reset(dut):
 async def test_jit_mnist_trained_pipeline(dut):
     await _reset(dut)
     run_dir = _choose_run_dir()
+    activation = _choose_activation()
+    output_activation = _choose_output_activation()
     sample_count = int(os.environ.get("TINYNPU_MNIST_COMPARE_SAMPLES", "3"))
-    data_dir = os.path.join(project_root, "data")
+    data_dir = _choose_data_dir()
     artifact, example, label = build_compiled_artifact_from_run(
         run_dir,
         data_dir=data_dir,
         sample_index=0,
         dequantize_output=False,
+        activation=activation,
+        output_activation=output_activation,
     )
     dut._log.info(f"run_dir={run_dir}")
+    dut._log.info(f"activation={activation} output_activation={output_activation}")
     dut._log.info(f"sample_count={sample_count}")
 
     _, _, _, _, test_ds = get_mnist_loaders(data_dir)
+    sample_indices = _choose_sample_indices(test_ds, sample_count)
+    sample_labels = [int(test_ds.targets[index]) for index in sample_indices]
     final_name = artifact.plan.outputs[0]
     checked = []
     last_logits = None
     last_label = None
     last_pred = None
 
-    for sample_index in range(sample_count):
+    dut._log.info(f"sample_indices={sample_indices}")
+    dut._log.info(f"sample_labels={sample_labels}")
+
+    for sample_index in sample_indices:
         sample_image, sample_label = test_ds[sample_index]
         inputs = {artifact.plan.inputs[0]: sample_image.unsqueeze(0).numpy()}
 

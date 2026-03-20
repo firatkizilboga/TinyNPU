@@ -104,6 +104,7 @@ class SegmentCompiler:
                 activation=int(activation),
                 in_precision=to_precision_mode(op.in_dtype),
                 out_precision=to_precision_mode(op.out_dtype),
+                h_gelu_x_scale_shift=int(op.h_gelu_x_scale_shift),
             )
 
         # Pre-assign globally planned addresses before compile() runs so that

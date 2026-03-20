@@ -288,6 +288,7 @@ class GoldenModel:
         multiplier: int = 1,
         shift: int = 0,
         activation: str = "none",
+        h_gelu_x_scale_shift: int = 7,
         out_dtype: DType = DType.INT16,
     ) -> np.ndarray:
         lhs_arr = np.array(lhs, dtype=np.int64)
@@ -308,11 +309,21 @@ class GoldenModel:
                     multiplier=multiplier,
                     shift=shift,
                     activation=activation,
+                    h_gelu_x_scale_shift=h_gelu_x_scale_shift,
                     out_dtype=out_dtype,
                 )
         return out
 
-    def _ppu(self, acc: int, bias: int, multiplier: int, shift: int, activation: str, out_dtype: DType) -> int:
+    def _ppu(
+        self,
+        acc: int,
+        bias: int,
+        multiplier: int,
+        shift: int,
+        activation: str,
+        h_gelu_x_scale_shift: int,
+        out_dtype: DType,
+    ) -> int:
         value = np.int64(acc) + np.int64(np.int32(bias))
         value *= np.int64(multiplier & 0xFFFF)
         if shift > 0:
@@ -330,7 +341,7 @@ class GoldenModel:
             value = np.int64(di_sigmoid(clamped, m_i=int(multiplier & 0xFFFF), k_i=int(shift), p_out=p_out))
         elif activation == "h_gelu":
             clamped = int(np.clip(value, -32768, 32767))
-            value = np.int64(h_gelu(clamped))
+            value = np.int64(h_gelu(clamped, x_scale_shift=int(h_gelu_x_scale_shift)))
         if out_dtype == DType.INT4:
             return int(np.clip(value, -8, 7))
         if out_dtype == DType.INT8:

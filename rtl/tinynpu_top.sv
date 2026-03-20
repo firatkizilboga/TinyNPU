@@ -35,6 +35,7 @@ module tinynpu_top #(
     logic [ 7:0]                 ppu_shift;
     logic [15:0]                 ppu_multiplier;
     logic [ 7:0]                 ppu_activation;
+    logic [ 7:0]                 ppu_h_gelu_x_scale_shift;
     logic [ 1:0]                 ppu_in_precision;
     logic [ 1:0]                 ppu_out_precision;
     logic [ 1:0]                 ppu_write_offset;
@@ -79,6 +80,7 @@ module tinynpu_top #(
         .ppu_shift      (ppu_shift),
         .ppu_multiplier (ppu_multiplier),
         .ppu_activation (ppu_activation),
+        .ppu_h_gelu_x_scale_shift(ppu_h_gelu_x_scale_shift),
         .ppu_in_precision (ppu_in_precision),
         .ppu_out_precision(ppu_out_precision),
         .ppu_write_offset(ppu_write_offset),
@@ -114,6 +116,7 @@ module tinynpu_top #(
         .ppu_shift      (ppu_shift),
         .ppu_multiplier (ppu_multiplier),
         .ppu_activation (ppu_activation),
+        .ppu_h_gelu_x_scale_shift(ppu_h_gelu_x_scale_shift),
         .ppu_in_precision (ppu_in_precision),
         .ppu_out_precision(ppu_out_precision),
         .ppu_write_offset(ppu_write_offset),

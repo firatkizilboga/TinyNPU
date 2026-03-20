@@ -93,7 +93,20 @@ class TinyNPUProgram:
     def add_expected_result(self, name, data):
         self.expected_results[name] = np.array(data)
 
-    def matmul(self, a_name, b_name, out_name, bias_name=None, shift=0, multiplier=1, activation=0, in_precision=PrecisionMode.INT16, out_precision=PrecisionMode.INT16, write_offset=0):
+    def matmul(
+        self,
+        a_name,
+        b_name,
+        out_name,
+        bias_name=None,
+        shift=0,
+        multiplier=1,
+        activation=0,
+        in_precision=PrecisionMode.INT16,
+        out_precision=PrecisionMode.INT16,
+        write_offset=0,
+        h_gelu_x_scale_shift=7,
+    ):
         if a_name not in self.symbols: raise ValueError(f"Symbol '{a_name}' not found.")
         if b_name not in self.symbols: raise ValueError(f"Symbol '{b_name}' not found.")
         A, B = self.symbols[a_name], self.symbols[b_name]
@@ -117,7 +130,19 @@ class TinyNPUProgram:
                 self.symbols[bias_name] = Symbol(bias_name, bias_shape, PrecisionMode.INT16, role='BIAS')
             else:
                 self.symbols[bias_name].storage_role = 'BIAS'
-        instr = MatMul(a_name, b_name, out_name, bias_name, shift, multiplier, activation, in_precision, out_precision, write_offset)
+        instr = MatMul(
+            a_name,
+            b_name,
+            out_name,
+            bias_name,
+            shift,
+            multiplier,
+            activation,
+            in_precision,
+            out_precision,
+            write_offset,
+            h_gelu_x_scale_shift,
+        )
         p_in = 1 << (2 - in_precision)
         instr.m = (A.shape[0] + self.array_size - 1) // self.array_size
         k_phys = (A.shape[1] + p_in - 1) // p_in

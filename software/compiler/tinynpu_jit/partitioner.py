@@ -706,7 +706,8 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                     "dtype": module_out_dtype.value,
                     "source": "compiler_ready_linear",
                     "module_name": module_name,
-                }
+                },
+                "h_gelu_x_scale_shift": int(getattr(module, "h_gelu_x_scale_shift", 7)),
             },
         )
         current_ops.append(
@@ -719,6 +720,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                 multiplier=multiplier,
                 shift=shift,
                 activation="none",
+                h_gelu_x_scale_shift=int(getattr(module, "h_gelu_x_scale_shift", 7)),
                 in_dtype=module_in_dtype,
                 out_dtype=module_out_dtype,
             )
@@ -855,7 +857,8 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                     "dtype": module_out_dtype.value,
                     "source": "compiler_ready_conv2d_matrix",
                     "module_name": module_name,
-                }
+                },
+                "h_gelu_x_scale_shift": int(getattr(module, "h_gelu_x_scale_shift", 7)),
             },
         )
         env[matmul_name] = expected_matrix.astype(np.int32)
@@ -869,6 +872,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                 multiplier=multiplier,
                 shift=shift,
                 activation="none",
+                h_gelu_x_scale_shift=int(getattr(module, "h_gelu_x_scale_shift", 7)),
                 in_dtype=module_in_dtype,
                 out_dtype=module_out_dtype,
             )
@@ -906,7 +910,8 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                     "dtype": module_out_dtype.value,
                     "source": "compiler_ready_conv2d",
                     "module_name": module_name,
-                }
+                },
+                "h_gelu_x_scale_shift": int(getattr(module, "h_gelu_x_scale_shift", 7)),
             },
         )
         expected_tensors[cols_name] = np.array(env[cols_name], copy=True)
@@ -968,6 +973,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             return False
 
         fused_op = segment_step.ops[-1]
+        h_gelu_x_scale_shift = int(tensors[source_name].metadata.get("h_gelu_x_scale_shift", fused_op.h_gelu_x_scale_shift))
         bias_value = tensors[fused_op.bias].data if fused_op.bias else None
         expected_matrix = golden.matmul(
             materialized_value(fused_op.lhs),
@@ -976,6 +982,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             multiplier=fused_op.multiplier,
             shift=fused_op.shift,
             activation=activation_kind,
+            h_gelu_x_scale_shift=h_gelu_x_scale_shift,
             out_dtype=fused_op.out_dtype,
         )
         env[fused_op.out] = expected_matrix.astype(np.int32)
@@ -995,6 +1002,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
         expected_tensors[out_name] = np.array(restored, copy=True)
 
         fused_op.activation = activation_kind
+        fused_op.h_gelu_x_scale_shift = h_gelu_x_scale_shift
         layout_step.name = out_name
         layout_step.outputs[0] = out_name
         return True
@@ -1140,6 +1148,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             multiplier = int(node.kwargs.get("multiplier", 1))
             shift = int(node.kwargs.get("shift", 0))
             activation = str(node.kwargs.get("activation", "none"))
+            h_gelu_x_scale_shift = int(node.kwargs.get("h_gelu_x_scale_shift", 7))
             in_dtype = parse_dtype(node.kwargs.get("in_dtype", "int16"))
             out_dtype = parse_dtype(node.kwargs.get("out_dtype", "int16"))
             output_scale = node.kwargs.get("output_scale")
@@ -1164,6 +1173,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                 multiplier=multiplier,
                 shift=shift,
                 activation=activation,
+                h_gelu_x_scale_shift=h_gelu_x_scale_shift,
                 out_dtype=out_dtype,
             )
             env[out_name] = expected.astype(np.int32)
@@ -1184,6 +1194,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                     multiplier=multiplier,
                     shift=shift,
                     activation=activation,
+                    h_gelu_x_scale_shift=h_gelu_x_scale_shift,
                     in_dtype=in_dtype,
                     out_dtype=out_dtype,
                 )
@@ -1195,7 +1206,9 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             activation_kind = "h_gelu"
             if current_ops and current_ops[-1].out == source and current_ops[-1].activation == "none":
                 matmul_op = current_ops[-1]
+                h_gelu_x_scale_shift = int(tensors[source].metadata.get("h_gelu_x_scale_shift", matmul_op.h_gelu_x_scale_shift))
                 matmul_op.activation = activation_kind
+                matmul_op.h_gelu_x_scale_shift = h_gelu_x_scale_shift
                 matmul_op.out = node.name
                 bias_value = tensors[matmul_op.bias].data if matmul_op.bias else None
                 expected = golden.matmul(
@@ -1205,6 +1218,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                     multiplier=matmul_op.multiplier,
                     shift=matmul_op.shift,
                     activation=activation_kind,
+                    h_gelu_x_scale_shift=h_gelu_x_scale_shift,
                     out_dtype=matmul_op.out_dtype,
                 )
                 env[node.name] = expected.astype(np.int32)
@@ -1253,6 +1267,10 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                 pass
             elif current_ops and current_ops[-1].out == source and current_ops[-1].activation == "none":
                 matmul_op = current_ops[-1]
+                if activation_kind == "h_gelu":
+                    matmul_op.h_gelu_x_scale_shift = int(
+                        tensors[source].metadata.get("h_gelu_x_scale_shift", matmul_op.h_gelu_x_scale_shift)
+                    )
                 matmul_op.activation = activation_kind
                 matmul_op.out = node.name
                 bias_value = tensors[matmul_op.bias].data if matmul_op.bias else None
@@ -1263,6 +1281,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                     multiplier=matmul_op.multiplier,
                     shift=matmul_op.shift,
                     activation=activation_kind,
+                    h_gelu_x_scale_shift=matmul_op.h_gelu_x_scale_shift,
                     out_dtype=matmul_op.out_dtype,
                 )
                 env[node.name] = expected.astype(np.int32)
@@ -1303,6 +1322,10 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                 host_kind = "sigmoid"
             if current_ops and current_ops[-1].out == source and current_ops[-1].activation == "none":
                 matmul_op = current_ops[-1]
+                if activation_kind == "h_gelu":
+                    matmul_op.h_gelu_x_scale_shift = int(
+                        tensors[source].metadata.get("h_gelu_x_scale_shift", matmul_op.h_gelu_x_scale_shift)
+                    )
                 matmul_op.activation = activation_kind
                 matmul_op.out = node.name
                 bias_value = tensors[matmul_op.bias].data if matmul_op.bias else None
@@ -1313,6 +1336,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                     multiplier=matmul_op.multiplier,
                     shift=matmul_op.shift,
                     activation=activation_kind,
+                    h_gelu_x_scale_shift=matmul_op.h_gelu_x_scale_shift,
                     out_dtype=matmul_op.out_dtype,
                 )
                 env[node.name] = expected.astype(np.int32)
@@ -1384,6 +1408,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                     multiplier=matmul_op.multiplier,
                     shift=matmul_op.shift,
                     activation=matmul_op.activation,
+                    h_gelu_x_scale_shift=matmul_op.h_gelu_x_scale_shift,
                     out_dtype=matmul_op.out_dtype,
                 )
                 env[node.name] = expected.astype(np.int32)
