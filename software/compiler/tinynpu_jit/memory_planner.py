@@ -73,12 +73,14 @@ class GlobalMemoryReport:
 def infer_roles(segment: NpuSegment) -> dict[str, str]:
     """Return per-tensor hardware role (A / B / BIAS / C) for a segment."""
     uses: dict[str, set[str]] = defaultdict(set)
+    produced_layouts: dict[str, str] = {}
     for op in segment.ops:
         uses[op.lhs].add("lhs")
         uses[op.rhs].add("rhs")
         if op.bias:
             uses[op.bias].add("bias")
         uses[op.out].add("out")
+        produced_layouts[op.out] = str(getattr(op, "output_layout", "c")).lower()
 
     roles: dict[str, str] = {}
     for name, kinds in uses.items():
@@ -89,7 +91,13 @@ def infer_roles(segment: NpuSegment) -> dict[str, str]:
         elif kinds == {"lhs"}:
             roles[name] = "A"
         elif "out" in kinds:
-            roles[name] = "C"
+            layout = produced_layouts.get(name, "c")
+            if layout == "a":
+                roles[name] = "A"
+            elif layout == "b":
+                roles[name] = "B"
+            else:
+                roles[name] = "C"
         else:
             roles[name] = "C"
     return roles

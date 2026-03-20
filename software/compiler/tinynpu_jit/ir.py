@@ -67,6 +67,7 @@ class MatMulOp:
     h_gelu_x_scale_shift: int = 7
     in_dtype: DType = DType.INT16
     out_dtype: DType = DType.INT16
+    output_layout: str = "c"
 
 
 @dataclass

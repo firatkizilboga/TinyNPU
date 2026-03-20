@@ -18,6 +18,12 @@ class ActivationMode(IntEnum):
     SIGMOID = 2
     H_GELU = 3
 
+
+class OutputLayout(IntEnum):
+    C = 0
+    A = 1
+    B = 2
+
 class Instruction:
     def encode(self, symbol_to_addr):
         raise NotImplementedError()
@@ -36,6 +42,7 @@ class MatMul(Instruction):
         out_prec=PrecisionMode.INT16,
         write_offset=0,
         h_gelu_x_scale_shift=7,
+        output_layout=OutputLayout.C,
     ):
         self.a = a
         self.b = b
@@ -48,6 +55,7 @@ class MatMul(Instruction):
         self.out_prec = out_prec
         self.write_offset = write_offset
         self.h_gelu_x_scale_shift = h_gelu_x_scale_shift
+        self.output_layout = output_layout
         
         # Tile dimensions (logical) will be set by the compiler during inference
         self.m = 0
@@ -76,6 +84,7 @@ class MatMul(Instruction):
         instr |= (self.write_offset & 0x3) << 84
         instr |= (self.in_prec & 0x3) << 82
         instr |= (self.h_gelu_x_scale_shift & 0xFF) << 74
+        instr |= (self.output_layout & 0x3) << 72
         return instr
 
 class Move(Instruction):
@@ -118,6 +127,7 @@ def pack_matmul(
     out_precision=PrecisionMode.INT16,
     write_offset=0,
     h_gelu_x_scale_shift=7,
+    output_layout=OutputLayout.C,
 ):
     instr = 0
     instr |= (opcode & 0xF) << 252
@@ -135,6 +145,7 @@ def pack_matmul(
     instr |= (write_offset & 0x3) << 84
     instr |= (in_precision & 0x3) << 82
     instr |= (h_gelu_x_scale_shift & 0xFF) << 74
+    instr |= (output_layout & 0x3) << 72
     return instr
 
 def pack_move(opcode, src, dest, count):
