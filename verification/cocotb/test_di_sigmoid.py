@@ -40,3 +40,18 @@ async def test_di_sigmoid_is_monotone(dut):
         if prev is not None:
             assert prev <= got, f"non-monotone around x_in={x_in}: prev={prev}, got={got}"
         prev = got
+
+
+@cocotb.test()
+async def test_di_sigmoid_supports_large_shift_values(dut):
+    dut.m_i.value = 26845
+    dut.k_i.value = 35
+    dut.p_out.value = 8
+    dut.alpha_smooth.value = 1
+
+    for x_in in (-4, -1, 0, 1, 4):
+        dut.x_in.value = x_in
+        await Timer(1, units="ns")
+        got = int(dut.y_out.value)
+        want = di_sigmoid(x_in, m_i=26845, k_i=35, p_out=8, alpha_smooth=1)
+        assert got == want, f"x_in={x_in}: got {got}, want {want}"

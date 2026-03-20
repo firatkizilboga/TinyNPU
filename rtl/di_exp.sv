@@ -8,12 +8,12 @@ module di_exp #(
     output logic        [OUTPUT_WIDTH-1:0] y_out
 );
 
-  localparam int unsigned Y_MAX = (1 << OUTPUT_WIDTH) - 1;
+  localparam longint unsigned Y_MAX = (OUTPUT_WIDTH < 63) ? ((64'd1 << OUTPUT_WIDTH) - 1) : {64{1'b1}};
 
   always_comb begin
-    int unsigned m_f;
-    int unsigned t_mag;
-    int unsigned period_numer;
+    longint unsigned m_f;
+    longint unsigned t_mag;
+    longint unsigned period_numer;
     int signed t_val;
     int signed q_i;
     int signed r_i;
@@ -31,8 +31,8 @@ module di_exp #(
     result_i = '0;
     x_ext = '0;
 
-    m_f = int'(m_i) + (int'(m_i) >> 1) - (int'(m_i) >> 4);
-    period_numer = (k_i < 31) ? (32'd1 << k_i) : 0;
+    m_f = longint'(m_i) + (longint'(m_i) >> 1) - (longint'(m_i) >> 4);
+    period_numer = (k_i < 63) ? (64'd1 << k_i) : 0;
 
     // I-LLM Algorithm 1, step 1: derive the negative period t from the
     // runtime integer scale pair (m_i, k_i).
@@ -42,7 +42,7 @@ module di_exp #(
       y_out = '0;
     end else begin
       x_ext = int'($signed(x_in));
-      t_val = -$signed(t_mag);
+      t_val = -int'($signed(t_mag));
 
       // I-LLM Algorithm 1, steps 2-3: x = q_i * t + r_i.
       q_i = x_ext / t_val;

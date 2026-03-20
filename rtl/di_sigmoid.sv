@@ -12,13 +12,13 @@ module di_sigmoid #(
 
   logic signed [INPUT_WIDTH-1:0] x_smoothed;
   logic signed [INPUT_WIDTH-1:0] exp_arg;
-  logic        [15:0] exp_zero;
-  logic        [15:0] exp_term;
+  logic        [31:0] exp_zero;
+  logic        [31:0] exp_term;
   logic               use_exp_term_numer;
 
   di_exp #(
       .INPUT_WIDTH(INPUT_WIDTH),
-      .OUTPUT_WIDTH(16)
+      .OUTPUT_WIDTH(32)
   ) u_di_exp_zero (
       .x_in('0),
       .m_i(m_i),
@@ -28,7 +28,7 @@ module di_sigmoid #(
 
   di_exp #(
       .INPUT_WIDTH(INPUT_WIDTH),
-      .OUTPUT_WIDTH(16)
+      .OUTPUT_WIDTH(32)
   ) u_di_exp_term (
       .x_in(exp_arg),
       .m_i(m_i),

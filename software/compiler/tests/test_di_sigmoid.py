@@ -48,6 +48,10 @@ def test_di_sigmoid_handles_optional_smoothing():
     assert smoothed < base
 
 
+def test_di_sigmoid_supports_large_shift_values():
+    assert di_sigmoid(0, m_i=26845, k_i=35, p_out=8, alpha_smooth=1) > 0
+
+
 def test_golden_model_exposes_same_di_sigmoid_helper():
     golden = GoldenModel()
     assert golden.di_sigmoid(12, m_i=128, k_i=12, p_out=8) == di_sigmoid(12, m_i=128, k_i=12, p_out=8)

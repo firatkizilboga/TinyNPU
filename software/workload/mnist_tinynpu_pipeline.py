@@ -131,9 +131,15 @@ def collect_model_layer_bits(model: nn.Module) -> dict[str, dict[str, int]]:
     return layer_bits
 
 
-def _apply_di_sigmoid_qat(x: torch.Tensor, *, layer: QLinear, output_scale: float = SIGMOID_OUTPUT_SCALE) -> torch.Tensor:
+def _apply_di_sigmoid_qat(
+    x: torch.Tensor,
+    *,
+    layer: QLinear,
+    output_scale: float = SIGMOID_OUTPUT_SCALE,
+    p_out: int = SIGMOID_P_OUT,
+) -> torch.Tensor:
     multiplier, shift = compute_fused_params(float(layer.w_scale.item()), float(layer.a_scale.item()), float(output_scale))
-    return _DiSigmoidSTE.apply(x, float(output_scale), int(multiplier), int(shift), int(SIGMOID_P_OUT))
+    return _DiSigmoidSTE.apply(x, float(output_scale), int(multiplier), int(shift), int(p_out))
 
 
 def _round_shift_signed_tensor(value: torch.Tensor, shift: int) -> torch.Tensor:
@@ -932,6 +938,7 @@ def load_qat_model_from_run(
 ) -> TinyMNISTQAT:
     run_path = Path(run_dir)
     qat_path = run_path / "qat.pt"
+    compat_qat_path = run_path / "qat.compat.pt"
     if not qat_path.exists():
         raise FileNotFoundError(f"Expected trained QAT checkpoint at {qat_path}.")
     if layer_configs is None:
@@ -968,8 +975,18 @@ def load_qat_model_from_run(
         use_di_sigmoid_approx=use_di_sigmoid_approx,
         use_h_gelu_approx=use_h_gelu_approx,
     ).to(device)
-    state_dict = torch.load(qat_path, map_location=device)
-    model.load_state_dict(state_dict)
+    load_path = compat_qat_path if compat_qat_path.exists() else qat_path
+    state_dict = torch.load(load_path, map_location=device)
+    try:
+        model.load_state_dict(state_dict)
+    except RuntimeError:
+        if load_path == compat_qat_path:
+            raise
+        # Older saved runs may predate later QAT metadata such as hard-GELU
+        # shift parameters. Materialize a schema-compatible checkpoint once so
+        # repeated benchmark runs do not need to retrain or remigrate.
+        model.load_state_dict(state_dict, strict=False)
+        torch.save(model.state_dict(), compat_qat_path)
     return model.eval()
 
 

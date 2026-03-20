@@ -442,6 +442,7 @@ def build_compiler_ready_model(
 
 def load_qat_model_from_run(run_dir: str, *, device: str = "cpu") -> tuple[TinyFeatureMLPQAT, dict[str, object]]:
     run_path = Path(run_dir)
+    compat_qat_path = run_path / "qat.compat.pt"
     with open(run_path / "summary.json", "r") as handle:
         summary = json.load(handle)
     layer_configs = layer_configs_from_summary(summary)
@@ -453,8 +454,15 @@ def load_qat_model_from_run(run_dir: str, *, device: str = "cpu") -> tuple[TinyF
         use_di_sigmoid_approx=True,
         use_h_gelu_approx=True,
     ).to(device)
-    state_dict = torch.load(run_path / "qat.pt", map_location=device)
-    qat_model.load_state_dict(state_dict)
+    load_path = compat_qat_path if compat_qat_path.exists() else (run_path / "qat.pt")
+    state_dict = torch.load(load_path, map_location=device)
+    try:
+        qat_model.load_state_dict(state_dict)
+    except RuntimeError:
+        if load_path == compat_qat_path:
+            raise
+        qat_model.load_state_dict(state_dict, strict=False)
+        torch.save(qat_model.state_dict(), compat_qat_path)
     return qat_model.eval(), summary
 
 
