@@ -58,9 +58,9 @@ digraph TinyNPUCompilerStack {
         fontcolor="#2D6A4F";
         fontsize=16;
 
-        Planner [label="Memory planner", fillcolor="#E7F6EC", color="#4F9A6C", fontcolor="#1f3328"];
-        Compiler [label="SegmentCompiler", fillcolor="#E7F6EC", color="#4F9A6C", fontcolor="#1f3328"];
-        Program [label="TinyNPUProgram\nemit + compile", fillcolor="#E7F6EC", color="#4F9A6C", fontcolor="#1f3328", width=2.2];
+        Planner [label="Memory planner\nroles + layouts", fillcolor="#E7F6EC", color="#4F9A6C", fontcolor="#1f3328"];
+        Compiler [label="SegmentCompiler\noutput_layout selection", fillcolor="#E7F6EC", color="#4F9A6C", fontcolor="#1f3328"];
+        Program [label="TinyNPUProgram\nemit ISA + layouts", fillcolor="#E7F6EC", color="#4F9A6C", fontcolor="#1f3328", width=2.2];
         Segment [label="Segment binaries\nIM + UB + symbols", fillcolor="#E7F6EC", color="#4F9A6C", fontcolor="#1f3328", width=2.2];
     }
 
