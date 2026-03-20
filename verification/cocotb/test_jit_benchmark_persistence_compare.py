@@ -23,6 +23,7 @@ def _sum_totals(reports):
         "npu_compute_cycles",
         "npu_overhead_cycles",
         "host_intrinsic_cycles",
+        "host_remaining_cycles",
     ]
     summed = {key: 0 for key in keys}
     for report in reports:

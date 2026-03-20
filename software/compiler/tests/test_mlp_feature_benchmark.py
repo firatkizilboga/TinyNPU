@@ -10,7 +10,7 @@ COMPILER_DIR = os.path.dirname(TESTS_DIR)
 PROJECT_ROOT = os.path.dirname(os.path.dirname(COMPILER_DIR))
 sys.path.insert(0, PROJECT_ROOT)
 
-from software.compiler.tinynpu_jit import compile_module
+from software.compiler.tinynpu_jit import VerificationMode, compile_module, run_host_emulation
 from software.compiler.tinynpu_jit.ir import NpuSegment
 from software.workload.mnist_mlp_feature_benchmark import (
     INPUT_DIM,
@@ -106,3 +106,34 @@ def test_feature_benchmark_internal_outputs_are_marked_as_a_layout():
     assert symbol_table["relu_1"]["role"] == "A"
     assert symbol_table["gelu"]["role"] == "A"
     assert symbol_table["sigmoid"]["role"] == "C"
+
+
+def test_feature_benchmark_reports_end_to_end_host_remaining_metric():
+    torch.manual_seed(0)
+    fp32_model = TinyFeatureMLPFP32(num_outputs=1)
+    layer_configs = build_feature_coverage_configs("mixed")
+    qat_model = initialize_qat_from_fp32(
+        fp32_model,
+        layer_configs=layer_configs,
+        calib_loader=_tiny_flat_calib_loader(),
+        device="cpu",
+    )
+    compiler_ready = build_compiler_ready_model(qat_model)
+    artifact = compile_module(compiler_ready, (torch.zeros(1, INPUT_DIM, dtype=torch.float32),))
+
+    result = run_host_emulation(
+        artifact,
+        {artifact.plan.inputs[0]: torch.zeros(1, INPUT_DIM, dtype=torch.float32).numpy()},
+        VerificationMode.OFF,
+        benchmark=True,
+    )
+    totals = result.benchmark.to_dict()["totals"]
+
+    assert "host_remaining_cycles" in totals
+    assert "end_to_end_analytical_speedup" in totals
+    assert totals["host_remaining_cycles"] == totals["host_intrinsic_cycles"]
+
+    expected = totals["cpu_replaced_cycles"] / (
+        totals["npu_compute_cycles"] + totals["npu_overhead_cycles"] + totals["host_remaining_cycles"]
+    )
+    assert totals["end_to_end_analytical_speedup"] == expected

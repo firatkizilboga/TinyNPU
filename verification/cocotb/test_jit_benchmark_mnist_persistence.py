@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import os
 import sys
 
@@ -27,12 +28,31 @@ def _choose_run_dir() -> str:
     return smoke_dir
 
 
+def _choose_data_dir() -> str:
+    env_data_dir = os.environ.get("TINYNPU_MNIST_DATA_DIR")
+    if env_data_dir:
+        return env_data_dir
+    return os.path.join(project_root, "data")
+
+
+def _load_run_activations(run_dir: str) -> tuple[str, str]:
+    for summary_name in ("summary.json", "gelu_summary.json", "sigmoid_summary.json"):
+        summary_path = os.path.join(run_dir, summary_name)
+        if not os.path.exists(summary_path):
+            continue
+        with open(summary_path, "r") as handle:
+            summary = json.load(handle)
+        return str(summary.get("activation", "relu")), str(summary.get("output_activation", "none"))
+    return "relu", "none"
+
+
 def _sum_totals(reports):
     keys = [
         "cpu_replaced_cycles",
         "npu_compute_cycles",
         "npu_overhead_cycles",
         "host_intrinsic_cycles",
+        "host_remaining_cycles",
     ]
     summed = {key: 0 for key in keys}
     for report in reports:
@@ -60,14 +80,18 @@ async def test_jit_benchmark_mnist_persistence(dut):
 
     await _reset(dut)
     run_dir = _choose_run_dir()
+    data_dir = _choose_data_dir()
+    activation, output_activation = _load_run_activations(run_dir)
     artifact, _, _ = build_compiled_artifact_from_run(
         run_dir,
-        data_dir=os.path.join(project_root, "data"),
+        data_dir=data_dir,
         sample_index=0,
         dequantize_output=False,
+        activation=activation,
+        output_activation=output_activation,
     )
     sample_count = int(os.environ.get("TINYNPU_BENCH_RUNS", "3"))
-    _, _, _, _, test_ds = get_mnist_loaders(os.path.join(project_root, "data"))
+    _, _, _, _, test_ds = get_mnist_loaders(data_dir)
 
     run_sim_params = inspect.signature(run_sim).parameters
     supports_executor = "executor" in run_sim_params
@@ -103,6 +127,8 @@ async def test_jit_benchmark_mnist_persistence(dut):
     tail_avg = {k: (tail_total[k] / tail_count if len(reports) > 1 else first[k]) for k in first if k.endswith('_cycles')}
 
     dut._log.info(f"run_dir={run_dir}")
+    dut._log.info(f"data_dir={data_dir}")
+    dut._log.info(f"activation={activation} output_activation={output_activation}")
     dut._log.info(f"supports_executor={supports_executor}")
     dut._log.info(f"runs={sample_count}")
     dut._log.info(f"first={first}")

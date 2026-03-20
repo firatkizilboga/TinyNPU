@@ -295,6 +295,12 @@ class SimulatorExecutor:
                         counts=counts,
                         attrs={"kind": step.kind},
                     )
+                    benchmark_report.add_entry(
+                        step=f"{step.name}:host_remaining",
+                        bucket="host_remaining",
+                        counts=counts,
+                        attrs={"kind": step.kind, "source_bucket": bucket},
+                    )
                 if debug:
                     debug_trace.append(
                         self.host_executor._debug_event(

@@ -207,6 +207,10 @@ class BenchmarkReport:
         return self.total_cycles("host_intrinsic")
 
     @property
+    def host_remaining_cycles(self) -> int:
+        return self.total_cycles("host_remaining")
+
+    @property
     def pure_acceleration_speedup(self) -> float | None:
         if self.npu_compute_cycles <= 0:
             return None
@@ -215,6 +219,13 @@ class BenchmarkReport:
     @property
     def integration_adjusted_speedup(self) -> float | None:
         denominator = self.npu_compute_cycles + self.npu_overhead_cycles
+        if denominator <= 0:
+            return None
+        return self.cpu_replaced_cycles / denominator
+
+    @property
+    def end_to_end_analytical_speedup(self) -> float | None:
+        denominator = self.npu_compute_cycles + self.npu_overhead_cycles + self.host_remaining_cycles
         if denominator <= 0:
             return None
         return self.cpu_replaced_cycles / denominator
@@ -233,8 +244,11 @@ class BenchmarkReport:
                 "npu_overhead_cycles": self.total_cycles("npu_overhead", cost_model),
                 "host_intrinsic_counts": self.total_counts("host_intrinsic").to_dict(),
                 "host_intrinsic_cycles": self.total_cycles("host_intrinsic", cost_model),
+                "host_remaining_counts": self.total_counts("host_remaining").to_dict(),
+                "host_remaining_cycles": self.total_cycles("host_remaining", cost_model),
                 "pure_acceleration_speedup": self._pure_acceleration_speedup(cost_model),
                 "integration_adjusted_speedup": self._integration_adjusted_speedup(cost_model),
+                "end_to_end_analytical_speedup": self._end_to_end_analytical_speedup(cost_model),
             },
             "entries": [entry.to_dict(cost_model) for entry in self.entries],
         }
@@ -259,6 +273,16 @@ class BenchmarkReport:
 
     def _integration_adjusted_speedup(self, cost_model: CostModel) -> float | None:
         denominator = self.total_cycles("npu_compute", cost_model) + self.total_cycles("npu_overhead", cost_model)
+        if denominator <= 0:
+            return None
+        return self.total_cycles("cpu_replaced", cost_model) / denominator
+
+    def _end_to_end_analytical_speedup(self, cost_model: CostModel) -> float | None:
+        denominator = (
+            self.total_cycles("npu_compute", cost_model)
+            + self.total_cycles("npu_overhead", cost_model)
+            + self.total_cycles("host_remaining", cost_model)
+        )
         if denominator <= 0:
             return None
         return self.total_cycles("cpu_replaced", cost_model) / denominator
