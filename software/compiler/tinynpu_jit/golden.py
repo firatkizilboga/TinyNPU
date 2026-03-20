@@ -5,6 +5,39 @@ import numpy as np
 from .ir import DType
 
 
+def di_exp_fixed(x_in: int, *, m_i: int, k_i: int) -> int:
+    """
+    Fixed-parameter software reference for Appendix A.2 Algorithm 1 (DI-Exp).
+
+    This helper intentionally freezes the dynamic scale path so the integer
+    arithmetic can be validated in isolation before any RTL integration work.
+    The effective scale factor is treated as ``s_f = m_f / 2^k_i`` where
+    ``m_f = m_i + (m_i >> 1) - (m_i >> 4)``.
+    """
+    if m_i <= 0:
+        raise ValueError(f"m_i must be positive, got {m_i}.")
+    if k_i < 0:
+        raise ValueError(f"k_i must be non-negative, got {k_i}.")
+
+    m_f = int(m_i + (m_i >> 1) - (m_i >> 4))
+    if m_f <= 0:
+        raise ValueError(f"Derived m_f must be positive, got {m_f}.")
+
+    # Round(-1 / s_f) with s_f = m_f / 2^k_i.
+    t_mag = ((1 << k_i) + (m_f // 2)) // m_f
+    if t_mag <= 0:
+        raise ValueError(
+            f"Chosen fixed parameters collapse DI-Exp period to zero: m_i={m_i}, k_i={k_i}, m_f={m_f}."
+        )
+    t = -int(t_mag)
+
+    q_i = int(x_in // t)
+    r_i = int(x_in - (q_i * t))
+    unshifted_exp = int((r_i >> 1) - t)
+    result = int(unshifted_exp >> q_i)
+    return max(0, result)
+
+
 class GoldenModel:
     def quantize(
         self,
@@ -104,6 +137,9 @@ class GoldenModel:
         shifted = source - np.max(source, axis=axis, keepdims=True)
         exp = np.exp(shifted)
         return exp / np.sum(exp, axis=axis, keepdims=True)
+
+    def di_exp_fixed(self, x_in: int, *, m_i: int, k_i: int) -> int:
+        return di_exp_fixed(x_in, m_i=m_i, k_i=k_i)
 
     def quantized_mean(
         self,
