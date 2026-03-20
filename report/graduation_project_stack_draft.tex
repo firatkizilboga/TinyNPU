@@ -196,24 +196,24 @@ I would like to thank my advisor, Assoc. Prof. Dr. Ayse Yilmazer, for her guidan
 \newpage
 \section*{\centering\thetitle}
 \centerline{\fontsize{16pt}{21.6pt}\sffamily\bfseries (SUMMARY)}
-TinyNPU is a compact accelerator project that evolved into a complete hardware/software stack. The project now includes a parameterized systolic-array-based neural processing unit, a PyTorch-first segmented compiler and runtime, a quantization-aware model preparation flow, RTL and host-side verification infrastructure, and performance and synthesis characterization tooling. The goal of the project is not merely to design a datapath, but to make that datapath usable from a realistic machine-learning workflow and measurable in a disciplined way.
+TinyNPU is a compact accelerator implemented as a complete hardware/software stack. It combines a parameterized systolic-array neural processing unit with a PyTorch-first segmented compiler and runtime, a quantization-aware model-preparation flow, RTL and host-side verification infrastructure, and performance and synthesis characterization tooling. The stack is designed to make the datapath usable from a realistic machine-learning workflow and measurable in a disciplined way.
 
 The hardware architecture is organized around an $N \times N$ output-stationary systolic array, a unified buffer, an instruction memory, streamer logic that feeds the array, and a post-processing unit that applies bias, rescaling, activation, and packed writeback. The software stack traces PyTorch models, partitions them into accelerator segments and host operations, compiles supported segments into TinyNPU instruction and buffer images, and executes the resulting plan on either host emulation or RTL simulation. Unsupported work is never hidden; it appears explicitly as host-side steps in the execution plan.
 
-One of the main lessons of the project is that the useful unit of design is the whole stack, not the RTL alone. Compiler-visible tensor semantics, physical packing format, host/NPU boundaries, verification points, and repeated-run runtime behavior all affect whether the accelerator is practical to use. For this reason, the project includes explicit host-op dispatch, compiler-owned expected tensors for verification, repeated-run sessions with persistent state, and benchmark accounting that separates accelerator compute cycles from runtime and protocol overhead.
+The useful unit of design is the whole stack, not the RTL alone. Compiler-visible tensor semantics, physical packing format, host/NPU boundaries, verification points, and repeated-run runtime behavior all affect whether the accelerator is practical to use. TinyNPU therefore includes explicit host-op dispatch, compiler-owned expected tensors for verification, repeated-run sessions with persistent state, and benchmark accounting that separates accelerator compute cycles from runtime and protocol overhead.
 
-The current experimental evidence is intentionally narrow but concrete. The implemented stack has been validated end-to-end on a trained MNIST model, and a controlled multi-tile matrix multiplication benchmark has been used to study compute speedup and integration overhead. In addition, a reproducible Yosys-based synthesis flow provides rough resource estimates for the current design. The report therefore presents TinyNPU not as a finished industrial inference platform, but as a working accelerator research system whose main value lies in understanding architecture, compilation, packing, and workload fit together.
+The implemented stack has been validated end-to-end on a trained MNIST model, and a controlled multi-tile matrix multiplication benchmark is used to study compute speedup and integration overhead. In addition, a reproducible Yosys-based synthesis flow provides rough resource estimates for the current design. The report presents TinyNPU as a working accelerator research system for studying architecture, compilation, packing, and workload fit together.
 
 \newpage
 \section*{\centering\theturkishtitle}
 \centerline{\fontsize{16pt}{21.6pt}\sffamily\bfseries (ÖZET)}
-TinyNPU, özel bir nöral işlemci birimi ile onu kullanılabilir hale getiren derleyici, çalışma zamanı, niceleme akışı ve benzetim tabanlı doğrulama ortamını birlikte geliştirmeyi amaçlayan bir projedir. Projenin hedefi yalnızca küçük bir hızlandırıcı çekirdeği tasarlamak değil, bu çekirdeği gerçek bir makine öğrenmesi iş akışında kullanılabilir hale getirmektir. Bu nedenle proje, PyTorch tabanlı model hazırlama sürecini destekleyen, nicelemeli modelleri hızlandırıcı segmentlerine dönüştüren, desteklenmeyen işlemleri ana işlemci üzerinde çalıştıran ve sonuçları yazılım referanslarıyla doğrulayan bütünleşik bir donanım-yazılım yapısı içermektedir.
+TinyNPU, sistolik dizi tabanlı bir nöral işlemci birimini onu kullanılabilir hale getiren derleyici, çalışma zamanı, niceleme akışı ve benzetim tabanlı doğrulama ortamıyla birlikte ele alan bütünleşik bir donanım-yazılım sistemidir. Amaç yalnızca küçük bir hızlandırıcı çekirdeği tasarlamak değil, bu çekirdeği gerçek bir makine öğrenmesi iş akışında kullanılabilir hale getirmektir. Bu nedenle sistem, PyTorch tabanlı model hazırlama sürecini destekleyen, nicelemeli modelleri hızlandırıcı segmentlerine dönüştüren, desteklenmeyen işlemleri ana işlemci üzerinde çalıştıran ve sonuçları yazılım referanslarıyla doğrulayan bir yapı olarak tasarlanmıştır.
 
 Donanım tarafında TinyNPU, birleşik tampon bellek ve komut belleği ile beslenen sistolik dizi tabanlı bir hesaplama çekirdeği etrafında kurulmuştur. Girdi aktivasyonları ve ağırlıklar birleşik tampondan akıtıcı birimlere, oradan da sistolik diziye iletilir. Hesaplama sonucunda oluşan değerler son işleme biriminden geçirilerek paketlenmiş biçimde tekrar belleğe yazılır. Bu yapı, yoğun nicelemeli matris işlemleri için verimli bir veri yolu sağlarken, dışarıdan görülen programlama modelini de yönetilebilir düzeyde tutmaktadır. Yazılım tarafı ise yüksek seviyeli model işlemlerini hızlandırıcı segmentleri ve gerekirse ana işlemci işlemlerini birlikte içeren bir yürütme planına dönüştürmektedir.
 
-Bu projedeki temel ilerleme, izole donanım deneylerinden uçtan uca çalışan bir sisteme geçilmesi olmuştur. Eğitilmiş MNIST modeli dahil gerçek iş yükleri yazılım ve donanım yığını üzerinden çalıştırılabilmektedir. Ayrıca, hızlandırıcının gerçek hesaplama çevrimlerini entegrasyon ek yüklerinden ayıran bir ölçüm altyapısı geliştirilmiştir. Böylece çekirdeğin kendi verimliliği ile yazılım, paketleme ve arayüz maliyetleri ayrı ayrı değerlendirilebilmektedir. Tekrarlı çıkarım senaryolarında gereksiz durum yüklemelerini azaltmak için oturum tabanlı çalışma ve ağırlık kalıcılığı desteği de eklenmiştir.
+Bu çalışmada sistem, eğitilmiş MNIST modeli dahil uçtan uca iş yükleri üzerinde doğrulanmıştır. Ayrıca, hızlandırıcının gerçek hesaplama çevrimlerini paketleme, arayüz ve çalışma zamanı maliyetlerinden ayıran bir ölçüm altyapısı kurulmuştur. Böylece çekirdeğin kendi verimliliği ile entegrasyon maliyetleri ayrı ayrı değerlendirilebilmektedir. Tekrarlı çıkarım senaryoları için oturum tabanlı çalışma ve ağırlık kalıcılığı desteği de eklenmiştir.
 
-Projenin mevcut durumu, donanımın anlamlı hesaplama yaptığı, ancak sistem seviyesindeki davranışın derleyici bölütlemesi, bellek yerleşimi ve çalışma zamanı düzenlemesine güçlü biçimde bağlı olduğunu göstermektedir. Bu nedenle proje, ``derleyiciyi var etmek'' aşamasını aşmış; bunun yerine derleyici ve çalışma zamanının karmaşıklığını yönetmek, gereksiz çevrim maliyetlerini azaltmak ve hangi iş yüklerinin bu mimariye uygun olduğunu anlamak gibi daha olgun tasarım sorularına yönelmiştir. Bu rapor, ortaya çıkan sistemi, temel tasarım kararlarını ve işlevsellik ile performans değerlendirmesinde kullanılan yöntemi özetlemektedir.
+Rapor, bu sistemi donanım mimarisi, model hazırlama ve derleme akışı, doğrulama yöntemi ve deneysel sonuçlarıyla birlikte sunmaktadır. Sonuçlar, sistolik çekirdeğin güçlü hesaplama sağladığını, ancak toplam davranışın hâlâ veri yerleşimi, bölütleme ve çalışma zamanı maliyetlerine duyarlı olduğunu göstermektedir.
 
 \newpage
 \tableofcontents
@@ -241,7 +241,7 @@ TinyNPU approaches this problem with four coupled components:
     \item \textbf{Verification and measurement infrastructure:} The project includes compiler-owned expected tensors, runtime verification points, repeated-run sessions, and benchmark accounting that separates accelerator compute from protocol and software overhead.
 \end{enumerate}
 
-The current project state should be read with that scope in mind. TinyNPU is already capable of running a trained MNIST model through the full compiler/runtime stack and of benchmarking a controlled multi-tile matrix multiplication workload. At the same time, workload coverage is still narrow, and the current results are most useful for understanding architecture, packing, compiler boundaries, and runtime cost rather than for claiming broad deployment readiness.
+TinyNPU runs a trained MNIST model through the full compiler/runtime stack and benchmarks a controlled multi-tile matrix multiplication workload. These experiments expose the architecture, packing behavior, compiler boundaries, and runtime cost of the current system.
 
 The rest of this report follows that logic. The next section positions TinyNPU relative to relevant literature in mixed-precision quantization, matrix multiplication, and accelerator design. The system model section then explains the implemented hardware and software stack in detail, followed by the experimental method, the current results, and the most important next steps.
 \newpage
@@ -258,13 +258,13 @@ The mathematical core of TinyNPU is still matrix-style computation, so the proje
 \subsection{Existing Accelerator Architectures}
 On the accelerator side, Google's TPU remains the canonical reference for systolic-array-style matrix acceleration \cite{jouppi2017datacenter}. Gemmini is especially relevant because it demonstrates how a systolic array, programming model, and system context can be treated as one full-stack research object rather than as an isolated RTL block \cite{genc2021gemmini}. That full-stack perspective is one of the strongest methodological reference points for TinyNPU.
 
-An earlier educational TinyTPU implementation was useful as a starting point for understanding systolic-array organization, but it was not a good endpoint for this project. Extending it toward mixed precision, tiled execution, and cleaner post-processing exposed the limits of treating the datapath as the whole problem. TinyNPU therefore diverged into a custom implementation with a different software contract, explicit host/accelerator boundaries, and a compiler/runtime that owns packing and verification rather than leaving those concerns informal.
+An earlier educational TinyTPU implementation was useful as a starting point for understanding systolic-array organization, but it was not a good endpoint for this project \cite{chin2025tinytpu}. Extending it toward mixed precision, tiled execution, and cleaner post-processing exposed the limits of treating the datapath as the whole problem. TinyNPU therefore diverged into a custom implementation with a different software contract, explicit host/accelerator boundaries, and a compiler/runtime that owns packing and verification rather than leaving those concerns informal.
 
 Taken together, these references define the design space in which TinyNPU sits. It is not trying to outscale large industrial accelerators. Its niche is a compact mixed-precision accelerator system in which the hardware, packing model, compiler/runtime, and measurement methodology can all be studied together in one working platform.
 \newpage
 
 \section{Developed Approach and System Model}
-The system is easier to understand when it is described as four cooperating subsystems: the TinyNPU hardware itself, the quantizer and model-preparation path, the compiler, and the runtime. The earlier draft used a more abstract ``data model / structural model / dynamic model'' split, but that hides the actual engineering boundaries of the project. What matters here is not an abstract taxonomy; it is how tensors move through these four concrete parts of the stack.
+The system is described here as four cooperating subsystems: the TinyNPU hardware itself, the quantizer and model-preparation path, the compiler, and the runtime. This organization matches the real engineering boundaries of the stack and makes the movement of tensors, instructions, and packed data explicit.
 
 \subsection{System Overview}
 At a high level, the flow is straightforward. A model starts either as a quantized PyTorch module or as a compiler-ready artifact produced by the quantization path. The compiler traces the model, partitions it into accelerator-supported regions and explicit host operations, lowers legal regions into TinyNPU instruction and buffer images, and packages the result as a compiled artifact. The runtime then executes that artifact step by step, loading the accelerator when needed, invoking host-side operations when needed, and checking expected tensors when verification is enabled. Inside the hardware, the unified buffer, streamers, systolic array, and post-processing unit implement the actual matrix-style execution path.
@@ -283,9 +283,130 @@ The TinyNPU hardware is organized around a control path and a compute path. The 
 
 Figure~\ref{fig:hardware-architecture} shows the top-level organization used throughout this report. The host-side runtime communicates with the accelerator through the MMIO interface, which is responsible for instruction loading and buffer access. Inside the accelerator, the unified buffer, input streamer, weight streamer, and systolic array form the main pipelined compute path. The post-processing unit is shown separately because it becomes active during the later drain and writeback phase rather than during the main feed phase of the array. This distinction is important for explaining both data movement and measured execution cost.
 
-The unified buffer is not just a generic scratchpad in this design. Architecturally, it behaves as a true wide dual-port memory with a masked write path. One read side serves the activation stream, while the other serves the weight stream; occasional control-unit random reads are arbitrated onto the activation-side port. Because the buffer is wide and row-oriented, this organization is also compatible with a banked memory implementation rather than requiring a single monolithic custom memory block.
+\subsubsection{Unified Buffer and Physical Roles}
 
-The processing element is where mixed precision becomes concrete. Each PE supports packed low-precision arithmetic rather than only a single scalar multiply. In the current implementation, a PE can perform four INT4 products, two INT8 products, or one INT16 product in a step, while accumulating the resulting partial sum in stationary form. The array therefore gains throughput both from spatial parallelism across rows and columns and from packed arithmetic within each PE.
+The unified buffer is not just a generic scratchpad in this design. Architecturally, it behaves as a true wide dual-port memory with a masked write path. One read side serves the activation stream, while the other serves the weight stream; occasional control-unit random reads are arbitrated onto the activation-side port. This form was chosen to keep both array feed directions active at the same time. A narrower or less concurrent memory interface would turn buffer access into the bottleneck and leave the systolic array underutilized. Because the buffer is wide and row-oriented, this organization is also compatible with a banked memory implementation rather than requiring a single monolithic custom memory block.
+
+Within that buffer, the legacy names A, B, C, and BIAS refer to physical roles, not to immutable tensor semantics. A is the left-fed operand: its tiles are packed so that each unified-buffer row can launch one horizontal activation vector into the systolic array boundary. B is the top-fed operand: its tiles are packed for the vertical weight stream and the corresponding skewer delays. C is the writeback region: it stores quantized output tiles in the packed format chosen by the output precision, so its physical layout may differ from the logical matrix view. BIAS is a separate region consumed only by the PPU, which loads one output-column bias vector before draining a tile. These names therefore describe how data is consumed by the hardware pipeline, not whether a tensor was logically an activation, a weight, or an intermediate result in the original model.
+
+\subsubsection{Systolic Array and Skewers}
+
+The array is output-stationary in the literal RTL sense. Packed activation words enter from the left edge and move one PE to the right per cycle. Packed weight words enter from the top edge and move one PE downward per cycle. What remains stationary is the output accumulator inside each PE: over the full reduction along the $K$ dimension, every PE repeatedly adds its local partial sum into the same 64-bit register. Only after the last $K$ contribution has been consumed does the array switch into drain mode and shift those accumulated results downward into the post-processing unit. This choice fits the dominant tiled-GEMM workload well because it keeps the reduction local to the PE and avoids repeatedly moving partial sums through the buffer system during the $K$ loop.
+
+The streamer/skewer logic is what makes this wavefront legal. It delays row $i$ by $i+1$ cycles so that the activation and weight packets that belong to the same dot-product term meet on the correct PE at the correct cycle. A tile therefore executes in three phases: feed the packed $K$-steps into the array, allow the wavefront to fill across the remaining diagonals, and then drain the stationary accumulators.
+
+The skewer sits between the unified buffer and the systolic array and adds small row- and column-dependent delays to the incoming streams. On the activation side, row \(i\) is delayed by \(i\) extra cycles before it enters the left edge; on the weight side, column \(j\) is delayed by \(j\) extra cycles before it enters the top edge. The values themselves do not change. What changes is when they enter the array. That timing offset creates the diagonal wavefront expected by the systolic schedule, so the activation and weight pieces that belong together meet at the correct PE in the correct cycle. Without the skewer, the data would enter as a flat burst and the alignment inside the array would be wrong.
+
+\subsubsection{Processing Element}
+
+The processing element is where mixed precision becomes concrete. Each PE latches one 16-bit packed activation word and the lower 16 bits of the vertical bus as the current packed weight word. In INT16 mode that word holds one signed multiply; in INT8 mode it holds two signed byte multiplies whose products are summed; in INT4 mode it holds four signed nibble multiplies whose products are summed. The resulting 32-bit partial sum is sign-extended and accumulated into a 64-bit stationary register.
+
+One subtle but important implementation detail is that the vertical PE-to-PE path is 64 bits wide even though the compute datapath consumes only 16-bit packed weights. This is not wasted width. During compute, only \texttt{data\_from\_top[15:0]} is interpreted as the incoming packed weight word and the full 64-bit bus is simply delayed and passed downward. During drain, the same physical column bus is re-used to shift full 64-bit accumulators from one row to the next. The shared bus keeps the PE interface uniform across compute and drain instead of requiring a second dedicated drain network.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.88\textwidth,height=0.64\textheight,keepaspectratio]{diagrams/pe_internals_graphviz.pdf}
+    \caption{Processing-element I/O in compute and drain modes.}
+    \label{fig:pe-internals}
+\end{figure}
+
+\subsubsection{Post-Processing Unit}
+
+The post-processing unit (PPU) is best understood as an \(N\)-lane row processor backed by an internal \(N \times N\) tile buffer. During drain, it receives one \(N\)-element accumulator row vector per cycle from the bottom of the systolic array, processes all \(N\) lanes of that row in parallel, and stores the quantized result into its internal tile buffer. Only after the full tile has been captured does it begin writing buffered rows back to the unified buffer. The current PPU therefore is not a second streaming mesh; it is a row-wise post-processing stage followed by buffered writeback.
+
+In the implemented RTL, the PPU first loads the bias vector in two chunks, four 32-bit bias values at a time. For each drained row it then evaluates the same requantization pipeline lane by lane:
+\[
+q = \mathrm{clip}_{p}\left(\mathrm{act}\left(\left((acc + bias) \times multiplier + 2^{shift-1}\right) \gg shift\right)\right)
+\]
+where \(acc\) is the 64-bit drained accumulator, \(bias\) is a sign-extended 32-bit bias term, \(multiplier\) is the 16-bit fixed-point requantization factor, \(\gg\) is an arithmetic right shift, \(\mathrm{act}(\cdot)\) is optional ReLU, and \(\mathrm{clip}_{p}(\cdot)\) saturates to the signed range of the selected output precision. In RTL terms, this is implemented as bias addition, 65-by-17-bit multiplication, round-to-nearest by adding \(2^{shift-1}\) before the shift when \(shift > 0\), optional ReLU, and final saturation to INT16, INT8, or INT4.
+
+Writeback is also precision-dependent. After the tile buffer has been filled, the PPU emits one buffered row per writeback cycle. For INT16 output, each 16-bit lane is written back directly. For INT8 and INT4 output, the PPU shifts the quantized value into the byte or nibble slot selected by the packed write offset, and the unified buffer applies a bit mask so that only that subword is updated while previously written sibling tiles in the same physical word are preserved. The control unit derives this packed write offset from the output tile index: two logical M-tiles share one physical word for INT8, and four logical M-tiles share one physical word for INT4. This makes the packed output layout directly compatible with the top-fed B-input layout of a following matmul when the compiler chooses an output precision that matches the next consumer's input precision. More general layout changes remain a compiler/runtime responsibility.
+
+\subsubsection{Control and Instruction Format}
+
+This behavior is programmed through a fixed-width 256-bit instruction format in instruction memory. The current \texttt{MATMUL} instruction encodes the opcode, base addresses for the A, B, C, and bias regions in the unified buffer, the tile counts along $M$, $K$, and $N$, and the PPU configuration fields for multiplier, shift, activation, input precision, output precision, and packed write offset. The control unit therefore does not fetch a stream of tiny scalar operations; it fetches a coarse-grained instruction that describes one tiled matrix-multiplication region and then steps through clear, feed, wait, drain, bias-load, and writeback states internally. This ISA was kept deliberately simple because the supported workload is highly predictable. A finer-grained instruction stream would add fetch and decode overhead without providing much useful flexibility in the current compiler contract.
+
+\begin{table}[H]
+    \centering
+    \small
+    \caption{Implemented \texttt{MATMUL} instruction field layout in the current RTL. Unlisted bits are presently unused by the decode path.}
+    \label{tab:matmul-isa}
+    \begin{tabularx}{\textwidth}{|l|l|Y|}
+        \hline
+        \textbf{Bits} & \textbf{Field} & \textbf{Meaning} \\
+        \hline
+        $[255:252]$ & \texttt{opcode} & Operation code; \texttt{ISA\_OP\_MATMUL} selects the tiled matrix-multiplication sequencer. \\
+        \hline
+        $[247:232]$ & \texttt{A\_base} & Unified-buffer base address of A tiles in activation layout. \\
+        \hline
+        $[231:216]$ & \texttt{B\_base} & Unified-buffer base address of B tiles in weight layout. \\
+        \hline
+        $[215:200]$ & \texttt{C\_base} & Unified-buffer base address of C writeback tiles. \\
+        \hline
+        $[183:168]$ & \texttt{M\_tiles} & Number of output-tile positions along the $M$ dimension. \\
+        \hline
+        $[167:152]$ & \texttt{K\_tiles} & Number of reduction passes per output tile. \\
+        \hline
+        $[151:136]$ & \texttt{N\_tiles} & Number of output-tile positions along the $N$ dimension. \\
+        \hline
+        $[135:120]$ & \texttt{BIAS\_base} & Unified-buffer base address of the bias payload consumed by the PPU. \\
+        \hline
+        $[119:112]$ & \texttt{shift} & Arithmetic right-shift amount for requantization. \\
+        \hline
+        $[111:96]$ & \texttt{multiplier} & Fixed-point requantization multiplier applied in the PPU. \\
+        \hline
+        $[95:88]$ & \texttt{activation} & Post-processing activation flags; bit 0 currently enables ReLU. \\
+        \hline
+        $[87:86]$ & \texttt{out\_precision} & Output packing precision used by the PPU writeback path. \\
+        \hline
+        $[85:84]$ & \texttt{write\_offset} & Reserved packed-lane field in the current instruction format. In the present RTL, the effective write offset is derived internally from output-tile index and output precision during packed writeback. \\
+        \hline
+        $[83:82]$ & \texttt{in\_precision} & Input precision mode broadcast to the systolic array PEs. \\
+        \hline
+    \end{tabularx}
+\end{table}
+
+The RTL decode path also recognizes a small set of simpler opcodes around this main instruction. \texttt{HALT} terminates the current instruction stream and places the control unit in the halted state, \texttt{NOP} advances without side effects, and \texttt{MOVE} is reserved for internal data movement. In the current JIT flow, \texttt{MATMUL} is the important emitted operation and \texttt{HALT} marks the end of the segment program.
+
+\begin{table}[H]
+    \centering
+    \small
+    \caption{Implemented instruction opcodes in the current RTL control path.}
+    \label{tab:isa-opcodes}
+    \begin{tabularx}{\textwidth}{|l|l|Y|}
+        \hline
+        \textbf{Opcode} & \textbf{Name} & \textbf{Role} \\
+        \hline
+        \texttt{0x0} & \texttt{NOP} & No operation; decode advances without performing accelerator work. \\
+        \hline
+        \texttt{0x1} & \texttt{HALT} & Terminates execution and leaves the controller in the halted state until the host issues another command. \\
+        \hline
+        \texttt{0x2} & \texttt{MATMUL} & Coarse-grained tiled matrix-multiplication instruction with integrated PPU configuration. \\
+        \hline
+        \texttt{0x3} & \texttt{MOVE} & Internal data-movement operation reserved by the RTL control path. \\
+        \hline
+    \end{tabularx}
+\end{table}
+
+Instruction execution is paired with a small MMIO command interface on the host side. The host does not directly drive internal control states; instead it writes a command register to request memory access or to start execution from a given instruction-memory address.
+
+\begin{table}[H]
+    \centering
+    \small
+    \caption{Host-visible MMIO commands used to service the accelerator.}
+    \label{tab:mmio-commands}
+    \begin{tabularx}{\textwidth}{|l|l|Y|}
+        \hline
+        \textbf{Command} & \textbf{Value} & \textbf{Meaning} \\
+        \hline
+        \texttt{CMD\_WRITE\_MEM} & \texttt{0x01} & Writes the current MMIO data value into unified-buffer or instruction-memory space at the selected address. \\
+        \hline
+        \texttt{CMD\_READ\_MEM} & \texttt{0x02} & Reads the selected memory location back into the MMIO-visible data register. \\
+        \hline
+        \texttt{CMD\_RUN} & \texttt{0x03} & Starts instruction execution from the instruction-memory address carried in the argument register. \\
+        \hline
+    \end{tabularx}
+\end{table}
 
 The control path is also observable, not only functional. The controller exposes internal state counters when performance monitoring is enabled, which makes it possible to see how much time is spent in fetch, decode, feed, wait, drain, and writeback states instead of treating the whole accelerator run as a black box.
 
@@ -308,7 +429,9 @@ The measured breakdown in Figure~\ref{fig:control-state-breakdown} makes the mai
 \subsection{Quantizer and Model Preparation}
 The quantization path exists to turn trained models into artifacts the compiler can actually lower. TinyNPU does not assume that generic floating-point PyTorch modules can be handed directly to the accelerator. The model-preparation code therefore carries explicit quantization metadata, compiler-ready conversion utilities, and calibration steps that make tensor ranges and signedness visible before compilation.
 
-This part of the stack also includes the current mixed-precision helper. Its purpose is limited and should be stated clearly: it is not a global bit-allocation solver. Instead, it provides a practical one-layer-at-a-time sensitivity workflow that can generate usable mixed-precision configurations, recalibrate them, and pass the result onward to the compiler-ready conversion path.
+In the current MNIST case study, this pipeline is exercised on a small four-layer model with three $3 \times 3$ convolutions followed by global average pooling and a final fully connected layer. The input is a $1 \times 28 \times 28$ image; the learned path is \texttt{Conv(1,16)} $\rightarrow$ \texttt{Conv(16,16)} $\rightarrow$ \texttt{Conv(16,16)} $\rightarrow$ \texttt{mean(H,W)} $\rightarrow$ \texttt{Linear(16,10)}. On the saved trained run used in this report, the FP32 model reached 77.69\% test accuracy, the post-training quantized initialization reached 66.38\%, and the QAT-refined model recovered to 77.56\%. This is the concrete role of the quantization subsystem in the stack: it preserves model quality closely enough that the resulting compiler-ready artifact still represents the intended trained model rather than a numerically unrelated toy export.
+
+This part of the stack also includes the current mixed-precision helper. Its purpose is limited and should be stated clearly: it is not a global bit-allocation solver. Instead, it provides a practical one-layer-at-a-time sensitivity workflow that can generate usable mixed-precision configurations, recalibrate them, and pass the result onward to the compiler-ready conversion path. In other words, the flow does not force one model-wide bitwidth; it can keep more sensitive tensors at higher precision while assigning narrower precision to tensors that tolerate it.
 
 \begin{figure}[H]
     \centering
@@ -317,12 +440,12 @@ This part of the stack also includes the current mixed-precision helper. Its pur
     \label{fig:bit-selection}
 \end{figure}
 
-The important role of this subsystem is therefore not to solve quantization research as a whole. It is to provide a disciplined bridge from trained or quantized models into forms that the TinyNPU compiler can lower without losing track of numerical meaning.
+The important role of this subsystem is therefore not to solve quantization research as a whole. It is to provide a disciplined bridge from trained or quantized models into forms that the TinyNPU compiler can lower without losing track of numerical meaning. In the current trained-MNIST path, the compiled host and RTL executions are validated against each other on sampled inputs, so the quantized model-preparation flow is connected all the way through segmented compilation and RTL-backed execution rather than stopping at an offline export boundary.
 
 \subsection{Compiler}
-The compiler is responsible for converting model structure into explicit execution structure. Rather than generating a monolithic accelerator-only program for the whole model, the compiler constructs an \texttt{ExecutionPlan} whose steps are typed as \texttt{NpuSegment}, \texttt{HostOp}, or \texttt{VerifyTensor}. \texttt{NpuSegment} groups accelerator-supported matrix-style work. \texttt{HostOp} keeps unsupported or intentionally host-side work explicit. \texttt{VerifyTensor} allows compiler-owned expected tensors to be checked later at runtime.
+The compiler is responsible for converting model structure into a mixed execution structure. Rather than generating a monolithic accelerator-only program for the whole model, the compiler constructs an \texttt{ExecutionPlan} whose steps are typed as \texttt{NpuSegment}, \texttt{HostOp}, or \texttt{VerifyTensor}. \texttt{NpuSegment} groups accelerator-supported matrix-style work. \texttt{HostOp} keeps unsupported or intentionally host-side work separate. \texttt{VerifyTensor} allows compiler-owned expected tensors to be checked later at runtime.
 
-This representation is the main reason the stack remains analyzable. Unsupported behavior is not hidden, and accelerator boundaries are not implicit. The compiler can therefore make packing, readback, and verification visible rather than treating them as side effects.
+This representation is the main reason the stack remains analyzable. Unsupported behavior is not folded into a fake accelerator-only view, and accelerator boundaries are not implicit. That is a deliberate policy: if someone wants to target TinyNPU effectively, the model and compiler flow should reflect the actual hardware boundaries rather than pretending full-model coverage already exists.
 
 \begin{figure}[H]
     \centering
@@ -334,6 +457,10 @@ This representation is the main reason the stack remains analyzable. Unsupported
 Figure~\ref{fig:compiler-stack} summarizes the implemented software flow. A model enters either directly as a supported quantized PyTorch module or through a compiler-ready conversion path built around \texttt{tinynpu\_quant}. The JIT frontend traces the model with FX, partitions it into a mixed execution plan, validates host operations, and lowers each accelerator segment through the memory planner and \texttt{SegmentCompiler}. The resulting \texttt{CompiledArtifact} contains the execution plan, per-segment IM/UB binaries, expected tensors for verification, and the memory-layout information required by the runtime.
 
 Packing is part of the compiler contract as well. The backend uses role-specific physical layouts for activation-side tensors, weight-side tensors, output buffers, and bias payloads. These are physical storage forms rather than semantic tensor meanings, but they are essential because legal execution depends on matching memory layout to the real feed directions and writeback format of the NPU.
+
+The important compiler policy is not the cycle-by-cycle tile schedule but where accelerator regions begin and end. The partitioner emits a mixed execution plan and forces a segment boundary whenever execution must return to the host, a verification point is requested, or an operation is outside the current NPU contract. As a result, host-side work such as dequantization, softmax, mean, layout restoration, and verification is represented directly as \texttt{HostOp} or \texttt{VerifyTensor} steps rather than being buried inside an accelerator launch.
+
+Memory planning follows the same policy. The unified buffer is divided into a static zone and a dynamic zone: weights and biases receive globally assigned packed addresses that can be shared across segments, while activations and outputs are placed in a per-segment dynamic region with liveness-based reuse. The planner also treats layout as a real physical requirement. If a tensor would need different hardware roles in different segments, it is given separate packed copies rather than assuming that one layout can safely serve all uses. At host-visible boundaries, the current validated flow preserves a host-friendly INT16 representation where possible, especially for boundaries that will be read back or consumed by host operations. The reason is simple: when data returns to the host, the runtime prefers to hand off the highest precision the current datapath can produce instead of requantizing early and making host-side functions such as softmax or verification unnecessarily lossy.
 
 \subsection{Runtime and Verification}
 The runtime executes the compiled artifact as a mixed host-accelerator loop. For each step in the execution plan, it either launches an accelerator segment, executes an explicit host operation, or checks a verification tensor. The key point is that host-side work is never hidden. If a step remains on the host, it remains visible in the plan and in the benchmark accounting.
@@ -352,27 +479,21 @@ Figure~\ref{fig:runtime-state} shows the same loop from the host-side orchestrat
 Verification is built into this same path. Compiler-owned expected tensors can be checked during execution, which means correctness is not limited to end-of-run output comparison. Benchmarking is also integrated here: the runtime can record hard RTL cycle counts for accelerator run windows while separately accounting for software-side overhead such as packing, MMIO traffic, and readback.
 
 \subsection{Current Scope Boundaries}
-The current system is deliberately narrower than a general-purpose deployment stack. The mixed-precision helper is meant to produce usable compiler-ready configurations, not to solve the global bit-allocation problem. The compiler handles a bounded set of operators and makes unsupported behavior explicit through host operations rather than pretending to provide transparent full-model lowering. Workload coverage is also still narrow: the current report is grounded in one end-to-end model case and one controlled kernel benchmark. These limitations are acceptable for the present project scope because the main objective is to build and understand a working accelerator system, not to claim a finished production compiler.
+The current system targets a narrow but concrete contract. The mixed-precision helper produces compiler-ready configurations rather than solving the global bit-allocation problem. The compiler supports a bounded operator set and routes remaining work through host steps. The evaluation focuses on one end-to-end model and one controlled kernel benchmark, which is enough to study the interaction between architecture, compilation, and runtime without overstating workload coverage.
 
 \newpage
 \section{Experimental Setup and Design} 
-The project was evaluated primarily in simulation, using both host-side execution and RTL-backed cocotb tests. This was necessary because the main goal of the project is not only to confirm functionality, but also to understand how compiler decisions, packing format, and runtime policy affect accelerator behavior before any physical implementation is assumed. Host emulation and RTL simulation share the same execution-plan concept, which made it possible to compare compiler behavior against a golden software model while still collecting hardware-facing evidence.
+Evaluation uses three evidence sources. Unit and regression tests verify correctness incrementally across the stack, including compiler transformations, execution-plan behavior, memory planning, and host-side operator semantics. RTL-backed cocotb tests then exercise the hardware/software path directly and expose the control-unit performance counters during execution. A reproducible Yosys flow provides rough logic and DSP estimates for the current top-level design, with and without abstracted memories.
 
-The experimentation setup contains three layers. First, unit and regression tests validate compiler transformations, execution-plan behavior, memory-planning behavior, and host-op semantics. Second, RTL simulation validates full hardware/software interaction and allows performance counters to be read during accelerator execution. Third, a reproducible Yosys-based synthesis flow provides rough logic and resource estimates for the current top-level design both with and without treating the major memories as abstract macros.
+Host emulation and RTL simulation execute the same compiled plan, so the same artifact can be checked both for tensor-level correctness and for hardware-visible cost. The control unit reports both total run-window cycles and per-state cycle and entry counts, which makes it possible to separate time spent in feed, wait, drain, writeback, and related control states.
 
-The RTL performance-monitoring path is particularly important for interpreting the accelerator measurements. With performance monitoring enabled, the control unit reports not only a total run-window cycle count, but also per-state cycle and entry counts for its internal control states. This makes it possible to distinguish broad classes of activity such as host service, fetch/decode, feed, wait, drain, and writeback when analyzing where the accelerator is actually spending time during a segment.
+The empirical results are organized around two workloads. The first is the trained MNIST pipeline used as an end-to-end validation case. The second is a controlled multi-tile GEMM chosen to force tiling on the current array and expose the split between array throughput and integration overhead.
 
-The current empirical evidence is intentionally limited and should be described honestly in the report. There is one full end-to-end model case study: a trained MNIST flow that passes through model preparation, compiler-ready conversion, segmented compilation, and RTL-backed validation. There is also one controlled performance case study: a multi-tile matrix multiplication workload large enough to force tiling on the current array configuration. This benchmark is not intended to represent full-model latency by itself; it is a kernel-level workload chosen to isolate the accelerator’s core behavior and the effect of integration overhead.
-
-The performance methodology separates different cost categories on purpose. Accelerator compute cycles are taken from RTL performance counters during the run window of a segment. Software-side overhead such as loading buffer images, issuing control transactions, packing and unpacking data, and executing host-only operations is accounted for separately. Several CPU reference models are also applied on the software side, but these are analytic comparison models rather than measurements from a physical reference processor. The purpose of those models is to bound and interpret the accelerator’s behavior, not to claim a definitive CPU-versus-NPU benchmark.
+The reported metrics keep those cost categories separate. Accelerator cycles are taken from the RTL run window of the NPU segment itself. Packing, MMIO traffic, tensor movement, and host-only operators are accounted for outside that run window. The CPU baselines used later in the report are analytic reference models for the same logical work, not measurements from a physical comparison platform.
 
 \newpage
 \section{Comparative Evaluation and Discussion}
-The current evaluation supports several concrete conclusions, but it should be read with the correct scope. The evidence is sufficient to show that the stack works end to end and that the accelerator core is meaningful. It is not yet broad enough to support sweeping claims about general workload coverage.
-
-First, the end-to-end software and hardware path is real. A trained MNIST model has been prepared for the compiler, compiled through the segmented JIT flow, and validated against RTL. This is important because the central claim of the project is not simply that individual kernels run, but that a model can move from PyTorch-side preparation into a real TinyNPU execution artifact and still preserve host/RTL correctness.
-
-Second, the performance tooling reveals a clear separation between core compute strength and integration cost. On the current multi-tile matrix multiplication benchmark, the RTL run window for the accelerator is only 369 cycles. Depending on the chosen CPU reference model, this translates to a large pure compute speedup range, but the integration-adjusted speedup is much lower because runtime and protocol overhead still matter. This is exactly the kind of conclusion the benchmark path was designed to support: the datapath itself may be strong, while the surrounding software and interface contract still leave room for improvement.
+This section focuses on two concrete artifacts: the trained MNIST flow as an end-to-end validation case, and the controlled multi-tile GEMM benchmark in Table~\ref{tab:matmul-benchmark}. The benchmark metrics are meant to separate core accelerator behavior from host-side cost; Appendix~\ref{app:benchmark-model} defines the cost model and the three reported quantities in detail.
 
 \begin{table}[H]
     \centering
@@ -391,7 +512,9 @@ Second, the performance tooling reveals a clear separation between core compute 
     \end{tabularx}
 \end{table}
 
-For the same workload, the measured accelerator run window was 369 cycles. Table~\ref{tab:matmul-benchmark} makes the key point visible: the compute core itself is strong, but integration-adjusted speedup is much lower than pure compute speedup because runtime and interface costs are still substantial.
+For this $13 \times 17$ by $17 \times 19$ GEMM, the measured accelerator run window was 369 cycles for the NPU segment itself. Read Table~\ref{tab:matmul-benchmark} together with Appendix~\ref{app:benchmark-model}: ``CPU replaced cycles'' estimates how much scalar work the same GEMM would require, ``pure acceleration speedup'' compares that work against the measured NPU run window, and ``integration-adjusted speedup'' adds the surrounding packing, MMIO, and runtime cost. The large gap between the last two columns is therefore the main result of the table: the core compute block is strong, but software and interface overhead still consume a large part of end-to-end execution.
+
+The main takeaway from Table~\ref{tab:matmul-benchmark} is therefore not the exact headline speedup value, but the split between inner compute strength and delivered system speedup. TinyNPU already replaces a substantial amount of scalar MAC work in a short RTL run window, yet that advantage is diluted once the cost of using the accelerator is included. For an examiner, the correct conclusion is that the arithmetic core is not the main weakness of the current stack; the limiting factor is the amount of movement and orchestration wrapped around each accelerator region.
 
 To connect this kernel benchmark to related low-bit GEMM work, Table~\ref{tab:mixgemm-kernel-scaling} reports the TinyNPU quantities that overlap with the comparison boundary used for Mix-GEMM \cite{reggiani2023mixgemm}. The shared boundary is precision scaling in tiled GEMM kernels, not end-to-end software-stack latency. TinyNPU therefore reports RTL-measured GEMM throughput and a region-level speedup under one fixed TinyNPU host model, while Mix-GEMM reports performance and speedups against OpenBLAS on a SiFive U740. The absolute speedup values are not interchangeable, but the precision-scaling trend is.
 
@@ -413,37 +536,25 @@ To connect this kernel benchmark to related low-bit GEMM work, Table~\ref{tab:mi
     \end{tabularx}
 \end{table}
 
-Table~\ref{tab:mixgemm-kernel-scaling} also makes one important limitation visible. The ideal scaling for lane packing is 2$\times$ for INT16$\rightarrow$INT8 and again 2$\times$ for INT8$\rightarrow$INT4. In the present GEMM set, TinyNPU achieves 1.48--1.65$\times$ for INT8/INT16 (74--83\% of ideal) and 1.31--1.48$\times$ for INT4/INT8 (66--74\% of ideal). Mix-GEMM reports closer-to-ideal scaling in the same broad sense; for example, their a5-w5 configuration is reported as a 60\% improvement over a8-w8 (1.6$\times$), which matches the ideal 8/5 scaling in that step \cite{reggiani2023mixgemm}. The gap in TinyNPU scaling is expected for small-to-medium tiles because fixed per-tile costs (feed/drain/control) and host-visible packing overhead do not shrink with bitwidth, while the number of logical MACs does.
+Table~\ref{tab:mixgemm-kernel-scaling} also makes one important limitation visible. If throughput scaled only with packed lanes, INT8 would deliver 2$\times$ the logical MAC rate of INT16, and INT4 would deliver another 2$\times$ over INT8. In the present GEMM set, TinyNPU achieves 1.48--1.65$\times$ for INT8/INT16 (74--83\% of ideal) and 1.31--1.48$\times$ for INT4/INT8 (66--74\% of ideal). Mix-GEMM reports closer-to-ideal scaling in the same broad sense; for example, their a5-w5 configuration is reported as a 60\% improvement over a8-w8 (1.6$\times$), which matches the ideal 8/5 scaling in that step \cite{reggiani2023mixgemm}. The gap in TinyNPU scaling is expected for small-to-medium tiles because fill, drain, and control costs remain roughly fixed while the number of logical MACs per compute cycle rises with narrower packing.
 
-Third, repeated-run runtime work is already justified by measured behavior. On a small repeated-run benchmark, static persistence reduced the modeled NPU-side overhead from 3036 to 1744 units, which corresponds to roughly a 42.6\% reduction. On trained MNIST, where the workload is more activation-heavy, the same idea still reduced repeated-run unified-buffer traffic from 17608 words to 14920 words, which is about a 15.3\% reduction. These numbers do not claim that the whole problem is solved; they show that repeated-run state reuse is a real and measurable optimization direction.
+The same table can also be read against the array's theoretical peak. For the current $8 \times 8$ array, the peak issue rates are 64 INT16 MACs/cycle, 128 INT8 MACs/cycle, and 256 INT4 MACs/cycle. On the largest reported kernel, $128^3$, TinyNPU reaches 50.22, 82.65, and 122.06 MACs/cycle, which corresponds to 78.5\%, 64.6\%, and 47.7\% of those respective peaks. This makes the scaling story clearer than gain ratios alone: larger kernels improve utilization by amortizing fill and drain overhead, but utilization still drops as precision narrows because the fixed control and wavefront costs consume a larger fraction of the run while the logical MAC count per cycle rises.
 
-\begin{table}[H]
-    \centering
-    \small
-    \caption{Observed effect of repeated-run persistence on two workloads.}
-    \label{tab:persistence-results}
-    \begin{tabularx}{\textwidth}{|l|l|Y|Y|Y|}
-        \hline
-        \textbf{Workload} & \textbf{Metric} & \makecell{\textbf{Baseline}} & \makecell{\textbf{Persistence}\\\textbf{path}} & \makecell{\textbf{Observed}\\\textbf{effect}} \\
-        \hline
-        Small repeated-run artifact & NPU overhead cycles & 3036 & 1744 & 42.6\% lower overhead \\
-        \hline
-        Trained MNIST & UB words per run & 17608 & 14920 & 15.3\% lower steady-state traffic \\
-        \hline
-    \end{tabularx}
-\end{table}
+Repeated-run persistence is also justified by measured behavior. In the trained MNIST flow, keeping stable state resident across runs reduces unified-buffer write traffic from 17608 to 14920 words per inference, which corresponds to a 15.3\% reduction.
 
-Fourth, the synthesis-oriented characterization confirms that the design is no longer trivial in hardware terms. Under the reproducible Yosys flow, the top-level design synthesized to an estimated 25117 logic cells when the major memories were abstracted and 33644 logic cells when the current memory implementation was kept, with 227 DSP48 blocks in both cases. These numbers are only rough synthesis proxies, not final silicon area, but they are enough to show that TinyNPU is a substantial compute block whose area and timing behavior now deserve serious attention.
+That 15.3\% reduction should not be read as a dramatic model-level speedup by itself. Its importance is narrower and more practical: it shows that a measurable fraction of repeated-run cost still comes from avoidable state movement rather than from arithmetic. In other words, the runtime is not yet ``done'' once the math works; keeping stable data resident across inferences already removes a non-trivial amount of protocol traffic.
 
-The most important interpretation of these results is that the project’s center of gravity has shifted. The compiler and runtime exist well enough to run real workloads. The pressing questions are now about workload fit, cycle reduction, memory sizing, and hardware cost, not about whether a compiler path can exist at all.
+Taken together, the current results point to a fairly clear bottleneck ranking. Inside the accelerator run window, Figure~\ref{fig:control-state-breakdown} shows that feed and wait dominate, so control and wavefront timing still matter even before software overhead is counted. At the system level, however, the larger limitation is the cost of launching and servicing relatively small accelerator regions: packing, MMIO traffic, readback, and host-visible boundaries dilute the raw core speedup more than fetch/decode overhead does. The next optimization most likely to improve integration-adjusted speedup is therefore not a more aggressive PE datapath, but reducing avoidable boundary cost by fusing larger accelerator regions, preserving reusable state across runs, and cutting unnecessary pack/unpack and readback traffic.
+
+A rough synthesis snapshot is included for scale. The current Yosys flow estimates 25117 logic cells when the major memories are abstracted and 33644 logic cells when the current memory implementation is kept, with 227 DSP48 blocks in both cases. These figures are synthesis proxies rather than final silicon area, but they are sufficient to place the design in a non-trivial hardware range.
 
 \newpage
 \section{Conclusion and Future Work}
-TinyNPU has reached the point where it should be treated as a real accelerator platform rather than as a collection of disconnected experiments. The project now contains a usable hardware architecture, a PyTorch-oriented model preparation flow, a segmented compiler/runtime, explicit host-boundary handling, repeated-inference support, verification infrastructure, and benchmark tooling capable of separating compute from overhead. That is a substantial transition from the early stage of simply proving that isolated RTL blocks or simple kernels behaved correctly.
+TinyNPU is a working mixed-precision accelerator platform with a usable hardware architecture, a PyTorch-oriented model-preparation flow, a segmented compiler/runtime, explicit host-boundary handling, repeated-inference support, verification infrastructure, and benchmark tooling that separates compute from overhead.
 
-At the same time, the project makes its own limitations visible in a useful way. The current system still pays a noticeable cost for segmentation, state movement, packing, and host-visible boundaries. The mixed-precision path is practical for preparing compiler-ready models, but it is not intended to solve the global bit-allocation problem. Workload coverage is still narrow, and the current performance story is based on one end-to-end model and one controlled kernel benchmark rather than on a broad suite of models.
+The results show a clear split between compute capability and integration cost. The systolic core delivers strong throughput on tiled GEMM, but practical execution still pays a noticeable cost for segmentation, state movement, packing, and host-visible boundaries. The mixed-precision path is practical for preparing compiler-ready models, and the current evaluation focuses on one end-to-end model and one controlled kernel benchmark.
 
-Those limitations point directly to the next phase of work. The highest-value future work is no longer ``make the compiler exist.'' It is to bring more models onto the stack, reduce avoidable runtime and interface overhead, increase the size of useful accelerator regions, and use real workloads to justify changes in unified-buffer and instruction-memory sizing. On the hardware side, synthesis and timing characterization should be extended beyond rough proxy numbers. On the software side, additional compiler work should be driven by measured workload needs rather than by abstraction for its own sake. That is the most credible path forward for TinyNPU as a research system.
+The immediate priorities are to bring more models onto the stack, reduce avoidable runtime and interface overhead, increase the size of useful accelerator regions, and use measured workloads to justify changes in unified-buffer and instruction-memory sizing. On the hardware side, synthesis and timing characterization should be extended beyond rough proxy numbers. On the software side, compiler work should continue to target the boundary cases and data-movement costs that show up in measured workloads.
 
 \appendix
 \section{Benchmark Cost Model}

@@ -1,0 +1,85 @@
+digraph PE_Internals {
+    graph [
+        rankdir=TB,
+        splines=false,
+        pad=0.2,
+        nodesep=0.5,
+        ranksep=0.45,
+        bgcolor="white",
+        fontname="Helvetica",
+        fontsize=18,
+        label="Processing Element I/O",
+        labelloc=t
+    ];
+
+    node [
+        fontname="Helvetica",
+        fontsize=13,
+        penwidth=2.0,
+        style="filled",
+        margin="0.18,0.10"
+    ];
+
+    edge [
+        penwidth=2.0,
+        arrowsize=0.8,
+        color="#334155"
+    ];
+
+    top_in [
+        label="from top\n[63:0]\nif compute: use [15:0]\nif drain: use acc [63:0]",
+        shape=invtrapezium,
+        fillcolor="#FEF3C7",
+        color="#D97706",
+        fontcolor="#78350F",
+        width=2.2,
+        height=0.95
+    ];
+
+    left_in [
+        label="from left\nactivation [15:0]",
+        shape=rarrow,
+        fillcolor="#DBEAFE",
+        color="#3B82F6",
+        fontcolor="#1E3A8A",
+        width=2.0,
+        height=0.7
+    ];
+
+    pe [
+        label="PE\n\nSWAR compute:\nINT16: p = a0*w0\nINT8:  p = a0*w0 + a1*w1\nINT4:  p = a0*w0 + a1*w1 + a2*w2 + a3*w3\nacc = acc + signext(p)\n\ndrain:\nsend accumulator downward",
+        shape=box,
+        fillcolor="#F8FAFC",
+        color="#64748B",
+        fontcolor="#0F172A",
+        width=3.4,
+        height=2.1
+    ];
+
+    right_out [
+        label="to right\nactivation [15:0]",
+        shape=rarrow,
+        fillcolor="#DBEAFE",
+        color="#60A5FA",
+        fontcolor="#1E3A8A",
+        width=2.0,
+        height=0.7
+    ];
+
+    bottom_out [
+        label="to bottom\n[63:0]\nif compute: weight out [15:0]\nif drain: send acc [63:0]",
+        shape=trapezium,
+        fillcolor="#F3E8FF",
+        color="#A855F7",
+        fontcolor="#581C87",
+        width=2.2,
+        height=0.95
+    ];
+
+    { rank=same; left_in; pe; right_out; }
+
+    top_in -> pe;
+    left_in -> pe;
+    pe -> right_out;
+    pe -> bottom_out;
+}
