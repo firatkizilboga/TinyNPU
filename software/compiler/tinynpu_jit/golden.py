@@ -5,37 +5,83 @@ import numpy as np
 from .ir import DType
 
 
-def di_exp_fixed(x_in: int, *, m_i: int, k_i: int) -> int:
+def di_exp(x_in: int, *, m_i: int, k_i: int) -> int:
     """
-    Fixed-parameter software reference for Appendix A.2 Algorithm 1 (DI-Exp).
+    Software reference for Appendix A.2 Algorithm 1 (DI-Exp).
 
-    This helper intentionally freezes the dynamic scale path so the integer
-    arithmetic can be validated in isolation before any RTL integration work.
-    The effective scale factor is treated as ``s_f = m_f / 2^k_i`` where
-    ``m_f = m_i + (m_i >> 1) - (m_i >> 4)``.
+    This follows the paper's integer interface directly: integer input ``x_in``,
+    integer multiplier-like parameter ``m_i``, and integer shift factor ``k_i``.
+    The implementation keeps the paper's structure but spells out the reciprocal
+    term explicitly so the code remains numerically well defined.
     """
     if m_i <= 0:
         raise ValueError(f"m_i must be positive, got {m_i}.")
     if k_i < 0:
         raise ValueError(f"k_i must be non-negative, got {k_i}.")
 
+    # Algorithm 1, line 1: m_f = m_i + (m_i >> 1) - (m_i >> 4).
+    # This is the paper's shift-add approximation used before the reciprocal step.
     m_f = int(m_i + (m_i >> 1) - (m_i >> 4))
     if m_f <= 0:
         raise ValueError(f"Derived m_f must be positive, got {m_f}.")
 
-    # Round(-1 / s_f) with s_f = m_f / 2^k_i.
-    t_mag = ((1 << k_i) + (m_f // 2)) // m_f
-    if t_mag <= 0:
+    # Algorithm 1, lines 2-3: the paper writes s_f = m_f >> k_i and
+    # t = round(-1 / s_f). To keep the integer arithmetic explicit, compute the
+    # reciprocal period directly as round(2^k_i / m_f), then negate it to obtain t.
+    s_i = ((1 << k_i) + (m_f // 2)) // m_f
+    if s_i <= 0:
         raise ValueError(
             f"Chosen fixed parameters collapse DI-Exp period to zero: m_i={m_i}, k_i={k_i}, m_f={m_f}."
         )
-    t = -int(t_mag)
+    t = -int(s_i)
 
+    # Algorithm 1, lines 4-5: q_i = floor(x_in / t), r_i = x_in - q_i * t.
     q_i = int(x_in // t)
     r_i = int(x_in - (q_i * t))
+
+    # Algorithm 1, line 6: unshifted_exp = (r_i >> 1) - t.
     unshifted_exp = int((r_i >> 1) - t)
+
+    # Algorithm 1, line 7: result = unshifted_exp >> q_i.
     result = int(unshifted_exp >> q_i)
     return max(0, result)
+
+
+def _int_div_prob(numer: int, denom: int, *, p_out: int) -> int:
+    if p_out <= 0:
+        raise ValueError(f"p_out must be positive, got {p_out}.")
+    if denom <= 0:
+        raise ValueError(f"Probability denominator must be positive, got {denom}.")
+
+    scale = (1 << (p_out - 1)) - 1
+    return int((numer * scale + (denom // 2)) // denom)
+
+
+def di_sigmoid(x_in: int, *, m_i: int, k_i: int, p_out: int = 8, alpha_smooth: int = 1) -> int:
+    """
+    Scalar DI-Sigmoid built from DI-Exp and the integer division pattern used by
+    the paper's DI-Softmax/DI-SwiGLU appendix.
+
+    The input is optionally smoothed, then mapped to a scalar sigmoid using
+    sigma(x) = 1 / (1 + exp(-x)) for x >= 0 and
+    sigma(x) = exp(x) / (1 + exp(x)) for x < 0.
+    """
+    if alpha_smooth <= 0:
+        raise ValueError(f"alpha_smooth must be positive, got {alpha_smooth}.")
+
+    x_smoothed = int(x_in // alpha_smooth)
+    exp_zero = di_exp(0, m_i=m_i, k_i=k_i)
+
+    # Keep DI-Exp on its natural non-positive domain.
+    if x_smoothed >= 0:
+        exp_term = di_exp(-x_smoothed, m_i=m_i, k_i=k_i)
+        numer = exp_zero
+    else:
+        exp_term = di_exp(x_smoothed, m_i=m_i, k_i=k_i)
+        numer = exp_term
+
+    denom = exp_zero + exp_term
+    return _int_div_prob(numer, denom, p_out=p_out)
 
 
 class GoldenModel:
@@ -138,8 +184,11 @@ class GoldenModel:
         exp = np.exp(shifted)
         return exp / np.sum(exp, axis=axis, keepdims=True)
 
-    def di_exp_fixed(self, x_in: int, *, m_i: int, k_i: int) -> int:
-        return di_exp_fixed(x_in, m_i=m_i, k_i=k_i)
+    def di_exp(self, x_in: int, *, m_i: int, k_i: int) -> int:
+        return di_exp(x_in, m_i=m_i, k_i=k_i)
+
+    def di_sigmoid(self, x_in: int, *, m_i: int, k_i: int, p_out: int = 8, alpha_smooth: int = 1) -> int:
+        return di_sigmoid(x_in, m_i=m_i, k_i=k_i, p_out=p_out, alpha_smooth=alpha_smooth)
 
     def quantized_mean(
         self,
@@ -220,6 +269,15 @@ class GoldenModel:
             value = (value + (np.int64(1) << (shift - 1))) >> shift
         if activation == "relu":
             value = max(0, value)
+        elif activation == "sigmoid":
+            if out_dtype == DType.INT4:
+                p_out = 4
+            elif out_dtype == DType.INT8:
+                p_out = 8
+            else:
+                p_out = 16
+            clamped = int(np.clip(value, -32768, 32767))
+            value = np.int64(di_sigmoid(clamped, m_i=int(multiplier & 0xFFFF), k_i=int(shift), p_out=p_out))
         if out_dtype == DType.INT4:
             return int(np.clip(value, -8, 7))
         if out_dtype == DType.INT8:

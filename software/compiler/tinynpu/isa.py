@@ -11,6 +11,12 @@ class PrecisionMode(IntEnum):
     INT8 = 1
     INT16 = 2
 
+
+class ActivationMode(IntEnum):
+    NONE = 0
+    RELU = 1
+    SIGMOID = 2
+
 class Instruction:
     def encode(self, symbol_to_addr):
         raise NotImplementedError()

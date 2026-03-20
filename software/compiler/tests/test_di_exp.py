@@ -6,10 +6,10 @@ TESTS_DIR = os.path.dirname(__file__)
 COMPILER_DIR = os.path.dirname(TESTS_DIR)
 sys.path.insert(0, COMPILER_DIR)
 
-from tinynpu_jit.golden import GoldenModel, di_exp_fixed
+from tinynpu_jit.golden import GoldenModel, di_exp
 
 
-def test_di_exp_fixed_matches_hand_worked_examples():
+def test_di_exp_matches_hand_worked_examples():
     # m_f = 128 + 64 - 8 = 184
     # s_f = 184 / 2^12 ~= 0.0449
     # t = round(-1 / s_f) = -22
@@ -24,27 +24,40 @@ def test_di_exp_fixed_matches_hand_worked_examples():
     }
 
     for x_in, want in expected.items():
-        assert di_exp_fixed(x_in, **params) == want
+        assert di_exp(x_in, **params) == want
 
 
-def test_di_exp_fixed_is_monotone_over_negative_domain():
+def test_di_exp_handles_multiple_integer_parameter_sets():
+    parameter_sets = [
+        {"m_i": 128, "k_i": 12},
+        {"m_i": 92, "k_i": 10},
+        {"m_i": 64, "k_i": 8},
+    ]
+    for params in parameter_sets:
+        ys = [di_exp(x_in, **params) for x_in in range(-64, 1)]
+        assert all(y >= 0 for y in ys)
+        for prev, curr in zip(ys, ys[1:]):
+            assert prev <= curr, f"DI-Exp should be non-decreasing as input increases: {prev} !<= {curr}"
+
+
+def test_di_exp_is_monotone_over_negative_domain():
     params = {"m_i": 128, "k_i": 12}
     xs = list(range(-128, 1))
-    ys = [di_exp_fixed(x_in, **params) for x_in in xs]
+    ys = [di_exp(x_in, **params) for x_in in xs]
 
     for prev, curr in zip(ys, ys[1:]):
         assert prev <= curr, f"DI-Exp should be non-decreasing as input increases: {prev} !<= {curr}"
 
 
-def test_di_exp_fixed_stays_non_negative():
+def test_di_exp_stays_non_negative():
     params = {"m_i": 128, "k_i": 12}
     for x_in in range(-256, 1):
-        assert di_exp_fixed(x_in, **params) >= 0
+        assert di_exp(x_in, **params) >= 0
 
 
-def test_di_exp_fixed_rejects_degenerate_fixed_parameters():
+def test_di_exp_rejects_degenerate_fixed_parameters():
     try:
-        di_exp_fixed(-8, m_i=1024, k_i=4)
+        di_exp(-8, m_i=1024, k_i=4)
     except ValueError as exc:
         assert "period to zero" in str(exc)
     else:
@@ -53,4 +66,4 @@ def test_di_exp_fixed_rejects_degenerate_fixed_parameters():
 
 def test_golden_model_exposes_same_di_exp_helper():
     golden = GoldenModel()
-    assert golden.di_exp_fixed(-23, m_i=128, k_i=12) == di_exp_fixed(-23, m_i=128, k_i=12)
+    assert golden.di_exp(-23, m_i=128, k_i=12) == di_exp(-23, m_i=128, k_i=12)

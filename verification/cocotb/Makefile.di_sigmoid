@@ -1,11 +1,12 @@
 SIM ?= verilator
 TOPLEVEL_LANG ?= verilog
-SIM_BUILD = sim_build_di_exp
+SIM_BUILD = sim_build_di_sigmoid
 
 VERILOG_SOURCES += $(PWD)/../../rtl/di_exp.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/di_sigmoid.sv
 
-TOPLEVEL = di_exp
-MODULE = test_di_exp
+TOPLEVEL = di_sigmoid
+MODULE = test_di_sigmoid
 
 ifeq ($(SIM),verilator)
 EXTRA_ARGS += --trace --trace-structs -Wno-fatal

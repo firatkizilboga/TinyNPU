@@ -36,56 +36,97 @@ module ppu (
 
   // Logic for quantization pipeline
   logic [15:0] quantized_row[`ARRAY_SIZE-1:0];
+  logic signed [81:0] pre_activation_row[`ARRAY_SIZE-1:0];
+  logic signed [15:0] sigmoid_in_row[`ARRAY_SIZE-1:0];
+  logic [15:0] sigmoid_out_row[`ARRAY_SIZE-1:0];
+  logic [7:0] sigmoid_p_out;
 
   always_comb begin
+    unique case (precision)
+      2'b00: sigmoid_p_out = 8'd4;
+      2'b01: sigmoid_p_out = 8'd8;
+      default: sigmoid_p_out = 8'd16;
+    endcase
+
     for (int i = 0; i < `ARRAY_SIZE; i++) begin
       logic signed [64:0] biased_acc;
       logic signed [81:0] rescaled; // 65-bit * 17-bit = 82 bits
       logic signed [82:0] rounded;  // 83 bits for carry
       logic signed [81:0] shifted;
+
+      biased_acc = $signed(acc_in[i]) + $signed({{33{bias_reg[i][31]}}, bias_reg[i]});
+      rescaled = biased_acc * $signed({1'b0, multiplier});
+
+      if (shift > 0) begin
+        rounded = rescaled + $signed({1'b0, (82'd1 << (shift - 1))});
+        shifted = 82'(signed'(rounded >>> shift));
+      end else begin
+        shifted = rescaled;
+      end
+
+      pre_activation_row[i] = shifted;
+
+      if (shifted > 32767) begin
+        sigmoid_in_row[i] = 16'sd32767;
+      end else if (shifted < -32768) begin
+        sigmoid_in_row[i] = -16'sd32768;
+      end else begin
+        sigmoid_in_row[i] = shifted[15:0];
+      end
+    end
+  end
+
+  generate
+    for (genvar i = 0; i < `ARRAY_SIZE; i++) begin : gen_sigmoid
+      di_sigmoid #(
+          .INPUT_WIDTH(16),
+          .OUTPUT_WIDTH(16)
+      ) u_di_sigmoid (
+          .x_in(sigmoid_in_row[i]),
+          .m_i(multiplier),
+          .k_i(shift),
+          .p_out(sigmoid_p_out),
+          .alpha_smooth(8'd1),
+          .y_out(sigmoid_out_row[i])
+      );
+    end
+  endgenerate
+
+  always_comb begin
+    for (int i = 0; i < `ARRAY_SIZE; i++) begin
+      logic signed [81:0] activated;
       logic signed [3:0]  sat4;
       logic signed [7:0]  sat8;
       logic signed [15:0] sat16;
       logic [15:0]        result_val;
 
-      // A. High-Precision Bias Addition (32-bit Bias)
-      biased_acc = $signed(acc_in[i]) + $signed({{33{bias_reg[i][31]}}, bias_reg[i]});
+      activated = pre_activation_row[i];
 
-      // B. Rescale (Multiplier) - Treat 16-bit multiplier as positive
-      rescaled = biased_acc * $signed({1'b0, multiplier});
-
-      // C. Rounding and Shift Right (Arithmetic)
-      if (shift > 0) begin
-        // Round to nearest: add 2^(shift-1)
-        rounded = rescaled + $signed({1'b0, (82'd1 << (shift - 1))});
-        shifted = rounded >>> shift;
-      end else begin
-        shifted = rescaled;
+      // Activation stage: 0 = none, 1 = ReLU, 2 = sigmoid.
+      if (activation == 8'd1) begin
+        if (activated < 0) activated = 0;
+      end else if (activation == 8'd2) begin
+        activated = 82'(signed'({1'b0, sigmoid_out_row[i]}));
       end
 
-      // D. Activation (ReLU) - Bit 0 of activation triggers ReLU
-      if (activation[0]) begin
-        if (shifted < 0) shifted = 0;
-      end
-
-      // E. Precision Saturation (Signed Ranges to match PE expectations)
+      // Precision saturation and packed writeback.
       unique case (precision)
         2'b00: begin  // INT4: [-8, 7]
-          if (shifted > 7)       sat4 = 7;
-          else if (shifted < -8) sat4 = -8;
-          else                   sat4 = shifted[3:0];
+          if (activated > 7)       sat4 = 7;
+          else if (activated < -8) sat4 = -8;
+          else                     sat4 = activated[3:0];
           result_val = (16'(unsigned'(sat4))) << (write_offset * 4);
         end
         2'b01: begin  // INT8: [-128, 127]
-          if (shifted > 127)       sat8 = 127;
-          else if (shifted < -128) sat8 = -128;
-          else                     sat8 = shifted[7:0];
+          if (activated > 127)       sat8 = 127;
+          else if (activated < -128) sat8 = -128;
+          else                       sat8 = activated[7:0];
           result_val = (16'(unsigned'(sat8))) << (write_offset * 8);
         end
         default: begin  // INT16: [-32768, 32767]
-          if (shifted > 32767)       sat16 = 32767;
-          else if (shifted < -32768) sat16 = -32768;
-          else                       sat16 = shifted[15:0];
+          if (activated > 32767)       sat16 = 32767;
+          else if (activated < -32768) sat16 = -32768;
+          else                         sat16 = activated[15:0];
           result_val = 16'(unsigned'(sat16));
         end
       endcase

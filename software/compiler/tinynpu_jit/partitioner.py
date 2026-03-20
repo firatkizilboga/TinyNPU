@@ -156,6 +156,13 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             if tensors[name].data is not None:
                 tensors[name].data = np.array(value, copy=True)
 
+    def materialized_value(name: str) -> np.ndarray:
+        if name in env:
+            return env[name]
+        if name in tensors and tensors[name].data is not None:
+            return np.array(tensors[name].data, copy=False)
+        raise KeyError(f"Tensor {name!r} has no materialized value in env or tensor storage.")
+
     def ensure_quantized_input(
         source_name: str,
         *,
@@ -1137,20 +1144,23 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
         if node.op == "call_function" and node.target in {
             getattr(torch, "relu", None),
             getattr(nn.functional, "relu", None),
+            getattr(torch, "sigmoid", None),
+            getattr(nn.functional, "sigmoid", None),
         }:
             source = node.args[0].name
+            activation_kind = "sigmoid" if "sigmoid" in str(node.target) else "relu"
             if current_ops and current_ops[-1].out == source and current_ops[-1].activation == "none":
                 matmul_op = current_ops[-1]
-                matmul_op.activation = "relu"
+                matmul_op.activation = activation_kind
                 matmul_op.out = node.name
                 bias_value = tensors[matmul_op.bias].data if matmul_op.bias else None
                 expected = golden.matmul(
-                    env[matmul_op.lhs],
-                    env[matmul_op.rhs],
+                    materialized_value(matmul_op.lhs),
+                    materialized_value(matmul_op.rhs),
                     bias=bias_value,
                     multiplier=matmul_op.multiplier,
                     shift=matmul_op.shift,
-                    activation="relu",
+                    activation=activation_kind,
                     out_dtype=matmul_op.out_dtype,
                 )
                 env[node.name] = expected.astype(np.int32)
@@ -1164,7 +1174,48 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                 continue
 
             flush_segment()
-            step = HostOp(name=node.name, kind="relu", inputs=[source], outputs=[node.name])
+            step = HostOp(name=node.name, kind=activation_kind, inputs=[source], outputs=[node.name])
+            steps.append(step)
+            evaluate_host_step(step)
+            tensors[node.name] = TensorSpec(
+                name=node.name,
+                shape=normalize_shape(env[node.name].shape),
+                dtype=tensors[source].dtype,
+                kind=TensorKind.INTERMEDIATE,
+                metadata=dict(tensors[source].metadata),
+            )
+            expected_tensors[node.name] = np.array(env[node.name], copy=True)
+            continue
+
+        if node.op == "call_method" and node.target in {"sigmoid"}:
+            source = node.args[0].name
+            activation_kind = "sigmoid"
+            if current_ops and current_ops[-1].out == source and current_ops[-1].activation == "none":
+                matmul_op = current_ops[-1]
+                matmul_op.activation = activation_kind
+                matmul_op.out = node.name
+                bias_value = tensors[matmul_op.bias].data if matmul_op.bias else None
+                expected = golden.matmul(
+                    materialized_value(matmul_op.lhs),
+                    materialized_value(matmul_op.rhs),
+                    bias=bias_value,
+                    multiplier=matmul_op.multiplier,
+                    shift=matmul_op.shift,
+                    activation=activation_kind,
+                    out_dtype=matmul_op.out_dtype,
+                )
+                env[node.name] = expected.astype(np.int32)
+                tensors[node.name] = TensorSpec(
+                    node.name,
+                    normalize_shape(expected.shape),
+                    matmul_op.out_dtype,
+                    TensorKind.INTERMEDIATE,
+                    metadata=dict(tensors[source].metadata),
+                )
+                continue
+
+            flush_segment()
+            step = HostOp(name=node.name, kind=activation_kind, inputs=[source], outputs=[node.name])
             steps.append(step)
             evaluate_host_step(step)
             tensors[node.name] = TensorSpec(
