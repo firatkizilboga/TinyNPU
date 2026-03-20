@@ -45,6 +45,7 @@ module ubss #(
     input  logic [ 1:0]                    ppu_in_precision,
     input  logic [ 1:0]                    ppu_out_precision,
     input  logic [ 1:0]                    ppu_write_offset,
+    input  output_layout_t                 ppu_output_layout,
 
     // ------------------------------------------------------------------------
     // Outputs
@@ -63,19 +64,23 @@ module ubss #(
     always_comb begin
         ub_wr_mask = '1; // Default: Write all bits (for MMIO/Load)
         if (ppu_wb_en) begin
-            unique case (ppu_out_precision)
-                2'b00: begin // INT4
-                    for (int i=0; i<`ARRAY_SIZE; i++) 
-                        ub_wr_mask[i*16 +: 16] = 16'h000F << (ppu_write_offset * 4);
-                end
-                2'b01: begin // INT8
-                    for (int i=0; i<`ARRAY_SIZE; i++)
-                        ub_wr_mask[i*16 +: 16] = 16'h00FF << (ppu_write_offset * 8);
-                end
-                default: begin // INT16 (2'b10)
-                    ub_wr_mask = '1;
-                end
-            endcase
+            if (ppu_output_layout == OUT_LAYOUT_A) begin
+                ub_wr_mask = '1;
+            end else begin
+                unique case (ppu_out_precision)
+                    2'b00: begin // INT4
+                        for (int i=0; i<`ARRAY_SIZE; i++) 
+                            ub_wr_mask[i*16 +: 16] = 16'h000F << (ppu_write_offset * 4);
+                    end
+                    2'b01: begin // INT8
+                        for (int i=0; i<`ARRAY_SIZE; i++)
+                            ub_wr_mask[i*16 +: 16] = 16'h00FF << (ppu_write_offset * 8);
+                    end
+                    default: begin // INT16 (2'b10)
+                        ub_wr_mask = '1;
+                    end
+                endcase
+            end
         end
     end
 
@@ -241,9 +246,27 @@ module ubss #(
         .h_gelu_x_scale_shift(ppu_h_gelu_x_scale_shift),
         .precision(ppu_out_precision),
         .write_offset(ppu_write_offset),
+        .output_layout(ppu_output_layout),
         .bias_in(cu_rdata),
         .acc_in(bottom_row_acc),
         .ub_wdata(ppu_wdata)
     );
+
+`ifdef PPU_DEBUG_SIGMOID
+    always_ff @(posedge clk) begin
+        if (rst_n && ppu_wb_en && ppu_activation == 8'd2) begin
+            $display(
+                "UBSS SIGMOID WB: cycle=%0d out_prec=%0d write_offset=%0d addr=%0d mask=%0h wdata=%0h",
+                ppu_cycle_idx,
+                ppu_out_precision,
+                ppu_write_offset,
+                cu_addr,
+                ub_wr_mask,
+                ppu_wdata
+            );
+            $fflush();
+        end
+    end
+`endif
 
 endmodule

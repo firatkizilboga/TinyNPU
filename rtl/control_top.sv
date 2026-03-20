@@ -39,6 +39,7 @@ module control_top #(
     output logic [ 1:0]                    ppu_in_precision,
     output logic [ 1:0]                    ppu_out_precision,
     output logic [ 1:0]                    ppu_write_offset,
+    output output_layout_t                 ppu_output_layout,
 
     // Sequencer Markers
     output logic                        sa_input_first,
@@ -137,6 +138,7 @@ module control_top #(
         .ppu_in_precision (ppu_in_precision),
         .ppu_out_precision(ppu_out_precision),
         .ppu_write_offset(ppu_write_offset),
+        .ppu_output_layout(ppu_output_layout),
         .all_done_in    (all_done_in)
     );
 
