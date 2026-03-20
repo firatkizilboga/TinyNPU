@@ -47,7 +47,7 @@ digraph TinyNPURuntimeState {
         Launch [label="issue RUN through MMIO\nset start address", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
         Wait [label="poll status until HALT", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
         ReadUB [label="read output vectors\nfrom UB", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
-        Unpack [label="unpack vectors into\nlogical output tensors", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
+        Unpack [label="unpack vectors into\nlogical output tensors\n(layout-aware)", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
     }
 
     HostOp [label="HostOp execution\ndequantize / requantize /\nsoftmax / mean / reshape", fillcolor="#FFF4E8", color="#C98A43", fontcolor="#4A3520"];
