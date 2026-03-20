@@ -318,7 +318,7 @@ In the implemented RTL, the PPU first loads the bias vector in two chunks, four 
 \[
 q = \mathrm{clip}_{p}\left(\mathrm{act}\left(\left((acc + bias) \times multiplier + 2^{shift-1}\right) \gg shift\right)\right)
 \]
-where \(acc\) is the 64-bit drained accumulator, \(bias\) is a sign-extended 32-bit bias term, \(multiplier\) is the 16-bit fixed-point requantization factor, \(\gg\) is an arithmetic right shift, \(\mathrm{act}(\cdot)\) is optional ReLU, and \(\mathrm{clip}_{p}(\cdot)\) saturates to the signed range of the selected output precision. In RTL terms, this is implemented as bias addition, 65-by-17-bit multiplication, round-to-nearest by adding \(2^{shift-1}\) before the shift when \(shift > 0\), optional ReLU, and final saturation to INT16, INT8, or INT4.
+where \(acc\) is the 64-bit drained accumulator, \(bias\) is a sign-extended 32-bit bias term, \(multiplier\) is the 16-bit fixed-point requantization factor, \(\gg\) is an arithmetic right shift, \(\mathrm{act}(\cdot)\) selects the configured post-processing nonlinearity, and \(\mathrm{clip}_{p}(\cdot)\) saturates to the signed range of the selected output precision. In the current stack, the activation stage supports plain ReLU, an integer sigmoid path derived from a DI-Exp-style integer nonlinear primitive in the spirit of I-LLM \cite{hu2024illm}, and a hardware-friendly hard-GELU approximation used when GELU is lowered into the accelerator. The GELU side is motivated by the original GELU formulation and its cheaper approximate forms \cite{hendrycks2016gelu}, together with I-BERT's observation that simpler hard-GELU-style operators are cheaper than fuller integer GELU constructions but also less accurate \cite{kim2021ibert}. TinyNPU therefore chose the simpler hard-GELU path for the current PPU rather than a more accurate I-GELU-style implementation, because the latter would have added substantially more hardware complexity to the post-processing stage. In RTL terms, this is implemented as bias addition, 65-by-17-bit multiplication, round-to-nearest by adding \(2^{shift-1}\) before the shift when \(shift > 0\), the selected activation, and final saturation to INT16, INT8, or INT4.
 
 Writeback is also precision-dependent. After the tile buffer has been filled, the PPU emits one buffered row per writeback cycle. For INT16 output, each 16-bit lane is written back directly. For INT8 and INT4 output, the PPU shifts the quantized value into the byte or nibble slot selected by the packed write offset, and the unified buffer applies a bit mask so that only that subword is updated while previously written sibling tiles in the same physical word are preserved. The control unit derives this packed write offset from the output tile index: two logical M-tiles share one physical word for INT8, and four logical M-tiles share one physical word for INT4. This makes the packed output layout directly compatible with the top-fed B-input layout of a following matmul when the compiler chooses an output precision that matches the next consumer's input precision. More general layout changes remain a compiler/runtime responsibility.
 
@@ -329,7 +329,7 @@ This behavior is programmed through a fixed-width 256-bit instruction format in 
 \begin{table}[H]
     \centering
     \small
-    \caption{Implemented \texttt{MATMUL} instruction field layout in the current RTL. Unlisted bits are presently unused by the decode path.}
+\caption{Implemented \texttt{MATMUL} instruction field layout in the current RTL. Unlisted bits are presently unused by the decode path.}
     \label{tab:matmul-isa}
     \begin{tabularx}{\textwidth}{|l|l|Y|}
         \hline
@@ -355,13 +355,15 @@ This behavior is programmed through a fixed-width 256-bit instruction format in 
         \hline
         $[111:96]$ & \texttt{multiplier} & Fixed-point requantization multiplier applied in the PPU. \\
         \hline
-        $[95:88]$ & \texttt{activation} & Post-processing activation flags; bit 0 currently enables ReLU. \\
+        $[95:88]$ & \texttt{activation} & Post-processing activation selector consumed by the PPU; current software uses it for ReLU, integer sigmoid, and hard-GELU modes. \\
         \hline
         $[87:86]$ & \texttt{out\_precision} & Output packing precision used by the PPU writeback path. \\
         \hline
         $[85:84]$ & \texttt{write\_offset} & Reserved packed-lane field in the current instruction format. In the present RTL, the effective write offset is derived internally from output-tile index and output precision during packed writeback. \\
         \hline
         $[83:82]$ & \texttt{in\_precision} & Input precision mode broadcast to the systolic array PEs. \\
+        \hline
+        $[81:74]$ & \texttt{h\_gelu\_x\_scale\_shift} & Per-op hard-GELU input-domain shift used by the PPU when GELU is lowered into the accelerator. \\
         \hline
     \end{tabularx}
 \end{table}
@@ -433,6 +435,8 @@ In the current MNIST case study, this pipeline is exercised on a small four-laye
 
 This part of the stack also includes the current mixed-precision helper. Its purpose is limited and should be stated clearly: it is not a global bit-allocation solver. Instead, it provides a practical one-layer-at-a-time sensitivity workflow that can generate usable mixed-precision configurations, recalibrate them, and pass the result onward to the compiler-ready conversion path. In other words, the flow does not force one model-wide bitwidth; it can keep more sensitive tensors at higher precision while assigning narrower precision to tensors that tolerate it.
 
+The QAT path also became the place where accelerator-specific nonlinear approximations were made explicit rather than being treated as an afterthought. For the integer sigmoid and hard-GELU experiments, QAT was used not merely to recover from generic quantization noise, but to train against the same broad nonlinear contract that the compiler would later freeze into the deployed artifact. In the GELU case, this included learning a per-layer hard-GELU input-domain shift that was later emitted as instruction metadata for the PPU. This is a more realistic role for QAT in TinyNPU than simply toggling fake quantizers: it becomes the stage where approximation-aware activation parameters are learned before the compiler lowers them into a static instruction stream. The integer nonlinear direction itself is motivated by work such as I-LLM and I-BERT, even though the final TinyNPU hard-GELU form is a project-specific hardware approximation rather than a verbatim paper operator \cite{hu2024illm,kim2021ibert}.
+
 \begin{figure}[H]
     \centering
     \includegraphics[width=0.88\textwidth,height=0.62\textheight,keepaspectratio]{diagrams/bit_selection_flow_graphviz.pdf}
@@ -493,7 +497,7 @@ The reported metrics keep those cost categories separate. Accelerator cycles are
 
 \newpage
 \section{Comparative Evaluation and Discussion}
-This section focuses on two concrete artifacts: the trained MNIST flow as an end-to-end validation case, and the controlled multi-tile GEMM benchmark in Table~\ref{tab:matmul-benchmark}. The benchmark metrics are meant to separate core accelerator behavior from host-side cost; Appendix~\ref{app:benchmark-model} defines the cost model and the three reported quantities in detail.
+This section focuses on two concrete artifacts: the trained MNIST flow as an end-to-end validation case, and the controlled multi-tile GEMM benchmark in Table~\ref{tab:matmul-benchmark}. The benchmark metrics are meant to separate core accelerator behavior from host-side cost; the benchmark-cost-model appendix defines the cost model and the three reported quantities in detail.
 
 \begin{table}[H]
     \centering
@@ -544,9 +548,13 @@ Repeated-run persistence is also justified by measured behavior. In the trained 
 
 That 15.3\% reduction should not be read as a dramatic model-level speedup by itself. Its importance is narrower and more practical: it shows that a measurable fraction of repeated-run cost still comes from avoidable state movement rather than from arithmetic. In other words, the runtime is not yet ``done'' once the math works; keeping stable data resident across inferences already removes a non-trivial amount of protocol traffic.
 
+An additional activation study helps clarify the numerical limits of the current post-processing path. Extending the PPU with hard-GELU made it possible to lower GELU-bearing layers into the accelerator, but the precision of the post-activation boundary turned out to matter far more than the control plumbing. In a W8A8 configuration, the hard-GELU path caused a severe PTQ collapse on the trained MNIST model: the baseline FP32 checkpoint reached 71.54\%, while the corresponding PTQ model fell to 12.14\% and QAT recovered only to 54.44\%. By inspection, the dominant failure case was the middle hidden layer: replacing only the second convolution's GELU with hard-GELU reduced accuracy to 11.35\%, whereas the same quantized model with exact GELU remained at 67.98\%.
+
+The same experiment also produced the most useful activation-design result in the report. When the hard-GELU path was kept at INT16 rather than forced back to INT8 at the post-activation boundary, PTQ improved immediately to 35.53\% and QAT recovered to 69.98\%, which is close to the 71.54\% FP32 reference. This shows that the main problem was not that hard-GELU was impossible to implement in TinyNPU, but that \emph{hard-GELU plus aggressive INT8 storage} discarded too much information at sensitive hidden boundaries. The corresponding compiler-ready INT16 variant did not fit the current unified-buffer budget---the second segment's \texttt{inner\_conv2\_im2col} tensor alone required 14112 words, exceeding the available dynamic region---but that failure is still informative. It identifies a concrete mixed-precision tradeoff: richer nonlinearities can remain numerically viable when their post-activation boundaries stay wide, but preserving that width raises memory pressure enough that selective INT16 use is a more realistic next step than blanket INT16 everywhere.
+
 Taken together, the current results point to a fairly clear bottleneck ranking. Inside the accelerator run window, Figure~\ref{fig:control-state-breakdown} shows that feed and wait dominate, so control and wavefront timing still matter even before software overhead is counted. At the system level, however, the larger limitation is the cost of launching and servicing relatively small accelerator regions: packing, MMIO traffic, readback, and host-visible boundaries dilute the raw core speedup more than fetch/decode overhead does. The next optimization most likely to improve integration-adjusted speedup is therefore not a more aggressive PE datapath, but reducing avoidable boundary cost by fusing larger accelerator regions, preserving reusable state across runs, and cutting unnecessary pack/unpack and readback traffic.
 
-A rough synthesis snapshot is included for scale. The current Yosys flow estimates 25117 logic cells when the major memories are abstracted and 33644 logic cells when the current memory implementation is kept, with 227 DSP48 blocks in both cases. These figures are synthesis proxies rather than final silicon area, but they are sufficient to place the design in a non-trivial hardware range.
+A rough synthesis snapshot is included only for scale. The current Yosys flow estimates 25117 logic cells when the major memories are abstracted and 33644 logic cells when the current memory implementation is kept, with 227 DSP48 blocks in both cases. These figures should now be treated as \emph{stale synthesis proxies} rather than current area numbers, because the RTL and software stack have continued to evolve after that snapshot. They are not final silicon area, but they are still sufficient to place the design in a non-trivial hardware range.
 
 \newpage
 \section{Conclusion and Future Work}
@@ -554,9 +562,65 @@ TinyNPU is a working mixed-precision accelerator platform with a usable hardware
 
 The results show a clear split between compute capability and integration cost. The systolic core delivers strong throughput on tiled GEMM, but practical execution still pays a noticeable cost for segmentation, state movement, packing, and host-visible boundaries. The mixed-precision path is practical for preparing compiler-ready models, and the current evaluation focuses on one end-to-end model and one controlled kernel benchmark.
 
-The immediate priorities are to bring more models onto the stack, reduce avoidable runtime and interface overhead, increase the size of useful accelerator regions, and use measured workloads to justify changes in unified-buffer and instruction-memory sizing. On the hardware side, synthesis and timing characterization should be extended beyond rough proxy numbers. On the software side, compiler work should continue to target the boundary cases and data-movement costs that show up in measured workloads.
+The immediate priorities are to bring more models onto the stack, reduce avoidable runtime and interface overhead, increase the size of useful accelerator regions, and use measured workloads to justify changes in unified-buffer and instruction-memory sizing. The hard-GELU study sharpened that agenda: richer nonlinearities are feasible in the current PPU, but only if the precision-memory tradeoff is handled explicitly. W8A8 hard-GELU was too lossy on the trained MNIST flow, while an INT16-preserving variant recovered nearly all of the FP32 accuracy but exceeded the present unified-buffer budget. That makes selective precision retention around sensitive activation boundaries a more useful next target than simply adding more nonlinear modes. On the hardware side, synthesis and timing characterization should be refreshed, because the logic-cell figures quoted earlier are now stale proxy numbers rather than up-to-date implementation results. On the software side, compiler work should continue to target the boundary cases and data-movement costs that show up in measured workloads.
 
 \appendix
+\section{Implemented Activation Algorithms}
+\label{app:activation-algorithms}
+
+This appendix records the activation functions as they were actually implemented in the TinyNPU software golden path and mirrored in the RTL primitives. These algorithms therefore describe the deployed integer contract rather than an idealized floating-point reference.
+
+\begin{algorithm}[H]
+\caption{TinyNPU DI-Exp}
+\begin{algorithmic}[1]
+\Require Integer input $x_{in}$, integer parameters $m_I > 0$, $k_I \ge 0$
+\Ensure Integer approximation of an exponential-like decay
+\State $m_F \gets m_I + (m_I \gg 1) - (m_I \gg 4)$
+\State $s_I \gets \left(2^{k_I} + \lfloor m_F / 2 \rfloor \right) \mathbin{/} m_F$
+\State $t \gets -s_I$
+\State $q \gets \lfloor x_{in} / t \rfloor$
+\State $r \gets x_{in} - q \cdot t$
+\State $u \gets (r \gg 1) - t$
+\State $y \gets u \gg q$
+\State \Return $\max(0, y)$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{TinyNPU DI-Sigmoid}
+\begin{algorithmic}[1]
+\Require Integer input $x_{in}$, integer parameters $m_I$, $k_I$, output precision parameter $p_{out}$, optional smoothing factor $\alpha_{smooth}$
+\Ensure Integer sigmoid approximation in a signed $p_{out}$-bit probability domain
+\State $x_s \gets \lfloor x_{in} / \alpha_{smooth} \rfloor$
+\State $e_0 \gets \textsc{DI-Exp}(0, m_I, k_I)$
+\If{$x_s \ge 0$}
+    \State $e \gets \textsc{DI-Exp}(-x_s, m_I, k_I)$
+    \State $n \gets e_0$
+\Else
+    \State $e \gets \textsc{DI-Exp}(x_s, m_I, k_I)$
+    \State $n \gets e$
+\EndIf
+\State $d \gets e_0 + e$
+\State $q_{max} \gets 2^{p_{out}-1} - 1$
+\State \Return $\left(n \cdot q_{max} + \lfloor d/2 \rfloor\right) \mathbin{/} d$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{TinyNPU Hard-GELU}
+\begin{algorithmic}[1]
+\Require Signed integer input $x_{in}$, activation-domain shift $k_x$, slope parameters $(n_s, k_s)$ approximating $1.702 \approx n_s / 2^{k_s}$
+\Ensure Signed integer hard-GELU result in the same activation domain
+\State $S \gets 2^{k_x}$
+\State $t_3 \gets 3S$
+\State $t_6 \gets 6S$
+\State $s \gets \textsc{RoundShiftSigned}(x_{in} \cdot n_s, k_s)$
+\State $g \gets \min(\max(s + t_3, 0), t_6)$
+\State $y \gets \textsc{RoundDivSigned}(x_{in} \cdot g, t_6)$
+\State \Return $y$
+\end{algorithmic}
+\end{algorithm}
+
 \section{Benchmark Cost Model}
 \label{app:benchmark-model}
 The benchmark path used in this project combines measured RTL cycle counts with an analytic reference-CPU model. The goal is not to claim a definitive comparison against a specific commercial processor. Instead, it is to make the accelerator results interpretable by separating three different questions:
