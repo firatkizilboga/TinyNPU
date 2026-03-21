@@ -1,0 +1,25 @@
+{
+  "title": "Run-phase state breakdown",
+  "subtitle": "Fair case study, warm inference, one-segment INT16 is_zero MLP",
+  "workload": "mlp_is_zero_int16",
+  "total_cycles": 2551,
+  "states": [
+    {"name": "CTRL_IDLE", "cycles": 7, "entries": 1, "group": "host"},
+    {"name": "CTRL_HOST_WRITE", "cycles": 1, "entries": 1, "group": "host"},
+    {"name": "CTRL_FETCH", "cycles": 5, "entries": 5, "group": "sequencing"},
+    {"name": "CTRL_DECODE", "cycles": 5, "entries": 5, "group": "sequencing"},
+    {"name": "CTRL_EXEC_MATMUL", "cycles": 33, "entries": 29, "group": "matmul"},
+    {"name": "CTRL_MM_CLEAR", "cycles": 25, "entries": 25, "group": "matmul"},
+    {"name": "CTRL_MM_FEED", "cycles": 1600, "entries": 25, "group": "matmul"},
+    {"name": "CTRL_MM_WAIT", "cycles": 425, "entries": 25, "group": "matmul"},
+    {"name": "CTRL_MM_LOAD_BIAS", "cycles": 50, "entries": 25, "group": "matmul"},
+    {"name": "CTRL_MM_DRAIN_SA", "cycles": 200, "entries": 25, "group": "matmul"},
+    {"name": "CTRL_MM_WRITEBACK", "cycles": 200, "entries": 25, "group": "matmul"}
+  ],
+  "omitted_zero_states": [
+    "CTRL_HOST_READ",
+    "CTRL_READ_WAIT",
+    "CTRL_EXEC_MOVE",
+    "CTRL_HALT"
+  ]
+}
