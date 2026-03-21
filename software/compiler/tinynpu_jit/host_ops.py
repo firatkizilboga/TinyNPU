@@ -23,6 +23,8 @@ class HostOpSpec:
     output_arity: int | None = 1
     required_attrs: tuple[str, ...] = field(default_factory=tuple)
     quant_boundary_policy: str = "passthrough"
+    include_in_cpu_full_baseline: bool = False
+    benchmark_summary: str = ""
     semantic_validator: Callable[[HostOp], None] | None = None
 
     def validate(self, step: HostOp) -> None:
@@ -390,6 +392,21 @@ def registered_host_op_kinds() -> tuple[str, ...]:
     return tuple(sorted(_HOST_OP_REGISTRY))
 
 
+def host_op_cost_model_rows() -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for kind in registered_host_op_kinds():
+        spec = get_host_op_spec(kind)
+        rows.append(
+            {
+                "kind": spec.kind,
+                "quant_boundary_policy": spec.quant_boundary_policy,
+                "include_in_cpu_full_baseline": spec.include_in_cpu_full_baseline,
+                "benchmark_summary": spec.benchmark_summary,
+            }
+        )
+    return rows
+
+
 def execute_host_op(step: HostOp, values: dict[str, np.ndarray], *, golden: GoldenModel | None = None) -> None:
     spec = get_host_op_spec(step.kind)
     spec.validate(step)
@@ -403,13 +420,19 @@ def benchmark_host_op(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str,
 
 
 for _spec in (
-    HostOpSpec("alias", _alias_eval, _movement_benchmark),
+    HostOpSpec(
+        "alias",
+        _alias_eval,
+        _movement_benchmark,
+        benchmark_summary="reads=N, writes=N, adds=N, branches=N",
+    ),
     HostOpSpec(
         "dequantize",
         _dequantize_eval,
         _dequantize_benchmark,
         required_attrs=("scale",),
         quant_boundary_policy="npu_to_host",
+        benchmark_summary="reads=N, muls=N, adds=N or 2N, writes=N, branches=N",
         semantic_validator=_require_positive_scale,
     ),
     HostOpSpec(
@@ -418,6 +441,7 @@ for _spec in (
         _im2col_benchmark,
         required_attrs=("kernel_size",),
         quant_boundary_policy="layout_transform",
+        benchmark_summary="reads=N, writes=N, adds=3N, branches=N",
         semantic_validator=_validate_im2col,
     ),
     HostOpSpec(
@@ -426,30 +450,79 @@ for _spec in (
         _movement_benchmark,
         required_attrs=("layout", "original_shape", "out_h", "out_w", "out_channels"),
         quant_boundary_policy="layout_transform",
+        benchmark_summary="reads=N, writes=N, adds=N, branches=N",
         semantic_validator=_validate_layout_restore,
     ),
-    HostOpSpec("mean", _mean_eval, _mean_benchmark, semantic_validator=_validate_mean),
-    HostOpSpec("gelu", _gelu_eval, _gelu_benchmark),
+    HostOpSpec(
+        "mean",
+        _mean_eval,
+        _mean_benchmark,
+        include_in_cpu_full_baseline=True,
+        benchmark_summary="reads=N_in, adds=N_in, divs=N_out, writes=N_out, branches=N_in+N_out (+ optional dequant work)",
+        semantic_validator=_validate_mean,
+    ),
+    HostOpSpec(
+        "gelu",
+        _gelu_eval,
+        _gelu_benchmark,
+        include_in_cpu_full_baseline=True,
+        benchmark_summary="reads=N, adds=3N, muls=2N, nonlinear=N, writes=N, branches=N",
+    ),
     HostOpSpec(
         "quantize",
         _quantize_eval,
         _quantize_benchmark,
         required_attrs=("scale",),
         quant_boundary_policy="host_to_npu",
+        benchmark_summary="reads=N, divs=N, adds=2N, clamps=N, writes=N, branches=N",
         semantic_validator=_require_positive_scale,
     ),
-    HostOpSpec("relu", _relu_eval, _relu_benchmark),
+    HostOpSpec(
+        "relu",
+        _relu_eval,
+        _relu_benchmark,
+        include_in_cpu_full_baseline=True,
+        benchmark_summary="reads=N, clamps=N, writes=N, branches=N",
+    ),
     HostOpSpec(
         "requantize",
         _requantize_eval,
         _requantize_benchmark,
         required_attrs=("scale",),
         quant_boundary_policy="host_to_npu",
+        benchmark_summary="reads=N, muls=N, adds=2N, clamps=N, writes=N, branches=N",
         semantic_validator=_require_positive_scale,
     ),
-    HostOpSpec("reshape", _reshape_eval, _movement_benchmark, required_attrs=("shape",), semantic_validator=_validate_reshape),
-    HostOpSpec("sigmoid", _sigmoid_eval, _sigmoid_benchmark),
-    HostOpSpec("softmax", _softmax_eval, _softmax_benchmark),
-    HostOpSpec("transpose", _transpose_eval, _movement_benchmark, semantic_validator=_validate_transpose),
+    HostOpSpec(
+        "reshape",
+        _reshape_eval,
+        _movement_benchmark,
+        required_attrs=("shape",),
+        include_in_cpu_full_baseline=True,
+        benchmark_summary="reads=N, writes=N, adds=N, branches=N",
+        semantic_validator=_validate_reshape,
+    ),
+    HostOpSpec(
+        "sigmoid",
+        _sigmoid_eval,
+        _sigmoid_benchmark,
+        include_in_cpu_full_baseline=True,
+        benchmark_summary="reads=N, adds=2N, divs=N, nonlinear=N, writes=N, branches=N",
+    ),
+    HostOpSpec(
+        "softmax",
+        _softmax_eval,
+        _softmax_benchmark,
+        include_in_cpu_full_baseline=True,
+        benchmark_summary="reads=2N, adds=3N, divs=N, nonlinear=N, writes=N, branches=2N",
+    ),
+    HostOpSpec(
+        "transpose",
+        _transpose_eval,
+        _movement_benchmark,
+        include_in_cpu_full_baseline=True,
+        benchmark_summary="reads=N, writes=N, adds=N, branches=N",
+        semantic_validator=_validate_transpose,
+    ),
 ):
     register_host_op(_spec)

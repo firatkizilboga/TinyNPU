@@ -18,6 +18,7 @@ from .benchmark import (
     estimate_npu_segment_cpu_counts,
     estimate_pack_counts,
     estimate_unpack_counts,
+    include_host_op_in_cpu_full_baseline,
 )
 from .executor import HostEmulationExecutor
 from .ir import NpuSegment, TensorSpec, VerificationMode, VerifyTensor
@@ -301,6 +302,13 @@ class SimulatorExecutor:
                         counts=counts,
                         attrs={"kind": step.kind, "source_bucket": bucket},
                     )
+                    if include_host_op_in_cpu_full_baseline(step):
+                        benchmark_report.add_entry(
+                            step=f"{step.name}:cpu_full",
+                            bucket="cpu_full_logical_host",
+                            counts=counts,
+                            attrs={"kind": step.kind, "source_bucket": bucket},
+                        )
                 if debug:
                     debug_trace.append(
                         self.host_executor._debug_event(

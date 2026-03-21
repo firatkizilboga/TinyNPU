@@ -56,6 +56,7 @@ def format_benchmark_report(execution_result: Any) -> str:
     lines = [
         "Benchmark Report",
         f"  cpu_replaced_cycles: {totals['cpu_replaced_cycles']}",
+        f"  cpu_full_baseline_cycles: {totals['cpu_full_baseline_cycles']}",
         f"  npu_compute_cycles: {totals['npu_compute_cycles']}",
         f"  npu_overhead_cycles: {totals['npu_overhead_cycles']}",
         f"  host_intrinsic_cycles: {totals['host_intrinsic_cycles']}",
@@ -63,6 +64,7 @@ def format_benchmark_report(execution_result: Any) -> str:
         f"  pure_acceleration_speedup: {totals['pure_acceleration_speedup']}",
         f"  integration_adjusted_speedup: {totals['integration_adjusted_speedup']}",
         f"  end_to_end_analytical_speedup: {totals['end_to_end_analytical_speedup']}",
+        f"  cpu_only_baseline_speedup: {totals['cpu_only_baseline_speedup']}",
         "",
     ]
     for entry in payload["entries"]:
@@ -78,12 +80,14 @@ def format_benchmark_comparison(execution_result: Any, cost_models: list[Any]) -
     for summary in report.model_comparison(cost_models):
         lines.append(
             f"  {summary['name']}: cpu_replaced={summary['cpu_replaced_cycles']} "
+            f"cpu_full={summary['cpu_full_baseline_cycles']} "
             f"npu_compute={summary['npu_compute_cycles']} "
             f"npu_overhead={summary['npu_overhead_cycles']} "
             f"host_remaining={summary['host_remaining_cycles']} "
             f"pure={summary['pure_acceleration_speedup']} "
             f"integration={summary['integration_adjusted_speedup']} "
-            f"end_to_end={summary['end_to_end_analytical_speedup']}"
+            f"end_to_end={summary['end_to_end_analytical_speedup']} "
+            f"cpu_only={summary['cpu_only_baseline_speedup']}"
         )
     return "\n".join(lines).rstrip() + "\n"
 

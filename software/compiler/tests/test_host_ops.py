@@ -21,7 +21,7 @@ from tinynpu_jit import (
     register_host_op,
     registered_host_op_kinds,
 )
-from tinynpu_jit.benchmark import estimate_host_op_counts
+from tinynpu_jit.benchmark import estimate_host_op_counts, helper_op_cost_model_rows, include_host_op_in_cpu_full_baseline
 from tinynpu_jit.executor import HostEmulationExecutor
 
 
@@ -157,3 +157,52 @@ def test_mean_benchmark_counts_embedded_dequantization_work():
     assert counts.reads == source.size * 2
     assert counts.muls == source.size
     assert counts.adds == source.size * 3
+
+
+@pytest.mark.parametrize(
+    ("step", "expected"),
+    [
+        (HostOp(name="q0", kind="quantize", inputs=["x"], outputs=["y"], attrs={"scale": 0.25}), False),
+        (HostOp(name="dq0", kind="dequantize", inputs=["x"], outputs=["y"], attrs={"scale": 0.25}), False),
+        (HostOp(name="rq0", kind="requantize", inputs=["x"], outputs=["y"], attrs={"scale": 0.25}), False),
+        (HostOp(name="mean0", kind="mean", inputs=["x"], outputs=["y"], attrs={"dim": [0]}), True),
+        (HostOp(name="soft0", kind="softmax", inputs=["x"], outputs=["y"], attrs={"axis": -1}), True),
+        (HostOp(name="tr0", kind="transpose", inputs=["x"], outputs=["y"], attrs={"axes": (1, 0)}), True),
+        (HostOp(name="i2c0", kind="im2col", inputs=["x"], outputs=["y"], attrs={"kernel_size": 3}), False),
+        (
+            HostOp(
+                name="lr0",
+                kind="layout_restore",
+                inputs=["x"],
+                outputs=["y"],
+                attrs={"layout": "hwc", "original_shape": (4, 4, 1), "out_h": 4, "out_w": 4, "out_channels": 1},
+            ),
+            False,
+        ),
+    ],
+)
+def test_cpu_only_baseline_inclusion_policy_matches_helper_semantics(step: HostOp, expected: bool):
+    x = np.zeros((4, 4), dtype=np.float32)
+    y = np.zeros((4, 4), dtype=np.float32)
+    if step.kind == "im2col":
+        x = np.zeros((4, 4, 1), dtype=np.float32)
+        y = np.zeros((16, 9), dtype=np.float32)
+    elif step.kind == "layout_restore":
+        x = np.zeros((16, 1), dtype=np.float32)
+        y = np.zeros((4, 4, 1), dtype=np.float32)
+    elif step.kind in {"quantize", "requantize"}:
+        y = np.zeros((4, 4), dtype=np.int8)
+    elif step.kind == "dequantize":
+        x = np.zeros((4, 4), dtype=np.int8)
+    values = {"x": x, "y": y}
+
+    assert include_host_op_in_cpu_full_baseline(step) is expected
+
+
+def test_helper_op_cost_model_rows_expose_report_table_metadata():
+    rows = {row["kind"]: row for row in helper_op_cost_model_rows()}
+
+    assert rows["quantize"]["benchmark_summary"] == "reads=N, divs=N, adds=2N, clamps=N, writes=N, branches=N"
+    assert rows["softmax"]["benchmark_summary"] == "reads=2N, adds=3N, divs=N, nonlinear=N, writes=N, branches=2N"
+    assert rows["transpose"]["include_in_cpu_full_baseline"] is True
+    assert rows["im2col"]["include_in_cpu_full_baseline"] is False

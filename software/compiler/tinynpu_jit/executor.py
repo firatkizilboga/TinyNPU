@@ -5,7 +5,13 @@ import math
 import numpy as np
 
 from .artifact import CompiledArtifact, ExecutionResult
-from .benchmark import BenchmarkReport, CostModel, estimate_host_op_counts, estimate_npu_segment_cpu_counts
+from .benchmark import (
+    BenchmarkReport,
+    CostModel,
+    estimate_host_op_counts,
+    estimate_npu_segment_cpu_counts,
+    include_host_op_in_cpu_full_baseline,
+)
 from .golden import GoldenModel
 from .host_ops import execute_host_op
 from .ir import HostOp, NpuSegment, TensorKind, VerificationMode, VerifyTensor
@@ -90,6 +96,13 @@ class HostEmulationExecutor:
                         counts=counts,
                         attrs={"kind": step.kind, "source_bucket": bucket},
                     )
+                    if include_host_op_in_cpu_full_baseline(step):
+                        benchmark_report.add_entry(
+                            step=f"{step.name}:cpu_full",
+                            bucket="cpu_full_logical_host",
+                            counts=counts,
+                            attrs={"kind": step.kind, "source_bucket": bucket},
+                        )
                 if debug:
                     debug_trace.append(
                         self._debug_event(

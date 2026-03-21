@@ -131,9 +131,13 @@ def test_feature_benchmark_reports_end_to_end_host_remaining_metric():
 
     assert "host_remaining_cycles" in totals
     assert "end_to_end_analytical_speedup" in totals
+    assert "cpu_full_baseline_cycles" in totals
+    assert "cpu_only_baseline_speedup" in totals
     assert totals["host_remaining_cycles"] == totals["host_intrinsic_cycles"]
+    assert totals["cpu_full_baseline_cycles"] == totals["cpu_replaced_cycles"]
 
     expected = totals["cpu_replaced_cycles"] / (
         totals["npu_compute_cycles"] + totals["npu_overhead_cycles"] + totals["host_remaining_cycles"]
     )
     assert totals["end_to_end_analytical_speedup"] == expected
+    assert totals["cpu_only_baseline_speedup"] == expected

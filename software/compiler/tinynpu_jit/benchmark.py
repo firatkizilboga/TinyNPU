@@ -5,7 +5,7 @@ from typing import Any
 
 import numpy as np
 
-from .host_ops import benchmark_host_op
+from .host_ops import benchmark_host_op, get_host_op_spec, host_op_cost_model_rows
 from .ir import DType, HostOp, MatMulOp, NpuSegment, TensorSpec
 
 
@@ -211,6 +211,14 @@ class BenchmarkReport:
         return self.total_cycles("host_remaining")
 
     @property
+    def cpu_full_baseline_counts(self) -> PrimitiveCounts:
+        return self.total_counts("cpu_replaced") + self.total_counts("cpu_full_logical_host")
+
+    @property
+    def cpu_full_baseline_cycles(self) -> int:
+        return self.total_cycles("cpu_replaced") + self.total_cycles("cpu_full_logical_host")
+
+    @property
     def pure_acceleration_speedup(self) -> float | None:
         if self.npu_compute_cycles <= 0:
             return None
@@ -230,6 +238,13 @@ class BenchmarkReport:
             return None
         return self.cpu_replaced_cycles / denominator
 
+    @property
+    def cpu_only_baseline_speedup(self) -> float | None:
+        denominator = self.npu_compute_cycles + self.npu_overhead_cycles + self.host_remaining_cycles
+        if denominator <= 0:
+            return None
+        return self.cpu_full_baseline_cycles / denominator
+
     def to_dict(self) -> dict[str, Any]:
         return self.to_dict_for_model(self.cost_model)
 
@@ -239,6 +254,13 @@ class BenchmarkReport:
             "totals": {
                 "cpu_replaced_counts": self.total_counts("cpu_replaced").to_dict(),
                 "cpu_replaced_cycles": self.total_cycles("cpu_replaced", cost_model),
+                "cpu_full_baseline_counts": (
+                    self.total_counts("cpu_replaced") + self.total_counts("cpu_full_logical_host")
+                ).to_dict(),
+                "cpu_full_baseline_cycles": (
+                    self.total_cycles("cpu_replaced", cost_model)
+                    + self.total_cycles("cpu_full_logical_host", cost_model)
+                ),
                 "npu_compute_cycles": self.total_cycles("npu_compute", cost_model),
                 "npu_overhead_counts": self.total_counts("npu_overhead").to_dict(),
                 "npu_overhead_cycles": self.total_cycles("npu_overhead", cost_model),
@@ -249,6 +271,7 @@ class BenchmarkReport:
                 "pure_acceleration_speedup": self._pure_acceleration_speedup(cost_model),
                 "integration_adjusted_speedup": self._integration_adjusted_speedup(cost_model),
                 "end_to_end_analytical_speedup": self._end_to_end_analytical_speedup(cost_model),
+                "cpu_only_baseline_speedup": self._cpu_only_baseline_speedup(cost_model),
             },
             "entries": [entry.to_dict(cost_model) for entry in self.entries],
         }
@@ -286,6 +309,19 @@ class BenchmarkReport:
         if denominator <= 0:
             return None
         return self.total_cycles("cpu_replaced", cost_model) / denominator
+
+    def _cpu_only_baseline_speedup(self, cost_model: CostModel) -> float | None:
+        denominator = (
+            self.total_cycles("npu_compute", cost_model)
+            + self.total_cycles("npu_overhead", cost_model)
+            + self.total_cycles("host_remaining", cost_model)
+        )
+        if denominator <= 0:
+            return None
+        numerator = self.total_cycles("cpu_replaced", cost_model) + self.total_cycles(
+            "cpu_full_logical_host", cost_model
+        )
+        return numerator / denominator
 
 
 def estimate_npu_segment_cpu_counts(segment: NpuSegment, tensors: dict[str, TensorSpec]) -> PrimitiveCounts:
@@ -365,6 +401,16 @@ def estimate_host_op_counts(step: HostOp, values: dict[str, np.ndarray]) -> tupl
     # validation, and benchmark categorization stay in one place.
     bucket, counts = benchmark_host_op(step, values)
     return bucket, counts
+
+
+def include_host_op_in_cpu_full_baseline(step: HostOp) -> bool:
+    spec = get_host_op_spec(step.kind)
+    spec.validate(step)
+    return bool(spec.include_in_cpu_full_baseline)
+
+
+def helper_op_cost_model_rows() -> list[dict[str, object]]:
+    return host_op_cost_model_rows()
 
 
 def estimate_pack_counts(value: np.ndarray, packed_words: int) -> PrimitiveCounts:
