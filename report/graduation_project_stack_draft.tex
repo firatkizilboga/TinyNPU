@@ -614,6 +614,8 @@ The clearest way to interpret the current performance story is as a two-case com
     \end{tabularx}
 \end{table}
 
+For these two persisted \texttt{is\_zero} artifacts, the separate CPU-only-baseline metric introduced in Appendix~\ref{app:benchmark-model} coincides with \(S_{\text{end}}\). Their retained host work is entirely accelerator-serving boundary handling rather than logical model work that would also remain in a CPU-only execution of the same networks.
+
 This comparison explains why the conv-heavy path ``comes back to bite'' the delivered speedup even though the arithmetic core is strong. The convolution model is not slow because its MAC regions are intrinsically weak; it is slow because each convolution crosses the host/NPU boundary twice for layout reasons. The host must materialize sliding-window matrices through \texttt{im2col}, the NPU processes that matrix multiplication region, and then the host must rebuild feature-map layout through \texttt{layout\_restore} so the next convolution can start from a normal tensor again. Those helpers are real remaining work, and under the stricter benchmark split they count against the delivered speedup. The one-segment MLP avoids exactly those penalties because it never leaves the linear-native contract of the array.
 
 A repeated-run experiment on the one-segment MLP shows the clean best-case path. After fixing an internal C-to-A layout mismatch by adding output-layout-aware writeback, the compiled host and RTL paths matched on a balanced 30-sample sweep with 15 positive and 15 negative examples. Under the ideal issue-1 reference model, the reused accelerator run window stayed at 2551 cycles per inference, while NPU overhead dropped from 2919 cycles on the first run to a stable 2729 cycles on runs 2--30. Only the initial \texttt{quantize} helper remained in the persisted host plan, so the unified host-remaining bucket was also only 448 cycles per inference in both the cold and warm cases. This corresponds to a pure accelerator speedup of \(34.78\times\) in both cases, an integration-adjusted speedup improving from \(16.22\times\) on the first run to \(16.80\times\) in steady state, and a stricter end-to-end analytical speedup improving from \(14.99\times\) to \(15.49\times\) once the remaining host helpers are also counted.
@@ -761,7 +763,38 @@ S_{\text{int}}  &= \frac{C_{\text{cpu}}}{C_{\text{npu}} + C_{\text{ovh}}} \\
 S_{\text{end}}  &= \frac{C_{\text{cpu}}}{C_{\text{npu}} + C_{\text{ovh}} + C_{\text{host}}}
 \end{align*}
 
-This definition is why the integration-adjusted and end-to-end analytical speedups are always lower than the pure accelerator speedup. \(S_{\text{int}}\) includes the cost of using the accelerator, not only the measured run window inside the hardware. \(S_{\text{end}}\) then tightens that denominator further by adding all remaining host-side helper work that the compiled plan still executes outside accelerator segments. That is an intentional design choice in the methodology: the project is trying to understand the full cost of practical use, not only the inner datapath in isolation.
+For a separate CPU-only comparison, the benchmark also forms \(C_{\text{cpu,full}}\): the modeled CPU-only cost of the logical program. This starts from \(C_{\text{cpu}}\) and adds only host-side functions that would still belong to the logical CPU program, such as \texttt{softmax}, \texttt{mean}, \texttt{reshape}, \texttt{transpose}, or an unfused host nonlinearity. Accelerator-serving helpers such as \texttt{quantize}, \texttt{dequantize}, \texttt{requantize}, \texttt{im2col}, \texttt{layout\_restore}, and alias-style movement helpers are excluded from that numerator. The corresponding metric is:
+\[
+S_{\text{full}} = \frac{C_{\text{cpu,full}}}{C_{\text{npu}} + C_{\text{ovh}} + C_{\text{host}}}
+\]
+
+This definition is why the integration-adjusted and end-to-end analytical speedups are always lower than the pure accelerator speedup. \(S_{\text{int}}\) includes the cost of using the accelerator, not only the measured run window inside the hardware. \(S_{\text{end}}\) then tightens that denominator further by adding all remaining host-side helper work that the compiled plan still executes outside accelerator segments. \(S_{\text{full}}\) answers a different question: it compares the delivered accelerator execution against a CPU-only execution of the same logical program instead of against only the work that was replaced by accelerator segments.
+
+\begin{table}[H]
+    \centering
+    \footnotesize
+    \caption{Higher-level helper-op cost models used in the benchmark flow. Here \(N\) denotes the number of logical tensor elements and \(N_{\text{out}}\) the number of reduction outputs.}
+    \label{tab:helper-cost-models}
+    \begin{tabularx}{\textwidth}{|l|X|c|c|}
+        \hline
+        \textbf{Helper op} & \textbf{Count model summary} & \(\mathbf{C_{\text{host}}}\) & \(\mathbf{C_{\text{cpu,full}}}\) \\
+        \hline
+        \texttt{quantize} & reads \(N\), divs \(N\), adds \(2N\), clamps \(N\), writes \(N\), branches \(N\) & yes & no \\
+        \hline
+        \texttt{dequantize} & reads \(N\), muls \(N\), adds \(N\) or \(2N\), writes \(N\), branches \(N\) & yes & no \\
+        \hline
+        \texttt{requantize} & reads \(N\), muls \(N\), adds \(2N\), clamps \(N\), writes \(N\), branches \(N\) & yes & no \\
+        \hline
+        \texttt{softmax} & reads \(2N\), adds \(3N\), divs \(N\), nonlinear \(N\), writes \(N\), branches \(2N\) & yes & yes \\
+        \hline
+        \texttt{mean} & reads \(N\), adds \(N\), divs \(N_{\text{out}}\), writes \(N_{\text{out}}\), branches \(N + N_{\text{out}}\) plus optional embedded dequant work & yes & yes \\
+        \hline
+        \texttt{reshape} / \texttt{transpose} & reads \(N\), writes \(N\), adds \(N\), branches \(N\) & yes & yes \\
+        \hline
+        \texttt{layout\_restore} / \texttt{im2col} / \texttt{alias} & reads \(N\), writes \(N\), loop-control/index adds, and branches; \texttt{im2col} uses \(3N\) adds in the current model & yes & no \\
+        \hline
+    \end{tabularx}
+\end{table}
 
 \newpage
 \bibliographystyle{plain}
