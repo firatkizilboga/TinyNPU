@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 
 
 ROOT = Path(__file__).resolve().parent
-DATA_PATH = ROOT / "control_state_breakdown_simple_chain.json"
-SVG_PATH = ROOT / "control_state_breakdown.svg"
-PDF_PATH = ROOT / "control_state_breakdown.pdf"
 
 GROUP_COLORS = {
     "host": "#D9A441",
@@ -19,12 +17,20 @@ GROUP_COLORS = {
 
 
 def main() -> None:
-    payload = json.loads(DATA_PATH.read_text())
+    if len(sys.argv) == 4:
+        data_path = Path(sys.argv[1])
+        svg_path = Path(sys.argv[2])
+        pdf_path = Path(sys.argv[3])
+    else:
+        data_path = ROOT / "control_state_breakdown_simple_chain.json"
+        svg_path = ROOT / "control_state_breakdown.svg"
+        pdf_path = ROOT / "control_state_breakdown.pdf"
+
+    payload = json.loads(data_path.read_text())
     states = payload["states"]
 
     labels = [item["name"].replace("CTRL_", "") for item in states]
     cycles = [item["cycles"] for item in states]
-    entries = [item["entries"] for item in states]
     colors = [GROUP_COLORS[item["group"]] for item in states]
     total_cycles = int(payload["total_cycles"])
 
@@ -37,12 +43,10 @@ def main() -> None:
         }
     )
 
-    fig, (ax_cycles, ax_entries) = plt.subplots(
-        2,
+    fig, ax_cycles = plt.subplots(
         1,
-        figsize=(9.2, 6.4),
-        gridspec_kw={"height_ratios": [3.0, 1.6]},
-        constrained_layout=True,
+        1,
+        figsize=(8.8, 5.2),
     )
 
     y_positions = list(range(len(labels)))
@@ -50,34 +54,31 @@ def main() -> None:
     ax_cycles.set_yticks(y_positions, labels)
     ax_cycles.invert_yaxis()
     ax_cycles.set_xlabel("Cycles")
-    ax_cycles.set_title(f"{payload['title']} ({payload['workload']}, total run window = {total_cycles} cycles)")
+    ax_cycles.set_title(
+        f"{payload['title']} ({payload['workload']}, total run window = {total_cycles} cycles)",
+        pad=26,
+    )
     ax_cycles.grid(axis="x", color="#DADADA", linewidth=0.6)
     ax_cycles.set_axisbelow(True)
 
     for y_pos, cycle_count in zip(y_positions, cycles):
         ax_cycles.text(cycle_count + 2, y_pos, str(cycle_count), va="center", ha="left", fontsize=9)
 
-    ax_entries.barh(y_positions, entries, color=colors, edgecolor="#2A2A2A", linewidth=0.8)
-    ax_entries.set_yticks(y_positions, labels)
-    ax_entries.invert_yaxis()
-    ax_entries.set_xlabel("Entry count")
-    ax_entries.grid(axis="x", color="#DADADA", linewidth=0.6)
-    ax_entries.set_axisbelow(True)
-
-    for y_pos, entry_count in zip(y_positions, entries):
-        ax_entries.text(entry_count + 0.15, y_pos, str(entry_count), va="center", ha="left", fontsize=9)
-
     legend_handles = [
         plt.Rectangle((0, 0), 1, 1, color=GROUP_COLORS["host"], ec="#2A2A2A"),
         plt.Rectangle((0, 0), 1, 1, color=GROUP_COLORS["sequencing"], ec="#2A2A2A"),
         plt.Rectangle((0, 0), 1, 1, color=GROUP_COLORS["matmul"], ec="#2A2A2A"),
     ]
-    fig.legend(
+    ax_cycles.legend(
         legend_handles,
         ["Host service", "Fetch / decode", "Matmul micro-sequence"],
-        loc="upper right",
+        loc="lower center",
+        bbox_to_anchor=(0.5, 1.02),
+        ncol=3,
         frameon=False,
     )
+
+    fig.subplots_adjust(left=0.29, right=0.98, top=0.82, bottom=0.16)
 
     fig.text(
         0.012,
@@ -87,8 +88,8 @@ def main() -> None:
         color="#444444",
     )
 
-    fig.savefig(SVG_PATH, format="svg")
-    fig.savefig(PDF_PATH, format="pdf")
+    fig.savefig(svg_path, format="svg")
+    fig.savefig(pdf_path, format="pdf")
 
 
 if __name__ == "__main__":
