@@ -413,11 +413,13 @@ Instruction execution is paired with a small MMIO command interface on the host 
 \subsection{Quantizer and Model Preparation}
 The quantization path exists to prepare trained models into coherent compiler-ready artifacts. The goal here is not to solve quantized training or bit allocation as standalone research problems. The goal is narrower and more practical: produce models whose weights, activations, ranges, signedness, and optional mixed-precision choices are explicit enough that the compiler can lower them without losing numerical coherence.
 
-In the \texttt{is\_zero} case study used later in the report, this pipeline is exercised on a four-layer MLP over resized \(8 \times 8\) MNIST, with the learned path \texttt{Linear} $\rightarrow$ \texttt{Linear} $\rightarrow$ \texttt{Linear} $\rightarrow$ \texttt{Linear}. On the saved INT16 run used in the report, the FP32, PTQ, and QAT variants all remained near 99\% accuracy. That is the concrete role of the model-preparation stack: keep the lowered artifact close enough to the trained reference that the compiler is still targeting a meaningful model rather than a broken export.
+The role of QAT is clearer in the activation study of Section~\ref{sec:activation-study}. In the \texttt{W16A16} example there, the reference MNIST classifier reached 71.54\% in FP32, post-training quantization reduced that to 35.53\%, and QAT recovered it to 69.98\%, which is close to the FP32 reference. In that example, QAT is not merely validating the export path. It is the stage that adapts the trained model to the quantized deployment contract that the final artifact must obey.
 
 This part of the stack also includes the mixed-precision helper. Its purpose is limited and should be stated clearly: it is not a global bit-allocation solver. Instead, it provides a practical one-layer-at-a-time sensitivity workflow that can generate usable mixed-precision configurations, recalibrate them, and pass the result onward to the compiler-ready conversion path. In other words, it is a way to prepare plausible deployable models for this hardware rather than a claim of optimal bit allocation.
 
-The QAT path is also where accelerator-specific activation approximations are prepared before lowering. For the integer sigmoid and hard-GELU experiments, QAT was used to train against the same broad activation contract that the compiler later freezes into the deployed artifact. In the GELU case, this included learning a per-layer hard-GELU input-domain shift that is emitted as instruction metadata for the PPU. The broader direction is motivated by work such as I-LLM and I-BERT, even though the final TinyNPU hard-GELU form is a project-specific hardware approximation rather than a verbatim paper operator \cite{hu2024illm,kim2021ibert}.
+The QAT path is more structured than simply toggling fake quantizers. It has three stages. First, a trained FP32 checkpoint is calibrated to estimate per-layer activation ranges and to initialize activation and weight scales. Second, the model is fine-tuned with quantized layers in place, so activations and weights see fake-quantized values during training. Third, the trained QAT model is frozen into a compiler-ready form with explicit integer weights, scale factors, output precisions, and fused multiplier/shift metadata. In TinyNPU, QAT is therefore the stage that turns a trained floating-point model into a deployable quantized artifact rather than the stage that performs lowering itself.
+
+This is also where accelerator-specific activation approximations are prepared before lowering. For the integer sigmoid and hard-GELU experiments, QAT trains against the same broad activation contract that the compiler later freezes into the deployed artifact. In the GELU case, this includes learning a per-layer hard-GELU input-domain shift that is emitted as instruction metadata for the PPU. The broader direction is motivated by work such as I-LLM and I-BERT, even though the final TinyNPU hard-GELU form is a project-specific hardware approximation rather than a verbatim paper operator \cite{hu2024illm,kim2021ibert}.
 
 \begin{figure}[H]
     \centering
@@ -426,7 +428,7 @@ The QAT path is also where accelerator-specific activation approximations are pr
     \label{fig:bit-selection}
 \end{figure}
 
-The important role of this subsystem is therefore not to solve quantization research as a whole. It is to provide a disciplined bridge from trained or quantized models into forms that the TinyNPU compiler can lower without losing track of numerical meaning. In the \texttt{is\_zero} artifact used in the case study, the compiled host and RTL executions are validated against each other on sampled inputs, so the quantized model-preparation flow is connected all the way through segmented compilation and RTL-backed execution rather than stopping at an offline export boundary.
+The important role of this subsystem is therefore not to solve quantization research as a whole. It is to provide a disciplined bridge from trained or quantized models into forms that the TinyNPU compiler can lower without losing track of numerical meaning. The resulting artifacts are then carried through segmented compilation and RTL-backed execution, with compiled-host and RTL behavior checked against each other on sampled inputs rather than stopping at an offline export boundary.
 
 \subsection{Compiler}
 The compiler is responsible for converting model structure into a mixed execution structure. Rather than generating a monolithic accelerator-only program for the whole model, the compiler constructs an \texttt{ExecutionPlan} whose steps are typed as \texttt{NpuSegment}, \texttt{HostOp}, or \texttt{VerifyTensor}. \texttt{NpuSegment} groups accelerator-supported matrix-style work. \texttt{HostOp} keeps unsupported or intentionally host-side work separate. \texttt{VerifyTensor} allows compiler-owned expected tensors to be checked later at runtime.
@@ -535,7 +537,7 @@ The clearest way to interpret the current performance story is as a two-case com
 \begin{table}[H]
     \centering
     \footnotesize
-    \caption{Case-study comparison using literal forward-style model definitions, literal execution-plan structure, and steady-state full-model speedup.}
+    \caption{Case-study comparison using literal forward-style model definitions, literal execution-plan structure, and steady-state speedups.}
     \label{tab:case-study-summary}
     \begin{tabularx}{\textwidth}{|>{\raggedright\arraybackslash}X|>{\raggedright\arraybackslash}X|}
         \hline
@@ -583,6 +585,10 @@ The clearest way to interpret the current performance story is as a two-case com
         \hspace*{1.3em}fc4 + sigmoid)\par
         } \\
         \hline
+        \multicolumn{2}{|l|}{\textbf{\(S_{\text{pure}}\)}} \\
+        \hline
+        \(220.17\times\) & \(34.78\times\) \\
+        \hline
         \multicolumn{2}{|l|}{\textbf{\(S_{\text{full}}\)}} \\
         \hline
         \(6.05\times\) & \(15.49\times\) \\
@@ -601,14 +607,30 @@ The conv-heavy feature model provides the complementary result under the same IN
 That pair of case studies is the most useful current performance result in the report. In the one-segment MLP, the host boundary is almost absent and the full-model speedup stays strong. In the conv-heavy path, by contrast, the pure accelerator number is misleadingly optimistic if taken alone. The host still executes \texttt{im2col}, \texttt{layout\_restore}, and the surrounding orchestration on every convolution boundary, so the full-model speedup is less than half the one-segment case even though the raw compute replacement number is much larger. This is why reducing host-visible layout work is now a more important next step than trying to make the core MAC datapath itself more aggressive.
 
 \subsection{Activation Study}
+\label{sec:activation-study}
 
 The activation study used a small MNIST classifier with three hidden convolution layers followed by mean pooling and a final fully connected layer, then replaced the hidden GELU path with TinyNPU's hardware-friendly hard-GELU. The result was simple. \texttt{W8A8} hard-GELU was too lossy: the FP32 reference reached 71.54\%, the corresponding \texttt{W8A8} PTQ model fell to 12.14\%, and QAT recovered only to 54.44\%. Keeping the hard-GELU boundary at INT16 instead changed the outcome substantially: PTQ improved to 35.53\% and QAT recovered to 69.98\%, close to the FP32 reference. Hard-GELU is only viable when the post-activation boundary retains sufficient precision. The full INT16 variant then exposed the next limit by exceeding the current unified-buffer budget, so the practical next step is selective INT16 retention around sensitive GELU boundaries rather than blanket INT16 everywhere.
 
 \subsection{Bottlenecks and Interpretation}
 
-Taken together, the current results point to a fairly clear bottleneck ranking. In the fair one-segment MLP, the warm run uses \(C_{\text{npu}} = 2551\), \(C_{\text{ovh}} = 2729\), and \(C_{\text{host}} = 448\) cycles, which is why its full-model speedup stays relatively strong at \(15.49\times\). In the fair conv path, the warm run uses only \(C_{\text{npu}} = 1778\) accelerator cycles, but it also pays \(C_{\text{ovh}} = 35491\) and \(C_{\text{host}} = 23644\) cycles, which drives the full-model speedup down to \(6.05\times\). The main bottleneck is therefore not the core MAC datapath. It is the cost of launching and servicing relatively small accelerator regions, especially when the plan repeatedly falls back to host-side layout helpers such as \texttt{im2col} and \texttt{layout\_restore}. The most useful next optimization is therefore to reduce avoidable boundary cost by fusing larger accelerator regions, preserving reusable state across runs, and cutting unnecessary pack/unpack and readback traffic.
+\begin{figure}[H]
+    \centering
+    \begin{minipage}[t]{0.49\textwidth}
+        \centering
+        \includegraphics[width=\textwidth,height=0.42\textheight,keepaspectratio]{diagrams/control_state_breakdown_case_conv.pdf}
+    \end{minipage}
+    \hfill
+    \begin{minipage}[t]{0.49\textwidth}
+        \centering
+        \includegraphics[width=\textwidth,height=0.42\textheight,keepaspectratio]{diagrams/control_state_breakdown_case_mlp.pdf}
+    \end{minipage}
+    \caption{Run-phase control-state breakdown for the two case-study artifacts under warm repeated inference. The conv-heavy feature model is shown on the left and the one-segment MLP on the right.}
+    \label{fig:case-study-control-breakdown}
+\end{figure}
 
-A rough synthesis snapshot is included only for scale. The current Yosys flow estimates 25117 logic cells when the major memories are abstracted and 33644 logic cells when the current memory implementation is kept, with 227 DSP48 blocks in both cases. These figures should now be treated as \emph{stale synthesis proxies} rather than current area numbers, because the RTL and software stack have continued to evolve after that snapshot. They are not final silicon area, but they are still sufficient to place the design in a non-trivial hardware range.
+Taken together, the current results point to a fairly clear bottleneck ranking. Figure~\ref{fig:case-study-control-breakdown} shows that inside the run window, both fair artifacts are dominated by \texttt{MM\_FEED} and \texttt{MM\_WAIT}; drain and writeback form the next block, while fetch/decode remain small. In the one-segment MLP, the warm run uses \(C_{\text{npu}} = 2551\), \(C_{\text{ovh}} = 2729\), and \(C_{\text{host}} = 448\) cycles, which is why its full-model speedup stays relatively strong at \(15.49\times\). In the fair conv path, the warm run uses only \(C_{\text{npu}} = 1778\) accelerator cycles, but it also pays \(C_{\text{ovh}} = 35491\) and \(C_{\text{host}} = 23644\) cycles, which drives the full-model speedup down to \(6.05\times\). The main bottleneck is therefore not the core MAC datapath. It is the cost of launching and servicing relatively small accelerator regions, especially when the plan repeatedly falls back to host-side layout helpers such as \texttt{im2col} and \texttt{layout\_restore}. The most useful next optimization is therefore to reduce avoidable boundary cost by fusing larger accelerator regions, preserving reusable state across runs, and cutting unnecessary pack/unpack and readback traffic.
+
+A rough synthesis snapshot is included only for scale. Under the Yosys flow used in this report, the top-level design estimates 25464 logic cells when the major memories are abstracted and 33324 logic cells when the current memory implementation is kept, with 227 DSP48 blocks in both cases. In the full-memory run, Yosys also infers 8192 \texttt{RAM128X1D} and 944 \texttt{RAM256X1S} primitives. These figures are still FPGA-style synthesis proxies rather than final silicon area, but they are sufficient to place the design in a non-trivial hardware range.
 
 \newpage
 \section{Conclusion and Future Work}
@@ -616,7 +638,7 @@ TinyNPU is a working mixed-precision accelerator platform with a usable hardware
 
 The results show a clear split between compute capability and integration cost. The systolic core delivers strong throughput on tiled GEMM, but practical execution still pays a noticeable cost for segmentation, state movement, packing, and host-visible boundaries. The mixed-precision path is practical for preparing compiler-ready models, and the current evaluation focuses on one end-to-end model and one controlled kernel benchmark.
 
-The immediate priorities are to bring more models onto the stack, reduce avoidable runtime and interface overhead, increase the size of useful accelerator regions, and use measured workloads to justify changes in unified-buffer and instruction-memory sizing. The hard-GELU study sharpened that agenda: richer nonlinearities are feasible in the current PPU, but only if the precision-memory tradeoff is handled explicitly. W8A8 hard-GELU was too lossy on the trained MNIST flow, while an INT16-preserving variant recovered nearly all of the FP32 accuracy but exceeded the present unified-buffer budget. That makes selective precision retention around sensitive activation boundaries a more useful next target than simply adding more nonlinear modes. On the hardware side, synthesis and timing characterization should be refreshed, because the quoted logic-cell figures are now stale proxy numbers rather than up-to-date implementation results. On the software side, compiler work should continue to target the boundary cases and data-movement costs that show up in measured workloads.
+The immediate priorities are to bring more models onto the stack, reduce avoidable runtime and interface overhead, increase the size of useful accelerator regions, and use measured workloads to justify changes in unified-buffer and instruction-memory sizing. The hard-GELU study sharpened that agenda: richer nonlinearities are feasible in the current PPU, but only if the precision-memory tradeoff is handled explicitly. In the evaluated MNIST GELU study, W8A8 hard-GELU was too lossy, while an INT16-preserving variant recovered nearly all of the FP32 accuracy but exceeded the present unified-buffer budget. That makes selective precision retention around sensitive activation boundaries a more useful next target than simply adding more nonlinear modes. On the hardware side, synthesis and timing characterization should now be extended beyond rough FPGA proxies toward a more complete implementation study. On the software side, compiler work should continue to target the boundary cases and data-movement costs that show up in measured workloads.
 
 \appendix
 \section{Implemented Activation Algorithms}
