@@ -19,6 +19,10 @@ TRACE_INIT_RE = re.compile(
     r"\n\s*initial begin\n\s*if \(\$test\$plusargs\(\"trace\"\)\) begin\n.*?\n\s*end\n\s*end\n",
     re.S,
 )
+READMEMH_INIT_RE = re.compile(
+    r"\n\s*initial begin\n\s*if \(INIT_FILE != \"\"\) begin\n\s*\$readmemh\(INIT_FILE,.*?\n\s*end\n\s*end\n",
+    re.S,
+)
 
 UNIFIED_BUFFER_BLACKBOX = '''`include "defines.sv"
 (* blackbox *) module unified_buffer #(parameter INIT_FILE = "") (
@@ -63,7 +67,7 @@ def run(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[
     return subprocess.run(cmd, cwd=cwd, text=True, capture_output=True, check=False)
 
 
-def stage_rtl(dst: Path, abstract_memory: bool) -> None:
+def stage_rtl(dst: Path, memory_mode: str) -> None:
     if dst.exists():
         shutil.rmtree(dst)
     shutil.copytree(RTL_DIR, dst)
@@ -76,8 +80,16 @@ def stage_rtl(dst: Path, abstract_memory: bool) -> None:
     top = TRACE_INIT_RE.sub("\n", top)
     (dst / "tinynpu_top.sv").write_text(top)
 
-    if abstract_memory:
+    for memory_name in ("unified_buffer.sv", "instruction_memory.sv"):
+        memory_path = dst / memory_name
+        if memory_path.exists():
+            text = memory_path.read_text()
+            text = READMEMH_INIT_RE.sub("\n", text)
+            memory_path.write_text(text)
+
+    if memory_mode in {"abstract-ram", "blackbox-ub"}:
         (dst / "unified_buffer.sv").write_text(UNIFIED_BUFFER_BLACKBOX)
+    if memory_mode in {"abstract-ram", "blackbox-im"}:
         (dst / "instruction_memory.sv").write_text(INSTRUCTION_MEMORY_BLACKBOX)
 
 
@@ -123,20 +135,32 @@ def parse_stats(log: str) -> dict[str, str]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Reproducible TinyNPU Yosys/slang synthesis flow")
-    ap.add_argument("--mode", choices=["abstract-ram", "full-ram"], default="abstract-ram")
-    ap.add_argument("--yosys-bin", default=str(Path("/tmp/yosys058-install/bin/yosys")))
-    ap.add_argument("--slang-plugin", default=str(Path("/tmp/yosys-slang-rec/build/slang.so")))
+    ap.add_argument(
+        "--mode",
+        choices=["abstract-ram", "full-ram", "blackbox-ub", "blackbox-im"],
+        default="abstract-ram",
+    )
+    ap.add_argument("--yosys-bin", default=str(ROOT / "tools" / "install" / "yosys" / "bin" / "yosys"))
+    ap.add_argument("--slang-plugin", default=str(ROOT / "tools" / "src" / "yosys-slang" / "build" / "slang.so"))
     ap.add_argument("--workdir", default=str(Path("/tmp/tinynpu_synth")))
     ap.add_argument("--save-log", default="")
+    ap.add_argument("--stage-only", action="store_true")
     args = ap.parse_args()
 
     workdir = Path(args.workdir).resolve()
-    staged = workdir / ("rtl_abstract_ram" if args.mode == "abstract-ram" else "rtl_full_ram")
-    script = workdir / ("synth_abstract_ram.ys" if args.mode == "abstract-ram" else "synth_full_ram.ys")
+    staged = workdir / f"rtl_{args.mode.replace('-', '_')}"
+    script = workdir / f"synth_{args.mode.replace('-', '_')}.ys"
     workdir.mkdir(parents=True, exist_ok=True)
 
-    stage_rtl(staged, abstract_memory=args.mode == "abstract-ram")
+    stage_rtl(staged, memory_mode=args.mode)
     build_script(staged, script)
+
+    if args.stage_only:
+        print(f"staged_rtl={staged}")
+        print(f"yosys_script={script}")
+        print(f"yosys_bin={args.yosys_bin}")
+        print(f"slang_plugin={args.slang_plugin}")
+        return 0
 
     cmd = [args.yosys_bin, "-Q", "-m", args.slang_plugin, str(script)]
     proc = run(cmd, cwd=ROOT)

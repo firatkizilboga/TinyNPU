@@ -65,7 +65,7 @@ digraph TinyNPUArchitecture {
         WtStream -> SA:n [label="vertical feed"];
     }
 
-    PPU [label="Post-Processing Unit", fillcolor="#ffe8db", color="#d18a66", fontcolor="#40261d", width=2.4, height=1.1];
+    PPU [label="Post-Processing Unit\n+ Layout Reformatter", fillcolor="#ffe8db", color="#d18a66", fontcolor="#40261d", width=2.6, height=1.2];
 
     { rank=min; Runtime; }
     { rank=same; Runtime; RuntimeMMIOSpacer; MMIO; }
@@ -78,7 +78,7 @@ digraph TinyNPUArchitecture {
     MMIO -> UB [dir=both, label="buffer load / readback"];
     SA -> PPU [label="drain / capture", minlen=1];
     UB -> PPU [constraint=false, style=dashed, label="bias", fontcolor="#6e6e6e", color="#7a7a7a"];
-    PPU -> UB [constraint=false, label="packed writeback"];
+    PPU -> UB [constraint=false, label="layout-aware writeback\ntranspose / repack"];
 
     Runtime -> RuntimeMMIOSpacer [style=invis, minlen=2];
     RuntimeMMIOSpacer -> MMIO [style=invis, minlen=2];
