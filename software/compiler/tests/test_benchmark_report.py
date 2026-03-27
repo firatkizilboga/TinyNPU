@@ -1,10 +1,16 @@
 import os
 import sys
+from dataclasses import dataclass
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from tinynpu_jit import BenchmarkReport, PrimitiveCounts
 from tinynpu_jit.inspect import format_benchmark_report
+
+
+@dataclass
+class _BenchmarkResultStub:
+    benchmark: BenchmarkReport
 
 
 def test_end_to_end_speedup_includes_host_intrinsic_cycles():
@@ -29,8 +35,5 @@ def test_format_benchmark_report_prints_end_to_end_speedup():
     report.add_entry(step="npu_overhead", bucket="npu_overhead", cycles=5)
     report.add_entry(step="host_softmax", bucket="host_intrinsic", cycles=10)
 
-    class Result:
-        benchmark = report
-
-    formatted = format_benchmark_report(Result())
+    formatted = format_benchmark_report(_BenchmarkResultStub(benchmark=report))
     assert "end_to_end_speedup: 1.0" in formatted

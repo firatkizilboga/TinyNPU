@@ -1384,8 +1384,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
 
         if node.op == "call_method" and node.target in {"transpose", "permute"}:
             source = node.args[0].name
-            source_value = np.array(env[source], copy=False)
-            rank = source_value.ndim
+            rank = np.array(env[source], copy=False).ndim
             if node.target == "transpose":
                 dim0 = int(node.args[1])
                 dim1 = int(node.args[2])
@@ -1415,9 +1414,10 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
         if node.op == "call_function" and node.target in {operator.truediv, getattr(torch, "div", None), getattr(torch, "mul", None)}:
             lhs = node.args[0]
             rhs = node.args[1]
-            if hasattr(lhs, "name") and not hasattr(rhs, "name"):
+            if hasattr(lhs, "name") and isinstance(rhs, (int, float, np.floating)):
                 source = lhs.name
                 scalar = float(rhs)
+                # Both scalar divide and scalar multiply lower into the same host "scale" primitive.
                 scale = (1.0 / scalar) if node.target in {operator.truediv, getattr(torch, "div", None)} else scalar
                 flush_segment()
                 step = HostOp(name=node.name, kind="scale", inputs=[source], outputs=[node.name], attrs={"scale": float(scale)})

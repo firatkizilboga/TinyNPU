@@ -151,11 +151,11 @@ def _softmax_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str
 
 def _scale_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
     scale = float(step.attrs["scale"])
-    values[step.outputs[0]] = np.array(values[step.inputs[0]], copy=False).astype(np.float32) * np.float32(scale)
+    values[step.outputs[0]] = np.array(values[step.inputs[0]], copy=False).astype(np.float32) * scale
 
 
-def _scale_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
-    elems = int(np.array(values[step.outputs[0]], copy=False).size)
+def _scale_estimate_counts(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
+    elems = int(np.size(values[step.outputs[0]]))
     return "host_intrinsic", _counts(
         reads=elems,
         muls=elems,
@@ -466,7 +466,7 @@ for _spec in (
     HostOpSpec(
         "scale",
         _scale_eval,
-        _scale_benchmark,
+        _scale_estimate_counts,
         required_attrs=("scale",),
         semantic_validator=_require_positive_scale,
     ),
