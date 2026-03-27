@@ -25,6 +25,11 @@ Current scope:
 - structured runtime debug tracing for host ops, NPU segments, verification, and simulator IO overlays
 - deterministic compile behavior with explicit failure if a segment exceeds UB capacity
 
+Performance note for attention-heavy (GPT/LLaMA-style) graphs:
+- `pure_acceleration_speedup` compares CPU-equivalent compute vs. NPU compute only.
+- `integration_adjusted_speedup` also includes NPU interface overhead.
+- `end_to_end_speedup` includes host intrinsic work too (`softmax`, `scale`, etc.), which is the most realistic headline metric for mixed host/NPU attention blocks.
+
 Key entry points:
 
 ```python

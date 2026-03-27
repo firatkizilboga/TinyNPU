@@ -61,6 +61,7 @@ def format_benchmark_report(execution_result: Any) -> str:
         f"  host_intrinsic_cycles: {totals['host_intrinsic_cycles']}",
         f"  pure_acceleration_speedup: {totals['pure_acceleration_speedup']}",
         f"  integration_adjusted_speedup: {totals['integration_adjusted_speedup']}",
+        f"  end_to_end_speedup: {totals['end_to_end_speedup']}",
         "",
     ]
     for entry in payload["entries"]:
@@ -78,8 +79,10 @@ def format_benchmark_comparison(execution_result: Any, cost_models: list[Any]) -
             f"  {summary['name']}: cpu_replaced={summary['cpu_replaced_cycles']} "
             f"npu_compute={summary['npu_compute_cycles']} "
             f"npu_overhead={summary['npu_overhead_cycles']} "
+            f"host_intrinsic={summary['host_intrinsic_cycles']} "
             f"pure={summary['pure_acceleration_speedup']} "
-            f"integration={summary['integration_adjusted_speedup']}"
+            f"integration={summary['integration_adjusted_speedup']} "
+            f"end_to_end={summary['end_to_end_speedup']}"
         )
     return "\n".join(lines).rstrip() + "\n"
 
