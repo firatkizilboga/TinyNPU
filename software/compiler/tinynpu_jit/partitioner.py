@@ -1382,6 +1382,56 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             )
             continue
 
+        if node.op == "call_method" and node.target in {"transpose", "permute"}:
+            source = node.args[0].name
+            source_value = np.array(env[source], copy=False)
+            rank = source_value.ndim
+            if node.target == "transpose":
+                dim0 = int(node.args[1])
+                dim1 = int(node.args[2])
+                axes = list(range(rank))
+                axes[dim0], axes[dim1] = axes[dim1], axes[dim0]
+            else:
+                raw_axes = node.args[1:]
+                if len(raw_axes) == 1 and isinstance(raw_axes[0], (tuple, list)):
+                    raw_axes = tuple(raw_axes[0])
+                axes = [int(axis) for axis in raw_axes]
+            flush_segment()
+            step = HostOp(name=node.name, kind="transpose", inputs=[source], outputs=[node.name], attrs={"axes": tuple(axes)})
+            steps.append(step)
+            evaluate_host_step(step)
+            source_spec = tensors[source]
+            tensors[node.name] = TensorSpec(
+                name=node.name,
+                shape=normalize_shape(env[node.name].shape),
+                dtype=source_spec.dtype,
+                kind=source_spec.kind,
+                data=np.array(env[node.name], copy=True) if source_spec.kind == TensorKind.CONSTANT else None,
+                metadata=dict(source_spec.metadata),
+            )
+            expected_tensors[node.name] = np.array(env[node.name], copy=True)
+            continue
+
+        if node.op == "call_function" and node.target in {operator.truediv, getattr(torch, "div", None), getattr(torch, "mul", None)}:
+            lhs = node.args[0]
+            rhs = node.args[1]
+            if hasattr(lhs, "name") and not hasattr(rhs, "name"):
+                source = lhs.name
+                scalar = float(rhs)
+                scale = (1.0 / scalar) if node.target in {operator.truediv, getattr(torch, "div", None)} else scalar
+                flush_segment()
+                step = HostOp(name=node.name, kind="scale", inputs=[source], outputs=[node.name], attrs={"scale": float(scale)})
+                steps.append(step)
+                evaluate_host_step(step)
+                tensors[node.name] = TensorSpec(
+                    name=node.name,
+                    shape=normalize_shape(env[node.name].shape),
+                    dtype=DType.FLOAT32,
+                    kind=TensorKind.INTERMEDIATE,
+                )
+                expected_tensors[node.name] = np.array(env[node.name], copy=True)
+                continue
+
         if node.op == "call_function" and node.target in {operator.add, getattr(torch, "add", None)}:
             lhs_node = node.args[0]
             rhs_node = node.args[1]

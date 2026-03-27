@@ -149,6 +149,22 @@ def _softmax_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str
     )
 
 
+def _scale_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
+    scale = float(step.attrs["scale"])
+    values[step.outputs[0]] = np.array(values[step.inputs[0]], copy=False).astype(np.float32) * np.float32(scale)
+
+
+def _scale_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
+    source_elements = int(np.array(values[step.inputs[0]], copy=False).size)
+    elems = int(np.array(values[step.outputs[0]], copy=False).size)
+    return "host_intrinsic", _counts(
+        reads=source_elements,
+        muls=elems,
+        writes=elems,
+        branches=elems,
+    )
+
+
 def _quantize_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
     values[step.outputs[0]] = golden.quantize(
         values[step.inputs[0]],
@@ -448,6 +464,13 @@ for _spec in (
         semantic_validator=_require_positive_scale,
     ),
     HostOpSpec("reshape", _reshape_eval, _movement_benchmark, required_attrs=("shape",), semantic_validator=_validate_reshape),
+    HostOpSpec(
+        "scale",
+        _scale_eval,
+        _scale_benchmark,
+        required_attrs=("scale",),
+        semantic_validator=_require_positive_scale,
+    ),
     HostOpSpec("sigmoid", _sigmoid_eval, _sigmoid_benchmark),
     HostOpSpec("softmax", _softmax_eval, _softmax_benchmark),
     HostOpSpec("transpose", _transpose_eval, _movement_benchmark, semantic_validator=_validate_transpose),

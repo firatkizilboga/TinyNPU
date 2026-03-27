@@ -140,6 +140,29 @@ def test_transpose_validation_rejects_duplicate_axes():
         compile_plan(plan, expected_tensors={})
 
 
+def test_scale_host_op_executes_and_is_registered():
+    step = HostOp(name="scale0", kind="scale", inputs=["x"], outputs=["y"], attrs={"scale": 0.5})
+    artifact = _artifact_for_host_op(step)
+    source = np.array([[-2.0, 0.0], [2.0, 4.0]], dtype=np.float32)
+
+    result = HostEmulationExecutor().run(artifact, {"x": source})
+
+    assert np.allclose(result.tensors["y"], source * 0.5)
+    assert "scale" in registered_host_op_kinds()
+
+    bucket, counts = estimate_host_op_counts(step, {"x": source, "y": result.tensors["y"]})
+    assert bucket == "host_intrinsic"
+    assert counts.muls == source.size
+
+
+def test_scale_validation_fails_on_non_positive_scale():
+    step = HostOp(name="scale0", kind="scale", inputs=["x"], outputs=["y"], attrs={"scale": 0.0})
+    plan = _artifact_for_host_op(step).plan
+
+    with pytest.raises(ValueError, match="scale > 0"):
+        compile_plan(plan, expected_tensors={})
+
+
 def test_mean_benchmark_counts_embedded_dequantization_work():
     step = HostOp(
         name="mean0",

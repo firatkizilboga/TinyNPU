@@ -19,6 +19,7 @@ Current scope:
 - TinyNPU lowering: explicit `matmul`, exported `linear`, exported `conv2d` lowered through host-side `im2col`, plus ordinary quantized `torch.ao.nn.quantized.Linear`
 - PyTorch quant boundary support: `torch.ao.nn.quantized.Quantize` / `DeQuantize`, plus `QuantStub` / `DeQuantStub` when explicit qparams are attached
 - ordinary quantized `torch.ao.nn.quantized.Conv2d` lowered through host-side `im2col`
+- host-side attention primitives: `softmax`, `transpose`, and scalar `scale` host ops (usable between NPU matmul segments)
 - host-emulation runtime for compile/run/verify validation
 - async simulator runtime entrypoint that targets the existing cocotb driver path
 - structured runtime debug tracing for host ops, NPU segments, verification, and simulator IO overlays
@@ -54,6 +55,18 @@ Examples:
 - `software/workload/benchmark_jit_multitile_matmul.py`: host-side benchmark accounting report for the new multi-tile JIT matmul
 - `software/workload/inspect_simple_chain.py`: prints the segmented plan, logical previews, and packed output vectors for the migrated simple-chain artifact
 - `tinynpu_quant.calibration.collect_tensor_percentile_scale(...)`: reusable percentile-based host-boundary calibration helper
+
+### Attention block lowering (GPT/LLaMA-style)
+
+A practical attention block decomposition on TinyNPU is:
+
+1. `Q @ K^T` on NPU (`NpuSegment` + `MatMulOp`)
+2. divide by `sqrt(d_k)` on host (`HostOp(kind="scale")`)
+3. masked/unmasked `softmax` on host (`HostOp(kind="softmax")`)
+4. (optional) quantize host result for NPU re-entry (`HostOp(kind="quantize")`)
+5. `P @ V` on NPU (`NpuSegment` + `MatMulOp`)
+
+This keeps high-density GEMMs on the accelerator while lowering nonlinear attention normalization on host ops. See `tests/test_attention_lowering.py` for a minimal end-to-end execution-plan example.
 
 PyTorch quantization toolkit:
 - `software/compiler/tinynpu_quant/`: extracted reusable quantization utilities
