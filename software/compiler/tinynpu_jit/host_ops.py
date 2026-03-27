@@ -155,13 +155,12 @@ def _scale_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel
 
 
 def _scale_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
-    source_elements = int(np.array(values[step.inputs[0]], copy=False).size)
     elems = int(np.array(values[step.outputs[0]], copy=False).size)
     return "host_intrinsic", _counts(
-        reads=source_elements,
+        reads=elems,
         muls=elems,
         writes=elems,
-        branches=elems,
+        branches=0,
     )
 
 

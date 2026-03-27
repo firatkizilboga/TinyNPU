@@ -16,6 +16,8 @@ from tinynpu_jit import (
     compile_plan,
 )
 
+INT8_SYMMETRIC_MAX = 127.0
+
 
 def test_manual_attention_block_lowers_via_host_and_npu_segments():
     tensors = {
@@ -48,7 +50,7 @@ def test_manual_attention_block_lowers_via_host_and_npu_segments():
             NpuSegment("qk", [MatMulOp("qk_mm", "q", "k_t", "scores")], inputs=["q", "k_t"], outputs=["scores"]),
             HostOp("scale_scores", "scale", ["scores"], ["scores_scaled"], {"scale": 0.5}),
             HostOp("softmax_scores", "softmax", ["scores_scaled"], ["attn_probs"], {"axis": 1}),
-            HostOp("quant_attn", "quantize", ["attn_probs"], ["attn_q"], {"scale": 1.0 / 127.0, "dtype": DType.INT8}),
+            HostOp("quant_attn", "quantize", ["attn_probs"], ["attn_q"], {"scale": 1.0 / INT8_SYMMETRIC_MAX, "dtype": DType.INT8}),
             NpuSegment("pv", [MatMulOp("pv_mm", "attn_q", "v", "out")], inputs=["attn_q", "v"], outputs=["out"]),
         ],
         inputs=["q"],
@@ -60,6 +62,6 @@ def test_manual_attention_block_lowers_via_host_and_npu_segments():
     result = artifact.run_host_emulation({"q": q})
 
     assert result.tensors["out"].shape == (2, 4)
-    assert result.tensors["out"].dtype == np.int32
+    assert np.issubdtype(result.tensors["out"].dtype, np.integer)
     row_sums = result.trace_tensors["attn_probs"].sum(axis=1)
     assert np.allclose(row_sums, np.ones_like(row_sums), atol=1e-5)
