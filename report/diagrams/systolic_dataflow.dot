@@ -1,0 +1,165 @@
+digraph SystolicDataflow {
+    graph [
+        rankdir=TB,
+        splines=ortho,
+        pad=0.4,
+        nodesep=0.6,
+        ranksep=0.7,
+        bgcolor="white",
+        fontname="Helvetica",
+        fontsize=18,
+        label="Output-Stationary Systolic Array Dataflow (4x4 shown)",
+        labelloc=t,
+        labeljust=c
+    ];
+
+    node [
+        shape=box,
+        style="filled",
+        fontname="Helvetica",
+        fontsize=11,
+        penwidth=2.0,
+        margin="0.12,0.08"
+    ];
+
+    edge [
+        fontname="Helvetica",
+        fontsize=10,
+        penwidth=1.6,
+        arrowsize=0.7
+    ];
+
+    // === Weight column inputs (top row) ===
+    w0 [label="w col 0", fillcolor="#fef3c7", color="#d97706", fontcolor="#78350f", shape=invtriangle, width=0.9, height=0.5];
+    w1 [label="w col 1", fillcolor="#fef3c7", color="#d97706", fontcolor="#78350f", shape=invtriangle, width=0.9, height=0.5];
+    w2 [label="w col 2", fillcolor="#fef3c7", color="#d97706", fontcolor="#78350f", shape=invtriangle, width=0.9, height=0.5];
+    w3 [label="w col 3", fillcolor="#fef3c7", color="#d97706", fontcolor="#78350f", shape=invtriangle, width=0.9, height=0.5];
+
+    // === Activation row inputs (left column) ===
+    a0 [label="a row 0", fillcolor="#dbeafe", color="#3b82f6", fontcolor="#1e3a5f", shape=rarrow, width=0.9, height=0.5];
+    a1 [label="a row 1", fillcolor="#dbeafe", color="#3b82f6", fontcolor="#1e3a5f", shape=rarrow, width=0.9, height=0.5];
+    a2 [label="a row 2", fillcolor="#dbeafe", color="#3b82f6", fontcolor="#1e3a5f", shape=rarrow, width=0.9, height=0.5];
+    a3 [label="a row 3", fillcolor="#dbeafe", color="#3b82f6", fontcolor="#1e3a5f", shape=rarrow, width=0.9, height=0.5];
+
+    // === Spacer for top-left corner ===
+    corner [label="", shape=point, width=0.01, style=invis];
+
+    // === 4x4 PE grid ===
+    pe00 [label="PE[0,0]\nacc += a0 * w0", fillcolor="#ecfdf5", color="#059669", fontcolor="#065f46", width=1.5, height=0.7];
+    pe01 [label="PE[0,1]\nacc += a0 * w1", fillcolor="#ecfdf5", color="#059669", fontcolor="#065f46", width=1.5, height=0.7];
+    pe02 [label="PE[0,2]\nacc += a0 * w2", fillcolor="#ecfdf5", color="#059669", fontcolor="#065f46", width=1.5, height=0.7];
+    pe03 [label="PE[0,3]\nacc += a0 * w3", fillcolor="#ecfdf5", color="#059669", fontcolor="#065f46", width=1.5, height=0.7];
+
+    pe10 [label="PE[1,0]\nacc += a1 * w0", fillcolor="#ecfdf5", color="#059669", fontcolor="#065f46", width=1.5, height=0.7];
+    pe11 [label="PE[1,1]\nacc += a1 * w1", fillcolor="#ecfdf5", color="#059669", fontcolor="#065f46", width=1.5, height=0.7];
+    pe12 [label="PE[1,2]\nacc += a1 * w2", fillcolor="#ecfdf5", color="#059669", fontcolor="#065f46", width=1.5, height=0.7];
+    pe13 [label="PE[1,3]\nacc += a1 * w3", fillcolor="#ecfdf5", color="#059669", fontcolor="#065f46", width=1.5, height=0.7];
+
+    pe20 [label="PE[2,0]\nacc += a2 * w0", fillcolor="#ecfdf5", color="#059669", fontcolor="#065f46", width=1.5, height=0.7];
+    pe21 [label="PE[2,1]\nacc += a2 * w1", fillcolor="#ecfdf5", color="#059669", fontcolor="#065f46", width=1.5, height=0.7];
+    pe22 [label="PE[2,2]\nacc += a2 * w2", fillcolor="#ecfdf5", color="#059669", fontcolor="#065f46", width=1.5, height=0.7];
+    pe23 [label="PE[2,3]\nacc += a2 * w3", fillcolor="#ecfdf5", color="#059669", fontcolor="#065f46", width=1.5, height=0.7];
+
+    pe30 [label="PE[3,0]\nacc += a3 * w0", fillcolor="#ecfdf5", color="#059669", fontcolor="#065f46", width=1.5, height=0.7];
+    pe31 [label="PE[3,1]\nacc += a3 * w1", fillcolor="#ecfdf5", color="#059669", fontcolor="#065f46", width=1.5, height=0.7];
+    pe32 [label="PE[3,2]\nacc += a3 * w2", fillcolor="#ecfdf5", color="#059669", fontcolor="#065f46", width=1.5, height=0.7];
+    pe33 [label="PE[3,3]\nacc += a3 * w3", fillcolor="#ecfdf5", color="#059669", fontcolor="#065f46", width=1.5, height=0.7];
+
+    // === Drain outputs (bottom) ===
+    d0 [label="drain 0", fillcolor="#ede9fe", color="#7c3aed", fontcolor="#4c1d95", shape=triangle, width=0.9, height=0.5];
+    d1 [label="drain 1", fillcolor="#ede9fe", color="#7c3aed", fontcolor="#4c1d95", shape=triangle, width=0.9, height=0.5];
+    d2 [label="drain 2", fillcolor="#ede9fe", color="#7c3aed", fontcolor="#4c1d95", shape=triangle, width=0.9, height=0.5];
+    d3 [label="drain 3", fillcolor="#ede9fe", color="#7c3aed", fontcolor="#4c1d95", shape=triangle, width=0.9, height=0.5];
+
+    // PPU label
+    ppu_label [label="Post-Processing Unit\n(bias, requant, activation, writeback)", fillcolor="#ffe8db", color="#d18a66", fontcolor="#40261d", width=5.0, height=0.6];
+
+    // === Rank constraints to enforce grid ===
+    { rank=same; corner; w0; w1; w2; w3; }
+    { rank=same; a0; pe00; pe01; pe02; pe03; }
+    { rank=same; a1; pe10; pe11; pe12; pe13; }
+    { rank=same; a2; pe20; pe21; pe22; pe23; }
+    { rank=same; a3; pe30; pe31; pe32; pe33; }
+    { rank=same; d0; d1; d2; d3; }
+
+    // === Invisible edges for column alignment ===
+    corner -> a0 [style=invis];
+    a0 -> a1 [style=invis];
+    a1 -> a2 [style=invis];
+    a2 -> a3 [style=invis];
+
+    w0 -> pe00 [style=invis, weight=10];
+    w1 -> pe01 [style=invis, weight=10];
+    w2 -> pe02 [style=invis, weight=10];
+    w3 -> pe03 [style=invis, weight=10];
+
+    // === Horizontal edges (activations flow right) ===
+    a0 -> pe00 [color="#3b82f6", penwidth=2.0];
+    pe00 -> pe01 [color="#3b82f6", penwidth=2.0];
+    pe01 -> pe02 [color="#3b82f6", penwidth=2.0];
+    pe02 -> pe03 [color="#3b82f6", penwidth=2.0];
+
+    a1 -> pe10 [color="#3b82f6", penwidth=2.0];
+    pe10 -> pe11 [color="#3b82f6", penwidth=2.0];
+    pe11 -> pe12 [color="#3b82f6", penwidth=2.0];
+    pe12 -> pe13 [color="#3b82f6", penwidth=2.0];
+
+    a2 -> pe20 [color="#3b82f6", penwidth=2.0];
+    pe20 -> pe21 [color="#3b82f6", penwidth=2.0];
+    pe21 -> pe22 [color="#3b82f6", penwidth=2.0];
+    pe22 -> pe23 [color="#3b82f6", penwidth=2.0];
+
+    a3 -> pe30 [color="#3b82f6", penwidth=2.0];
+    pe30 -> pe31 [color="#3b82f6", penwidth=2.0];
+    pe31 -> pe32 [color="#3b82f6", penwidth=2.0];
+    pe32 -> pe33 [color="#3b82f6", penwidth=2.0];
+
+    // === Vertical edges (weights flow down) ===
+    w0 -> pe00 [color="#d97706", penwidth=2.0];
+    pe00 -> pe10 [color="#d97706", penwidth=2.0];
+    pe10 -> pe20 [color="#d97706", penwidth=2.0];
+    pe20 -> pe30 [color="#d97706", penwidth=2.0];
+
+    w1 -> pe01 [color="#d97706", penwidth=2.0];
+    pe01 -> pe11 [color="#d97706", penwidth=2.0];
+    pe11 -> pe21 [color="#d97706", penwidth=2.0];
+    pe21 -> pe31 [color="#d97706", penwidth=2.0];
+
+    w2 -> pe02 [color="#d97706", penwidth=2.0];
+    pe02 -> pe12 [color="#d97706", penwidth=2.0];
+    pe12 -> pe22 [color="#d97706", penwidth=2.0];
+    pe22 -> pe32 [color="#d97706", penwidth=2.0];
+
+    w3 -> pe03 [color="#d97706", penwidth=2.0];
+    pe03 -> pe13 [color="#d97706", penwidth=2.0];
+    pe13 -> pe23 [color="#d97706", penwidth=2.0];
+    pe23 -> pe33 [color="#d97706", penwidth=2.0];
+
+    // === Drain edges (accumulators shift down to PPU) ===
+    pe30 -> d0 [color="#7c3aed", style=dashed, penwidth=1.8];
+    pe31 -> d1 [color="#7c3aed", style=dashed, penwidth=1.8];
+    pe32 -> d2 [color="#7c3aed", style=dashed, penwidth=1.8];
+    pe33 -> d3 [color="#7c3aed", style=dashed, penwidth=1.8];
+
+    d0 -> ppu_label [style=invis];
+    d1 -> ppu_label [style=invis];
+    d2 -> ppu_label [style=invis];
+    d3 -> ppu_label [style=invis];
+
+    // === Legend ===
+    legend [
+        label=<
+        <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2">
+        <TR><TD ALIGN="LEFT"><FONT COLOR="#3b82f6"><B>&#x2192; Blue:</B></FONT> activations flow left to right (1 cycle/PE)</TD></TR>
+        <TR><TD ALIGN="LEFT"><FONT COLOR="#d97706"><B>&#x2193; Orange:</B></FONT> weights flow top to bottom (1 cycle/PE)</TD></TR>
+        <TR><TD ALIGN="LEFT"><FONT COLOR="#059669"><B>&#x25a0; Green:</B></FONT> accumulators stay stationary during compute</TD></TR>
+        <TR><TD ALIGN="LEFT"><FONT COLOR="#7c3aed"><B>&#x2193; Purple:</B></FONT> drain mode shifts accumulators down to PPU</TD></TR>
+        </TABLE>
+        >,
+        shape=note,
+        fillcolor="#f8fafc",
+        color="#94a3b8",
+        fontsize=11,
+        margin="0.16,0.10"
+    ];
+}
