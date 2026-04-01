@@ -75,7 +75,10 @@ def _emit_array_decl(
     *,
     section_data: bool,
 ) -> str:
-    attr = ' __attribute__((section(".data")))' if section_data else ""
+    if section_data:
+        attr = ' __attribute__((section(".data")))'
+    else:
+        attr = ' __attribute__((section(".noinit")))'
     if values is None:
         return f"static {c_type} {name}[{length}]{attr};"
     if not values:
