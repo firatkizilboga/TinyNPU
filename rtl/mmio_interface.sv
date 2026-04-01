@@ -28,6 +28,7 @@ module mmio_interface (
   logic [      `ARG_WIDTH-1:0] arg_reg;
   logic [   `BUFFER_WIDTH-1:0] mmvr_reg;
   logic                        doorbell_q;
+  logic                        mmvr_host_override;
 
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
@@ -36,8 +37,18 @@ module mmio_interface (
       arg_reg    <= '0;
       mmvr_reg   <= '0;
       doorbell_q <= 1'b0;
+      mmvr_host_override <= 1'b0;
     end else begin
       doorbell_q <= 1'b0;
+
+      // Once host software starts preparing the next command while READ_WAIT
+      // is still presenting stale readback data, keep MMVR under host control
+      // until the control unit leaves READ_WAIT.
+      if (!mmvr_wr_en) begin
+        mmvr_host_override <= 1'b0;
+      end else if (host_wr_en) begin
+        mmvr_host_override <= 1'b1;
+      end
 
       // Host writes
       if (host_wr_en) begin
@@ -60,6 +71,7 @@ module mmio_interface (
       // Host writes to MMVR must take precedence, otherwise the first WRITE_MEM
       // issued from READ_WAIT can be overwritten by stale readback data.
       if (mmvr_wr_en &&
+          !mmvr_host_override &&
           !(host_wr_en &&
             host_addr >= `REG_MMVR &&
             host_addr < (`REG_MMVR + (`BUFFER_WIDTH / 8)))) begin

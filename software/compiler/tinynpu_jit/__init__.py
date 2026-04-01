@@ -1,5 +1,6 @@
 from .api import compile_module, compile_plan, run_host_emulation
 from .artifact import CompiledArtifact, ExecutionResult, SegmentArtifact
+from .baremetal_emit import emit_cv32e40p_c, write_cv32e40p_c
 from .benchmark import (
     BenchmarkEntry,
     BenchmarkReport,
@@ -45,6 +46,7 @@ __all__ = [
     "VerifyTensor",
     "compile_module",
     "compile_plan",
+    "emit_cv32e40p_c",
     "get_host_op_spec",
     "mark_for_verify",
     "npu_matmul",
@@ -56,4 +58,5 @@ __all__ = [
     "run",
     "run_sim",
     "run_host_emulation",
+    "write_cv32e40p_c",
 ]
