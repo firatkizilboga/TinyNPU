@@ -428,6 +428,9 @@ def emit_cv32e40p_c(
             for symbol_name, symbol in sorted(segment.symbol_table.items()):
                 if symbol["role"] != "BIAS":
                     continue
+                spec = artifact.plan.tensors.get(symbol_name)
+                if spec is not None and spec.kind == TensorKind.CONSTANT:
+                    continue
                 body_lines.append(
                     "    write_tensor_to_npu("
                     f"{_emit_tensor_reference(symbol_name)}, 0x{int(symbol['addr']):04x}u, "
@@ -523,6 +526,8 @@ def emit_cv32e40p_c(
 
     if repeat_count > 1:
         main_lines.append(f"    for (int repeat_iter = 0; repeat_iter < {repeat_count}; ++repeat_iter) {{")
+        main_lines.append('        printf("repeat.iter=%d\\n", repeat_iter + 1);')
+        main_lines.append("        fflush(stdout);")
         main_lines.extend([f"    {line}" for line in body_lines])
         main_lines.append("    }")
         main_lines.append(f'    printf("repeat.count=%d\\n", {repeat_count});')
