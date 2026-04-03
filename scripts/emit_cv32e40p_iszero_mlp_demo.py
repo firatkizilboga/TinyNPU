@@ -21,6 +21,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--cpu-baseline", action="store_true", help="Emit timed CPU baseline matmul path for each NPU segment.")
     parser.add_argument(
+        "--repeat-count",
+        type=int,
+        default=1,
+        help="Repeat the inference body this many times after one-time UB/IM preload.",
+    )
+    parser.add_argument(
         "--no-cpu-verify",
         action="store_true",
         help="Disable CPU-vs-NPU segment output cross-checks when CPU baseline emission is enabled.",
@@ -48,6 +54,7 @@ def main() -> None:
         program_name="cv32e40p_iszero_mlp_demo",
         emit_cpu_baseline=args.cpu_baseline,
         verify_cpu_baseline=args.cpu_baseline and not args.no_cpu_verify,
+        repeat_count=args.repeat_count,
     )
     prediction = int(float(host_result.tensors[artifact.plan.outputs[0]].reshape(-1)[0]) >= 0.5)
     print(output_path)

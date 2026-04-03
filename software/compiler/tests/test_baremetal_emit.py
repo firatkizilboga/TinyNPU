@@ -105,3 +105,38 @@ def test_emit_cv32e40p_c_with_cpu_baseline_for_segment():
     assert 'print_cycle_delta32("segment.seg_cpu.cpu"' in source
     assert 'print_cycle_delta32("segment.seg_cpu.npu"' in source
     assert 'cpu baseline mismatch: segment seg_cpu output y' in source
+
+
+def test_emit_cv32e40p_c_with_repeat_count_accumulates_warm_totals():
+    x = np.array([[1, -2], [3, 4]], dtype=np.int16)
+    w = np.array([[2, 1], [0, -1]], dtype=np.int16)
+
+    tensors = {
+        "x": TensorSpec("x", x.shape, DType.INT16, TensorKind.INPUT),
+        "w": TensorSpec("w", w.shape, DType.INT16, TensorKind.CONSTANT, data=w),
+        "y": TensorSpec("y", (2, 2), DType.INT16, TensorKind.OUTPUT, is_final_output=True),
+    }
+    steps = [
+        NpuSegment("seg_repeat", [MatMulOp("op0", "x", "w", "y")], inputs=["x", "w"], outputs=["y"]),
+    ]
+    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=["x"], outputs=["y"])
+    plan.add_verification_step("y", "final_y")
+
+    y = np.clip(x.astype(np.int32) @ w.astype(np.int32), -32768, 32767).astype(np.int16)
+    artifact = compile_plan(plan, {"y": y})
+
+    source = emit_cv32e40p_c(
+        artifact,
+        {"x": x},
+        program_name="unit_test_repeat",
+        emit_cpu_baseline=True,
+        verify_cpu_baseline=True,
+        repeat_count=10,
+    )
+
+    assert "for (int repeat_iter = 0; repeat_iter < 10; ++repeat_iter)" in source
+    assert 'if (repeat_iter == 0) printf("NpuSegment: seg_repeat\\n");' in source
+    assert "segment_npu_total += delta;" in source
+    assert "segment_cpu_total += delta;" in source
+    assert 'printf("repeat.program.npu.hot.total cycles=%lu\\n"' in source
+    assert 'printf("repeat.program.cpu.hot.avg cycles=%lu\\n"' in source
