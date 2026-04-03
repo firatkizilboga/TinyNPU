@@ -146,6 +146,18 @@ def _emit_tensor_reference(name: str, suffix: str = "") -> str:
     return f"&{_sanitize(name)}{suffix}"
 
 
+def _activation_code(kind: str) -> int:
+    mapping = {
+        "none": 0,
+        "relu": 1,
+        "sigmoid": 2,
+        "h_gelu": 3,
+    }
+    if kind not in mapping:
+        raise NotImplementedError(f"Bare-metal CPU baseline does not support activation '{kind}'.")
+    return mapping[kind]
+
+
 def _emit_host_step_attrs(step: HostOp) -> tuple[list[str], list[str]]:
     decls: list[str] = []
     lines: list[str] = []
@@ -159,6 +171,8 @@ def _emit_host_step_attrs(step: HostOp) -> tuple[list[str], list[str]]:
         lines.append(f"    host_relu({out_ref}, {in_ref});")
     elif step.kind == "sigmoid":
         lines.append(f"    host_sigmoid({out_ref}, {in_ref});")
+    elif step.kind == "gelu":
+        lines.append(f"    host_gelu({out_ref}, {in_ref});")
     elif step.kind == "quantize":
         scale = float(step.attrs["scale"])
         zero_point = int(step.attrs.get("zero_point", 0))
@@ -242,7 +256,12 @@ def emit_cv32e40p_c(
     *,
     program_name: str = "tinynpu_generated",
     defines_path: str | None = None,
+    emit_cpu_baseline: bool = False,
+    verify_cpu_baseline: bool = False,
 ) -> str:
+    if verify_cpu_baseline and not emit_cpu_baseline:
+        raise ValueError("verify_cpu_baseline requires emit_cpu_baseline=True.")
+
     for name in artifact.plan.inputs:
         if name not in inputs:
             raise KeyError(f"Missing runtime input '{name}' for bare-metal emission.")
@@ -259,7 +278,11 @@ def emit_cv32e40p_c(
 
     decls: list[str] = []
     main_lines: list[str] = [
+        "    uint32_t cycle_t0 = 0;",
+        "    uint32_t cycle_t1 = 0;",
+        "    uint32_t cycle_segment_t0 = 0;",
         f'    printf("TinyNPU bare-metal program: {program_name}\\n");',
+        "    tb_timer_reset_counter();",
     ]
     verify_lines: list[str] = []
 
@@ -285,11 +308,25 @@ def emit_cv32e40p_c(
         decls.append(storage_decl)
         decls.append(tensor_decl)
 
+    if emit_cpu_baseline:
+        for step in artifact.plan.steps:
+            if not isinstance(step, NpuSegment):
+                continue
+            cpu_suffix = f"__cpu_{_sanitize(step.name)}"
+            for tensor_name in sorted({op.out for op in step.ops}):
+                cpu_spec = artifact.plan.tensors[tensor_name].clone_without_data()
+                storage_decl, tensor_decl = _emit_tensor_storage(cpu_spec, runtime_inputs={}, suffix=cpu_suffix)
+                decls.append(storage_decl)
+                decls.append(tensor_decl)
+
     if artifact.static_ub_image:
         decls.append(_emit_u32x4_image("tinynpu_static_ub_image", [int(word) for word in artifact.static_ub_image]))
+        main_lines.append("    cycle_t0 = read_mcycle32();")
         main_lines.append(
             f"    load_ub_image(0u, tinynpu_static_ub_image, {len(artifact.static_ub_image)});"
         )
+        main_lines.append("    cycle_t1 = read_mcycle32();")
+        main_lines.append('    print_cycle_delta32("preload.ub_image", cycle_t0, cycle_t1);')
 
     im_start_addrs: dict[str, int] = {}
     next_im_addr = im_base_addr
@@ -306,9 +343,12 @@ def emit_cv32e40p_c(
         image_name = f"im_{_sanitize(step.name)}"
         im_start_addrs[step.name] = next_im_addr
         decls.append(_emit_u32x4_image(image_name, flattened_chunks))
+        main_lines.append("    cycle_t0 = read_mcycle32();")
         main_lines.append(
             f"    load_im_image(0x{next_im_addr:04x}u, {image_name}, {len(flattened_chunks)});"
         )
+        main_lines.append("    cycle_t1 = read_mcycle32();")
+        main_lines.append(f'    print_cycle_delta32("preload.{image_name}", cycle_t0, cycle_t1);')
         next_im_addr += len(flattened_chunks)
 
     for step in artifact.plan.steps:
@@ -316,15 +356,33 @@ def emit_cv32e40p_c(
             attr_decls, lines = _emit_host_step_attrs(step)
             decls.extend(attr_decls)
             main_lines.append(f'    printf("HostOp {step.kind}: {step.name}\\n");')
+            main_lines.append("    cycle_t0 = read_mcycle32();")
             main_lines.extend(lines)
+            main_lines.append("    cycle_t1 = read_mcycle32();")
+            main_lines.append(f'    print_cycle_delta32("hostop.{_sanitize(step.name)}", cycle_t0, cycle_t1);')
             continue
 
         if isinstance(step, NpuSegment):
             segment = artifact.segment_artifacts[step.name]
+            produced_inside = {op.out for op in step.ops}
+            cpu_suffix = f"__cpu_{_sanitize(step.name)}"
+            cpu_outputs = {op.out for op in step.ops}
+
+            def _segment_ref(name: str | None) -> str:
+                if name is None:
+                    return "NULL"
+                if emit_cpu_baseline and name in cpu_outputs:
+                    return _emit_tensor_reference(name, cpu_suffix)
+                return _emit_tensor_reference(name)
+
             main_lines.append(f'    printf("NpuSegment: {step.name}\\n");')
+            main_lines.append("    cycle_segment_t0 = read_mcycle32();")
+            main_lines.append("    cycle_t0 = read_mcycle32();")
             for tensor_name in step.inputs:
                 spec = artifact.plan.tensors[tensor_name]
                 if spec.kind == TensorKind.CONSTANT:
+                    continue
+                if tensor_name in produced_inside:
                     continue
                 symbol = segment.symbol_table[tensor_name]
                 main_lines.append(
@@ -340,12 +398,47 @@ def emit_cv32e40p_c(
                     f"{_emit_tensor_reference(symbol_name)}, 0x{int(symbol['addr']):04x}u, "
                     f"\"{symbol['role']}\", {int(symbol['precision'])}, {int(symbol['word_count'])});"
                 )
+            main_lines.append("    cycle_t1 = read_mcycle32();")
+            main_lines.append(f'    print_cycle_delta32("segment.{_sanitize(step.name)}.stage", cycle_t0, cycle_t1);')
+            main_lines.append("    cycle_t0 = read_mcycle32();")
             main_lines.append(f"    if (npu_run(0x{im_start_addrs[step.name]:04x}u) != 0) return EXIT_FAILURE;")
+            main_lines.append("    cycle_t1 = read_mcycle32();")
+            main_lines.append(f'    print_cycle_delta32("segment.{_sanitize(step.name)}.run", cycle_t0, cycle_t1);')
+            main_lines.append("    cycle_t0 = read_mcycle32();")
             for output_name in step.outputs:
                 symbol = segment.symbol_table[output_name]
                 main_lines.append(
-                    f"    read_role_c_tensor({_emit_tensor_reference(output_name)}, 0x{int(symbol['addr']):04x}u, {int(symbol['precision'])});"
+                    "    read_tensor_from_npu("
+                    f"{_emit_tensor_reference(output_name)}, 0x{int(symbol['addr']):04x}u, "
+                    f"\"{symbol['role']}\", {int(symbol['precision'])});"
                 )
+            main_lines.append("    cycle_t1 = read_mcycle32();")
+            main_lines.append(f'    print_cycle_delta32("segment.{_sanitize(step.name)}.readback", cycle_t0, cycle_t1);')
+            main_lines.append(f'    print_cycle_delta32("segment.{_sanitize(step.name)}.npu", cycle_segment_t0, cycle_t1);')
+
+            if emit_cpu_baseline:
+                main_lines.append("    cycle_t0 = read_mcycle32();")
+                for op in step.ops:
+                    main_lines.append(
+                        "    host_matmul("
+                        f"{_segment_ref(op.out)}, {_segment_ref(op.lhs)}, {_segment_ref(op.rhs)}, {_segment_ref(op.bias)}, "
+                        f"{int(op.multiplier)}, {int(op.shift)}, {_activation_code(op.activation)}, {int(op.h_gelu_x_scale_shift)});"
+                    )
+                main_lines.append("    cycle_t1 = read_mcycle32();")
+                main_lines.append(f'    print_cycle_delta32("segment.{_sanitize(step.name)}.cpu", cycle_t0, cycle_t1);')
+
+                if verify_cpu_baseline:
+                    for output_name in step.outputs:
+                        cpu_output_ref = _emit_tensor_reference(output_name, cpu_suffix)
+                        npu_output_ref = _emit_tensor_reference(output_name)
+                        main_lines.append(f"    if (!tensor_matches_expected({npu_output_ref}, {cpu_output_ref})) {{")
+                        main_lines.append(
+                            f'        printf("cpu baseline mismatch: segment {step.name} output {output_name}\\n");'
+                        )
+                        main_lines.append(f"        print_tensor({npu_output_ref});")
+                        main_lines.append(f"        print_tensor({cpu_output_ref});")
+                        main_lines.append("        return EXIT_FAILURE;")
+                        main_lines.append("    }")
             continue
 
         if isinstance(step, VerifyTensor):
@@ -389,6 +482,8 @@ def write_cv32e40p_c(
     *,
     program_name: str = "tinynpu_generated",
     defines_path: str | None = None,
+    emit_cpu_baseline: bool = False,
+    verify_cpu_baseline: bool = False,
 ) -> Path:
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -398,6 +493,8 @@ def write_cv32e40p_c(
             inputs,
             program_name=program_name,
             defines_path=defines_path,
+            emit_cpu_baseline=emit_cpu_baseline,
+            verify_cpu_baseline=verify_cpu_baseline,
         )
     )
     return output

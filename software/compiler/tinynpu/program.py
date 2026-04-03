@@ -2,7 +2,7 @@ import numpy as np
 import os
 import re
 import json
-from .isa import Opcode, HostCmd, PrecisionMode, MatMul, Move, Halt, generate_host_messages
+from .isa import Opcode, HostCmd, PrecisionMode, MatMul, Move, Halt, OutputLayout, generate_host_messages
 from .packer import Packer
 from .memory import MemoryManager
 
@@ -93,7 +93,21 @@ class TinyNPUProgram:
     def add_expected_result(self, name, data):
         self.expected_results[name] = np.array(data)
 
-    def matmul(self, a_name, b_name, out_name, bias_name=None, shift=0, multiplier=1, activation=0, in_precision=PrecisionMode.INT16, out_precision=PrecisionMode.INT16, write_offset=0):
+    def matmul(
+        self,
+        a_name,
+        b_name,
+        out_name,
+        bias_name=None,
+        shift=0,
+        multiplier=1,
+        activation=0,
+        in_precision=PrecisionMode.INT16,
+        out_precision=PrecisionMode.INT16,
+        write_offset=0,
+        h_gelu_x_scale_shift=7,
+        output_layout=OutputLayout.C,
+    ):
         if a_name not in self.symbols: raise ValueError(f"Symbol '{a_name}' not found.")
         if b_name not in self.symbols: raise ValueError(f"Symbol '{b_name}' not found.")
         A, B = self.symbols[a_name], self.symbols[b_name]
@@ -104,12 +118,17 @@ class TinyNPUProgram:
         if B.storage_role != 'C':
             B.storage_role = 'B'
         if A.shape[1] != B.shape[0]: raise ValueError(f"Dimension mismatch: {A.shape} and {B.shape}")
+        if output_layout == OutputLayout.A:
+            out_role = 'A'
+        elif output_layout == OutputLayout.B:
+            out_role = 'B'
+        else:
+            out_role = 'C'
         if out_name not in self.symbols:
             out_shape = (A.shape[0], B.shape[1])
-            self.symbols[out_name] = Symbol(out_name, out_shape, out_precision, role='C')
+            self.symbols[out_name] = Symbol(out_name, out_shape, out_precision, role=out_role)
         else:
-            # Update existing symbol to reflect it's now a MATMUL output
-            self.symbols[out_name].storage_role = 'C'
+            self.symbols[out_name].storage_role = out_role
             self.symbols[out_name].precision = out_precision
         if bias_name:
             if bias_name not in self.symbols:
@@ -117,7 +136,20 @@ class TinyNPUProgram:
                 self.symbols[bias_name] = Symbol(bias_name, bias_shape, PrecisionMode.INT16, role='BIAS')
             else:
                 self.symbols[bias_name].storage_role = 'BIAS'
-        instr = MatMul(a_name, b_name, out_name, bias_name, shift, multiplier, activation, in_precision, out_precision, write_offset)
+        instr = MatMul(
+            a_name,
+            b_name,
+            out_name,
+            bias_name,
+            shift,
+            multiplier,
+            activation,
+            in_precision,
+            out_precision,
+            write_offset,
+            h_gelu_x_scale_shift,
+            output_layout,
+        )
         p_in = 1 << (2 - in_precision)
         instr.m = (A.shape[0] + self.array_size - 1) // self.array_size
         k_phys = (A.shape[1] + p_in - 1) // p_in

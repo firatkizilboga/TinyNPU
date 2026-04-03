@@ -13,6 +13,9 @@ VERILOG_SOURCES += $(PWD)/../../rtl/skewer.sv
 VERILOG_SOURCES += $(PWD)/../../rtl/systolic_array.sv
 VERILOG_SOURCES += $(PWD)/../../rtl/pe.sv
 VERILOG_SOURCES += $(PWD)/../../rtl/ppu.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/di_exp.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/di_sigmoid.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/h_gelu.sv
 
 TOPLEVEL = tinynpu_top
 MODULE = test_compiler_top

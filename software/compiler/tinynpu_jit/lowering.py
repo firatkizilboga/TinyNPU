@@ -19,6 +19,7 @@ class SegmentCompiler:
         self.defines_path = defines_path
 
     def compile(self, plan: ExecutionPlan, expected_tensors: dict[str, np.ndarray]) -> CompiledArtifact:
+        self._annotate_output_layouts(plan)
         # Read UB capacity from hardware config
         _tmp = TinyNPUProgram(defines_path=self.defines_path)
         ub_capacity = int(_tmp.hw.params.get("BUFFER_DEPTH", 0))
@@ -51,6 +52,27 @@ class SegmentCompiler:
             memory_report=memory_report,
             static_ub_image=memory_report.static_ub_image,
         )
+
+    def _annotate_output_layouts(self, plan: ExecutionPlan) -> None:
+        for step in plan.steps:
+            if not isinstance(step, NpuSegment):
+                continue
+            for index, op in enumerate(step.ops):
+                if op.out in step.outputs:
+                    op.output_layout = "c"
+                    continue
+                later_uses: set[str] = set()
+                for later in step.ops[index + 1 :]:
+                    if later.lhs == op.out:
+                        later_uses.add("lhs")
+                    if later.rhs == op.out:
+                        later_uses.add("rhs")
+                if later_uses == {"lhs"}:
+                    op.output_layout = "a"
+                elif later_uses == {"rhs"}:
+                    op.output_layout = "b"
+                else:
+                    op.output_layout = "c"
 
     def _compile_npu_segment(
         self,
@@ -86,6 +108,18 @@ class SegmentCompiler:
             program.declare_data(name, data, precision=precision, role=role)
 
         for op in segment.ops:
+            activation = 0
+            if op.activation == "relu":
+                activation = 1
+            elif op.activation == "sigmoid":
+                activation = 2
+            elif op.activation == "h_gelu":
+                activation = 3
+            output_layout = 0
+            if op.output_layout == "a":
+                output_layout = 1
+            elif op.output_layout == "b":
+                output_layout = 2
             program.matmul(
                 op.lhs,
                 op.rhs,
@@ -93,9 +127,12 @@ class SegmentCompiler:
                 bias_name=op.bias,
                 shift=op.shift,
                 multiplier=op.multiplier,
-                activation=1 if op.activation == "relu" else 0,
+                activation=activation,
                 in_precision=to_precision_mode(op.in_dtype),
                 out_precision=to_precision_mode(op.out_dtype),
+                write_offset=0,
+                h_gelu_x_scale_shift=int(op.h_gelu_x_scale_shift),
+                output_layout=output_layout,
             )
 
         # Pre-assign globally planned addresses before compile() runs so that

@@ -12,8 +12,10 @@ module ppu (
     input logic [                    7:0] shift,
     input logic [                   15:0] multiplier,
     input logic [                    7:0] activation,
+    input logic [                    7:0] h_gelu_x_scale_shift,
     input logic [                    1:0] precision,
     input logic [                    1:0] write_offset,
+    input output_layout_t                 output_layout,
 
     // Data from Unified Buffer (for Bias Loading)
     input logic [`BUFFER_WIDTH-1:0] bias_in,
@@ -24,6 +26,9 @@ module ppu (
     // Output to Unified Buffer (64-bit vector)
     output logic [`BUFFER_WIDTH-1:0] ub_wdata
 );
+
+  localparam int INT4_WORDS_PER_TILE = (`ARRAY_SIZE / 4);
+  localparam int INT8_WORDS_PER_TILE = (`ARRAY_SIZE / 2);
 
   // Internal storage for one full tile (quantized to 16-bit)
   logic [15:0] storage [`ARRAY_SIZE-1:0] [`ARRAY_SIZE-1:0];
@@ -36,17 +41,25 @@ module ppu (
 
   // Logic for quantization pipeline
   logic [15:0] quantized_row[`ARRAY_SIZE-1:0];
+  logic signed [81:0] pre_activation_row[`ARRAY_SIZE-1:0];
+  logic signed [15:0] sigmoid_in_row[`ARRAY_SIZE-1:0];
+  logic [15:0] sigmoid_out_row[`ARRAY_SIZE-1:0];
+  logic signed [15:0] h_gelu_in_row[`ARRAY_SIZE-1:0];
+  logic signed [15:0] h_gelu_out_row[`ARRAY_SIZE-1:0];
+  logic [7:0] sigmoid_p_out;
 
   always_comb begin
+    unique case (precision)
+      2'b00: sigmoid_p_out = 8'd4;
+      2'b01: sigmoid_p_out = 8'd8;
+      default: sigmoid_p_out = 8'd16;
+    endcase
+
     for (int i = 0; i < `ARRAY_SIZE; i++) begin
       logic signed [64:0] biased_acc;
       logic signed [81:0] rescaled; // 65-bit * 17-bit = 82 bits
       logic signed [82:0] rounded;  // 83 bits for carry
       logic signed [81:0] shifted;
-      logic signed [3:0]  sat4;
-      logic signed [7:0]  sat8;
-      logic signed [15:0] sat16;
-      logic [15:0]        result_val;
 
       // A. High-Precision Bias Addition (32-bit Bias)
       biased_acc = $signed(acc_in[i]) + $signed({{33{bias_reg[i][31]}}, bias_reg[i]});
@@ -63,33 +76,87 @@ module ppu (
         shifted = rescaled;
       end
 
-      // D. Activation (ReLU) - Bit 0 of activation triggers ReLU
-      if (activation[0]) begin
-        if (shifted < 0) shifted = 0;
+      pre_activation_row[i] = shifted;
+
+      if (shifted > 32767) begin
+        sigmoid_in_row[i] = 16'sd32767;
+        h_gelu_in_row[i] = 16'sd32767;
+      end else if (shifted < -32768) begin
+        sigmoid_in_row[i] = -16'sd32768;
+        h_gelu_in_row[i] = -16'sd32768;
+      end else begin
+        sigmoid_in_row[i] = shifted[15:0];
+        h_gelu_in_row[i] = shifted[15:0];
+      end
+    end
+  end
+
+  generate
+    for (genvar i = 0; i < `ARRAY_SIZE; i++) begin : gen_sigmoid
+      di_sigmoid #(
+          .INPUT_WIDTH(16),
+          .OUTPUT_WIDTH(16)
+      ) u_di_sigmoid (
+          .x_in(sigmoid_in_row[i]),
+          .m_i(multiplier),
+          .k_i(shift),
+          .p_out(sigmoid_p_out),
+          .alpha_smooth(8'd1),
+          .y_out(sigmoid_out_row[i])
+      );
+
+      h_gelu #(
+          .INPUT_WIDTH(16),
+          .OUTPUT_WIDTH(16)
+      ) u_h_gelu (
+          .x_in(h_gelu_in_row[i]),
+          .x_scale_shift(h_gelu_x_scale_shift),
+          .slope_num(16'd218),
+          .slope_shift(8'd7),
+          .y_out(h_gelu_out_row[i])
+      );
+    end
+  endgenerate
+
+  always_comb begin
+    for (int i = 0; i < `ARRAY_SIZE; i++) begin
+      logic signed [81:0] activated;
+      logic signed [3:0]  sat4;
+      logic signed [7:0]  sat8;
+      logic signed [15:0] sat16;
+      logic [15:0]        result_val;
+
+      activated = pre_activation_row[i];
+
+      if (activation == 8'd1) begin
+        if (activated < 0) activated = 0;
+      end else if (activation == 8'd2) begin
+        activated = 82'(signed'({1'b0, sigmoid_out_row[i]}));
+      end else if (activation == 8'd3) begin
+        activated = 82'(signed'(h_gelu_out_row[i]));
       end
 
-      // E. Precision Saturation (Signed Ranges to match PE expectations)
       unique case (precision)
         2'b00: begin  // INT4: [-8, 7]
-          if (shifted > 7)       sat4 = 7;
-          else if (shifted < -8) sat4 = -8;
-          else                   sat4 = shifted[3:0];
+          if (activated > 7)       sat4 = 7;
+          else if (activated < -8) sat4 = -8;
+          else                     sat4 = activated[3:0];
           result_val = (16'(unsigned'(sat4))) << (write_offset * 4);
         end
         2'b01: begin  // INT8: [-128, 127]
-          if (shifted > 127)       sat8 = 127;
-          else if (shifted < -128) sat8 = -128;
-          else                     sat8 = shifted[7:0];
+          if (activated > 127)       sat8 = 127;
+          else if (activated < -128) sat8 = -128;
+          else                       sat8 = activated[7:0];
           result_val = (16'(unsigned'(sat8))) << (write_offset * 8);
         end
         default: begin  // INT16: [-32768, 32767]
-          if (shifted > 32767)       sat16 = 32767;
-          else if (shifted < -32768) sat16 = -32768;
-          else                       sat16 = shifted[15:0];
+          if (activated > 32767)       sat16 = 32767;
+          else if (activated < -32768) sat16 = -32768;
+          else                         sat16 = activated[15:0];
           result_val = 16'(unsigned'(sat16));
         end
       endcase
-      
+
       quantized_row[i] = result_val;
     end
   end
@@ -138,10 +205,58 @@ module ppu (
     end
   end
 
-  generate
-    for (genvar i = 0; i < `ARRAY_SIZE; i++) begin : gen_output
-      assign ub_wdata[i*16+:16] = storage[ppu_cycle_idx][i];
+  always_comb begin
+    ub_wdata = '0;
+    if (output_layout == OUT_LAYOUT_A) begin
+      unique case (precision)
+        2'b00: begin
+          if (ppu_cycle_idx < INT4_WORDS_PER_TILE) begin
+            for (int row = 0; row < `ARRAY_SIZE; row++) begin
+              logic [15:0] packed_word;
+              packed_word = '0;
+              for (int nib = 0; nib < 4; nib++) begin
+                packed_word |= (storage[row][(ppu_cycle_idx * 4) + nib] & 16'h000F) << (nib * 4);
+              end
+              ub_wdata[row*16 +: 16] = packed_word;
+            end
+          end
+        end
+        2'b01: begin
+          if (ppu_cycle_idx < INT8_WORDS_PER_TILE) begin
+            for (int row = 0; row < `ARRAY_SIZE; row++) begin
+              logic [15:0] packed_word;
+              packed_word = '0;
+              packed_word[7:0]  = storage[row][(ppu_cycle_idx * 2)][7:0];
+              packed_word[15:8] = storage[row][(ppu_cycle_idx * 2) + 1][7:0];
+              ub_wdata[row*16 +: 16] = packed_word;
+            end
+          end
+        end
+        default: begin
+          for (int row = 0; row < `ARRAY_SIZE; row++) begin
+            ub_wdata[row*16 +: 16] = storage[row][ppu_cycle_idx];
+          end
+        end
+      endcase
+    end else begin
+      unique case (precision)
+        2'b00: begin
+          for (int col = 0; col < `ARRAY_SIZE; col++) begin
+            ub_wdata[col*16 +: 16] = (storage[ppu_cycle_idx][col] & 16'h000F) << (write_offset * 4);
+          end
+        end
+        2'b01: begin
+          for (int col = 0; col < `ARRAY_SIZE; col++) begin
+            ub_wdata[col*16 +: 16] = (storage[ppu_cycle_idx][col] & 16'h00FF) << (write_offset * 8);
+          end
+        end
+        default: begin
+          for (int col = 0; col < `ARRAY_SIZE; col++) begin
+            ub_wdata[col*16 +: 16] = storage[ppu_cycle_idx][col];
+          end
+        end
+      endcase
     end
-  endgenerate
+  end
 
 endmodule

@@ -63,6 +63,45 @@ def test_emit_cv32e40p_c_for_two_segment_relu_chain():
     assert "host_relu" in source
     assert "write_tensor_to_npu(&x" in source
     assert "write_tensor_to_npu(&h_relu" in source
-    assert "read_role_c_tensor(&h" in source
-    assert "read_role_c_tensor(&y" in source
+    assert 'read_tensor_from_npu(&h, ' in source
+    assert 'read_tensor_from_npu(&y, ' in source
     assert "All outputs matched expected tensors" in source
+
+
+def test_emit_cv32e40p_c_with_cpu_baseline_for_segment():
+    x = np.array([[1, -2], [3, 4]], dtype=np.int16)
+    w = np.array([[2, 1], [0, -1]], dtype=np.int16)
+    bias = np.array([[1, -3]], dtype=np.int32)
+
+    tensors = {
+        "x": TensorSpec("x", x.shape, DType.INT16, TensorKind.INPUT),
+        "w": TensorSpec("w", w.shape, DType.INT16, TensorKind.CONSTANT, data=w),
+        "y_bias": TensorSpec("y_bias", bias.shape, DType.INT32, TensorKind.CONSTANT, data=bias),
+        "y": TensorSpec("y", (2, 2), DType.INT16, TensorKind.OUTPUT, is_final_output=True),
+    }
+    steps = [
+        NpuSegment(
+            "seg_cpu",
+            [MatMulOp("op0", "x", "w", "y", bias="y_bias", multiplier=3, shift=1, activation="relu")],
+            inputs=["x", "w", "y_bias"],
+            outputs=["y"],
+        ),
+    ]
+    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=["x"], outputs=["y"])
+    plan.add_verification_step("y", "final_y")
+
+    y = np.array([[5, 0], [10, 0]], dtype=np.int16)
+    artifact = compile_plan(plan, {"y": y})
+
+    source = emit_cv32e40p_c(
+        artifact,
+        {"x": x},
+        program_name="unit_test_cpu_baseline",
+        emit_cpu_baseline=True,
+        verify_cpu_baseline=True,
+    )
+
+    assert "host_matmul(&y__cpu_seg_cpu" in source
+    assert 'print_cycle_delta32("segment.seg_cpu.cpu"' in source
+    assert 'print_cycle_delta32("segment.seg_cpu.npu"' in source
+    assert 'cpu baseline mismatch: segment seg_cpu output y' in source

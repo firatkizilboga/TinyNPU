@@ -27,6 +27,7 @@ def npu_matmul(
     multiplier: int = 1,
     shift: int = 0,
     activation: str = "none",
+    h_gelu_x_scale_shift: int = 7,
     in_dtype: str = "int16",
     out_dtype: str = "int16",
     output_scale: float | None = None,
@@ -37,6 +38,10 @@ def npu_matmul(
     result = torch.matmul(lhs, rhs)
     if activation == "relu":
         return torch.relu(result)
+    if activation == "sigmoid":
+        return torch.sigmoid(result)
+    if activation == "h_gelu":
+        return torch.nn.functional.gelu(result)
     return result
 
 

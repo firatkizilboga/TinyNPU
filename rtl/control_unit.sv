@@ -48,9 +48,11 @@ module control_unit #(
     output logic [ 7:0]                    ppu_shift,
     output logic [15:0]                    ppu_multiplier,
     output logic [ 7:0]                    ppu_activation,
+    output logic [ 7:0]                    ppu_h_gelu_x_scale_shift,
     output logic [ 1:0]                    ppu_in_precision,
     output logic [ 1:0]                    ppu_out_precision,
     output logic [ 1:0]                    ppu_write_offset,
+    output output_layout_t                 ppu_output_layout,
 
     input logic all_done_in
 );
@@ -100,9 +102,11 @@ module control_unit #(
   logic [ 7:0] mm_shift;
   logic [15:0] mm_multiplier;
   logic [ 7:0] mm_activation;
+  logic [ 7:0] mm_h_gelu_x_scale_shift;
   logic [ 1:0] mm_in_precision;
   logic [ 1:0] mm_out_precision;
   logic [ 1:0] mm_write_offset;
+  output_layout_t mm_output_layout;
   logic [15:0] m_idx, n_idx, k_idx;
 
   // Flexible counter width for NxN support
@@ -134,7 +138,8 @@ module control_unit #(
       {latched_cmd, latched_addr, latched_mmvr, latched_arg} <= '0;
       {move_src, move_dest, move_count, move_phase} <= '0;
       {mm_a_base, mm_b_base, mm_c_base, mm_bias_base, mm_m_total, mm_k_total, mm_n_total} <= '0;
-      {mm_shift, mm_multiplier, mm_activation, mm_in_precision, mm_out_precision, mm_write_offset} <= '0;
+      {mm_shift, mm_multiplier, mm_activation, mm_h_gelu_x_scale_shift, mm_in_precision, mm_out_precision, mm_write_offset} <= '0;
+      mm_output_layout <= OUT_LAYOUT_C;
       {m_idx, n_idx, k_idx, cycle_cnt} <= '0;
       perf_total_cycles <= '0;
       for (int perf_i = 0; perf_i < CTRL_STATE_COUNT; perf_i++) begin
@@ -182,6 +187,8 @@ module control_unit #(
         mm_out_precision  <= im_rdata[87:86];
         mm_write_offset   <= im_rdata[85:84];
         mm_in_precision   <= im_rdata[83:82];
+        mm_h_gelu_x_scale_shift <= im_rdata[81:74];
+        mm_output_layout  <= output_layout_t'(im_rdata[73:72]);
         m_idx <= '0;
         n_idx <= '0;
         k_idx <= '0;
@@ -208,6 +215,11 @@ module control_unit #(
     logic [ 1:0] packed_write_offset;
     logic [15:0] m_idx_packed;
     logic [15:0] m_total_packed;
+    logic [15:0] n_idx_packed;
+    logic [15:0] n_total_packed;
+    logic [$clog2(`ARRAY_SIZE)-1:0]   a_word_base;
+    logic [$clog2(`ARRAY_SIZE+1)-1:0] a_words_per_tile;
+    logic        wb_valid_cycle;
 
     always_comb begin
         unique case (mm_out_precision)
@@ -215,18 +227,31 @@ module control_unit #(
                 m_idx_packed     = m_idx >> 2;
                 packed_write_offset = m_idx[1:0];
                 m_total_packed   = (mm_m_total + 16'd3) >> 2;
+                n_idx_packed     = n_idx >> 2;
+                n_total_packed   = (mm_n_total + 16'd3) >> 2;
+                a_word_base      = (n_idx[1:0] * (`ARRAY_SIZE / 4));
+                a_words_per_tile = (`ARRAY_SIZE / 4);
             end
             2'b01: begin // INT8: 2 tiles per word
                 m_idx_packed     = m_idx >> 1;
                 packed_write_offset = {1'b0, m_idx[0]};
                 m_total_packed   = (mm_m_total + 16'd1) >> 1;
+                n_idx_packed     = n_idx >> 1;
+                n_total_packed   = (mm_n_total + 16'd1) >> 1;
+                a_word_base      = (n_idx[0] * (`ARRAY_SIZE / 2));
+                a_words_per_tile = (`ARRAY_SIZE / 2);
             end
             default: begin // INT16: 1 tile per word
                 m_idx_packed     = m_idx;
                 packed_write_offset = 2'b0;
                 m_total_packed   = mm_m_total;
+                n_idx_packed     = n_idx;
+                n_total_packed   = mm_n_total;
+                a_word_base      = '0;
+                a_words_per_tile = `ARRAY_SIZE;
             end
         endcase
+        wb_valid_cycle = (mm_output_layout != OUT_LAYOUT_A) || (cycle_cnt < a_words_per_tile);
     end
 
     always_comb begin
@@ -256,9 +281,11 @@ module control_unit #(
         ppu_shift = mm_shift;
         ppu_multiplier = mm_multiplier;
         ppu_activation = mm_activation;
+        ppu_h_gelu_x_scale_shift = mm_h_gelu_x_scale_shift;
         ppu_in_precision = mm_in_precision;
         ppu_out_precision = mm_out_precision;
-        ppu_write_offset = packed_write_offset;
+        ppu_write_offset = (mm_output_layout == OUT_LAYOUT_A) ? 2'b0 : packed_write_offset;
+        ppu_output_layout = mm_output_layout;
         mmvr_wr_en = 1'b0;
         mmvr_out = '0;
 
@@ -480,12 +507,14 @@ module control_unit #(
       CTRL_MM_WRITEBACK: begin
         status_out = `STATUS_BUSY;
         ub_req = 1'b1;
-        ub_wr_en = 1'b1;
-        ppu_wb_en = 1'b1;
+        ub_wr_en = wb_valid_cycle;
+        ppu_wb_en = wb_valid_cycle;
 
-        // Writeback Address: pack consecutive M-tiles into the same physical word.
-        // This makes output compatible with Input B (Top Matrix) packing for Layer 2.
-        ub_addr = mm_c_base + (m_idx_packed * mm_n_total * `ARRAY_SIZE) + (n_idx * `ARRAY_SIZE) + cycle_cnt;
+        if (mm_output_layout == OUT_LAYOUT_A) begin
+          ub_addr = mm_c_base + (m_idx * n_total_packed * `ARRAY_SIZE) + (n_idx_packed * `ARRAY_SIZE) + a_word_base + cycle_cnt;
+        end else begin
+          ub_addr = mm_c_base + (m_idx_packed * mm_n_total * `ARRAY_SIZE) + (n_idx * `ARRAY_SIZE) + cycle_cnt;
+        end
 
         if (cycle_cnt == (`ARRAY_SIZE - 1)) begin
           cycle_next = '0;

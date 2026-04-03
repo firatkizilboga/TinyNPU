@@ -41,9 +41,11 @@ module ubss #(
     input  logic [ 7:0]                    ppu_shift,
     input  logic [15:0]                    ppu_multiplier,
     input  logic [ 7:0]                    ppu_activation,
+    input  logic [ 7:0]                    ppu_h_gelu_x_scale_shift,
     input  logic [ 1:0]                    ppu_in_precision,
     input  logic [ 1:0]                    ppu_out_precision,
     input  logic [ 1:0]                    ppu_write_offset,
+    input  output_layout_t                 ppu_output_layout,
 
     // ------------------------------------------------------------------------
     // Outputs
@@ -62,19 +64,23 @@ module ubss #(
     always_comb begin
         ub_wr_mask = '1; // Default: Write all bits (for MMIO/Load)
         if (ppu_wb_en) begin
-            unique case (ppu_out_precision)
-                2'b00: begin // INT4
-                    for (int i=0; i<`ARRAY_SIZE; i++) 
-                        ub_wr_mask[i*16 +: 16] = 16'h000F << (ppu_write_offset * 4);
-                end
-                2'b01: begin // INT8
-                    for (int i=0; i<`ARRAY_SIZE; i++)
-                        ub_wr_mask[i*16 +: 16] = 16'h00FF << (ppu_write_offset * 8);
-                end
-                default: begin // INT16 (2'b10)
-                    ub_wr_mask = '1;
-                end
-            endcase
+            if (ppu_output_layout == OUT_LAYOUT_A) begin
+                ub_wr_mask = '1;
+            end else begin
+                unique case (ppu_out_precision)
+                    2'b00: begin // INT4
+                        for (int i=0; i<`ARRAY_SIZE; i++) 
+                            ub_wr_mask[i*16 +: 16] = 16'h000F << (ppu_write_offset * 4);
+                    end
+                    2'b01: begin // INT8
+                        for (int i=0; i<`ARRAY_SIZE; i++)
+                            ub_wr_mask[i*16 +: 16] = 16'h00FF << (ppu_write_offset * 8);
+                    end
+                    default: begin // INT16 (2'b10)
+                        ub_wr_mask = '1;
+                    end
+                endcase
+            end
         end
     end
 
@@ -234,11 +240,13 @@ module ubss #(
               .bias_en       (ppu_bias_en),
               .bias_clear    (ppu_bias_clear),
               .ppu_cycle_idx (ppu_cycle_idx),
-              .shift         (ppu_shift),
+        .shift         (ppu_shift),
         .multiplier(ppu_multiplier),
         .activation(ppu_activation),
+        .h_gelu_x_scale_shift(ppu_h_gelu_x_scale_shift),
         .precision(ppu_out_precision),
         .write_offset(ppu_write_offset),
+        .output_layout(ppu_output_layout),
         .bias_in(cu_rdata),
         .acc_in(bottom_row_acc),
         .ub_wdata(ppu_wdata)
