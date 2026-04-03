@@ -258,9 +258,12 @@ def emit_cv32e40p_c(
     defines_path: str | None = None,
     emit_cpu_baseline: bool = False,
     verify_cpu_baseline: bool = False,
+    repeat_count: int = 1,
 ) -> str:
     if verify_cpu_baseline and not emit_cpu_baseline:
         raise ValueError("verify_cpu_baseline requires emit_cpu_baseline=True.")
+    if repeat_count < 1:
+        raise ValueError("repeat_count must be >= 1.")
 
     for name in artifact.plan.inputs:
         if name not in inputs:
@@ -284,6 +287,16 @@ def emit_cv32e40p_c(
         f'    printf("TinyNPU bare-metal program: {program_name}\\n");',
         "    tb_timer_reset_counter();",
     ]
+    if repeat_count > 1:
+        main_lines.extend(
+            [
+                "    uint32_t delta = 0;",
+                "    uint32_t preload_total = 0;",
+                "    uint32_t host_total = 0;",
+                "    uint32_t segment_npu_total = 0;",
+                "    uint32_t segment_cpu_total = 0;",
+            ]
+        )
     verify_lines: list[str] = []
 
     tensor_names_emitted: set[str] = set()
@@ -326,6 +339,9 @@ def emit_cv32e40p_c(
             f"    load_ub_image(0u, tinynpu_static_ub_image, {len(artifact.static_ub_image)});"
         )
         main_lines.append("    cycle_t1 = read_mcycle32();")
+        if repeat_count > 1:
+            main_lines.append("    delta = cycle_t0 - cycle_t1;")
+            main_lines.append("    preload_total += delta;")
         main_lines.append('    print_cycle_delta32("preload.ub_image", cycle_t0, cycle_t1);')
 
     im_start_addrs: dict[str, int] = {}
@@ -348,18 +364,34 @@ def emit_cv32e40p_c(
             f"    load_im_image(0x{next_im_addr:04x}u, {image_name}, {len(flattened_chunks)});"
         )
         main_lines.append("    cycle_t1 = read_mcycle32();")
+        if repeat_count > 1:
+            main_lines.append("    delta = cycle_t0 - cycle_t1;")
+            main_lines.append("    preload_total += delta;")
         main_lines.append(f'    print_cycle_delta32("preload.{image_name}", cycle_t0, cycle_t1);')
         next_im_addr += len(flattened_chunks)
+
+    body_lines: list[str] = []
 
     for step in artifact.plan.steps:
         if isinstance(step, HostOp):
             attr_decls, lines = _emit_host_step_attrs(step)
             decls.extend(attr_decls)
-            main_lines.append(f'    printf("HostOp {step.kind}: {step.name}\\n");')
-            main_lines.append("    cycle_t0 = read_mcycle32();")
-            main_lines.extend(lines)
-            main_lines.append("    cycle_t1 = read_mcycle32();")
-            main_lines.append(f'    print_cycle_delta32("hostop.{_sanitize(step.name)}", cycle_t0, cycle_t1);')
+            if repeat_count > 1:
+                body_lines.append(f'    if (repeat_iter == 0) printf("HostOp {step.kind}: {step.name}\\n");')
+                body_lines.append("    cycle_t0 = read_mcycle32();")
+                body_lines.extend(lines)
+                body_lines.append("    cycle_t1 = read_mcycle32();")
+                body_lines.append("    delta = cycle_t0 - cycle_t1;")
+                body_lines.append("    host_total += delta;")
+                body_lines.append(
+                    f'    if (repeat_iter == 0) print_cycle_delta32("hostop.{_sanitize(step.name)}", cycle_t0, cycle_t1);'
+                )
+            else:
+                body_lines.append(f'    printf("HostOp {step.kind}: {step.name}\\n");')
+                body_lines.append("    cycle_t0 = read_mcycle32();")
+                body_lines.extend(lines)
+                body_lines.append("    cycle_t1 = read_mcycle32();")
+                body_lines.append(f'    print_cycle_delta32("hostop.{_sanitize(step.name)}", cycle_t0, cycle_t1);')
             continue
 
         if isinstance(step, NpuSegment):
@@ -375,9 +407,12 @@ def emit_cv32e40p_c(
                     return _emit_tensor_reference(name, cpu_suffix)
                 return _emit_tensor_reference(name)
 
-            main_lines.append(f'    printf("NpuSegment: {step.name}\\n");')
-            main_lines.append("    cycle_segment_t0 = read_mcycle32();")
-            main_lines.append("    cycle_t0 = read_mcycle32();")
+            if repeat_count > 1:
+                body_lines.append(f'    if (repeat_iter == 0) printf("NpuSegment: {step.name}\\n");')
+            else:
+                body_lines.append(f'    printf("NpuSegment: {step.name}\\n");')
+            body_lines.append("    cycle_segment_t0 = read_mcycle32();")
+            body_lines.append("    cycle_t0 = read_mcycle32();")
             for tensor_name in step.inputs:
                 spec = artifact.plan.tensors[tensor_name]
                 if spec.kind == TensorKind.CONSTANT:
@@ -385,7 +420,7 @@ def emit_cv32e40p_c(
                 if tensor_name in produced_inside:
                     continue
                 symbol = segment.symbol_table[tensor_name]
-                main_lines.append(
+                body_lines.append(
                     "    write_tensor_to_npu("
                     f"{_emit_tensor_reference(tensor_name)}, 0x{int(symbol['addr']):04x}u, "
                     f"\"{symbol['role']}\", {int(symbol['precision'])}, {int(symbol['word_count'])});"
@@ -393,52 +428,79 @@ def emit_cv32e40p_c(
             for symbol_name, symbol in sorted(segment.symbol_table.items()):
                 if symbol["role"] != "BIAS":
                     continue
-                main_lines.append(
+                body_lines.append(
                     "    write_tensor_to_npu("
                     f"{_emit_tensor_reference(symbol_name)}, 0x{int(symbol['addr']):04x}u, "
                     f"\"{symbol['role']}\", {int(symbol['precision'])}, {int(symbol['word_count'])});"
                 )
-            main_lines.append("    cycle_t1 = read_mcycle32();")
-            main_lines.append(f'    print_cycle_delta32("segment.{_sanitize(step.name)}.stage", cycle_t0, cycle_t1);')
-            main_lines.append("    cycle_t0 = read_mcycle32();")
-            main_lines.append(f"    if (npu_run(0x{im_start_addrs[step.name]:04x}u) != 0) return EXIT_FAILURE;")
-            main_lines.append("    cycle_t1 = read_mcycle32();")
-            main_lines.append(f'    print_cycle_delta32("segment.{_sanitize(step.name)}.run", cycle_t0, cycle_t1);')
-            main_lines.append("    cycle_t0 = read_mcycle32();")
+            body_lines.append("    cycle_t1 = read_mcycle32();")
+            if repeat_count > 1:
+                body_lines.append(
+                    f'    if (repeat_iter == 0) print_cycle_delta32("segment.{_sanitize(step.name)}.stage", cycle_t0, cycle_t1);'
+                )
+            else:
+                body_lines.append(f'    print_cycle_delta32("segment.{_sanitize(step.name)}.stage", cycle_t0, cycle_t1);')
+            body_lines.append("    cycle_t0 = read_mcycle32();")
+            body_lines.append(f"    if (npu_run(0x{im_start_addrs[step.name]:04x}u) != 0) return EXIT_FAILURE;")
+            body_lines.append("    cycle_t1 = read_mcycle32();")
+            if repeat_count > 1:
+                body_lines.append(
+                    f'    if (repeat_iter == 0) print_cycle_delta32("segment.{_sanitize(step.name)}.run", cycle_t0, cycle_t1);'
+                )
+            else:
+                body_lines.append(f'    print_cycle_delta32("segment.{_sanitize(step.name)}.run", cycle_t0, cycle_t1);')
+            body_lines.append("    cycle_t0 = read_mcycle32();")
             for output_name in step.outputs:
                 symbol = segment.symbol_table[output_name]
-                main_lines.append(
+                body_lines.append(
                     "    read_tensor_from_npu("
                     f"{_emit_tensor_reference(output_name)}, 0x{int(symbol['addr']):04x}u, "
                     f"\"{symbol['role']}\", {int(symbol['precision'])});"
                 )
-            main_lines.append("    cycle_t1 = read_mcycle32();")
-            main_lines.append(f'    print_cycle_delta32("segment.{_sanitize(step.name)}.readback", cycle_t0, cycle_t1);')
-            main_lines.append(f'    print_cycle_delta32("segment.{_sanitize(step.name)}.npu", cycle_segment_t0, cycle_t1);')
+            body_lines.append("    cycle_t1 = read_mcycle32();")
+            if repeat_count > 1:
+                body_lines.append("    delta = cycle_segment_t0 - cycle_t1;")
+                body_lines.append("    segment_npu_total += delta;")
+                body_lines.append(
+                    f'    if (repeat_iter == 0) print_cycle_delta32("segment.{_sanitize(step.name)}.readback", cycle_t0, cycle_t1);'
+                )
+                body_lines.append(
+                    f'    if (repeat_iter == 0) print_cycle_delta32("segment.{_sanitize(step.name)}.npu", cycle_segment_t0, cycle_t1);'
+                )
+            else:
+                body_lines.append(f'    print_cycle_delta32("segment.{_sanitize(step.name)}.readback", cycle_t0, cycle_t1);')
+                body_lines.append(f'    print_cycle_delta32("segment.{_sanitize(step.name)}.npu", cycle_segment_t0, cycle_t1);')
 
             if emit_cpu_baseline:
-                main_lines.append("    cycle_t0 = read_mcycle32();")
+                body_lines.append("    cycle_t0 = read_mcycle32();")
                 for op in step.ops:
-                    main_lines.append(
+                    body_lines.append(
                         "    host_matmul("
                         f"{_segment_ref(op.out)}, {_segment_ref(op.lhs)}, {_segment_ref(op.rhs)}, {_segment_ref(op.bias)}, "
                         f"{int(op.multiplier)}, {int(op.shift)}, {_activation_code(op.activation)}, {int(op.h_gelu_x_scale_shift)});"
                     )
-                main_lines.append("    cycle_t1 = read_mcycle32();")
-                main_lines.append(f'    print_cycle_delta32("segment.{_sanitize(step.name)}.cpu", cycle_t0, cycle_t1);')
+                body_lines.append("    cycle_t1 = read_mcycle32();")
+                if repeat_count > 1:
+                    body_lines.append("    delta = cycle_t0 - cycle_t1;")
+                    body_lines.append("    segment_cpu_total += delta;")
+                    body_lines.append(
+                        f'    if (repeat_iter == 0) print_cycle_delta32("segment.{_sanitize(step.name)}.cpu", cycle_t0, cycle_t1);'
+                    )
+                else:
+                    body_lines.append(f'    print_cycle_delta32("segment.{_sanitize(step.name)}.cpu", cycle_t0, cycle_t1);')
 
                 if verify_cpu_baseline:
                     for output_name in step.outputs:
                         cpu_output_ref = _emit_tensor_reference(output_name, cpu_suffix)
                         npu_output_ref = _emit_tensor_reference(output_name)
-                        main_lines.append(f"    if (!tensor_matches_expected({npu_output_ref}, {cpu_output_ref})) {{")
-                        main_lines.append(
+                        body_lines.append(f"    if (!tensor_matches_expected({npu_output_ref}, {cpu_output_ref})) {{")
+                        body_lines.append(
                             f'        printf("cpu baseline mismatch: segment {step.name} output {output_name}\\n");'
                         )
-                        main_lines.append(f"        print_tensor({npu_output_ref});")
-                        main_lines.append(f"        print_tensor({cpu_output_ref});")
-                        main_lines.append("        return EXIT_FAILURE;")
-                        main_lines.append("    }")
+                        body_lines.append(f"        print_tensor({npu_output_ref});")
+                        body_lines.append(f"        print_tensor({cpu_output_ref});")
+                        body_lines.append("        return EXIT_FAILURE;")
+                        body_lines.append("    }")
             continue
 
         if isinstance(step, VerifyTensor):
@@ -458,6 +520,38 @@ def emit_cv32e40p_c(
                 verify_lines.append(f"        print_tensor({_emit_tensor_reference(step.tensor_name, '_expected')});")
                 verify_lines.append("        return EXIT_FAILURE;")
                 verify_lines.append("    }")
+
+    if repeat_count > 1:
+        main_lines.append(f"    for (int repeat_iter = 0; repeat_iter < {repeat_count}; ++repeat_iter) {{")
+        main_lines.extend([f"    {line}" for line in body_lines])
+        main_lines.append("    }")
+        main_lines.append(f'    printf("repeat.count=%d\\n", {repeat_count});')
+        main_lines.append('    printf("repeat.preload.total cycles=%lu\\n", (unsigned long)preload_total);')
+        main_lines.append('    printf("repeat.host.shared.total cycles=%lu\\n", (unsigned long)host_total);')
+        main_lines.append('    printf("repeat.segment.npu.total cycles=%lu\\n", (unsigned long)segment_npu_total);')
+        main_lines.append(
+            '    printf("repeat.program.npu.hot.total cycles=%lu\\n", (unsigned long)(host_total + segment_npu_total));'
+        )
+        main_lines.append(
+            '    printf("repeat.program.npu.cold.total cycles=%lu\\n", (unsigned long)(preload_total + host_total + segment_npu_total));'
+        )
+        main_lines.append(
+            '    printf("repeat.program.npu.hot.avg cycles=%lu\\n", (unsigned long)((host_total + segment_npu_total) / (uint32_t)'
+            f"{repeat_count}"
+            '));'
+        )
+        if emit_cpu_baseline:
+            main_lines.append('    printf("repeat.segment.cpu.total cycles=%lu\\n", (unsigned long)segment_cpu_total);')
+            main_lines.append(
+                '    printf("repeat.program.cpu.hot.total cycles=%lu\\n", (unsigned long)(host_total + segment_cpu_total));'
+            )
+            main_lines.append(
+                '    printf("repeat.program.cpu.hot.avg cycles=%lu\\n", (unsigned long)((host_total + segment_cpu_total) / (uint32_t)'
+                f"{repeat_count}"
+                '));'
+            )
+    else:
+        main_lines.extend(body_lines)
 
     main_lines.append('    printf("Final outputs:\\n");')
     for output_name in artifact.plan.outputs:
@@ -484,6 +578,7 @@ def write_cv32e40p_c(
     defines_path: str | None = None,
     emit_cpu_baseline: bool = False,
     verify_cpu_baseline: bool = False,
+    repeat_count: int = 1,
 ) -> Path:
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -495,6 +590,7 @@ def write_cv32e40p_c(
             defines_path=defines_path,
             emit_cpu_baseline=emit_cpu_baseline,
             verify_cpu_baseline=verify_cpu_baseline,
+            repeat_count=repeat_count,
         )
     )
     return output

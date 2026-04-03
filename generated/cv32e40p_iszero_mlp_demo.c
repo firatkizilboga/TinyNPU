@@ -607,34 +607,132 @@ static void host_im2col(
     }
 }
 
-static int64_t floor_div_i64(int64_t numer, int64_t denom)
+typedef union {
+    int64_t s64;
+    struct {
+        uint32_t lo;
+        int32_t hi;
+    } words;
+} HostI64Bits;
+
+static int32_t host_floor_div_i32(int32_t numer, int32_t denom)
 {
     runtime_assert(denom != 0, "division by zero");
-    int64_t quot = numer / denom;
-    int64_t rem = numer % denom;
+    int32_t quot = numer / denom;
+    int32_t rem = numer % denom;
     if (rem != 0 && ((rem < 0) != (denom < 0))) {
         quot -= 1;
     }
     return quot;
 }
 
+static int32_t host_round_shift_i32(int32_t value, int32_t shift)
+{
+    if (shift <= 0) {
+        return value;
+    }
+    runtime_assert(shift < 31, "32-bit rounded shift requires shift < 31");
+
+    uint32_t magnitude = value < 0 ? (uint32_t)(-(value + 1)) + 1u : (uint32_t)value;
+    magnitude += (uint32_t)(1u << (shift - 1));
+    magnitude >>= shift;
+    if (value >= 0) {
+        runtime_assert(magnitude <= 0x7fffffffu, "32-bit rounded shift overflow");
+        return (int32_t)magnitude;
+    }
+    if (magnitude == 0x80000000u) {
+        return INT32_MIN;
+    }
+    runtime_assert(magnitude <= 0x7fffffffu, "32-bit rounded shift overflow");
+    return -(int32_t)magnitude;
+}
+
+static int32_t host_round_div_signed_u32(uint32_t numer_abs, uint32_t denom, int negative)
+{
+    runtime_assert(denom > 0u, "round_div requires positive denom");
+    uint32_t rounded = (numer_abs + (denom / 2u)) / denom;
+    if (!negative) {
+        runtime_assert(rounded <= 0x7fffffffu, "rounded division overflow");
+        return (int32_t)rounded;
+    }
+    if (rounded == 0x80000000u) {
+        return INT32_MIN;
+    }
+    runtime_assert(rounded <= 0x7fffffffu, "rounded division overflow");
+    return -(int32_t)rounded;
+}
+
+static int32_t host_round_shift_i64_to_i32(int64_t value, int32_t shift)
+{
+    if (shift <= 0) {
+        runtime_assert(value >= (int64_t)INT32_MIN && value <= (int64_t)INT32_MAX, "requantized value overflow");
+        return (int32_t)value;
+    }
+    runtime_assert(shift < 64, "64-bit rounded shift requires shift < 64");
+    runtime_assert(value != INT64_MIN, "64-bit rounded shift does not support INT64_MIN");
+
+    int negative = value < 0;
+    HostI64Bits bits = {.s64 = negative ? -value : value};
+    uint32_t lo = bits.words.lo;
+    uint32_t hi = (uint32_t)bits.words.hi;
+    int round_shift = shift - 1;
+
+    if (round_shift < 32) {
+        uint32_t add_lo = 1u << round_shift;
+        uint32_t prev_lo = lo;
+        lo += add_lo;
+        if (lo < prev_lo) {
+            hi += 1u;
+        }
+    } else {
+        hi += 1u << (round_shift - 32);
+    }
+
+    uint32_t out_lo = 0u;
+    uint32_t out_hi = 0u;
+    if (shift < 32) {
+        out_lo = (lo >> shift) | (hi << (32 - shift));
+        out_hi = hi >> shift;
+    } else if (shift == 32) {
+        out_lo = hi;
+    } else {
+        out_lo = hi >> (shift - 32);
+    }
+
+    if (!negative) {
+        runtime_assert(out_hi == 0u && out_lo <= 0x7fffffffu, "requantized value overflow");
+        return (int32_t)out_lo;
+    }
+    runtime_assert(out_hi == 0u && out_lo <= 0x80000000u, "requantized value overflow");
+    if (out_lo == 0x80000000u) {
+        return INT32_MIN;
+    }
+    return -(int32_t)out_lo;
+}
+
 static int32_t host_di_exp(int32_t x_in, int32_t m_i, int32_t k_i)
 {
     runtime_assert(m_i > 0, "di_exp requires positive m_i");
-    runtime_assert(k_i >= 0, "di_exp requires non-negative k_i");
+    runtime_assert(k_i >= 0 && k_i < 31, "di_exp fast path requires 0 <= k_i < 31");
 
-    int64_t m_f = (int64_t)m_i + ((int64_t)m_i >> 1) - ((int64_t)m_i >> 4);
+    int32_t m_f = m_i + (m_i >> 1) - (m_i >> 4);
     runtime_assert(m_f > 0, "di_exp derived m_f must be positive");
 
-    int64_t s_i = ((((int64_t)1) << k_i) + (m_f / 2)) / m_f;
+    uint32_t s_i_u = ((1u << k_i) + (uint32_t)(m_f / 2)) / (uint32_t)m_f;
+    runtime_assert(s_i_u <= 0x7fffffffu, "di_exp derived s_i overflow");
+    int32_t s_i = (int32_t)s_i_u;
     runtime_assert(s_i > 0, "di_exp derived s_i must be positive");
 
-    int64_t t = -s_i;
-    int64_t q_i = floor_div_i64((int64_t)x_in, t);
-    int64_t r_i = (int64_t)x_in - (q_i * t);
-    int64_t unshifted_exp = (r_i >> 1) - t;
-    int64_t result = unshifted_exp >> q_i;
-    return (int32_t)(result > 0 ? result : 0);
+    int32_t t = -s_i;
+    int32_t q_i = host_floor_div_i32(x_in, t);
+    runtime_assert(q_i >= 0, "di_exp expects non-positive input");
+    int32_t r_i = x_in - (q_i * t);
+    int32_t unshifted_exp = (r_i >> 1) - t;
+    if (q_i >= 31) {
+        return 0;
+    }
+    int32_t result = unshifted_exp >> q_i;
+    return result > 0 ? result : 0;
 }
 
 static int32_t host_int_div_prob(int32_t numer, int32_t denom, int32_t p_out)
@@ -642,14 +740,15 @@ static int32_t host_int_div_prob(int32_t numer, int32_t denom, int32_t p_out)
     runtime_assert(p_out > 0, "probability width must be positive");
     runtime_assert(denom > 0, "probability denominator must be positive");
     int32_t scale = (1 << (p_out - 1)) - 1;
-    return (int32_t)((((int64_t)numer * (int64_t)scale) + (denom / 2)) / denom);
+    runtime_assert(scale == 0 || numer <= (INT32_MAX / scale), "sigmoid scaling overflow");
+    return (int32_t)(((numer * scale) + (denom / 2)) / denom);
 }
 
 static int32_t host_di_sigmoid(int32_t x_in, int32_t m_i, int32_t k_i, int32_t p_out, int32_t alpha_smooth)
 {
     runtime_assert(alpha_smooth > 0, "sigmoid smoothing must be positive");
 
-    int32_t x_smoothed = (int32_t)floor_div_i64((int64_t)x_in, (int64_t)alpha_smooth);
+    int32_t x_smoothed = host_floor_div_i32(x_in, alpha_smooth);
     int32_t exp_zero = host_di_exp(0, m_i, k_i);
     int32_t exp_term = 0;
     int32_t numer = 0;
@@ -665,38 +764,17 @@ static int32_t host_di_sigmoid(int32_t x_in, int32_t m_i, int32_t k_i, int32_t p
     return host_int_div_prob(numer, exp_zero + exp_term, p_out);
 }
 
-static int32_t host_round_shift_signed(int64_t value, int32_t shift)
-{
-    if (shift <= 0) {
-        return (int32_t)value;
-    }
-    int64_t rounder = ((int64_t)1) << (shift - 1);
-    if (value >= 0) {
-        return (int32_t)((value + rounder) >> shift);
-    }
-    return (int32_t)(-(((-value) + rounder) >> shift));
-}
-
-static int32_t host_round_div_signed(int64_t numer, int32_t denom)
-{
-    runtime_assert(denom > 0, "round_div requires positive denom");
-    int32_t half = denom / 2;
-    if (numer >= 0) {
-        return (int32_t)((numer + half) / denom);
-    }
-    return (int32_t)(-(((-numer) + half) / denom));
-}
-
 static int32_t host_h_gelu_i32(int32_t x_in, int32_t x_scale_shift)
 {
     runtime_assert(x_scale_shift >= 0, "h_gelu scale shift must be non-negative");
     const int32_t slope_num = 218;
     const int32_t slope_shift = 7;
+    runtime_assert(x_scale_shift < 28, "h_gelu scale shift too large for 32-bit denom");
     const int32_t scale_denom = 1 << x_scale_shift;
     const int32_t three_int = 3 * scale_denom;
     const int32_t six_int = 6 * scale_denom;
 
-    int32_t slope_term = host_round_shift_signed((int64_t)x_in * (int64_t)slope_num, slope_shift);
+    int32_t slope_term = host_round_shift_i32(x_in * slope_num, slope_shift);
     int32_t gate_int = slope_term + three_int;
     if (gate_int < 0) {
         gate_int = 0;
@@ -704,7 +782,11 @@ static int32_t host_h_gelu_i32(int32_t x_in, int32_t x_scale_shift)
     if (gate_int > six_int) {
         gate_int = six_int;
     }
-    return host_round_div_signed((int64_t)x_in * (int64_t)gate_int, six_int);
+
+    uint32_t abs_x = x_in < 0 ? (uint32_t)(-(x_in + 1)) + 1u : (uint32_t)x_in;
+    uint64_t numer_check = (uint64_t)abs_x * (uint64_t)(uint32_t)gate_int;
+    runtime_assert(numer_check <= 0xffffffffu, "h_gelu fast path overflow");
+    return host_round_div_signed_u32((uint32_t)numer_check, (uint32_t)six_int, x_in < 0);
 }
 
 static int32_t host_apply_ppu(
@@ -718,24 +800,22 @@ static int32_t host_apply_ppu(
 {
     int64_t value = acc + (int64_t)((int32_t)bias);
     value *= (int64_t)(multiplier & 0xFFFF);
-    if (shift > 0) {
-        value = (value + (((int64_t)1) << (shift - 1))) >> shift;
-    }
+    int32_t requantized = host_round_shift_i64_to_i32(value, shift);
 
     if (activation == HOST_ACT_RELU) {
-        if (value < 0) {
-            value = 0;
+        if (requantized < 0) {
+            requantized = 0;
         }
     } else if (activation == HOST_ACT_SIGMOID) {
         int32_t p_out = out_dtype == TINY_DTYPE_INT4 ? 4 : out_dtype == TINY_DTYPE_INT8 ? 8 : 16;
-        int32_t clamped = clip_for_output_dtype(value, TINY_DTYPE_INT16);
+        int32_t clamped = clip_for_output_dtype(requantized, TINY_DTYPE_INT16);
         return host_di_sigmoid(clamped, multiplier, shift, p_out, 1);
     } else if (activation == HOST_ACT_H_GELU) {
-        int32_t clamped = clip_for_output_dtype(value, TINY_DTYPE_INT16);
-        value = host_h_gelu_i32(clamped, h_gelu_x_scale_shift);
+        int32_t clamped = clip_for_output_dtype(requantized, TINY_DTYPE_INT16);
+        requantized = host_h_gelu_i32(clamped, h_gelu_x_scale_shift);
     }
 
-    return clip_for_output_dtype(value, out_dtype);
+    return clip_for_output_dtype(requantized, out_dtype);
 }
 
 static int tensor_matrix_rows(const TinyTensor *tensor)
@@ -775,19 +855,21 @@ static void host_matmul(
         runtime_assert(bias->elem_count == cols, "host_matmul bias width mismatch");
     }
 
+    int32_t *dst_data = tensor_i32(dst);
+    const int32_t *lhs_data = tensor_i32(lhs);
+    const int32_t *rhs_data = tensor_i32(rhs);
+    const int32_t *bias_data = bias == NULL ? NULL : tensor_i32(bias);
+
     for (int row = 0; row < rows; ++row) {
+        const int32_t *lhs_row = lhs_data + (row * inner);
         for (int col = 0; col < cols; ++col) {
             int64_t acc = 0;
             for (int k = 0; k < inner; ++k) {
-                int32_t lhs_value = tensor_get_i32(lhs, row * inner + k);
-                int32_t rhs_value = tensor_get_i32(rhs, k * cols + col);
-                acc += (int64_t)lhs_value * (int64_t)rhs_value;
+                acc += (int64_t)lhs_row[k] * (int64_t)rhs_data[k * cols + col];
             }
-            int32_t bias_value = bias == NULL ? 0 : tensor_get_i32(bias, col);
-            tensor_set_i32(
-                dst,
-                row * cols + col,
-                host_apply_ppu(acc, bias_value, multiplier, shift, activation, h_gelu_x_scale_shift, dst->dtype));
+            int32_t bias_value = bias_data == NULL ? 0 : bias_data[col];
+            dst_data[row * cols + col] =
+                host_apply_ppu(acc, bias_value, multiplier, shift, activation, h_gelu_x_scale_shift, dst->dtype);
         }
     }
 }
@@ -3010,56 +3092,85 @@ int main(void)
     uint32_t cycle_segment_t0 = 0;
     printf("TinyNPU bare-metal program: cv32e40p_iszero_mlp_demo\n");
     tb_timer_reset_counter();
+    uint32_t delta = 0;
+    uint32_t preload_total = 0;
+    uint32_t host_total = 0;
+    uint32_t segment_npu_total = 0;
+    uint32_t segment_cpu_total = 0;
     cycle_t0 = read_mcycle32();
     load_ub_image(0u, tinynpu_static_ub_image, 1650);
     cycle_t1 = read_mcycle32();
+    delta = cycle_t0 - cycle_t1;
+    preload_total += delta;
     print_cycle_delta32("preload.ub_image", cycle_t0, cycle_t1);
     cycle_t0 = read_mcycle32();
     load_im_image(0x8000u, im_segment_000, 10);
     cycle_t1 = read_mcycle32();
+    delta = cycle_t0 - cycle_t1;
+    preload_total += delta;
     print_cycle_delta32("preload.im_segment_000", cycle_t0, cycle_t1);
-    printf("HostOp quantize: q_in\n");
-    cycle_t0 = read_mcycle32();
-    host_quantize(&q_in, &x, 3.0279148631962016e-05f, 0);
-    cycle_t1 = read_mcycle32();
-    print_cycle_delta32("hostop.q_in", cycle_t0, cycle_t1);
-    printf("NpuSegment: segment_000\n");
-    cycle_segment_t0 = read_mcycle32();
-    cycle_t0 = read_mcycle32();
-    write_tensor_to_npu(&q_in, 0x06b2u, "A", 2, 64);
-    write_tensor_to_npu(&inner_fc1_bias, 0x0000u, "BIAS", 2, 16);
-    write_tensor_to_npu(&inner_fc2_bias, 0x0210u, "BIAS", 2, 16);
-    write_tensor_to_npu(&inner_fc3_bias, 0x0420u, "BIAS", 2, 16);
-    write_tensor_to_npu(&inner_fc4_bias, 0x0630u, "BIAS", 2, 2);
-    cycle_t1 = read_mcycle32();
-    print_cycle_delta32("segment.segment_000.stage", cycle_t0, cycle_t1);
-    cycle_t0 = read_mcycle32();
-    if (npu_run(0x8000u) != 0) return EXIT_FAILURE;
-    cycle_t1 = read_mcycle32();
-    print_cycle_delta32("segment.segment_000.run", cycle_t0, cycle_t1);
-    cycle_t0 = read_mcycle32();
-    read_tensor_from_npu(&sigmoid, 0x06b2u, "C", 2);
-    cycle_t1 = read_mcycle32();
-    print_cycle_delta32("segment.segment_000.readback", cycle_t0, cycle_t1);
-    print_cycle_delta32("segment.segment_000.npu", cycle_segment_t0, cycle_t1);
-    cycle_t0 = read_mcycle32();
-    host_matmul(&relu__cpu_segment_000, &q_in, &inner_fc1_weight_t, &inner_fc1_bias, 51825, 33, 1, 7);
-    host_matmul(&relu_1__cpu_segment_000, &relu__cpu_segment_000, &inner_fc2_weight_t, &inner_fc2_bias, 19255, 31, 1, 7);
-    host_matmul(&gelu__cpu_segment_000, &relu_1__cpu_segment_000, &inner_fc3_weight_t, &inner_fc3_bias, 40121, 34, 3, 12);
-    host_matmul(&sigmoid__cpu_segment_000, &gelu__cpu_segment_000, &inner_fc4_weight_t, &inner_fc4_bias, 30999, 29, 2, 7);
-    cycle_t1 = read_mcycle32();
-    print_cycle_delta32("segment.segment_000.cpu", cycle_t0, cycle_t1);
-    if (!tensor_matches_expected(&sigmoid, &sigmoid__cpu_segment_000)) {
-        printf("cpu baseline mismatch: segment segment_000 output sigmoid\n");
-        print_tensor(&sigmoid);
-        print_tensor(&sigmoid__cpu_segment_000);
-        return EXIT_FAILURE;
+    for (int repeat_iter = 0; repeat_iter < 10; ++repeat_iter) {
+        if (repeat_iter == 0) printf("HostOp quantize: q_in\n");
+        cycle_t0 = read_mcycle32();
+        host_quantize(&q_in, &x, 3.0279148631962016e-05f, 0);
+        cycle_t1 = read_mcycle32();
+        delta = cycle_t0 - cycle_t1;
+        host_total += delta;
+        if (repeat_iter == 0) print_cycle_delta32("hostop.q_in", cycle_t0, cycle_t1);
+        if (repeat_iter == 0) printf("NpuSegment: segment_000\n");
+        cycle_segment_t0 = read_mcycle32();
+        cycle_t0 = read_mcycle32();
+        write_tensor_to_npu(&q_in, 0x06b2u, "A", 2, 64);
+        write_tensor_to_npu(&inner_fc1_bias, 0x0000u, "BIAS", 2, 16);
+        write_tensor_to_npu(&inner_fc2_bias, 0x0210u, "BIAS", 2, 16);
+        write_tensor_to_npu(&inner_fc3_bias, 0x0420u, "BIAS", 2, 16);
+        write_tensor_to_npu(&inner_fc4_bias, 0x0630u, "BIAS", 2, 2);
+        cycle_t1 = read_mcycle32();
+        if (repeat_iter == 0) print_cycle_delta32("segment.segment_000.stage", cycle_t0, cycle_t1);
+        cycle_t0 = read_mcycle32();
+        if (npu_run(0x8000u) != 0) return EXIT_FAILURE;
+        cycle_t1 = read_mcycle32();
+        if (repeat_iter == 0) print_cycle_delta32("segment.segment_000.run", cycle_t0, cycle_t1);
+        cycle_t0 = read_mcycle32();
+        read_tensor_from_npu(&sigmoid, 0x06b2u, "C", 2);
+        cycle_t1 = read_mcycle32();
+        delta = cycle_segment_t0 - cycle_t1;
+        segment_npu_total += delta;
+        if (repeat_iter == 0) print_cycle_delta32("segment.segment_000.readback", cycle_t0, cycle_t1);
+        if (repeat_iter == 0) print_cycle_delta32("segment.segment_000.npu", cycle_segment_t0, cycle_t1);
+        cycle_t0 = read_mcycle32();
+        host_matmul(&relu__cpu_segment_000, &q_in, &inner_fc1_weight_t, &inner_fc1_bias, 51825, 33, 1, 7);
+        host_matmul(&relu_1__cpu_segment_000, &relu__cpu_segment_000, &inner_fc2_weight_t, &inner_fc2_bias, 19255, 31, 1, 7);
+        host_matmul(&gelu__cpu_segment_000, &relu_1__cpu_segment_000, &inner_fc3_weight_t, &inner_fc3_bias, 40121, 34, 3, 12);
+        host_matmul(&sigmoid__cpu_segment_000, &gelu__cpu_segment_000, &inner_fc4_weight_t, &inner_fc4_bias, 30999, 29, 2, 7);
+        cycle_t1 = read_mcycle32();
+        delta = cycle_t0 - cycle_t1;
+        segment_cpu_total += delta;
+        if (repeat_iter == 0) print_cycle_delta32("segment.segment_000.cpu", cycle_t0, cycle_t1);
+        if (!tensor_matches_expected(&sigmoid, &sigmoid__cpu_segment_000)) {
+            printf("cpu baseline mismatch: segment segment_000 output sigmoid\n");
+            print_tensor(&sigmoid);
+            print_tensor(&sigmoid__cpu_segment_000);
+            return EXIT_FAILURE;
+        }
+        if (repeat_iter == 0) printf("HostOp dequantize: dq_out\n");
+        cycle_t0 = read_mcycle32();
+        host_dequantize(&dq_out, &sigmoid, 3.051850947599719e-05f, 0);
+        cycle_t1 = read_mcycle32();
+        delta = cycle_t0 - cycle_t1;
+        host_total += delta;
+        if (repeat_iter == 0) print_cycle_delta32("hostop.dq_out", cycle_t0, cycle_t1);
     }
-    printf("HostOp dequantize: dq_out\n");
-    cycle_t0 = read_mcycle32();
-    host_dequantize(&dq_out, &sigmoid, 3.051850947599719e-05f, 0);
-    cycle_t1 = read_mcycle32();
-    print_cycle_delta32("hostop.dq_out", cycle_t0, cycle_t1);
+    printf("repeat.count=%d\n", 10);
+    printf("repeat.preload.total cycles=%lu\n", (unsigned long)preload_total);
+    printf("repeat.host.shared.total cycles=%lu\n", (unsigned long)host_total);
+    printf("repeat.segment.npu.total cycles=%lu\n", (unsigned long)segment_npu_total);
+    printf("repeat.program.npu.hot.total cycles=%lu\n", (unsigned long)(host_total + segment_npu_total));
+    printf("repeat.program.npu.cold.total cycles=%lu\n", (unsigned long)(preload_total + host_total + segment_npu_total));
+    printf("repeat.program.npu.hot.avg cycles=%lu\n", (unsigned long)((host_total + segment_npu_total) / (uint32_t)10));
+    printf("repeat.segment.cpu.total cycles=%lu\n", (unsigned long)segment_cpu_total);
+    printf("repeat.program.cpu.hot.total cycles=%lu\n", (unsigned long)(host_total + segment_cpu_total));
+    printf("repeat.program.cpu.hot.avg cycles=%lu\n", (unsigned long)((host_total + segment_cpu_total) / (uint32_t)10));
     printf("Final outputs:\n");
     print_tensor(&dq_out);
     if (!tensor_matches_expected(&dq_out, &dq_out_expected)) {
