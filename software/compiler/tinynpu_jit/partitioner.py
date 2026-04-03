@@ -156,6 +156,13 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             if tensors[name].data is not None:
                 tensors[name].data = np.array(value, copy=True)
 
+    def materialized_value(name: str) -> np.ndarray:
+        if name in env:
+            return env[name]
+        if name in tensors and tensors[name].data is not None:
+            return np.array(tensors[name].data, copy=False)
+        raise KeyError(f"Tensor {name!r} has no materialized value in env or tensor storage.")
+
     def ensure_quantized_input(
         source_name: str,
         *,
@@ -626,6 +633,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             TensorKind.CONSTANT,
             data=np.array(weight_t, copy=True),
         )
+        env[rhs_name] = np.array(weight_t, copy=True)
         current_inputs.add(rhs_name)
 
         bias_tensor = getattr(module, "bias_int32", None)
@@ -699,7 +707,8 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                     "dtype": module_out_dtype.value,
                     "source": "compiler_ready_linear",
                     "module_name": module_name,
-                }
+                },
+                "h_gelu_x_scale_shift": int(getattr(module, "h_gelu_x_scale_shift", 7)),
             },
         )
         current_ops.append(
@@ -712,6 +721,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                 multiplier=multiplier,
                 shift=shift,
                 activation="none",
+                h_gelu_x_scale_shift=int(getattr(module, "h_gelu_x_scale_shift", 7)),
                 in_dtype=module_in_dtype,
                 out_dtype=module_out_dtype,
             )
@@ -805,6 +815,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             TensorKind.CONSTANT,
             data=np.array(kernel_t, copy=True),
         )
+        env[kernel_t_name] = np.array(kernel_t, copy=True)
         current_inputs.add(kernel_t_name)
 
         bias_name = None
@@ -848,7 +859,8 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                     "dtype": module_out_dtype.value,
                     "source": "compiler_ready_conv2d_matrix",
                     "module_name": module_name,
-                }
+                },
+                "h_gelu_x_scale_shift": int(getattr(module, "h_gelu_x_scale_shift", 7)),
             },
         )
         env[matmul_name] = expected_matrix.astype(np.int32)
@@ -862,6 +874,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                 multiplier=multiplier,
                 shift=shift,
                 activation="none",
+                h_gelu_x_scale_shift=int(getattr(module, "h_gelu_x_scale_shift", 7)),
                 in_dtype=module_in_dtype,
                 out_dtype=module_out_dtype,
             )
@@ -899,7 +912,8 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                     "dtype": module_out_dtype.value,
                     "source": "compiler_ready_conv2d",
                     "module_name": module_name,
-                }
+                },
+                "h_gelu_x_scale_shift": int(getattr(module, "h_gelu_x_scale_shift", 7)),
             },
         )
         expected_tensors[cols_name] = np.array(env[cols_name], copy=True)
@@ -1084,6 +1098,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             multiplier = int(node.kwargs.get("multiplier", 1))
             shift = int(node.kwargs.get("shift", 0))
             activation = str(node.kwargs.get("activation", "none"))
+            h_gelu_x_scale_shift = int(node.kwargs.get("h_gelu_x_scale_shift", 7))
             in_dtype = parse_dtype(node.kwargs.get("in_dtype", "int16"))
             out_dtype = parse_dtype(node.kwargs.get("out_dtype", "int16"))
             output_scale = node.kwargs.get("output_scale")
@@ -1108,6 +1123,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                 multiplier=multiplier,
                 shift=shift,
                 activation=activation,
+                h_gelu_x_scale_shift=h_gelu_x_scale_shift,
                 out_dtype=out_dtype,
             )
             env[out_name] = expected.astype(np.int32)
@@ -1128,29 +1144,97 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                     multiplier=multiplier,
                     shift=shift,
                     activation=activation,
+                    h_gelu_x_scale_shift=h_gelu_x_scale_shift,
                     in_dtype=in_dtype,
                     out_dtype=out_dtype,
                 )
             )
             continue
 
-        if node.op == "call_function" and node.target in {
-            getattr(torch, "relu", None),
-            getattr(nn.functional, "relu", None),
-        }:
+        if node.op == "call_function":
+            source = node.args[0].name if node.args else None
+            target_name = str(node.target)
+            if "sigmoid" in target_name:
+                activation_kind = "sigmoid"
+                host_kind = "sigmoid"
+            elif "gelu" in target_name:
+                activation_kind = "h_gelu"
+                host_kind = "gelu"
+            elif node.target in {getattr(torch, "relu", None), getattr(nn.functional, "relu", None)}:
+                activation_kind = "relu"
+                host_kind = "relu"
+            else:
+                activation_kind = None
+                host_kind = None
+            if activation_kind is not None and source is not None:
+                if current_ops and current_ops[-1].out == source and current_ops[-1].activation == "none":
+                    matmul_op = current_ops[-1]
+                    if activation_kind == "h_gelu":
+                        matmul_op.h_gelu_x_scale_shift = int(
+                            tensors[source].metadata.get("h_gelu_x_scale_shift", matmul_op.h_gelu_x_scale_shift)
+                        )
+                    matmul_op.activation = activation_kind
+                    matmul_op.out = node.name
+                    bias_value = tensors[matmul_op.bias].data if matmul_op.bias else None
+                    expected = golden.matmul(
+                        materialized_value(matmul_op.lhs),
+                        materialized_value(matmul_op.rhs),
+                        bias=bias_value,
+                        multiplier=matmul_op.multiplier,
+                        shift=matmul_op.shift,
+                        activation=activation_kind,
+                        h_gelu_x_scale_shift=matmul_op.h_gelu_x_scale_shift,
+                        out_dtype=matmul_op.out_dtype,
+                    )
+                    env[node.name] = expected.astype(np.int32)
+                    tensors[node.name] = TensorSpec(
+                        node.name,
+                        normalize_shape(expected.shape),
+                        matmul_op.out_dtype,
+                        TensorKind.INTERMEDIATE,
+                        metadata=dict(tensors[source].metadata),
+                    )
+                    continue
+
+                flush_segment()
+                step = HostOp(name=node.name, kind=host_kind, inputs=[source], outputs=[node.name])
+                steps.append(step)
+                evaluate_host_step(step)
+                tensors[node.name] = TensorSpec(
+                    name=node.name,
+                    shape=normalize_shape(env[node.name].shape),
+                    dtype=tensors[source].dtype,
+                    kind=TensorKind.INTERMEDIATE,
+                    metadata=dict(tensors[source].metadata),
+                )
+                expected_tensors[node.name] = np.array(env[node.name], copy=True)
+                continue
+
+        if node.op == "call_method" and node.target in {"sigmoid", "gelu"}:
             source = node.args[0].name
+            if node.target == "gelu":
+                activation_kind = "h_gelu"
+                host_kind = "gelu"
+            else:
+                activation_kind = "sigmoid"
+                host_kind = "sigmoid"
             if current_ops and current_ops[-1].out == source and current_ops[-1].activation == "none":
                 matmul_op = current_ops[-1]
-                matmul_op.activation = "relu"
+                if activation_kind == "h_gelu":
+                    matmul_op.h_gelu_x_scale_shift = int(
+                        tensors[source].metadata.get("h_gelu_x_scale_shift", matmul_op.h_gelu_x_scale_shift)
+                    )
+                matmul_op.activation = activation_kind
                 matmul_op.out = node.name
                 bias_value = tensors[matmul_op.bias].data if matmul_op.bias else None
                 expected = golden.matmul(
-                    env[matmul_op.lhs],
-                    env[matmul_op.rhs],
+                    materialized_value(matmul_op.lhs),
+                    materialized_value(matmul_op.rhs),
                     bias=bias_value,
                     multiplier=matmul_op.multiplier,
                     shift=matmul_op.shift,
-                    activation="relu",
+                    activation=activation_kind,
+                    h_gelu_x_scale_shift=matmul_op.h_gelu_x_scale_shift,
                     out_dtype=matmul_op.out_dtype,
                 )
                 env[node.name] = expected.astype(np.int32)
@@ -1164,7 +1248,7 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                 continue
 
             flush_segment()
-            step = HostOp(name=node.name, kind="relu", inputs=[source], outputs=[node.name])
+            step = HostOp(name=node.name, kind=host_kind, inputs=[source], outputs=[node.name])
             steps.append(step)
             evaluate_host_step(step)
             tensors[node.name] = TensorSpec(

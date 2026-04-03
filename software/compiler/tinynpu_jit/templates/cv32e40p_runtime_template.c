@@ -5,6 +5,8 @@
 #include <string.h>
 
 #define NPU_BASE 0x30000000u
+#define TB_TIMER_CTRL_BASE 0x15000000u
+#define TB_TIMER_COUNT_REG 0x15001000u
 #define TINY_ARRAY_SIZE __TINY_ARRAY_SIZE__
 #define TINY_BUFFER_WORDS_32 __TINY_BUFFER_WORDS_32__
 #define TINY_MMVR_BYTES (TINY_BUFFER_WORDS_32 * 4)
@@ -37,6 +39,13 @@ typedef enum {
     TINY_DTYPE_FLOAT32 = 4,
 } TinyDType;
 
+enum {
+    HOST_ACT_NONE = 0,
+    HOST_ACT_RELU = 1,
+    HOST_ACT_SIGMOID = 2,
+    HOST_ACT_H_GELU = 3,
+};
+
 typedef struct {
     const char *name;
     void *data;
@@ -47,6 +56,41 @@ typedef struct {
 } TinyTensor;
 
 static volatile uint8_t *const npu = (volatile uint8_t *)NPU_BASE;
+static volatile uint32_t *const tb_timer_ctrl = (volatile uint32_t *)TB_TIMER_CTRL_BASE;
+static volatile uint32_t *const tb_timer_value = (volatile uint32_t *)(TB_TIMER_CTRL_BASE + 4u);
+static volatile uint32_t *const tb_timer_count = (volatile uint32_t *)TB_TIMER_COUNT_REG;
+
+volatile uint32_t runtime_cycle_start __attribute__((section(".noinit")));
+volatile uint32_t runtime_cycle_post_bss __attribute__((section(".noinit")));
+volatile uint32_t runtime_cycle_post_init __attribute__((section(".noinit")));
+volatile uint32_t runtime_cycle_pre_main __attribute__((section(".noinit")));
+
+static inline uint32_t read_mcycle32(void)
+{
+    return *tb_timer_count;
+}
+
+static void print_cycle_delta32(const char *label, uint32_t start, uint32_t end)
+{
+    /* The testbench timer counts down from 0xFFFFFFFF, so elapsed cycles are start - end. */
+    printf("%s cycles=%lu\n", label, (unsigned long)(start - end));
+}
+
+static void print_startup_cycle_report(void)
+{
+    print_cycle_delta32("startup.bss_clear", runtime_cycle_start, runtime_cycle_post_bss);
+    print_cycle_delta32("startup.init_array", runtime_cycle_post_bss, runtime_cycle_post_init);
+    print_cycle_delta32("startup.to_main", runtime_cycle_post_init, runtime_cycle_pre_main);
+    print_cycle_delta32("startup.total", runtime_cycle_start, runtime_cycle_pre_main);
+}
+
+static void tb_timer_reset_counter(void)
+{
+    *tb_timer_ctrl = 0u;
+    *tb_timer_value = 0xFFFFFFFFu;
+    while (*tb_timer_count == 0u) {
+    }
+}
 
 static inline void npu_write8(uint32_t reg, uint8_t value)
 {
@@ -205,6 +249,20 @@ static int32_t clip_for_dtype(int64_t value, TinyDType dtype)
     return (int32_t)value;
 }
 
+static int32_t clip_for_output_dtype(int64_t value, TinyDType dtype)
+{
+    if (dtype == TINY_DTYPE_INT32) {
+        if (value < INT32_MIN) {
+            return INT32_MIN;
+        }
+        if (value > INT32_MAX) {
+            return INT32_MAX;
+        }
+        return (int32_t)value;
+    }
+    return clip_for_dtype(value, dtype);
+}
+
 static void host_alias(TinyTensor *dst, const TinyTensor *src)
 {
     runtime_assert(dst->elem_count == src->elem_count, "alias size mismatch");
@@ -242,6 +300,17 @@ static void host_sigmoid(TinyTensor *dst, const TinyTensor *src)
     for (int i = 0; i < src->elem_count; ++i) {
         float value = tensor_get_float(src, i);
         tensor_set_float(dst, i, 1.0f / (1.0f + expf(-value)));
+    }
+}
+
+static void host_gelu(TinyTensor *dst, const TinyTensor *src)
+{
+    runtime_assert(dst->dtype == TINY_DTYPE_FLOAT32, "gelu expects float output");
+    runtime_assert(dst->elem_count == src->elem_count, "gelu size mismatch");
+    for (int i = 0; i < src->elem_count; ++i) {
+        float value = tensor_get_float(src, i);
+        float erf_term = erff(value / sqrtf(2.0f));
+        tensor_set_float(dst, i, 0.5f * value * (1.0f + erf_term));
     }
 }
 
@@ -538,6 +607,191 @@ static void host_im2col(
     }
 }
 
+static int64_t floor_div_i64(int64_t numer, int64_t denom)
+{
+    runtime_assert(denom != 0, "division by zero");
+    int64_t quot = numer / denom;
+    int64_t rem = numer % denom;
+    if (rem != 0 && ((rem < 0) != (denom < 0))) {
+        quot -= 1;
+    }
+    return quot;
+}
+
+static int32_t host_di_exp(int32_t x_in, int32_t m_i, int32_t k_i)
+{
+    runtime_assert(m_i > 0, "di_exp requires positive m_i");
+    runtime_assert(k_i >= 0, "di_exp requires non-negative k_i");
+
+    int64_t m_f = (int64_t)m_i + ((int64_t)m_i >> 1) - ((int64_t)m_i >> 4);
+    runtime_assert(m_f > 0, "di_exp derived m_f must be positive");
+
+    int64_t s_i = ((((int64_t)1) << k_i) + (m_f / 2)) / m_f;
+    runtime_assert(s_i > 0, "di_exp derived s_i must be positive");
+
+    int64_t t = -s_i;
+    int64_t q_i = floor_div_i64((int64_t)x_in, t);
+    int64_t r_i = (int64_t)x_in - (q_i * t);
+    int64_t unshifted_exp = (r_i >> 1) - t;
+    int64_t result = unshifted_exp >> q_i;
+    return (int32_t)(result > 0 ? result : 0);
+}
+
+static int32_t host_int_div_prob(int32_t numer, int32_t denom, int32_t p_out)
+{
+    runtime_assert(p_out > 0, "probability width must be positive");
+    runtime_assert(denom > 0, "probability denominator must be positive");
+    int32_t scale = (1 << (p_out - 1)) - 1;
+    return (int32_t)((((int64_t)numer * (int64_t)scale) + (denom / 2)) / denom);
+}
+
+static int32_t host_di_sigmoid(int32_t x_in, int32_t m_i, int32_t k_i, int32_t p_out, int32_t alpha_smooth)
+{
+    runtime_assert(alpha_smooth > 0, "sigmoid smoothing must be positive");
+
+    int32_t x_smoothed = (int32_t)floor_div_i64((int64_t)x_in, (int64_t)alpha_smooth);
+    int32_t exp_zero = host_di_exp(0, m_i, k_i);
+    int32_t exp_term = 0;
+    int32_t numer = 0;
+
+    if (x_smoothed >= 0) {
+        exp_term = host_di_exp(-x_smoothed, m_i, k_i);
+        numer = exp_zero;
+    } else {
+        exp_term = host_di_exp(x_smoothed, m_i, k_i);
+        numer = exp_term;
+    }
+
+    return host_int_div_prob(numer, exp_zero + exp_term, p_out);
+}
+
+static int32_t host_round_shift_signed(int64_t value, int32_t shift)
+{
+    if (shift <= 0) {
+        return (int32_t)value;
+    }
+    int64_t rounder = ((int64_t)1) << (shift - 1);
+    if (value >= 0) {
+        return (int32_t)((value + rounder) >> shift);
+    }
+    return (int32_t)(-(((-value) + rounder) >> shift));
+}
+
+static int32_t host_round_div_signed(int64_t numer, int32_t denom)
+{
+    runtime_assert(denom > 0, "round_div requires positive denom");
+    int32_t half = denom / 2;
+    if (numer >= 0) {
+        return (int32_t)((numer + half) / denom);
+    }
+    return (int32_t)(-(((-numer) + half) / denom));
+}
+
+static int32_t host_h_gelu_i32(int32_t x_in, int32_t x_scale_shift)
+{
+    runtime_assert(x_scale_shift >= 0, "h_gelu scale shift must be non-negative");
+    const int32_t slope_num = 218;
+    const int32_t slope_shift = 7;
+    const int32_t scale_denom = 1 << x_scale_shift;
+    const int32_t three_int = 3 * scale_denom;
+    const int32_t six_int = 6 * scale_denom;
+
+    int32_t slope_term = host_round_shift_signed((int64_t)x_in * (int64_t)slope_num, slope_shift);
+    int32_t gate_int = slope_term + three_int;
+    if (gate_int < 0) {
+        gate_int = 0;
+    }
+    if (gate_int > six_int) {
+        gate_int = six_int;
+    }
+    return host_round_div_signed((int64_t)x_in * (int64_t)gate_int, six_int);
+}
+
+static int32_t host_apply_ppu(
+    int64_t acc,
+    int32_t bias,
+    int32_t multiplier,
+    int32_t shift,
+    int32_t activation,
+    int32_t h_gelu_x_scale_shift,
+    TinyDType out_dtype)
+{
+    int64_t value = acc + (int64_t)((int32_t)bias);
+    value *= (int64_t)(multiplier & 0xFFFF);
+    if (shift > 0) {
+        value = (value + (((int64_t)1) << (shift - 1))) >> shift;
+    }
+
+    if (activation == HOST_ACT_RELU) {
+        if (value < 0) {
+            value = 0;
+        }
+    } else if (activation == HOST_ACT_SIGMOID) {
+        int32_t p_out = out_dtype == TINY_DTYPE_INT4 ? 4 : out_dtype == TINY_DTYPE_INT8 ? 8 : 16;
+        int32_t clamped = clip_for_output_dtype(value, TINY_DTYPE_INT16);
+        return host_di_sigmoid(clamped, multiplier, shift, p_out, 1);
+    } else if (activation == HOST_ACT_H_GELU) {
+        int32_t clamped = clip_for_output_dtype(value, TINY_DTYPE_INT16);
+        value = host_h_gelu_i32(clamped, h_gelu_x_scale_shift);
+    }
+
+    return clip_for_output_dtype(value, out_dtype);
+}
+
+static int tensor_matrix_rows(const TinyTensor *tensor)
+{
+    return tensor->rank == 1 ? 1 : tensor->shape[0];
+}
+
+static int tensor_matrix_cols(const TinyTensor *tensor)
+{
+    return tensor->rank == 1 ? tensor->shape[0] : tensor->shape[1];
+}
+
+static void host_matmul(
+    TinyTensor *dst,
+    const TinyTensor *lhs,
+    const TinyTensor *rhs,
+    const TinyTensor *bias,
+    int32_t multiplier,
+    int32_t shift,
+    int32_t activation,
+    int32_t h_gelu_x_scale_shift)
+{
+    runtime_assert(dst->dtype != TINY_DTYPE_FLOAT32, "host_matmul expects integer output");
+    runtime_assert(lhs->dtype != TINY_DTYPE_FLOAT32, "host_matmul expects integer lhs");
+    runtime_assert(rhs->dtype != TINY_DTYPE_FLOAT32, "host_matmul expects integer rhs");
+    runtime_assert(bias == NULL || bias->dtype != TINY_DTYPE_FLOAT32, "host_matmul expects integer bias");
+
+    const int rows = tensor_matrix_rows(lhs);
+    const int inner = tensor_matrix_cols(lhs);
+    const int rhs_rows = tensor_matrix_rows(rhs);
+    const int cols = tensor_matrix_cols(rhs);
+
+    runtime_assert(inner == rhs_rows, "host_matmul dimension mismatch");
+    runtime_assert(tensor_matrix_rows(dst) == rows, "host_matmul output row mismatch");
+    runtime_assert(tensor_matrix_cols(dst) == cols, "host_matmul output col mismatch");
+    if (bias != NULL) {
+        runtime_assert(bias->elem_count == cols, "host_matmul bias width mismatch");
+    }
+
+    for (int row = 0; row < rows; ++row) {
+        for (int col = 0; col < cols; ++col) {
+            int64_t acc = 0;
+            for (int k = 0; k < inner; ++k) {
+                int32_t lhs_value = tensor_get_i32(lhs, row * inner + k);
+                int32_t rhs_value = tensor_get_i32(rhs, k * cols + col);
+                acc += (int64_t)lhs_value * (int64_t)rhs_value;
+            }
+            int32_t bias_value = bias == NULL ? 0 : tensor_get_i32(bias, col);
+            tensor_set_i32(
+                dst,
+                row * cols + col,
+                host_apply_ppu(acc, bias_value, multiplier, shift, activation, h_gelu_x_scale_shift, dst->dtype));
+        }
+    }
+}
+
 static void npu_write_mmvr(const uint32_t chunks[TINY_BUFFER_WORDS_32])
 {
     for (int part = 0; part < TINY_BUFFER_WORDS_32; ++part) {
@@ -581,17 +835,13 @@ static int npu_read_mem_word(uint16_t addr, uint8_t out[TINY_MMVR_BYTES])
 static int npu_run(uint32_t start_addr)
 {
     uint8_t status = 0;
-    int saw_busy = 0;
     npu_write32(REG_ARG, start_addr);
     npu_write8(REG_CMD, CMD_RUN);
     npu_doorbell();
 
     for (int poll = 0; poll < 200000; ++poll) {
         status = npu_read8(REG_STATUS);
-        if (status == STATUS_BUSY) {
-            saw_busy = 1;
-        }
-        if (saw_busy && status == STATUS_HALTED) {
+        if (status == STATUS_HALTED) {
             return 0;
         }
     }
@@ -790,6 +1040,97 @@ static void read_role_c_tensor(TinyTensor *dst, uint16_t addr, int precision)
             }
         }
     }
+}
+
+static void read_role_a_tensor(TinyTensor *dst, uint16_t addr, int precision)
+{
+    runtime_assert(dst->dtype != TINY_DTYPE_FLOAT32, "NPU readback expects integer output tensor");
+    const int p = 1 << (2 - precision);
+    const int bits = 16 / p;
+    const int mask = (1 << bits) - 1;
+    const int rows = dst->rank == 1 ? 1 : dst->shape[0];
+    const int cols = dst->rank == 1 ? dst->shape[0] : dst->shape[1];
+    const int m_tiles = (rows + TINY_ARRAY_SIZE - 1) / TINY_ARRAY_SIZE;
+    const int k_words = (cols + p - 1) / p;
+    const int k_tiles = (k_words + TINY_ARRAY_SIZE - 1) / TINY_ARRAY_SIZE;
+    uint8_t bytes[TINY_MMVR_BYTES];
+
+    for (int mt = 0; mt < m_tiles; ++mt) {
+        for (int kt = 0; kt < k_tiles; ++kt) {
+            uint16_t tile_addr = (uint16_t)(addr + (mt * k_tiles * TINY_ARRAY_SIZE) + (kt * TINY_ARRAY_SIZE));
+            for (int col_in_tile = 0; col_in_tile < TINY_ARRAY_SIZE; ++col_in_tile) {
+                runtime_assert(npu_read_mem_word((uint16_t)(tile_addr + col_in_tile), bytes) == 0, "readback failed");
+                for (int row_in_tile = 0; row_in_tile < TINY_ARRAY_SIZE; ++row_in_tile) {
+                    uint16_t packed_lane = (uint16_t)bytes[row_in_tile * 2] | ((uint16_t)bytes[row_in_tile * 2 + 1] << 8);
+                    int row_idx = mt * TINY_ARRAY_SIZE + row_in_tile;
+                    for (int bit_idx = 0; bit_idx < p; ++bit_idx) {
+                        int col_idx = ((kt * TINY_ARRAY_SIZE) + col_in_tile) * p + bit_idx;
+                        if (row_idx < rows && col_idx < cols) {
+                            int32_t value = (packed_lane >> (bit_idx * bits)) & mask;
+                            if (value & (1 << (bits - 1))) {
+                                value -= (1 << bits);
+                            }
+                            tensor_set_i32(dst, row_idx * cols + col_idx, value);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void read_role_b_tensor(TinyTensor *dst, uint16_t addr, int precision)
+{
+    runtime_assert(dst->dtype != TINY_DTYPE_FLOAT32, "NPU readback expects integer output tensor");
+    const int p = 1 << (2 - precision);
+    const int bits = 16 / p;
+    const int mask = (1 << bits) - 1;
+    const int rows = dst->rank == 1 ? 1 : dst->shape[0];
+    const int cols = dst->rank == 1 ? dst->shape[0] : dst->shape[1];
+    const int k_words = (rows + p - 1) / p;
+    const int k_tiles = (k_words + TINY_ARRAY_SIZE - 1) / TINY_ARRAY_SIZE;
+    const int n_tiles = (cols + TINY_ARRAY_SIZE - 1) / TINY_ARRAY_SIZE;
+    uint8_t bytes[TINY_MMVR_BYTES];
+
+    for (int kt = 0; kt < k_tiles; ++kt) {
+        for (int nt = 0; nt < n_tiles; ++nt) {
+            uint16_t tile_addr = (uint16_t)(addr + (kt * n_tiles * TINY_ARRAY_SIZE) + (nt * TINY_ARRAY_SIZE));
+            for (int row_word = 0; row_word < TINY_ARRAY_SIZE; ++row_word) {
+                runtime_assert(npu_read_mem_word((uint16_t)(tile_addr + row_word), bytes) == 0, "readback failed");
+                for (int col_in_tile = 0; col_in_tile < TINY_ARRAY_SIZE; ++col_in_tile) {
+                    uint16_t packed_lane = (uint16_t)bytes[col_in_tile * 2] | ((uint16_t)bytes[col_in_tile * 2 + 1] << 8);
+                    int col_idx = nt * TINY_ARRAY_SIZE + col_in_tile;
+                    for (int bit_idx = 0; bit_idx < p; ++bit_idx) {
+                        int row_idx = ((kt * TINY_ARRAY_SIZE) + row_word) * p + bit_idx;
+                        if (row_idx < rows && col_idx < cols) {
+                            int32_t value = (packed_lane >> (bit_idx * bits)) & mask;
+                            if (value & (1 << (bits - 1))) {
+                                value -= (1 << bits);
+                            }
+                            tensor_set_i32(dst, row_idx * cols + col_idx, value);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void read_tensor_from_npu(TinyTensor *dst, uint16_t addr, const char *role, int precision)
+{
+    if (strcmp(role, "A") == 0) {
+        read_role_a_tensor(dst, addr, precision);
+        return;
+    }
+    if (strcmp(role, "B") == 0) {
+        read_role_b_tensor(dst, addr, precision);
+        return;
+    }
+    if (strcmp(role, "C") == 0) {
+        read_role_c_tensor(dst, addr, precision);
+        return;
+    }
+    runtime_fail("unsupported NPU readback role");
 }
 
 static void load_ub_image(uint16_t base_addr, const uint32_t image[][TINY_BUFFER_WORDS_32], int word_count)

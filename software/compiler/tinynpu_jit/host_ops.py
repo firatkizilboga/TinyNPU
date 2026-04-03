@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Any, Callable
 
 import numpy as np
@@ -209,6 +210,25 @@ def _sigmoid_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str
     )
 
 
+def _gelu_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
+    source = np.array(values[step.inputs[0]], dtype=np.float32)
+    erf = np.vectorize(math.erf, otypes=[np.float32])(source / np.float32(np.sqrt(2.0)))
+    values[step.outputs[0]] = np.float32(0.5) * source * (np.float32(1.0) + erf)
+
+
+def _gelu_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
+    source_elements = int(np.array(values[step.inputs[0]], copy=False).size)
+    elems = int(np.array(values[step.outputs[0]], copy=False).size)
+    return "host_intrinsic", _counts(
+        reads=source_elements,
+        adds=elems * 3,
+        muls=elems * 2,
+        nonlinear=elems,
+        writes=elems,
+        branches=elems,
+    )
+
+
 def _relu_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
     values[step.outputs[0]] = np.maximum(values[step.inputs[0]], 0)
 
@@ -400,6 +420,7 @@ for _spec in (
         quant_boundary_policy="layout_transform",
         semantic_validator=_validate_im2col,
     ),
+    HostOpSpec("gelu", _gelu_eval, _gelu_benchmark),
     HostOpSpec(
         "layout_restore",
         _layout_restore_eval,

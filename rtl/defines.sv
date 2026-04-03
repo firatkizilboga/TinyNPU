@@ -43,6 +43,13 @@ typedef enum logic [1:0] {
     MODE_RSVD  = 2'b11            // Reserved
 } precision_mode_t;
 
+typedef enum logic [1:0] {
+    OUT_LAYOUT_C    = 2'b00,
+    OUT_LAYOUT_A    = 2'b01,
+    OUT_LAYOUT_B    = 2'b10,
+    OUT_LAYOUT_RSVD = 2'b11
+} output_layout_t;
+
 // Instruction register field definitions
 typedef struct packed {
     precision_mode_t mode;        // [15:14] Bit-width mode

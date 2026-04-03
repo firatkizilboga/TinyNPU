@@ -5,6 +5,94 @@ import numpy as np
 from .ir import DType
 
 
+def di_exp(x_in: int, *, m_i: int, k_i: int) -> int:
+    if m_i <= 0:
+        raise ValueError(f"m_i must be positive, got {m_i}.")
+    if k_i < 0:
+        raise ValueError(f"k_i must be non-negative, got {k_i}.")
+
+    m_f = int(m_i + (m_i >> 1) - (m_i >> 4))
+    if m_f <= 0:
+        raise ValueError(f"Derived m_f must be positive, got {m_f}.")
+
+    s_i = ((1 << k_i) + (m_f // 2)) // m_f
+    if s_i <= 0:
+        raise ValueError(
+            f"Chosen fixed parameters collapse DI-Exp period to zero: m_i={m_i}, k_i={k_i}, m_f={m_f}."
+        )
+    t = -int(s_i)
+
+    q_i = int(x_in // t)
+    r_i = int(x_in - (q_i * t))
+    unshifted_exp = int((r_i >> 1) - t)
+    result = int(unshifted_exp >> q_i)
+    return max(0, result)
+
+
+def _int_div_prob(numer: int, denom: int, *, p_out: int) -> int:
+    if p_out <= 0:
+        raise ValueError(f"p_out must be positive, got {p_out}.")
+    if denom <= 0:
+        raise ValueError(f"Probability denominator must be positive, got {denom}.")
+
+    scale = (1 << (p_out - 1)) - 1
+    return int((numer * scale + (denom // 2)) // denom)
+
+
+def di_sigmoid(x_in: int, *, m_i: int, k_i: int, p_out: int = 8, alpha_smooth: int = 1) -> int:
+    if alpha_smooth <= 0:
+        raise ValueError(f"alpha_smooth must be positive, got {alpha_smooth}.")
+
+    x_smoothed = int(x_in // alpha_smooth)
+    exp_zero = di_exp(0, m_i=m_i, k_i=k_i)
+
+    if x_smoothed >= 0:
+        exp_term = di_exp(-x_smoothed, m_i=m_i, k_i=k_i)
+        numer = exp_zero
+    else:
+        exp_term = di_exp(x_smoothed, m_i=m_i, k_i=k_i)
+        numer = exp_term
+
+    denom = exp_zero + exp_term
+    return _int_div_prob(numer, denom, p_out=p_out)
+
+
+def _round_shift_signed(value: int, shift: int) -> int:
+    if shift <= 0:
+        return int(value)
+    rounder = 1 << (shift - 1)
+    if value >= 0:
+        return int((value + rounder) >> shift)
+    return -int(((-value) + rounder) >> shift)
+
+
+def _round_div_signed(numer: int, denom: int) -> int:
+    if denom <= 0:
+        raise ValueError(f"denom must be positive, got {denom}.")
+    half = denom // 2
+    if numer >= 0:
+        return int((numer + half) // denom)
+    return -int(((-numer) + half) // denom)
+
+
+def h_gelu(x_in: int, *, x_scale_shift: int = 7, slope_num: int = 218, slope_shift: int = 7) -> int:
+    if x_scale_shift < 0:
+        raise ValueError(f"x_scale_shift must be non-negative, got {x_scale_shift}.")
+    if slope_num <= 0:
+        raise ValueError(f"slope_num must be positive, got {slope_num}.")
+    if slope_shift < 0:
+        raise ValueError(f"slope_shift must be non-negative, got {slope_shift}.")
+
+    scale_denom = 1 << x_scale_shift
+    three_int = 3 * scale_denom
+    six_int = 6 * scale_denom
+
+    slope_term = _round_shift_signed(int(x_in) * int(slope_num), slope_shift)
+    gate_int = min(max(slope_term + three_int, 0), six_int)
+
+    return _round_div_signed(int(x_in) * gate_int, six_int)
+
+
 class GoldenModel:
     def quantize(
         self,
@@ -105,6 +193,15 @@ class GoldenModel:
         exp = np.exp(shifted)
         return exp / np.sum(exp, axis=axis, keepdims=True)
 
+    def di_exp(self, x_in: int, *, m_i: int, k_i: int) -> int:
+        return di_exp(x_in, m_i=m_i, k_i=k_i)
+
+    def di_sigmoid(self, x_in: int, *, m_i: int, k_i: int, p_out: int = 8, alpha_smooth: int = 1) -> int:
+        return di_sigmoid(x_in, m_i=m_i, k_i=k_i, p_out=p_out, alpha_smooth=alpha_smooth)
+
+    def h_gelu(self, x_in: int, *, x_scale_shift: int = 7, slope_num: int = 218, slope_shift: int = 7) -> int:
+        return h_gelu(x_in, x_scale_shift=x_scale_shift, slope_num=slope_num, slope_shift=slope_shift)
+
     def quantized_mean(
         self,
         value,
@@ -153,6 +250,7 @@ class GoldenModel:
         multiplier: int = 1,
         shift: int = 0,
         activation: str = "none",
+        h_gelu_x_scale_shift: int = 7,
         out_dtype: DType = DType.INT16,
     ) -> np.ndarray:
         lhs_arr = np.array(lhs, dtype=np.int64)
@@ -173,17 +271,34 @@ class GoldenModel:
                     multiplier=multiplier,
                     shift=shift,
                     activation=activation,
+                    h_gelu_x_scale_shift=h_gelu_x_scale_shift,
                     out_dtype=out_dtype,
                 )
         return out
 
-    def _ppu(self, acc: int, bias: int, multiplier: int, shift: int, activation: str, out_dtype: DType) -> int:
+    def _ppu(
+        self,
+        acc: int,
+        bias: int,
+        multiplier: int,
+        shift: int,
+        activation: str,
+        h_gelu_x_scale_shift: int,
+        out_dtype: DType,
+    ) -> int:
         value = np.int64(acc) + np.int64(np.int32(bias))
         value *= np.int64(multiplier & 0xFFFF)
         if shift > 0:
             value = (value + (np.int64(1) << (shift - 1))) >> shift
         if activation == "relu":
             value = max(0, value)
+        elif activation == "sigmoid":
+            p_out = 4 if out_dtype == DType.INT4 else 8 if out_dtype == DType.INT8 else 16
+            clamped = int(np.clip(value, -32768, 32767))
+            return int(self.di_sigmoid(clamped, m_i=int(multiplier), k_i=int(shift), p_out=p_out))
+        elif activation == "h_gelu":
+            clamped = int(np.clip(value, -32768, 32767))
+            value = self.h_gelu(clamped, x_scale_shift=int(h_gelu_x_scale_shift))
         if out_dtype == DType.INT4:
             return int(np.clip(value, -8, 7))
         if out_dtype == DType.INT8:
