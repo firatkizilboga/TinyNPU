@@ -255,3 +255,58 @@ def test_compile_plan_fuses_layout_restore_into_matrix_im2col():
     source_v2 = emit_cv32e40p_program_v2(artifact, {}, program_name="unit_test_matrix_hwc_v2")
     assert ".kind = TNPU_HOST_IM2COL" in source_v2
     assert ".attrs_i32 = {2, 1, 0, 2, 2, 2, 3, 0}" in source_v2
+
+
+def test_compile_plan_converts_matrix_im2col_to_conv_stream():
+    xmat = np.arange(16 * 8, dtype=np.int16).reshape(16, 8)
+    cols = np.zeros((9, 32), dtype=np.int16)
+    w = np.ones((32, 4), dtype=np.int16)
+    y = np.zeros((9, 4), dtype=np.int16)
+
+    tensors = {
+        "xmat": TensorSpec("xmat", xmat.shape, DType.INT16, TensorKind.INPUT),
+        "cols": TensorSpec("cols", cols.shape, DType.INT16, TensorKind.INTERMEDIATE),
+        "w": TensorSpec("w", w.shape, DType.INT16, TensorKind.CONSTANT, data=w),
+        "y": TensorSpec("y", y.shape, DType.INT16, TensorKind.OUTPUT, is_final_output=True),
+    }
+    steps = [
+        HostOp(
+            "conv2_im2col",
+            "im2col",
+            inputs=["xmat"],
+            outputs=["cols"],
+            attrs={
+                "kernel_size": 2,
+                "stride": 1,
+                "padding": 0,
+                "input_layout": "matrix_hwc",
+                "matrix_h": 4,
+                "matrix_w": 4,
+                "matrix_c": 8,
+            },
+        ),
+        NpuSegment(
+            "seg_conv",
+            [MatMulOp("op0", "cols", "w", "y", in_dtype=DType.INT16, out_dtype=DType.INT16)],
+            inputs=["cols", "w"],
+            outputs=["y"],
+        ),
+    ]
+    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=["xmat"], outputs=["y"])
+    artifact = compile_plan(plan, {"y": y})
+
+    host_kinds = [step.kind for step in artifact.plan.steps if isinstance(step, HostOp)]
+    assert "im2col" not in host_kinds
+
+    seg = next(step for step in artifact.plan.steps if isinstance(step, NpuSegment))
+    assert seg.ops[0].lhs == "xmat"
+    assert seg.ops[0].conv_stream is not None
+    assert seg.ops[0].conv_stream["input_h"] == 4
+    assert seg.ops[0].conv_stream["input_w"] == 4
+    assert seg.ops[0].conv_stream["input_c"] == 8
+    assert seg.ops[0].conv_stream["kernel_size"] == 2
+    first_instr = artifact.segment_artifacts["seg_conv"].binary["im"][0]
+    assert ((first_instr >> 71) & 0x1) == 1
+
+    source = emit_cv32e40p_c(artifact, {"xmat": xmat}, program_name="unit_test_conv_stream")
+    assert "HostOp im2col" not in source
