@@ -98,13 +98,11 @@ module instruction_memory #(
         host_shared_rd_data = 32'h0;
         row_idx = 0;
         chunk_idx = 0;
-        if (host_shared_rd_en) begin
-            row_idx = host_addr_rel / INST_CHUNKS;
-            chunk_idx = host_addr_rel % INST_CHUNKS;
-            if (row_idx < `IM_SIZE) begin
-                host_shared_rd_data =
-                    memory[row_idx][chunk_idx * `BUFFER_WIDTH + (host_shared_lane * 32) +: 32];
-            end
+        row_idx = host_addr_rel / INST_CHUNKS;
+        chunk_idx = host_addr_rel % INST_CHUNKS;
+        if (row_idx < `IM_SIZE) begin
+            host_shared_rd_data =
+                memory[row_idx][chunk_idx * `BUFFER_WIDTH + (host_shared_lane * 32) +: 32];
         end
     end
 
