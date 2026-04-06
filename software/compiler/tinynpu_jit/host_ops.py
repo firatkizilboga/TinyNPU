@@ -92,8 +92,14 @@ def _validate_im2col(step: HostOp) -> None:
         raise ValueError(f"Host op 'im2col' requires stride > 0, got {stride}.")
     if padding < 0:
         raise ValueError(f"Host op 'im2col' requires padding >= 0, got {padding}.")
-    if layout not in {"hwc", "chw"}:
+    if layout not in {"hwc", "chw", "matrix_hwc"}:
         raise ValueError(f"Host op 'im2col' does not support input_layout={layout!r}.")
+    if layout == "matrix_hwc":
+        matrix_h = int(step.attrs.get("matrix_h", 0))
+        matrix_w = int(step.attrs.get("matrix_w", 0))
+        matrix_c = int(step.attrs.get("matrix_c", 0))
+        if matrix_h <= 0 or matrix_w <= 0 or matrix_c <= 0:
+            raise ValueError("Host op 'im2col' matrix_hwc layout requires positive matrix_h/matrix_w/matrix_c attrs.")
 
 
 def _validate_layout_restore(step: HostOp) -> None:
@@ -296,7 +302,17 @@ def _movement_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[st
 def _im2col_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
     image = np.array(values[step.inputs[0]], copy=False)
     layout = step.attrs.get("input_layout", "hwc")
-    if layout == "chw":
+    if layout == "matrix_hwc":
+        matrix_h = int(step.attrs["matrix_h"])
+        matrix_w = int(step.attrs["matrix_w"])
+        matrix_c = int(step.attrs["matrix_c"])
+        expected_shape = (matrix_h * matrix_w, matrix_c)
+        if image.shape != expected_shape:
+            raise ValueError(
+                f"im2col matrix_hwc input shape mismatch: expected {expected_shape}, got {tuple(image.shape)}."
+            )
+        image = image.reshape(matrix_h, matrix_w, matrix_c)
+    elif layout == "chw":
         if image.ndim == 4:
             if image.shape[0] != 1:
                 raise NotImplementedError(

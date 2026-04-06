@@ -200,3 +200,58 @@ def test_emit_cv32e40p_program_v2_structured_program():
     assert "TNPU_OP_HOST" in source
     assert "TNPU_OP_VERIFY" in source
     assert "TNPU_HOST_RELU" in source
+
+
+def test_compile_plan_fuses_layout_restore_into_matrix_im2col():
+    a = np.arange(20, dtype=np.int16).reshape(4, 5)
+    b = np.ones((5, 3), dtype=np.int16)
+    mat = np.clip(a.astype(np.int32) @ b.astype(np.int32), -32768, 32767).astype(np.int16)
+    cols = np.zeros((1, 12), dtype=np.int16)
+    w2 = np.ones((12, 2), dtype=np.int16)
+    y = np.zeros((1, 2), dtype=np.int16)
+
+    tensors = {
+        "a": TensorSpec("a", a.shape, DType.INT16, TensorKind.CONSTANT, data=a),
+        "b": TensorSpec("b", b.shape, DType.INT16, TensorKind.CONSTANT, data=b),
+        "mat": TensorSpec("mat", mat.shape, DType.INT16, TensorKind.INTERMEDIATE),
+        "restored": TensorSpec("restored", (2, 2, 3), DType.INT16, TensorKind.INTERMEDIATE),
+        "cols": TensorSpec("cols", cols.shape, DType.INT16, TensorKind.INTERMEDIATE),
+        "w2": TensorSpec("w2", w2.shape, DType.INT16, TensorKind.CONSTANT, data=w2),
+        "y": TensorSpec("y", y.shape, DType.INT16, TensorKind.OUTPUT, is_final_output=True),
+    }
+    steps = [
+        NpuSegment("seg0", [MatMulOp("op0", "a", "b", "mat")], inputs=["a", "b"], outputs=["mat"]),
+        HostOp(
+            "restore",
+            "layout_restore",
+            inputs=["mat"],
+            outputs=["restored"],
+            attrs={"layout": "hwc", "original_shape": (2, 2, 3), "out_h": 2, "out_w": 2, "out_channels": 3},
+        ),
+        HostOp(
+            "im2col_next",
+            "im2col",
+            inputs=["restored"],
+            outputs=["cols"],
+            attrs={"kernel_size": 2, "stride": 1, "padding": 0, "input_layout": "hwc"},
+        ),
+        NpuSegment("seg1", [MatMulOp("op1", "cols", "w2", "y")], inputs=["cols", "w2"], outputs=["y"]),
+    ]
+    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=[], outputs=["y"])
+    artifact = compile_plan(plan, {"y": y})
+
+    kinds = [step.kind for step in artifact.plan.steps if isinstance(step, HostOp)]
+    assert "layout_restore" not in kinds
+    fused_im2col = next(step for step in artifact.plan.steps if isinstance(step, HostOp) and step.kind == "im2col")
+    assert fused_im2col.inputs == ["mat"]
+    assert fused_im2col.attrs["input_layout"] == "matrix_hwc"
+    assert fused_im2col.attrs["matrix_h"] == 2
+    assert fused_im2col.attrs["matrix_w"] == 2
+    assert fused_im2col.attrs["matrix_c"] == 3
+
+    source_v1 = emit_cv32e40p_c(artifact, {}, program_name="unit_test_matrix_hwc")
+    assert "host_im2col_matrix(&cols, &mat, 2, 2, 3, 2, 1, 0);" in source_v1
+
+    source_v2 = emit_cv32e40p_program_v2(artifact, {}, program_name="unit_test_matrix_hwc_v2")
+    assert ".kind = TNPU_HOST_IM2COL" in source_v2
+    assert ".attrs_i32 = {2, 1, 0, 2, 2, 2, 3, 0}" in source_v2

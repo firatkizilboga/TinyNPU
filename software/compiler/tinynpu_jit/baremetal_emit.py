@@ -227,10 +227,19 @@ def _emit_host_step_attrs(step: HostOp) -> tuple[list[str], list[str]]:
         kernel_size = int(step.attrs["kernel_size"])
         stride = int(step.attrs.get("stride", 1))
         padding = int(step.attrs.get("padding", 0))
-        layout_is_chw = 1 if str(step.attrs.get("input_layout", "hwc")) == "chw" else 0
-        lines.append(
-            f"    host_im2col({out_ref}, {in_ref}, {kernel_size}, {stride}, {padding}, {layout_is_chw});"
-        )
+        input_layout = str(step.attrs.get("input_layout", "hwc"))
+        if input_layout == "matrix_hwc":
+            matrix_h = int(step.attrs["matrix_h"])
+            matrix_w = int(step.attrs["matrix_w"])
+            matrix_c = int(step.attrs["matrix_c"])
+            lines.append(
+                f"    host_im2col_matrix({out_ref}, {in_ref}, {matrix_h}, {matrix_w}, {matrix_c}, {kernel_size}, {stride}, {padding});"
+            )
+        else:
+            layout_is_chw = 1 if input_layout == "chw" else 0
+            lines.append(
+                f"    host_im2col({out_ref}, {in_ref}, {kernel_size}, {stride}, {padding}, {layout_is_chw});"
+            )
     elif step.kind == "layout_restore":
         layout_is_chw = 1 if str(step.attrs["layout"]) == "chw" else 0
         original_rank = len(tuple(step.attrs["original_shape"]))

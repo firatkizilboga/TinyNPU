@@ -140,7 +140,19 @@ static int tnpu_execute_host_op(TinyTensor *runtime_tensors, const TnpuHostOp *o
                 op->attrs_i32[2]);
             return 0;
         case TNPU_HOST_IM2COL:
-            host_im2col(out, in, op->attrs_i32[0], op->attrs_i32[1], op->attrs_i32[2], op->attrs_i32[3]);
+            if (op->attrs_i32[3] == 2) {
+                host_im2col_matrix(
+                    out,
+                    in,
+                    op->attrs_i32[4],
+                    op->attrs_i32[5],
+                    op->attrs_i32[6],
+                    op->attrs_i32[0],
+                    op->attrs_i32[1],
+                    op->attrs_i32[2]);
+            } else {
+                host_im2col(out, in, op->attrs_i32[0], op->attrs_i32[1], op->attrs_i32[2], op->attrs_i32[3]);
+            }
             return 0;
         case TNPU_HOST_LAYOUT_RESTORE:
             host_layout_restore(
