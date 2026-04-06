@@ -614,6 +614,52 @@ static void host_im2col(
     }
 }
 
+static void host_im2col_matrix(
+    TinyTensor *dst,
+    const TinyTensor *src,
+    int matrix_h,
+    int matrix_w,
+    int matrix_c,
+    int kernel_size,
+    int stride,
+    int padding)
+{
+    runtime_assert(src->dtype != TINY_DTYPE_FLOAT32, "im2col_matrix expects integer input");
+    runtime_assert(dst->dtype != TINY_DTYPE_FLOAT32, "im2col_matrix expects integer output");
+    runtime_assert(kernel_size > 0 && stride > 0 && padding >= 0, "im2col_matrix attrs invalid");
+    runtime_assert(src->rank == 2, "im2col_matrix expects rank-2 [H*W, C] input");
+    runtime_assert(matrix_h > 0 && matrix_w > 0 && matrix_c > 0, "im2col_matrix requires positive matrix dims");
+    runtime_assert(src->shape[0] == matrix_h * matrix_w, "im2col_matrix H*W mismatch");
+    runtime_assert(src->shape[1] == matrix_c, "im2col_matrix C mismatch");
+
+    const int out_h = ((matrix_h + (2 * padding) - kernel_size) / stride) + 1;
+    const int out_w = ((matrix_w + (2 * padding) - kernel_size) / stride) + 1;
+    runtime_assert(dst->elem_count == out_h * out_w * kernel_size * kernel_size * matrix_c, "im2col_matrix output shape mismatch");
+
+    int patch_index = 0;
+    for (int y = 0; y <= (matrix_h + 2 * padding - kernel_size); y += stride) {
+        for (int x = 0; x <= (matrix_w + 2 * padding - kernel_size); x += stride) {
+            int out_linear_base = patch_index * (kernel_size * kernel_size * matrix_c);
+            int out_linear = out_linear_base;
+            for (int channel = 0; channel < matrix_c; ++channel) {
+                for (int ky = 0; ky < kernel_size; ++ky) {
+                    for (int kx = 0; kx < kernel_size; ++kx) {
+                        int in_y = y + ky - padding;
+                        int in_x = x + kx - padding;
+                        int32_t value = 0;
+                        if (in_y >= 0 && in_y < matrix_h && in_x >= 0 && in_x < matrix_w) {
+                            int src_linear = (in_y * matrix_w + in_x) * matrix_c + channel;
+                            value = tensor_get_i32(src, src_linear);
+                        }
+                        tensor_set_i32(dst, out_linear++, value);
+                    }
+                }
+            }
+            patch_index += 1;
+        }
+    }
+}
+
 typedef union {
     int64_t s64;
     struct {

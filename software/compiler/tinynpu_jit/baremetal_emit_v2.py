@@ -405,7 +405,14 @@ def emit_cv32e40p_program_v2(
                 attrs_i32[0] = int(step.attrs["kernel_size"])
                 attrs_i32[1] = int(step.attrs.get("stride", 1))
                 attrs_i32[2] = int(step.attrs.get("padding", 0))
-                attrs_i32[3] = 1 if str(step.attrs.get("input_layout", "hwc")) == "chw" else 0
+                layout = str(step.attrs.get("input_layout", "hwc"))
+                if layout == "matrix_hwc":
+                    attrs_i32[3] = 2
+                    attrs_i32[4] = int(step.attrs["matrix_h"])
+                    attrs_i32[5] = int(step.attrs["matrix_w"])
+                    attrs_i32[6] = int(step.attrs["matrix_c"])
+                else:
+                    attrs_i32[3] = 1 if layout == "chw" else 0
             elif step.kind == "layout_restore":
                 attrs_i32[0] = 1 if str(step.attrs["layout"]) == "chw" else 0
                 attrs_i32[1] = len(tuple(step.attrs["original_shape"]))

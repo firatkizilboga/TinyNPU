@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from collections import Counter
+
 import numpy as np
 
 from tinynpu import TinyNPUProgram
 
 from .artifact import CompiledArtifact, SegmentArtifact
-from .ir import DType, ExecutionPlan, NpuSegment, TensorKind, to_precision_mode
+from .ir import DType, ExecutionPlan, HostOp, NpuSegment, TensorKind, VerifyTensor, to_precision_mode
 from .memory_planner import (
     MemoryPlanEntry,
     SegmentMemoryPlan,
@@ -19,6 +21,7 @@ class SegmentCompiler:
         self.defines_path = defines_path
 
     def compile(self, plan: ExecutionPlan, expected_tensors: dict[str, np.ndarray]) -> CompiledArtifact:
+        self._fuse_layout_restore_im2col(plan)
         self._annotate_output_layouts(plan)
         # Read UB capacity from hardware config
         _tmp = TinyNPUProgram(defines_path=self.defines_path)
@@ -52,6 +55,64 @@ class SegmentCompiler:
             memory_report=memory_report,
             static_ub_image=memory_report.static_ub_image,
         )
+
+    @staticmethod
+    def _is_matrix_hwc_source_shape(shape: tuple[int, ...], out_h: int, out_w: int, out_c: int) -> bool:
+        if len(shape) != 2:
+            return False
+        return int(shape[0]) == (out_h * out_w) and int(shape[1]) == out_c
+
+    def _fuse_layout_restore_im2col(self, plan: ExecutionPlan) -> None:
+        tensor_uses: Counter[str] = Counter()
+        for step in plan.steps:
+            if isinstance(step, HostOp):
+                for name in step.inputs:
+                    tensor_uses[name] += 1
+            elif isinstance(step, NpuSegment):
+                for op in step.ops:
+                    tensor_uses[op.lhs] += 1
+                    tensor_uses[op.rhs] += 1
+                    if op.bias:
+                        tensor_uses[op.bias] += 1
+            elif isinstance(step, VerifyTensor):
+                tensor_uses[step.tensor_name] += 1
+        for out_name in plan.outputs:
+            tensor_uses[out_name] += 1
+
+        rewritten_steps = []
+        i = 0
+        while i < len(plan.steps):
+            step = plan.steps[i]
+            if (
+                isinstance(step, HostOp)
+                and step.kind == "layout_restore"
+                and i + 1 < len(plan.steps)
+                and isinstance(plan.steps[i + 1], HostOp)
+                and plan.steps[i + 1].kind == "im2col"
+            ):
+                next_step = plan.steps[i + 1]
+                restored_name = step.outputs[0]
+                if next_step.inputs and next_step.inputs[0] == restored_name and tensor_uses[restored_name] == 1:
+                    out_h = int(step.attrs["out_h"])
+                    out_w = int(step.attrs["out_w"])
+                    out_channels = int(step.attrs["out_channels"])
+                    src_name = step.inputs[0]
+                    src_spec = plan.tensors.get(src_name)
+                    if src_spec and self._is_matrix_hwc_source_shape(src_spec.shape, out_h, out_w, out_channels):
+                        fused_attrs = dict(next_step.attrs)
+                        fused_attrs["input_layout"] = "matrix_hwc"
+                        fused_attrs["matrix_h"] = out_h
+                        fused_attrs["matrix_w"] = out_w
+                        fused_attrs["matrix_c"] = out_channels
+                        next_step.inputs = [src_name]
+                        next_step.attrs = fused_attrs
+                        rewritten_steps.append(next_step)
+                        i += 2
+                        continue
+            rewritten_steps.append(step)
+            i += 1
+
+        plan.steps = rewritten_steps
 
     def _annotate_output_layouts(self, plan: ExecutionPlan) -> None:
         for step in plan.steps:
