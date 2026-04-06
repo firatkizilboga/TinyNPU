@@ -160,9 +160,9 @@ module ubss #(
     end
 
     assign host_shared_wr_fire = (host_shared_allow === 1'b1) && (host_shared_wr_en === 1'b1);
-    assign host_shared_rd_data = ((host_shared_allow === 1'b1) && (host_shared_rd_en === 1'b1))
-        ? host_data_comb[(host_shared_lane * 32) +: 32]
-        : 32'h0;
+    // Keep read data address-driven (not rd_en-gated). The core samples on
+    // response timing, which can be a cycle after the request pulse.
+    assign host_shared_rd_data = host_data_comb[(host_shared_lane * 32) +: 32];
 
     unified_buffer #(
         .INIT_FILE(UB_INIT_FILE)
