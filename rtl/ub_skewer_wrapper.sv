@@ -61,6 +61,7 @@ module ub_skewer_wrapper #(
 
   // UB outputs (before skewing)
   logic [BUFFER_WIDTH-1:0] ub_input_data;
+  logic [BUFFER_WIDTH-1:0] ub_input_data_comb;
   logic [BUFFER_WIDTH-1:0] ub_weight_data;
   logic                    ub_input_first;
   logic                    ub_input_last;
@@ -84,6 +85,7 @@ module ub_skewer_wrapper #(
 
       // Write interface
       .wr_en  (wr_en),
+      .wr_mask('1),
       .wr_addr(wr_addr),
       .wr_data(wr_data),
 
@@ -94,6 +96,7 @@ module ub_skewer_wrapper #(
       .input_first_out(ub_input_first),
       .input_last_out (ub_input_last),
       .input_data     (ub_input_data),
+      .input_data_comb(ub_input_data_comb),
 
       // Weight read interface
       .weight_first_in (weight_first_in),
@@ -101,7 +104,9 @@ module ub_skewer_wrapper #(
       .weight_addr     (weight_addr),
       .weight_first_out(ub_weight_first),
       .weight_last_out (ub_weight_last),
-      .weight_data     (ub_weight_data)
+      .weight_data     (ub_weight_data),
+      .host_addr       ('0),
+      .host_data_comb  ()
   );
 
   // ========================================================================

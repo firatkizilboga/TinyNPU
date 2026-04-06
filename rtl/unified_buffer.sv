@@ -27,7 +27,11 @@ module unified_buffer #(
     input  logic [  `ADDR_WIDTH-1:0] weight_addr,
     output logic                     weight_first_out,
     output logic                     weight_last_out,
-    output logic [`BUFFER_WIDTH-1:0] weight_data
+    output logic [`BUFFER_WIDTH-1:0] weight_data,
+
+    // Optional host shared read tap.
+    input  logic [  `ADDR_WIDTH-1:0] host_addr,
+    output logic [`BUFFER_WIDTH-1:0] host_data_comb
 );
 
   // Memory: BUFFER_DEPTH rows × BUFFER_WIDTH bits per row
@@ -35,6 +39,7 @@ module unified_buffer #(
 
   // Port A combinational read tap (used by CU when arbiter maps CU onto Port A).
   assign input_data_comb = memory[input_addr];
+  assign host_data_comb  = memory[host_addr];
 
   // Write logic (negedge for timing hygiene)
   always_ff @(negedge clk) begin

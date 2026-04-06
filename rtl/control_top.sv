@@ -13,6 +13,15 @@ module control_top #(
     input  logic                        host_wr_en,
     output logic [`HOST_DATA_WIDTH-1:0] host_rd_data,
 
+    // Optional shared SRAM host window into IM.
+    input  logic [`ADDR_WIDTH-1:0]      host_shared_addr,
+    input  logic [1:0]                  host_shared_lane,
+    input  logic [31:0]                 host_shared_wr_data,
+    input  logic [3:0]                  host_shared_wr_be,
+    input  logic                        host_shared_wr_en,
+    input  logic                        host_shared_rd_en,
+    output logic [31:0]                 host_shared_rd_data,
+
     // Interface to Unified Buffer
     output logic                        ub_req,
     output logic                        ub_wr_en,
@@ -46,6 +55,9 @@ module control_top #(
     output logic                        sa_input_last,
     output logic                        sa_weight_first,
     output logic                        sa_weight_last,
+
+    // Shared SRAM host access gate (high when host direct access is safe)
+    output logic                        host_shared_allow,
     input  logic                        all_done_in
 );
 
@@ -57,6 +69,8 @@ module control_top #(
     logic [`HOST_DATA_WIDTH-1:0] status_bus;
     logic                        mmvr_wr_en;
     logic [`BUFFER_WIDTH-1:0]    mmvr_internal;
+    logic                        host_shared_im_wr_fire;
+    logic                        host_shared_im_rd_fire;
 
     // Instruction Memory Internal Signals
     logic                        im_wr_en;
@@ -91,6 +105,13 @@ module control_top #(
         .wr_en   (im_wr_en),
         .wr_addr (im_addr),
         .wr_data (im_wdata),
+        .host_shared_addr(host_shared_addr),
+        .host_shared_lane(host_shared_lane),
+        .host_shared_wr_data(host_shared_wr_data),
+        .host_shared_wr_be(host_shared_wr_be),
+        .host_shared_wr_en(host_shared_im_wr_fire),
+        .host_shared_rd_en(host_shared_im_rd_fire),
+        .host_shared_rd_data(host_shared_rd_data),
         .rd_addr (im_addr),
         .rd_data (im_rdata)
     );
@@ -141,5 +162,9 @@ module control_top #(
         .ppu_output_layout(ppu_output_layout),
         .all_done_in    (all_done_in)
     );
+
+    assign host_shared_allow = (status_bus != `STATUS_BUSY);
+    assign host_shared_im_wr_fire = host_shared_allow && host_shared_wr_en;
+    assign host_shared_im_rd_fire = host_shared_allow && host_shared_rd_en;
 
 endmodule
