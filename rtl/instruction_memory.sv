@@ -68,8 +68,7 @@ module instruction_memory #(
             if (row_idx < `IM_SIZE) begin
                 memory[row_idx][chunk_idx * `BUFFER_WIDTH +: `BUFFER_WIDTH] <= wr_data;
             end
-        end
-        if (host_shared_wr_en) begin
+        end else if (host_shared_wr_en) begin
             row_idx = host_addr_rel / INST_CHUNKS;
             chunk_idx = host_addr_rel % INST_CHUNKS;
             if (row_idx < `IM_SIZE) begin
