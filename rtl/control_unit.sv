@@ -107,6 +107,13 @@ module control_unit #(
   logic [ 1:0] mm_out_precision;
   logic [ 1:0] mm_write_offset;
   output_layout_t mm_output_layout;
+  logic        mm_conv_stream_en;
+  logic [ 7:0] mm_conv_kernel;
+  logic [ 7:0] mm_conv_stride;
+  logic [ 7:0] mm_conv_padding;
+  logic [15:0] mm_conv_in_h;
+  logic [15:0] mm_conv_in_w;
+  logic [14:0] mm_conv_in_c;
   logic [15:0] m_idx, n_idx, k_idx;
 
   // Flexible counter width for NxN support
@@ -140,6 +147,13 @@ module control_unit #(
       {mm_a_base, mm_b_base, mm_c_base, mm_bias_base, mm_m_total, mm_k_total, mm_n_total} <= '0;
       {mm_shift, mm_multiplier, mm_activation, mm_h_gelu_x_scale_shift, mm_in_precision, mm_out_precision, mm_write_offset} <= '0;
       mm_output_layout <= OUT_LAYOUT_C;
+      mm_conv_stream_en <= 1'b0;
+      mm_conv_kernel <= '0;
+      mm_conv_stride <= '0;
+      mm_conv_padding <= '0;
+      mm_conv_in_h <= '0;
+      mm_conv_in_w <= '0;
+      mm_conv_in_c <= '0;
       {m_idx, n_idx, k_idx, cycle_cnt} <= '0;
       perf_total_cycles <= '0;
       for (int perf_i = 0; perf_i < CTRL_STATE_COUNT; perf_i++) begin
@@ -189,6 +203,13 @@ module control_unit #(
         mm_in_precision   <= im_rdata[83:82];
         mm_h_gelu_x_scale_shift <= im_rdata[81:74];
         mm_output_layout  <= output_layout_t'(im_rdata[73:72]);
+        mm_conv_stream_en <= im_rdata[71];
+        mm_conv_kernel <= im_rdata[70:63];
+        mm_conv_stride <= im_rdata[62:55];
+        mm_conv_padding <= im_rdata[54:47];
+        mm_conv_in_h <= im_rdata[46:31];
+        mm_conv_in_w <= im_rdata[30:15];
+        mm_conv_in_c <= im_rdata[14:0];
         m_idx <= '0;
         n_idx <= '0;
         k_idx <= '0;
@@ -220,6 +241,24 @@ module control_unit #(
     logic [$clog2(`ARRAY_SIZE)-1:0]   a_word_base;
     logic [$clog2(`ARRAY_SIZE+1)-1:0] a_words_per_tile;
     logic        wb_valid_cycle;
+    logic [15:0] conv_row_lin;
+    logic [15:0] conv_out_h;
+    logic [15:0] conv_out_w;
+    logic [31:0] conv_out_elems;
+    logic [15:0] conv_c_phys;
+    logic [15:0] conv_c_tiles;
+    logic [15:0] conv_k_window_idx;
+    logic [15:0] conv_c_tile_idx;
+    logic [15:0] conv_oy;
+    logic [15:0] conv_ox;
+    logic [15:0] conv_ky;
+    logic [15:0] conv_kx;
+    logic [15:0] conv_in_y;
+    logic [15:0] conv_in_x;
+    logic [15:0] conv_in_row_lin;
+    logic [15:0] conv_input_addr;
+    logic        conv_row_valid;
+    logic [2:0]  conv_pack_factor;
 
     always_comb begin
         unique case (mm_out_precision)
@@ -252,6 +291,36 @@ module control_unit #(
             end
         endcase
         wb_valid_cycle = (mm_output_layout != OUT_LAYOUT_A) || (cycle_cnt < a_words_per_tile);
+
+        conv_row_lin = (m_idx * `ARRAY_SIZE) + cycle_cnt;
+        conv_out_h = 16'd0;
+        conv_out_w = 16'd0;
+        if (mm_conv_stride != 0 && mm_conv_kernel != 0) begin
+            conv_out_h = ((mm_conv_in_h + (mm_conv_padding << 1) - mm_conv_kernel) / mm_conv_stride) + 1;
+            conv_out_w = ((mm_conv_in_w + (mm_conv_padding << 1) - mm_conv_kernel) / mm_conv_stride) + 1;
+        end
+        conv_out_elems = conv_out_h * conv_out_w;
+        unique case (mm_in_precision)
+            2'b00: conv_pack_factor = 3'd4; // INT4
+            2'b01: conv_pack_factor = 3'd2; // INT8
+            default: conv_pack_factor = 3'd1; // INT16
+        endcase
+        conv_c_phys = (mm_conv_in_c + conv_pack_factor - 1) / conv_pack_factor;
+        conv_c_tiles = (conv_c_phys + `ARRAY_SIZE - 1) / `ARRAY_SIZE;
+        conv_k_window_idx = (conv_c_tiles != 0) ? (k_idx / conv_c_tiles) : 16'd0;
+        conv_c_tile_idx = (conv_c_tiles != 0) ? (k_idx % conv_c_tiles) : 16'd0;
+        conv_ky = (mm_conv_kernel != 0) ? (conv_k_window_idx / mm_conv_kernel) : 16'd0;
+        conv_kx = (mm_conv_kernel != 0) ? (conv_k_window_idx % mm_conv_kernel) : 16'd0;
+        conv_oy = (conv_out_w != 0) ? (conv_row_lin / conv_out_w) : 16'd0;
+        conv_ox = (conv_out_w != 0) ? (conv_row_lin % conv_out_w) : 16'd0;
+        conv_in_y = (conv_oy * mm_conv_stride) + conv_ky;
+        conv_in_x = (conv_ox * mm_conv_stride) + conv_kx;
+        conv_in_row_lin = (conv_in_y * mm_conv_in_w) + conv_in_x;
+        conv_input_addr = mm_a_base
+            + ((conv_in_row_lin / `ARRAY_SIZE) * (conv_c_tiles * `ARRAY_SIZE))
+            + (conv_c_tile_idx * `ARRAY_SIZE)
+            + (conv_in_row_lin % `ARRAY_SIZE);
+        conv_row_valid = (conv_row_lin < conv_out_elems);
     end
 
     always_comb begin
@@ -457,7 +526,17 @@ module control_unit #(
         status_out = `STATUS_BUSY;
         compute_enable = 1'b1;
 
-        ub_addr   = mm_a_base + (m_idx * mm_k_total * `ARRAY_SIZE) + (k_idx * `ARRAY_SIZE) + cycle_cnt;
+        if (mm_conv_stream_en) begin
+          if (conv_row_valid) begin
+            ub_addr = conv_input_addr;
+          end else begin
+            // Tail rows inside the final M tile are outside logical output and
+            // ignored by shape-aware host readback.
+            ub_addr = mm_a_base;
+          end
+        end else begin
+          ub_addr = mm_a_base + (m_idx * mm_k_total * `ARRAY_SIZE) + (k_idx * `ARRAY_SIZE) + cycle_cnt;
+        end
         ub_w_addr = mm_b_base + (k_idx * mm_n_total * `ARRAY_SIZE) + (n_idx * `ARRAY_SIZE) + cycle_cnt;
 
         if (k_idx == 0 && cycle_cnt == 0) begin

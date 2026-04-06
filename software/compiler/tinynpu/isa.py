@@ -43,6 +43,7 @@ class MatMul(Instruction):
         write_offset=0,
         h_gelu_x_scale_shift=7,
         output_layout=OutputLayout.C,
+        conv_stream=None,
     ):
         self.a = a
         self.b = b
@@ -56,6 +57,7 @@ class MatMul(Instruction):
         self.write_offset = write_offset
         self.h_gelu_x_scale_shift = h_gelu_x_scale_shift
         self.output_layout = output_layout
+        self.conv_stream = conv_stream
         
         # Tile dimensions (logical) will be set by the compiler during inference
         self.m = 0
@@ -85,6 +87,14 @@ class MatMul(Instruction):
         instr |= (self.in_prec & 0x3) << 82
         instr |= (self.h_gelu_x_scale_shift & 0xFF) << 74
         instr |= (self.output_layout & 0x3) << 72
+        if self.conv_stream is not None:
+            instr |= (1 & 0x1) << 71
+            instr |= (int(self.conv_stream.get("kernel_size", 0)) & 0xFF) << 63
+            instr |= (int(self.conv_stream.get("stride", 0)) & 0xFF) << 55
+            instr |= (int(self.conv_stream.get("padding", 0)) & 0xFF) << 47
+            instr |= (int(self.conv_stream.get("input_h", 0)) & 0xFFFF) << 31
+            instr |= (int(self.conv_stream.get("input_w", 0)) & 0xFFFF) << 15
+            instr |= (int(self.conv_stream.get("input_c", 0)) & 0x7FFF)
         return instr
 
 class Move(Instruction):
@@ -128,6 +138,7 @@ def pack_matmul(
     write_offset=0,
     h_gelu_x_scale_shift=7,
     output_layout=OutputLayout.C,
+    conv_stream=None,
 ):
     instr = 0
     instr |= (opcode & 0xF) << 252
@@ -146,6 +157,14 @@ def pack_matmul(
     instr |= (in_precision & 0x3) << 82
     instr |= (h_gelu_x_scale_shift & 0xFF) << 74
     instr |= (output_layout & 0x3) << 72
+    if conv_stream is not None:
+        instr |= (1 & 0x1) << 71
+        instr |= (int(conv_stream.get("kernel_size", 0)) & 0xFF) << 63
+        instr |= (int(conv_stream.get("stride", 0)) & 0xFF) << 55
+        instr |= (int(conv_stream.get("padding", 0)) & 0xFF) << 47
+        instr |= (int(conv_stream.get("input_h", 0)) & 0xFFFF) << 31
+        instr |= (int(conv_stream.get("input_w", 0)) & 0xFFFF) << 15
+        instr |= (int(conv_stream.get("input_c", 0)) & 0x7FFF)
     return instr
 
 def pack_move(opcode, src, dest, count):

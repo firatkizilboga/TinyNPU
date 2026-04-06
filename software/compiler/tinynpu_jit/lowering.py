@@ -21,10 +21,12 @@ class SegmentCompiler:
         self.defines_path = defines_path
 
     def compile(self, plan: ExecutionPlan, expected_tensors: dict[str, np.ndarray]) -> CompiledArtifact:
+        _tmp = TinyNPUProgram(defines_path=self.defines_path)
+        array_size = int(_tmp.hw.params.get("ARRAY_SIZE", 8))
         self._fuse_layout_restore_im2col(plan)
+        self._materialize_conv_stream_im2col(plan, array_size=array_size)
         self._annotate_output_layouts(plan)
         # Read UB capacity from hardware config
-        _tmp = TinyNPUProgram(defines_path=self.defines_path)
         ub_capacity = int(_tmp.hw.params.get("BUFFER_DEPTH", 0))
         if ub_capacity <= 0:
             ub_capacity = int(_tmp.hw.params.get("IM_BASE_ADDR", 0x8000))
@@ -114,6 +116,83 @@ class SegmentCompiler:
 
         plan.steps = rewritten_steps
 
+    def _materialize_conv_stream_im2col(self, plan: ExecutionPlan, *, array_size: int) -> None:
+        def physical_per_word(dtype: DType) -> int:
+            if dtype == DType.INT4:
+                return 4
+            if dtype == DType.INT8:
+                return 2
+            return 1
+
+        tensor_uses: Counter[str] = Counter()
+        for step in plan.steps:
+            if isinstance(step, HostOp):
+                for name in step.inputs:
+                    tensor_uses[name] += 1
+            elif isinstance(step, NpuSegment):
+                for op in step.ops:
+                    tensor_uses[op.lhs] += 1
+                    tensor_uses[op.rhs] += 1
+                    if op.bias:
+                        tensor_uses[op.bias] += 1
+
+        rewritten_steps = []
+        i = 0
+        while i < len(plan.steps):
+            step = plan.steps[i]
+            if (
+                isinstance(step, HostOp)
+                and step.kind == "im2col"
+                and str(step.attrs.get("input_layout")) == "matrix_hwc"
+                and i + 1 < len(plan.steps)
+                and isinstance(plan.steps[i + 1], NpuSegment)
+            ):
+                seg = plan.steps[i + 1]
+                if seg.ops:
+                    op = seg.ops[0]
+                    cols_name = step.outputs[0]
+                    src_name = step.inputs[0]
+                    if (
+                        op.lhs == cols_name
+                        and tensor_uses[cols_name] == 1
+                        and src_name in plan.tensors
+                    ):
+                        kernel = int(step.attrs.get("kernel_size", 0))
+                        stride = int(step.attrs.get("stride", 1))
+                        padding = int(step.attrs.get("padding", 0))
+                        in_h = int(step.attrs.get("matrix_h", 0))
+                        in_w = int(step.attrs.get("matrix_w", 0))
+                        in_c = int(step.attrs.get("matrix_c", 0))
+                        src_shape = tuple(int(dim) for dim in plan.tensors[src_name].shape)
+                        source_is_matrix = len(src_shape) == 2 and src_shape[0] == (in_h * in_w) and src_shape[1] == in_c
+                        if (
+                            source_is_matrix
+                            and kernel > 0
+                            and stride > 0
+                            and padding == 0
+                        ):
+                            p_in = physical_per_word(op.in_dtype)
+                            c_phys = (in_c + p_in - 1) // p_in
+                            if c_phys > 0 and (c_phys % array_size) == 0:
+                                op.lhs = src_name
+                                op.conv_stream = {
+                                    "input_h": in_h,
+                                    "input_w": in_w,
+                                    "input_c": in_c,
+                                    "kernel_size": kernel,
+                                    "stride": stride,
+                                    "padding": padding,
+                                }
+                                seg.inputs = sorted({name for name in seg.inputs if name != cols_name} | {src_name})
+                                rewritten_steps.append(seg)
+                                i += 2
+                                continue
+
+            rewritten_steps.append(step)
+            i += 1
+
+        plan.steps = rewritten_steps
+
     def _annotate_output_layouts(self, plan: ExecutionPlan) -> None:
         for step in plan.steps:
             if not isinstance(step, NpuSegment):
@@ -194,6 +273,7 @@ class SegmentCompiler:
                 write_offset=0,
                 h_gelu_x_scale_shift=int(op.h_gelu_x_scale_shift),
                 output_layout=output_layout,
+                conv_stream=op.conv_stream,
             )
 
         # Pre-assign globally planned addresses before compile() runs so that
