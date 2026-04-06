@@ -7,9 +7,16 @@
 #define NPU_BASE 0x30000000u
 #define TB_TIMER_CTRL_BASE 0x15000000u
 #define TB_TIMER_COUNT_REG 0x15001000u
+#define TINY_IM_BASE_ADDR 0x8000u
+#define NPU_SHARED_UB_BASE 0x31000000u
+#define NPU_SHARED_IM_BASE 0x32000000u
 #define TINY_ARRAY_SIZE __TINY_ARRAY_SIZE__
 #define TINY_BUFFER_WORDS_32 __TINY_BUFFER_WORDS_32__
 #define TINY_MMVR_BYTES (TINY_BUFFER_WORDS_32 * 4)
+
+#ifndef TINYNPU_USE_SHARED_SRAM
+#define TINYNPU_USE_SHARED_SRAM 0
+#endif
 
 enum {
     REG_STATUS = 0x00,
@@ -886,15 +893,59 @@ static void npu_doorbell(void)
     npu_write8(REG_MMVR + (uint32_t)(TINY_MMVR_BYTES - 1), 0);
 }
 
+#if TINYNPU_USE_SHARED_SRAM
+static inline uintptr_t npu_shared_base_for_addr(uint16_t addr)
+{
+    return (addr >= TINY_IM_BASE_ADDR) ? (uintptr_t)NPU_SHARED_IM_BASE : (uintptr_t)NPU_SHARED_UB_BASE;
+}
+
+static inline uint32_t npu_shared_rel_word_for_addr(uint16_t addr)
+{
+    return (addr >= TINY_IM_BASE_ADDR) ? (uint32_t)(addr - TINY_IM_BASE_ADDR) : (uint32_t)addr;
+}
+
+static void npu_shared_write_word(uint16_t addr, const uint32_t chunks[TINY_BUFFER_WORDS_32])
+{
+    const uintptr_t base = npu_shared_base_for_addr(addr);
+    const uintptr_t word_addr = base + (uintptr_t)(npu_shared_rel_word_for_addr(addr) * (uint32_t)TINY_MMVR_BYTES);
+    for (int part = 0; part < TINY_BUFFER_WORDS_32; ++part) {
+        volatile uint32_t *slot = (volatile uint32_t *)(word_addr + (uintptr_t)(part * 4u));
+        *slot = chunks[part];
+    }
+}
+
+static void npu_shared_read_word(uint16_t addr, uint8_t out[TINY_MMVR_BYTES])
+{
+    const uintptr_t base = npu_shared_base_for_addr(addr);
+    const uintptr_t word_addr = base + (uintptr_t)(npu_shared_rel_word_for_addr(addr) * (uint32_t)TINY_MMVR_BYTES);
+    for (int part = 0; part < TINY_BUFFER_WORDS_32; ++part) {
+        volatile uint32_t *slot = (volatile uint32_t *)(word_addr + (uintptr_t)(part * 4u));
+        const uint32_t value = *slot;
+        out[part * 4 + 0] = (uint8_t)((value >> 0) & 0xFFu);
+        out[part * 4 + 1] = (uint8_t)((value >> 8) & 0xFFu);
+        out[part * 4 + 2] = (uint8_t)((value >> 16) & 0xFFu);
+        out[part * 4 + 3] = (uint8_t)((value >> 24) & 0xFFu);
+    }
+}
+#endif
+
 static void npu_write_mem_word(uint16_t addr, const uint32_t chunks[TINY_BUFFER_WORDS_32])
 {
+#if TINYNPU_USE_SHARED_SRAM
+    npu_shared_write_word(addr, chunks);
+#else
     npu_write16(REG_ADDR, addr);
     npu_write8(REG_CMD, CMD_WRITE_MEM);
     npu_write_mmvr(chunks);
+#endif
 }
 
 static int npu_read_mem_word(uint16_t addr, uint8_t out[TINY_MMVR_BYTES])
 {
+#if TINYNPU_USE_SHARED_SRAM
+    npu_shared_read_word(addr, out);
+    return 0;
+#else
     uint8_t status = 0;
     npu_write16(REG_ADDR, addr);
     npu_write8(REG_CMD, CMD_READ_MEM);
@@ -912,6 +963,7 @@ static int npu_read_mem_word(uint16_t addr, uint8_t out[TINY_MMVR_BYTES])
 
     printf("NPU read timeout at 0x%04x status=0x%02x\n", addr, (unsigned)status);
     return -1;
+#endif
 }
 
 static int npu_run(uint32_t start_addr)

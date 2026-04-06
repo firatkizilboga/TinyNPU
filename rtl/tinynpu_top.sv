@@ -13,6 +13,16 @@ module tinynpu_top #(
     input  logic                        host_wr_en,
     output logic [`HOST_DATA_WIDTH-1:0] host_rd_data,
 
+    // Optional shared SRAM host window into UB/IM.
+    input  logic [`ADDR_WIDTH-1:0]      host_shared_addr,
+    input  logic [1:0]                  host_shared_lane,
+    input  logic [31:0]                 host_shared_wr_data,
+    input  logic [3:0]                  host_shared_wr_be,
+    input  logic                        host_shared_wr_en,
+    input  logic                        host_shared_rd_en,
+    output logic [31:0]                 host_shared_rd_data,
+    output logic                        host_shared_allow,
+
     output logic [(`ARRAY_SIZE * `ARRAY_SIZE * `ACC_WIDTH)-1:0] results_flat,
     output logic result_valid,
     output logic all_done
@@ -30,6 +40,14 @@ module tinynpu_top #(
     logic                        ppu_wb_en;
     logic                        ppu_bias_en;
     logic                        ppu_bias_clear;
+    logic                        host_shared_allow_int;
+    logic [31:0]                 host_shared_ub_rd_data;
+    logic [31:0]                 host_shared_im_rd_data;
+    logic                        host_shared_is_im;
+    logic                        host_shared_ub_wr_en;
+    logic                        host_shared_ub_rd_en;
+    logic                        host_shared_im_wr_en;
+    logic                        host_shared_im_rd_en;
     logic [$clog2(`ARRAY_SIZE)-1:0] ppu_cycle_idx;
     logic                        ppu_capture_en;
     logic [ 7:0]                 ppu_shift;
@@ -60,6 +78,13 @@ module tinynpu_top #(
         .host_wr_data   (host_wr_data),
         .host_wr_en     (host_wr_en),
         .host_rd_data   (host_rd_data),
+        .host_shared_addr(host_shared_addr),
+        .host_shared_lane(host_shared_lane),
+        .host_shared_wr_data(host_shared_wr_data),
+        .host_shared_wr_be(host_shared_wr_be),
+        .host_shared_wr_en(host_shared_im_wr_en),
+        .host_shared_rd_en(host_shared_im_rd_en),
+        .host_shared_rd_data(host_shared_im_rd_data),
         .ub_req         (ub_req),
         .ub_wr_en       (ub_wr_en),
         .ub_addr        (ub_addr),
@@ -76,6 +101,7 @@ module tinynpu_top #(
         .sa_input_last  (sa_input_last),
         .sa_weight_first(sa_weight_first),
         .sa_weight_last (sa_weight_last),
+        .host_shared_allow(host_shared_allow_int),
         .ppu_cycle_idx  (ppu_cycle_idx),
         .ppu_capture_en (ppu_capture_en),
         .ppu_shift      (ppu_shift),
@@ -100,6 +126,14 @@ module tinynpu_top #(
         .cu_addr        (ub_addr),
         .cu_wdata       (ub_wdata),
         .cu_rdata       (ub_rdata),
+        .host_shared_addr(host_shared_addr),
+        .host_shared_lane(host_shared_lane),
+        .host_shared_wr_data(host_shared_wr_data),
+        .host_shared_wr_be(host_shared_wr_be),
+        .host_shared_wr_en(host_shared_ub_wr_en),
+        .host_shared_rd_en(host_shared_ub_rd_en),
+        .host_shared_allow(host_shared_allow_int),
+        .host_shared_rd_data(host_shared_ub_rd_data),
         .sa_input_addr  (ub_addr),
         .sa_input_first (sa_input_first),
         .sa_input_last  (sa_input_last),
@@ -127,5 +161,13 @@ module tinynpu_top #(
         .result_valid   (result_valid),
         .all_done       (all_done)
     );
+
+    assign host_shared_is_im = (host_shared_addr >= `IM_BASE_ADDR);
+    assign host_shared_ub_wr_en = host_shared_wr_en && !host_shared_is_im;
+    assign host_shared_ub_rd_en = host_shared_rd_en && !host_shared_is_im;
+    assign host_shared_im_wr_en = host_shared_wr_en && host_shared_is_im;
+    assign host_shared_im_rd_en = host_shared_rd_en && host_shared_is_im;
+    assign host_shared_rd_data = host_shared_is_im ? host_shared_im_rd_data : host_shared_ub_rd_data;
+    assign host_shared_allow = host_shared_allow_int;
 
 endmodule

@@ -17,6 +17,18 @@ module ubss #(
     output logic [`BUFFER_WIDTH-1:0] cu_rdata,  // Data to CU (MMIO Read / Move)
 
     // ------------------------------------------------------------------------
+    // Host shared SRAM window (32-bit lane access into 128-bit UB word)
+    // ------------------------------------------------------------------------
+    input  logic [`ADDR_WIDTH-1:0]   host_shared_addr,
+    input  logic [1:0]               host_shared_lane,
+    input  logic [31:0]              host_shared_wr_data,
+    input  logic [3:0]               host_shared_wr_be,
+    input  logic                     host_shared_wr_en,
+    input  logic                     host_shared_rd_en,
+    input  logic                     host_shared_allow,
+    output logic [31:0]              host_shared_rd_data,
+
+    // ------------------------------------------------------------------------
     // Systolic Array Interface (Streamer)
     // ------------------------------------------------------------------------
     input  logic [`ADDR_WIDTH-1:0]   sa_input_addr,   // Base address for Input Matrix
@@ -59,6 +71,9 @@ module ubss #(
     logic [`BUFFER_WIDTH-1:0] ub_rdata_internal;
     logic [`BUFFER_WIDTH-1:0] ppu_wdata;
     logic [`BUFFER_WIDTH-1:0] ub_wr_mask;
+    logic [`BUFFER_WIDTH-1:0] host_shared_mask;
+    logic [`BUFFER_WIDTH-1:0] host_shared_wide_wdata;
+    logic                     host_shared_wr_fire;
     
     // Mask Generation for Compact Packing
     always_comb begin
@@ -84,9 +99,12 @@ module ubss #(
         end
     end
 
-    // Mux for UB Write Data: Either from CU (MMIO Load) or PPU (Compute Result)
+    // Mux for UB Write Data: PPU (compute result) > host_shared > CU (MMIO load)
+    // PPU must win to avoid corrupting writeback.
     logic [`BUFFER_WIDTH-1:0] ub_final_wdata;
-    assign ub_final_wdata = (ppu_wb_en) ? ppu_wdata : cu_wdata;
+    assign ub_final_wdata = ppu_wb_en ? ppu_wdata
+                          : host_shared_wr_fire ? host_shared_wide_wdata
+                          : cu_wdata;
 
     // ========================================================================
     // Unified Buffer Instance
@@ -97,6 +115,7 @@ module ubss #(
     logic [`BUFFER_WIDTH-1:0] skewer_input_data;
     logic [`BUFFER_WIDTH-1:0] skewer_input_data_comb;
     logic [`BUFFER_WIDTH-1:0] skewer_weight_data;
+    logic [`BUFFER_WIDTH-1:0] host_data_comb;
     logic                     skewer_input_first, skewer_input_last;
     logic                     skewer_weight_first, skewer_weight_last;
     logic [`ADDR_WIDTH-1:0]   ub_port_a_addr;
@@ -129,14 +148,30 @@ module ubss #(
     // CU reads observe Port A combinational tap when arbiter routes CU onto Port A.
     assign cu_rdata = cu_req && !cu_wr_en ? skewer_input_data_comb : '0;
 
+    always_comb begin
+        host_shared_mask = '0;
+        host_shared_wide_wdata = '0;
+        for (int b = 0; b < 4; b++) begin
+            if (host_shared_wr_be[b]) begin
+                host_shared_mask[(host_shared_lane * 32) + (b * 8) +: 8] = 8'hFF;
+            end
+        end
+        host_shared_wide_wdata[(host_shared_lane * 32) +: 32] = host_shared_wr_data;
+    end
+
+    assign host_shared_wr_fire = (host_shared_allow === 1'b1) && (host_shared_wr_en === 1'b1);
+    assign host_shared_rd_data = ((host_shared_allow === 1'b1) && (host_shared_rd_en === 1'b1))
+        ? host_data_comb[(host_shared_lane * 32) +: 32]
+        : 32'h0;
+
     unified_buffer #(
         .INIT_FILE(UB_INIT_FILE)
     ) u_buffer (
         .clk             (clk),
         .rst_n           (rst_n),
-        .wr_en           (cu_wr_en | ppu_wb_en),
-        .wr_mask         (ub_wr_mask),
-        .wr_addr         (cu_addr),
+        .wr_en           (cu_wr_en | ppu_wb_en | host_shared_wr_fire),
+        .wr_mask         (host_shared_wr_fire && !ppu_wb_en ? host_shared_mask : ub_wr_mask),
+        .wr_addr         (host_shared_wr_fire && !ppu_wb_en ? host_shared_addr : cu_addr),
         .wr_data         (ub_final_wdata),
         
         // Port A: SA Input Stream or CU Read (arbiter selected)
@@ -154,7 +189,9 @@ module ubss #(
         .weight_addr     (ub_port_b_addr),
         .weight_first_out(skewer_weight_first),
         .weight_last_out (skewer_weight_last),
-        .weight_data     (skewer_weight_data)
+        .weight_data     (skewer_weight_data),
+        .host_addr       (host_shared_addr),
+        .host_data_comb  (host_data_comb)
     );
     
     // ========================================================================
