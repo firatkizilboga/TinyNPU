@@ -129,8 +129,6 @@ class TinyNPUProgram:
             padding = int(conv_stream["padding"])
             if A.shape != (in_h * in_w, in_c):
                 raise ValueError(f"conv_stream expects lhs shape {(in_h * in_w, in_c)}, got {A.shape}.")
-            if padding != 0:
-                raise ValueError("conv_stream currently supports padding=0 only.")
             if kernel <= 0 or stride <= 0:
                 raise ValueError("conv_stream requires kernel_size > 0 and stride > 0.")
             out_h = ((in_h + 2 * padding - kernel) // stride) + 1
@@ -151,9 +149,12 @@ class TinyNPUProgram:
         else:
             out_role = 'C'
         if out_name not in self.symbols:
-            out_shape = (A.shape[0], B.shape[1])
+            out_rows = expected_out_rows if conv_stream is not None else A.shape[0]
+            out_shape = (out_rows, B.shape[1])
             self.symbols[out_name] = Symbol(out_name, out_shape, out_precision, role=out_role)
         else:
+            out_rows = expected_out_rows if conv_stream is not None else A.shape[0]
+            self.symbols[out_name].shape = (out_rows, B.shape[1])
             self.symbols[out_name].storage_role = out_role
             self.symbols[out_name].precision = out_precision
         if bias_name:

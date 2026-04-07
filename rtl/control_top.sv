@@ -29,6 +29,12 @@ module control_top #(
     output logic [`ADDR_WIDTH-1:0]      ub_w_addr, // For Weights
     output logic [`BUFFER_WIDTH-1:0]    ub_wdata,
     input  logic [`BUFFER_WIDTH-1:0]    ub_rdata,
+    output logic                        conv_stream_gather_en,
+    output logic [`ADDR_WIDTH-1:0]      conv_stream_lane_word_addr[`ARRAY_SIZE-1:0],
+    output logic [$clog2(`ARRAY_SIZE)-1:0] conv_stream_lane_word_lane[`ARRAY_SIZE-1:0],
+    output logic [1:0]                  conv_stream_lane_subidx[`ARRAY_SIZE-1:0],
+    output logic [`ARRAY_SIZE-1:0]      conv_stream_lane_valid,
+    output logic [1:0]                  conv_stream_in_precision,
 
     // Interface to Systolic Array & PPU
     output logic                        acc_clear,
@@ -140,6 +146,12 @@ module control_top #(
         .ub_w_addr      (ub_w_addr),
         .ub_wdata       (ub_wdata),
         .ub_rdata       (ub_rdata),
+        .conv_stream_gather_en(conv_stream_gather_en),
+        .conv_stream_lane_word_addr(conv_stream_lane_word_addr),
+        .conv_stream_lane_word_lane(conv_stream_lane_word_lane),
+        .conv_stream_lane_subidx(conv_stream_lane_subidx),
+        .conv_stream_lane_valid(conv_stream_lane_valid),
+        .conv_stream_in_precision(conv_stream_in_precision),
         .acc_clear      (acc_clear),
         .compute_enable (compute_enable),
         .drain_enable   (drain_enable),
