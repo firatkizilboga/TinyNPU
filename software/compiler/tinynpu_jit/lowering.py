@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+import os
 
 import numpy as np
 
@@ -17,14 +18,20 @@ from .memory_planner import (
 
 
 class SegmentCompiler:
-    def __init__(self, defines_path: str | None = None):
+    def __init__(self, defines_path: str | None = None, enable_conv_stream: bool | None = None):
         self.defines_path = defines_path
+        if enable_conv_stream is None:
+            env_value = os.getenv("TINYNPU_ENABLE_CONV_STREAM", "1").strip().lower()
+            self.enable_conv_stream = env_value in {"1", "true", "yes", "on"}
+        else:
+            self.enable_conv_stream = bool(enable_conv_stream)
 
     def compile(self, plan: ExecutionPlan, expected_tensors: dict[str, np.ndarray]) -> CompiledArtifact:
         _tmp = TinyNPUProgram(defines_path=self.defines_path)
         array_size = int(_tmp.hw.params.get("ARRAY_SIZE", 8))
         self._fuse_layout_restore_im2col(plan)
-        self._materialize_conv_stream_im2col(plan, array_size=array_size)
+        if self.enable_conv_stream:
+            self._materialize_conv_stream_im2col(plan, array_size=array_size)
         self._annotate_output_layouts(plan)
         # Read UB capacity from hardware config
         ub_capacity = int(_tmp.hw.params.get("BUFFER_DEPTH", 0))
@@ -169,11 +176,10 @@ class SegmentCompiler:
                             source_is_matrix
                             and kernel > 0
                             and stride > 0
-                            and padding == 0
                         ):
                             p_in = physical_per_word(op.in_dtype)
                             c_phys = (in_c + p_in - 1) // p_in
-                            if c_phys > 0 and (c_phys % array_size) == 0:
+                            if c_phys > 0:
                                 op.lhs = src_name
                                 op.conv_stream = {
                                     "input_h": in_h,
