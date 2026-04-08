@@ -96,7 +96,7 @@ def _emit_u32x4_image(name: str, words: list[int]) -> str:
     if not rows:
         rows = ["    {0u, 0u, 0u, 0u}"]
     return (
-        f'static uint32_t {name}[{len(rows)}][TINY_BUFFER_WORDS_32] __attribute__((section(".data"))) = {{\n'
+        f'static uint32_t {name}[{len(rows)}][TINY_BUFFER_WORDS_32] __attribute__((section(".data"), aligned(16))) = {{\n'
         + ",\n".join(rows)
         + "\n};"
     )
@@ -175,8 +175,9 @@ def _emit_host_step_attrs(step: HostOp) -> tuple[list[str], list[str]]:
         lines.append(f"    host_gelu({out_ref}, {in_ref});")
     elif step.kind == "quantize":
         scale = float(step.attrs["scale"])
+        inv_scale = 1.0 / scale
         zero_point = int(step.attrs.get("zero_point", 0))
-        lines.append(f"    host_quantize({out_ref}, {in_ref}, {_format_scalar(scale, dtype=DType.FLOAT32)}, {zero_point});")
+        lines.append(f"    host_quantize({out_ref}, {in_ref}, {_format_scalar(inv_scale, dtype=DType.FLOAT32)}, {zero_point});")
     elif step.kind == "dequantize":
         scale = float(step.attrs["scale"])
         zero_point = int(step.attrs.get("zero_point", 0))

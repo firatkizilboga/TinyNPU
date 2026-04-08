@@ -10,8 +10,8 @@
 #define TINY_IM_BASE_ADDR 0x8000u
 #define NPU_SHARED_UB_BASE 0x31000000u
 #define NPU_SHARED_IM_BASE 0x32000000u
-#define TINY_ARRAY_SIZE __TINY_ARRAY_SIZE__
-#define TINY_BUFFER_WORDS_32 __TINY_BUFFER_WORDS_32__
+#define TINY_ARRAY_SIZE 8
+#define TINY_BUFFER_WORDS_32 4
 #define TINY_MMVR_BYTES (TINY_BUFFER_WORDS_32 * 4)
 
 #ifndef TINYNPU_USE_SHARED_SRAM
@@ -1439,9 +1439,157 @@ static int tensor_matches_expected(const TinyTensor *actual, const TinyTensor *e
     return 1;
 }
 
-__GENERATED_DECLS__
+static int32_t xmat_data[252] __attribute__((section(".data"))) = {
+    -15, -14, -13, -12, -11, -10, -9, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, -15, -14, -13, -12, -11, -10, -9, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, -15, -14, -13, -12, -11, -10, -9, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, -15, -14, -13, -12, -11, -10, -9, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, -15, -14, -13, -12, -11, -10, -9, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, -15, -14, -13, -12, -11, -10, -9, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, -15, -14, -13, -12, -11, -10, -9, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, -15, -14, -13, -12, -11, -10, -9, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, -15, -14, -13, -12
+};
+
+static TinyTensor xmat = {"xmat", xmat_data, TINY_DTYPE_INT16, 2, {36, 7, 1, 1}, 252};
+
+static int32_t cols_data[2268] __attribute__((section(".noinit")));
+
+static TinyTensor cols = {"cols", cols_data, TINY_DTYPE_INT16, 2, {36, 63, 1, 1}, 2268};
+
+static int32_t w_data[378] __attribute__((section(".data"))) = {
+    -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, -8, -7, -6, -5
+};
+
+static TinyTensor w = {"w", w_data, TINY_DTYPE_INT16, 2, {63, 6, 1, 1}, 378};
+
+static int32_t y_data[216] __attribute__((section(".noinit")));
+
+static TinyTensor y = {"y", y_data, TINY_DTYPE_INT16, 2, {36, 6, 1, 1}, 216};
+
+static int32_t y_expected_data[216] __attribute__((section(".data"))) = {
+    12, 132, 150, -36, -103, -68, -263, -222, 176, 200, 207, 78, -214, -334, -216, 55, 309, 19, 52, 174, -112, -245, 132, 84, 39, 341, 116, 44, -45, 87, -229, -151, 29, 311, -2, -145, -452, -349, 43, 469, 62, -192, 329, -2, -112, -18, 110, 272, 318, 164, 112, -263, -77, 143, 214, 268, 305, 19, -233, 76, -479, -279, 312, 53, -172, -363, 143, -68, -58, 105, 438, -62, 226, -17, -158, -78, 223, -37, 170, 374, 85, 0, -51, -68, 35, 416, 185, 158, -362, -321, -193, -193, 130, 657, 164, -295, 416, 35, -142, -115, -54, 41, 369, 277, 219, -213, -288, -142, 253, 191, 44, -222, -267, -6, -175, -25, 499, 173, -119, -377, -279, -479, -424, -165, 128, 455, 268, 214, -231, -472, -152, 202, 164, 318, -38, -190, -308, 135, -118, -29, -93, -4, 102, -98, -433, -376, -64, 316, 390, 56, 348, -83, -327, -367, 154, 182, 275, 21, -165, -147, -95, -9, 171, 125, 28, 135, -251, -76, -553, -453, 4, 665, 306, -19, 15, -304, -436, -415, -190, 256, 35, -191, -315, -235, 15, 146, 33, 73, 215, -68, -181, 216, -227, -38, 253, 119, 36, -64, -332, -304, -174, 58, 222, -158, 28, -136, -198, -158, 222, 58, 120, 447, 196, 47, 0, 123
+};
+
+static TinyTensor y_expected = {"y", y_expected_data, TINY_DTYPE_INT16, 2, {36, 6, 1, 1}, 216};
+
+static int32_t y__cpu_seg_conv_data[216] __attribute__((section(".noinit")));
+
+static TinyTensor y__cpu_seg_conv = {"y", y__cpu_seg_conv_data, TINY_DTYPE_INT16, 2, {36, 6, 1, 1}, 216};
+
+static uint32_t tinynpu_static_ub_image[64][TINY_BUFFER_WORDS_32] __attribute__((section(".data"), aligned(16))) = {
+    {0xfff9fff8u, 0xfffbfffau, 0xfffdfffcu, 0x00000000u},
+    {0xfffffffeu, 0x00010000u, 0x00030002u, 0x00000000u},
+    {0x00050004u, 0x00070006u, 0xfff80008u, 0x00000000u},
+    {0xfffafff9u, 0xfffcfffbu, 0xfffefffdu, 0x00000000u},
+    {0x0000ffffu, 0x00020001u, 0x00040003u, 0x00000000u},
+    {0x00060005u, 0x00080007u, 0xfff9fff8u, 0x00000000u},
+    {0xfffbfffau, 0xfffdfffcu, 0xfffffffeu, 0x00000000u},
+    {0x00010000u, 0x00030002u, 0x00050004u, 0x00000000u},
+    {0x00070006u, 0xfff80008u, 0xfffafff9u, 0x00000000u},
+    {0xfffcfffbu, 0xfffefffdu, 0x0000ffffu, 0x00000000u},
+    {0x00020001u, 0x00040003u, 0x00060005u, 0x00000000u},
+    {0x00080007u, 0xfff9fff8u, 0xfffbfffau, 0x00000000u},
+    {0xfffdfffcu, 0xfffffffeu, 0x00010000u, 0x00000000u},
+    {0x00030002u, 0x00050004u, 0x00070006u, 0x00000000u},
+    {0xfff80008u, 0xfffafff9u, 0xfffcfffbu, 0x00000000u},
+    {0xfffefffdu, 0x0000ffffu, 0x00020001u, 0x00000000u},
+    {0x00040003u, 0x00060005u, 0x00080007u, 0x00000000u},
+    {0xfff9fff8u, 0xfffbfffau, 0xfffdfffcu, 0x00000000u},
+    {0xfffffffeu, 0x00010000u, 0x00030002u, 0x00000000u},
+    {0x00050004u, 0x00070006u, 0xfff80008u, 0x00000000u},
+    {0xfffafff9u, 0xfffcfffbu, 0xfffefffdu, 0x00000000u},
+    {0x0000ffffu, 0x00020001u, 0x00040003u, 0x00000000u},
+    {0x00060005u, 0x00080007u, 0xfff9fff8u, 0x00000000u},
+    {0xfffbfffau, 0xfffdfffcu, 0xfffffffeu, 0x00000000u},
+    {0x00010000u, 0x00030002u, 0x00050004u, 0x00000000u},
+    {0x00070006u, 0xfff80008u, 0xfffafff9u, 0x00000000u},
+    {0xfffcfffbu, 0xfffefffdu, 0x0000ffffu, 0x00000000u},
+    {0x00020001u, 0x00040003u, 0x00060005u, 0x00000000u},
+    {0x00080007u, 0xfff9fff8u, 0xfffbfffau, 0x00000000u},
+    {0xfffdfffcu, 0xfffffffeu, 0x00010000u, 0x00000000u},
+    {0x00030002u, 0x00050004u, 0x00070006u, 0x00000000u},
+    {0xfff80008u, 0xfffafff9u, 0xfffcfffbu, 0x00000000u},
+    {0xfffefffdu, 0x0000ffffu, 0x00020001u, 0x00000000u},
+    {0x00040003u, 0x00060005u, 0x00080007u, 0x00000000u},
+    {0xfff9fff8u, 0xfffbfffau, 0xfffdfffcu, 0x00000000u},
+    {0xfffffffeu, 0x00010000u, 0x00030002u, 0x00000000u},
+    {0x00050004u, 0x00070006u, 0xfff80008u, 0x00000000u},
+    {0xfffafff9u, 0xfffcfffbu, 0xfffefffdu, 0x00000000u},
+    {0x0000ffffu, 0x00020001u, 0x00040003u, 0x00000000u},
+    {0x00060005u, 0x00080007u, 0xfff9fff8u, 0x00000000u},
+    {0xfffbfffau, 0xfffdfffcu, 0xfffffffeu, 0x00000000u},
+    {0x00010000u, 0x00030002u, 0x00050004u, 0x00000000u},
+    {0x00070006u, 0xfff80008u, 0xfffafff9u, 0x00000000u},
+    {0xfffcfffbu, 0xfffefffdu, 0x0000ffffu, 0x00000000u},
+    {0x00020001u, 0x00040003u, 0x00060005u, 0x00000000u},
+    {0x00080007u, 0xfff9fff8u, 0xfffbfffau, 0x00000000u},
+    {0xfffdfffcu, 0xfffffffeu, 0x00010000u, 0x00000000u},
+    {0x00030002u, 0x00050004u, 0x00070006u, 0x00000000u},
+    {0xfff80008u, 0xfffafff9u, 0xfffcfffbu, 0x00000000u},
+    {0xfffefffdu, 0x0000ffffu, 0x00020001u, 0x00000000u},
+    {0x00040003u, 0x00060005u, 0x00080007u, 0x00000000u},
+    {0xfff9fff8u, 0xfffbfffau, 0xfffdfffcu, 0x00000000u},
+    {0xfffffffeu, 0x00010000u, 0x00030002u, 0x00000000u},
+    {0x00050004u, 0x00070006u, 0xfff80008u, 0x00000000u},
+    {0xfffafff9u, 0xfffcfffbu, 0xfffefffdu, 0x00000000u},
+    {0x0000ffffu, 0x00020001u, 0x00040003u, 0x00000000u},
+    {0x00060005u, 0x00080007u, 0xfff9fff8u, 0x00000000u},
+    {0xfffbfffau, 0xfffdfffcu, 0xfffffffeu, 0x00000000u},
+    {0x00010000u, 0x00030002u, 0x00050004u, 0x00000000u},
+    {0x00070006u, 0xfff80008u, 0xfffafff9u, 0x00000000u},
+    {0xfffcfffbu, 0xfffefffdu, 0x0000ffffu, 0x00000000u},
+    {0x00020001u, 0x00040003u, 0x00060005u, 0x00000000u},
+    {0x00080007u, 0xfff9fff8u, 0xfffbfffau, 0x00000000u},
+    {0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u}
+};
+
+static uint32_t im_seg_conv[4][TINY_BUFFER_WORDS_32] __attribute__((section(".data"), aligned(16))) = {
+    {0x00000000u, 0x00000000u, 0x00881c00u, 0xff000001u},
+    {0x080001ffu, 0x00000500u, 0x00018000u, 0x20004000u},
+    {0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u},
+    {0x00000000u, 0x00000000u, 0x00000000u, 0x10000000u}
+};
 
 int main(void)
 {
-__GENERATED_MAIN__
+    uint32_t cycle_t0 = 0;
+    uint32_t cycle_t1 = 0;
+    uint32_t cycle_segment_t0 = 0;
+    printf("TinyNPU bare-metal program: cv32e40p_int16_cpu_vs_npu_conv_demo\n");
+    tb_timer_reset_counter();
+    cycle_t0 = read_mcycle32();
+    load_ub_image(0u, tinynpu_static_ub_image, 64);
+    cycle_t1 = read_mcycle32();
+    print_cycle_delta32("preload.ub_image", cycle_t0, cycle_t1);
+    cycle_t0 = read_mcycle32();
+    load_im_image(0x8000u, im_seg_conv, 4);
+    cycle_t1 = read_mcycle32();
+    print_cycle_delta32("preload.im_seg_conv", cycle_t0, cycle_t1);
+    printf("HostOp im2col: conv_im2col\n");
+    cycle_t0 = read_mcycle32();
+    host_im2col_matrix(&cols, &xmat, 6, 6, 7, 3, 1, 1);
+    cycle_t1 = read_mcycle32();
+    print_cycle_delta32("hostop.conv_im2col", cycle_t0, cycle_t1);
+    printf("NpuSegment: seg_conv\n");
+    cycle_segment_t0 = read_mcycle32();
+    cycle_t0 = read_mcycle32();
+    write_tensor_to_npu(&cols, 0x0040u, "A", 2, 320);
+    cycle_t1 = read_mcycle32();
+    print_cycle_delta32("segment.seg_conv.stage", cycle_t0, cycle_t1);
+    cycle_t0 = read_mcycle32();
+    if (npu_run(0x8000u) != 0) return EXIT_FAILURE;
+    cycle_t1 = read_mcycle32();
+    print_cycle_delta32("segment.seg_conv.run", cycle_t0, cycle_t1);
+    cycle_t0 = read_mcycle32();
+    read_tensor_from_npu(&y, 0x0180u, "C", 2);
+    cycle_t1 = read_mcycle32();
+    print_cycle_delta32("segment.seg_conv.readback", cycle_t0, cycle_t1);
+    print_cycle_delta32("segment.seg_conv.npu", cycle_segment_t0, cycle_t1);
+    cycle_t0 = read_mcycle32();
+    host_matmul(&y__cpu_seg_conv, &cols, &w, NULL, 1, 0, 0, 7);
+    cycle_t1 = read_mcycle32();
+    print_cycle_delta32("segment.seg_conv.cpu", cycle_t0, cycle_t1);
+    if (!tensor_matches_expected(&y, &y__cpu_seg_conv)) {
+        printf("cpu baseline mismatch: segment seg_conv output y\n");
+        print_tensor(&y);
+        print_tensor(&y__cpu_seg_conv);
+        return EXIT_FAILURE;
+    }
+    printf("Final outputs:\n");
+    print_tensor(&y);
+    printf("All outputs matched expected tensors\n");
+    return EXIT_SUCCESS;
 }

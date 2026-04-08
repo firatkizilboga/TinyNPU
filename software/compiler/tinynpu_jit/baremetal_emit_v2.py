@@ -362,8 +362,11 @@ def emit_cv32e40p_program_v2(
             arr0_name = "NULL"
             arr0_len = 0
 
-            if step.kind in {"quantize", "dequantize", "requantize"}:
+            if step.kind in {"dequantize", "requantize"}:
                 attrs_f32[0] = float(step.attrs["scale"])
+                attrs_i32[0] = int(step.attrs.get("zero_point", 0))
+            elif step.kind == "quantize":
+                attrs_f32[0] = 1.0 / float(step.attrs["scale"])
                 attrs_i32[0] = int(step.attrs.get("zero_point", 0))
             elif step.kind == "transpose":
                 axes = tuple(int(axis) for axis in step.attrs.get("axes", []))
