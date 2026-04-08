@@ -148,14 +148,19 @@ module systolic_array (
                 
                 // DEBUG for PE[0][0]
                 if (r == 0 && c == 0) begin : debug_pe00
+                    int pe00_trace_count;
                     always_ff @(posedge clk) begin
-                        if (valid_h_bus[r][c] && !drain_enable && !acc_clear) begin
-                             // Since inputs are latched inside PE, we should look at bus values 
-                             // that WILL be latched.
-                             // $display("PE[0][0]: Input=%d Weight=%d Acc=%d", 
-                             //     $signed(horizontal_bus[r][c]), 
-                             //     $signed(vertical_bus[r][c][15:0]), 
-                             //     pe_accumulators[r][c]);
+                        if ($test$plusargs("trace_pe00") &&
+                            valid_h_bus[r][c] && valid_v_bus[r][c] &&
+                            !drain_enable && !acc_clear &&
+                            pe00_trace_count < 100) begin
+                             // Inputs seen by PE[0][0] before internal latch.
+                             $display("[PE00] in=%0d wt=%0d acc=%0d mode=%0d",
+                                 $signed(horizontal_bus[r][c]),
+                                 $signed(vertical_bus[r][c][15:0]),
+                                 pe_accumulators[r][c],
+                                 precision_mode);
+                             pe00_trace_count <= pe00_trace_count + 1;
                         end
                     end
                 end

@@ -7,9 +7,16 @@
 #define NPU_BASE 0x30000000u
 #define TB_TIMER_CTRL_BASE 0x15000000u
 #define TB_TIMER_COUNT_REG 0x15001000u
+#define TINY_IM_BASE_ADDR 0x8000u
+#define NPU_SHARED_UB_BASE 0x31000000u
+#define NPU_SHARED_IM_BASE 0x32000000u
 #define TINY_ARRAY_SIZE 8
 #define TINY_BUFFER_WORDS_32 4
 #define TINY_MMVR_BYTES (TINY_BUFFER_WORDS_32 * 4)
+
+#ifndef TINYNPU_USE_SHARED_SRAM
+#define TINYNPU_USE_SHARED_SRAM 0
+#endif
 
 enum {
     REG_STATUS = 0x00,
@@ -24,9 +31,6 @@ enum {
     CMD_READ_MEM = 0x02,
     CMD_RUN = 0x03,
 };
-
-#define WRITE_ARG_PACK_ENABLE (1u << 31)
-#define WRITE_ARG_PHASE_SHIFT 2
 
 enum {
     STATUS_BUSY = 0x01,
@@ -73,15 +77,10 @@ static inline uint32_t read_mcycle32(void)
     return *tb_timer_count;
 }
 
-static void npu_write_mem_word(uint16_t addr, const uint32_t chunks[TINY_BUFFER_WORDS_32]);
-static void npu_write_mem_lanes(uint16_t addr, int precision, int phase, const uint16_t lanes[TINY_ARRAY_SIZE]);
-static void lanes_to_chunks(const uint16_t lanes[TINY_ARRAY_SIZE], uint32_t chunks[TINY_BUFFER_WORDS_32]);
-
 static void print_cycle_delta32(const char *label, uint32_t start, uint32_t end)
 {
     /* The testbench timer counts down from 0xFFFFFFFF, so elapsed cycles are start - end. */
     printf("%s cycles=%lu\n", label, (unsigned long)(start - end));
-    fflush(stdout);
 }
 
 static void print_startup_cycle_report(void)
@@ -127,7 +126,6 @@ static void npu_write32(uint32_t reg, uint32_t value)
 static void runtime_fail(const char *message)
 {
     printf("runtime failure: %s\n", message);
-    fflush(stdout);
     exit(EXIT_FAILURE);
 }
 
@@ -530,11 +528,6 @@ static void host_layout_restore(
     runtime_assert(dst->dtype != TINY_DTYPE_FLOAT32, "layout_restore expects integer output");
     runtime_assert(src->elem_count == out_h * out_w * out_channels, "layout_restore size mismatch");
 
-    if (!layout_is_chw) {
-        host_reshape(dst, src);
-        return;
-    }
-
     for (int h = 0; h < out_h; ++h) {
         for (int w = 0; w < out_w; ++w) {
             for (int c = 0; c < out_channels; ++c) {
@@ -549,96 +542,6 @@ static void host_layout_restore(
                     dst_linear = src_linear;
                 }
                 tensor_set_i32(dst, dst_linear, tensor_get_i32(src, src_linear));
-            }
-        }
-    }
-}
-
-static void write_im2col_to_npu_a(
-    const TinyTensor *src,
-    uint16_t base_addr,
-    int precision,
-    int word_count,
-    int kernel_size,
-    int stride,
-    int padding,
-    int input_layout_is_chw)
-{
-    runtime_assert(src->dtype != TINY_DTYPE_FLOAT32, "im2col->A write expects integer input");
-    runtime_assert(kernel_size > 0 && stride > 0 && padding >= 0, "im2col->A attrs invalid");
-
-    int h = 0;
-    int w = 0;
-    int c = 0;
-    int has_batch = (src->rank == 4);
-    if (input_layout_is_chw) {
-        if (has_batch) {
-            runtime_assert(src->shape[0] == 1, "im2col->A only supports batch size 1");
-            c = src->shape[1];
-            h = src->shape[2];
-            w = src->shape[3];
-        } else {
-            c = src->shape[0];
-            h = src->shape[1];
-            w = src->shape[2];
-        }
-    } else {
-        runtime_assert(src->rank == 3, "hwc im2col->A expects rank-3 input");
-        h = src->shape[0];
-        w = src->shape[1];
-        c = src->shape[2];
-    }
-
-    const int p = 1 << (2 - precision);
-    const int out_h = ((h + (2 * padding) - kernel_size) / stride) + 1;
-    const int out_w = ((w + (2 * padding) - kernel_size) / stride) + 1;
-    const int rows = out_h * out_w;
-    const int cols = kernel_size * kernel_size * c;
-    const int m_tiles = (rows + TINY_ARRAY_SIZE - 1) / TINY_ARRAY_SIZE;
-    const int k_tiles = ((cols / p) + TINY_ARRAY_SIZE - 1) / TINY_ARRAY_SIZE;
-    const int kernel_plane = kernel_size * kernel_size;
-    const int32_t *src_data = tensor_i32(src);
-    uint16_t addr = base_addr;
-
-    runtime_assert(word_count == m_tiles * k_tiles * TINY_ARRAY_SIZE, "fused im2col role A word count mismatch");
-
-    for (int mt = 0; mt < m_tiles; ++mt) {
-        for (int kt = 0; kt < k_tiles; ++kt) {
-            for (int lane_selector = 0; lane_selector < TINY_ARRAY_SIZE; ++lane_selector) {
-                for (int pack_phase = 0; pack_phase < p; ++pack_phase) {
-                    uint16_t lanes[TINY_ARRAY_SIZE];
-                    for (int lane = 0; lane < TINY_ARRAY_SIZE; ++lane) {
-                        const int row = mt * TINY_ARRAY_SIZE + lane;
-                        const int col = (kt * TINY_ARRAY_SIZE + lane_selector) * p + pack_phase;
-                        int patch_y = 0;
-                        int patch_x = 0;
-                        int32_t value = 0;
-                        if (row < rows) {
-                            patch_y = row / out_w;
-                            patch_x = row % out_w;
-                        }
-                        if (row < rows && col < cols) {
-                            const int channel = col / kernel_plane;
-                            const int kernel_offset = col % kernel_plane;
-                            const int ky = kernel_offset / kernel_size;
-                            const int kx = kernel_offset % kernel_size;
-                            const int in_y = patch_y * stride + ky - padding;
-                            const int in_x = patch_x * stride + kx - padding;
-                            if (in_y >= 0 && in_y < h && in_x >= 0 && in_x < w) {
-                                int src_linear;
-                                if (input_layout_is_chw) {
-                                    src_linear = channel * h * w + in_y * w + in_x;
-                                } else {
-                                    src_linear = (in_y * w + in_x) * c + channel;
-                                }
-                                value = src_data[src_linear];
-                            }
-                        }
-                        lanes[lane] = (uint16_t)value;
-                    }
-                    npu_write_mem_lanes(addr, precision, pack_phase, lanes);
-                }
-                addr++;
             }
         }
     }
@@ -978,11 +881,6 @@ static void host_matmul(
     }
 }
 
-static uint32_t make_pack_write_arg(int precision, int phase)
-{
-    return WRITE_ARG_PACK_ENABLE | ((uint32_t)(phase & 0x3) << WRITE_ARG_PHASE_SHIFT) | (uint32_t)(precision & 0x3);
-}
-
 static void npu_write_mmvr(const uint32_t chunks[TINY_BUFFER_WORDS_32])
 {
     for (int part = 0; part < TINY_BUFFER_WORDS_32; ++part) {
@@ -995,26 +893,59 @@ static void npu_doorbell(void)
     npu_write8(REG_MMVR + (uint32_t)(TINY_MMVR_BYTES - 1), 0);
 }
 
-static void npu_write_mem_word(uint16_t addr, const uint32_t chunks[TINY_BUFFER_WORDS_32])
+#if TINYNPU_USE_SHARED_SRAM
+static inline uintptr_t npu_shared_base_for_addr(uint16_t addr)
 {
-    npu_write16(REG_ADDR, addr);
-    npu_write32(REG_ARG, 0u);
-    npu_write8(REG_CMD, CMD_WRITE_MEM);
-    npu_write_mmvr(chunks);
+    return (addr >= TINY_IM_BASE_ADDR) ? (uintptr_t)NPU_SHARED_IM_BASE : (uintptr_t)NPU_SHARED_UB_BASE;
 }
 
-static void npu_write_mem_lanes(uint16_t addr, int precision, int phase, const uint16_t lanes[TINY_ARRAY_SIZE])
+static inline uint32_t npu_shared_rel_word_for_addr(uint16_t addr)
 {
-    uint32_t chunks[TINY_BUFFER_WORDS_32];
-    lanes_to_chunks(lanes, chunks);
+    return (addr >= TINY_IM_BASE_ADDR) ? (uint32_t)(addr - TINY_IM_BASE_ADDR) : (uint32_t)addr;
+}
+
+static void npu_shared_write_word(uint16_t addr, const uint32_t chunks[TINY_BUFFER_WORDS_32])
+{
+    const uintptr_t base = npu_shared_base_for_addr(addr);
+    const uintptr_t word_addr = base + (uintptr_t)(npu_shared_rel_word_for_addr(addr) * (uint32_t)TINY_MMVR_BYTES);
+    for (int part = 0; part < TINY_BUFFER_WORDS_32; ++part) {
+        volatile uint32_t *slot = (volatile uint32_t *)(word_addr + (uintptr_t)(part * 4u));
+        *slot = chunks[part];
+    }
+}
+
+static void npu_shared_read_word(uint16_t addr, uint8_t out[TINY_MMVR_BYTES])
+{
+    const uintptr_t base = npu_shared_base_for_addr(addr);
+    const uintptr_t word_addr = base + (uintptr_t)(npu_shared_rel_word_for_addr(addr) * (uint32_t)TINY_MMVR_BYTES);
+    for (int part = 0; part < TINY_BUFFER_WORDS_32; ++part) {
+        volatile uint32_t *slot = (volatile uint32_t *)(word_addr + (uintptr_t)(part * 4u));
+        const uint32_t value = *slot;
+        out[part * 4 + 0] = (uint8_t)((value >> 0) & 0xFFu);
+        out[part * 4 + 1] = (uint8_t)((value >> 8) & 0xFFu);
+        out[part * 4 + 2] = (uint8_t)((value >> 16) & 0xFFu);
+        out[part * 4 + 3] = (uint8_t)((value >> 24) & 0xFFu);
+    }
+}
+#endif
+
+static void npu_write_mem_word(uint16_t addr, const uint32_t chunks[TINY_BUFFER_WORDS_32])
+{
+#if TINYNPU_USE_SHARED_SRAM
+    npu_shared_write_word(addr, chunks);
+#else
     npu_write16(REG_ADDR, addr);
-    npu_write32(REG_ARG, make_pack_write_arg(precision, phase));
     npu_write8(REG_CMD, CMD_WRITE_MEM);
     npu_write_mmvr(chunks);
+#endif
 }
 
 static int npu_read_mem_word(uint16_t addr, uint8_t out[TINY_MMVR_BYTES])
 {
+#if TINYNPU_USE_SHARED_SRAM
+    npu_shared_read_word(addr, out);
+    return 0;
+#else
     uint8_t status = 0;
     npu_write16(REG_ADDR, addr);
     npu_write8(REG_CMD, CMD_READ_MEM);
@@ -1032,6 +963,7 @@ static int npu_read_mem_word(uint16_t addr, uint8_t out[TINY_MMVR_BYTES])
 
     printf("NPU read timeout at 0x%04x status=0x%02x\n", addr, (unsigned)status);
     return -1;
+#endif
 }
 
 static int npu_run(uint32_t start_addr)
@@ -1064,44 +996,62 @@ static void lanes_to_chunks(const uint16_t lanes[TINY_ARRAY_SIZE], uint32_t chun
     }
 }
 
-static void gather_tensor_write_lanes(
+static void pack_tensor_word(
     const TinyTensor *tensor,
     char role_kind,
     int precision,
     int tile0,
     int tile1,
     int lane_selector,
-    int pack_phase,
-    uint16_t out_lanes[TINY_ARRAY_SIZE])
+    uint32_t out_chunks[TINY_BUFFER_WORDS_32])
 {
     const int p = 1 << (2 - precision);
+    const int bits = 16 / p;
+    const int mask = (1 << bits) - 1;
     const int rows = tensor->rank == 1 ? 1 : tensor->shape[0];
     const int cols = tensor->rank == 1 ? tensor->shape[0] : tensor->shape[1];
+    uint16_t lanes[TINY_ARRAY_SIZE];
     for (int lane = 0; lane < TINY_ARRAY_SIZE; ++lane) {
-        int32_t value = 0;
+        uint16_t subword = 0;
         if (role_kind == 'A') {
             int row = tile0 * TINY_ARRAY_SIZE + lane;
-            int col = (tile1 * TINY_ARRAY_SIZE + lane_selector) * p + pack_phase;
-            if (row < rows && col < cols) {
-                value = tensor_get_i32(tensor, row * cols + col);
+            int start_k = (tile1 * TINY_ARRAY_SIZE + lane_selector) * p;
+            for (int bit_idx = 0; bit_idx < p; ++bit_idx) {
+                int col = start_k + bit_idx;
+                int32_t value = 0;
+                if (row < rows && col < cols) {
+                    value = tensor_get_i32(tensor, row * cols + col);
+                }
+                subword |= (uint16_t)(((uint32_t)value & (uint32_t)mask) << (bit_idx * bits));
             }
         } else if (role_kind == 'B') {
             int col = tile1 * TINY_ARRAY_SIZE + lane;
-            int row = (tile0 * TINY_ARRAY_SIZE + lane_selector) * p + pack_phase;
-            if (row < rows && col < cols) {
-                value = tensor_get_i32(tensor, row * cols + col);
+            int start_k = (tile0 * TINY_ARRAY_SIZE + lane_selector) * p;
+            for (int bit_idx = 0; bit_idx < p; ++bit_idx) {
+                int row = start_k + bit_idx;
+                int32_t value = 0;
+                if (row < rows && col < cols) {
+                    value = tensor_get_i32(tensor, row * cols + col);
+                }
+                subword |= (uint16_t)(((uint32_t)value & (uint32_t)mask) << (bit_idx * bits));
             }
         } else if (role_kind == 'C') {
-            int row = tile0 * (TINY_ARRAY_SIZE * p) + lane_selector + pack_phase * TINY_ARRAY_SIZE;
+            int row_start = tile0 * (TINY_ARRAY_SIZE * p) + lane_selector;
             int col = tile1 * TINY_ARRAY_SIZE + lane;
-            if (row < rows && col < cols) {
-                value = tensor_get_i32(tensor, row * cols + col);
+            for (int bit_idx = 0; bit_idx < p; ++bit_idx) {
+                int row = row_start + bit_idx * TINY_ARRAY_SIZE;
+                int32_t value = 0;
+                if (row < rows && col < cols) {
+                    value = tensor_get_i32(tensor, row * cols + col);
+                }
+                subword |= (uint16_t)(((uint32_t)value & (uint32_t)mask) << (bit_idx * bits));
             }
         } else {
             runtime_fail("unsupported pack role");
         }
-        out_lanes[lane] = (uint16_t)value;
+        lanes[lane] = subword;
     }
+    lanes_to_chunks(lanes, out_chunks);
 }
 
 static void write_tensor_to_npu(
@@ -1123,12 +1073,9 @@ static void write_tensor_to_npu(
         for (int mt = 0; mt < m_tiles; ++mt) {
             for (int kt = 0; kt < k_tiles; ++kt) {
                 for (int lane_selector = 0; lane_selector < TINY_ARRAY_SIZE; ++lane_selector) {
-                    for (int pack_phase = 0; pack_phase < p; ++pack_phase) {
-                        uint16_t lanes[TINY_ARRAY_SIZE];
-                        gather_tensor_write_lanes(tensor, 'A', precision, mt, kt, lane_selector, pack_phase, lanes);
-                        npu_write_mem_lanes(addr, precision, pack_phase, lanes);
-                    }
-                    addr++;
+                    uint32_t chunks[TINY_BUFFER_WORDS_32];
+                    pack_tensor_word(tensor, 'A', precision, mt, kt, lane_selector, chunks);
+                    npu_write_mem_word(addr++, chunks);
                 }
             }
         }
@@ -1142,12 +1089,9 @@ static void write_tensor_to_npu(
         for (int kt = 0; kt < k_tiles; ++kt) {
             for (int nt = 0; nt < n_tiles; ++nt) {
                 for (int lane_selector = 0; lane_selector < TINY_ARRAY_SIZE; ++lane_selector) {
-                    for (int pack_phase = 0; pack_phase < p; ++pack_phase) {
-                        uint16_t lanes[TINY_ARRAY_SIZE];
-                        gather_tensor_write_lanes(tensor, 'B', precision, kt, nt, lane_selector, pack_phase, lanes);
-                        npu_write_mem_lanes(addr, precision, pack_phase, lanes);
-                    }
-                    addr++;
+                    uint32_t chunks[TINY_BUFFER_WORDS_32];
+                    pack_tensor_word(tensor, 'B', precision, kt, nt, lane_selector, chunks);
+                    npu_write_mem_word(addr++, chunks);
                 }
             }
         }
@@ -1161,12 +1105,9 @@ static void write_tensor_to_npu(
         for (int mt_phys_idx = 0; mt_phys_idx < mt_phys; ++mt_phys_idx) {
             for (int nt = 0; nt < n_tiles; ++nt) {
                 for (int lane_selector = 0; lane_selector < TINY_ARRAY_SIZE; ++lane_selector) {
-                    for (int pack_phase = 0; pack_phase < p; ++pack_phase) {
-                        uint16_t lanes[TINY_ARRAY_SIZE];
-                        gather_tensor_write_lanes(tensor, 'C', precision, mt_phys_idx, nt, lane_selector, pack_phase, lanes);
-                        npu_write_mem_lanes(addr, precision, pack_phase, lanes);
-                    }
-                    addr++;
+                    uint32_t chunks[TINY_BUFFER_WORDS_32];
+                    pack_tensor_word(tensor, 'C', precision, mt_phys_idx, nt, lane_selector, chunks);
+                    npu_write_mem_word(addr++, chunks);
                 }
             }
         }
@@ -3186,79 +3127,41 @@ int main(void)
     uint32_t cycle_t1 = 0;
     uint32_t cycle_segment_t0 = 0;
     printf("TinyNPU bare-metal program: cv32e40p_iszero_mlp_demo\n");
-    fflush(stdout);
     tb_timer_reset_counter();
-    uint32_t delta = 0;
-    uint32_t preload_total = 0;
-    uint32_t host_total = 0;
-    uint32_t segment_npu_total = 0;
-    uint32_t segment_cpu_total = 0;
     cycle_t0 = read_mcycle32();
     load_ub_image(0u, tinynpu_static_ub_image, 1650);
     cycle_t1 = read_mcycle32();
-    delta = cycle_t0 - cycle_t1;
-    preload_total += delta;
     print_cycle_delta32("preload.ub_image", cycle_t0, cycle_t1);
     cycle_t0 = read_mcycle32();
     load_im_image(0x8000u, im_segment_000, 10);
     cycle_t1 = read_mcycle32();
-    delta = cycle_t0 - cycle_t1;
-    preload_total += delta;
     print_cycle_delta32("preload.im_segment_000", cycle_t0, cycle_t1);
-    for (int repeat_iter = 0; repeat_iter < 10; ++repeat_iter) {
-        printf("repeat.iter=%d\n", repeat_iter + 1);
-        fflush(stdout);
-        if (repeat_iter == 0) printf("HostOp quantize: q_in\n");
-        if (repeat_iter == 0) fflush(stdout);
-        cycle_t0 = read_mcycle32();
-        host_quantize(&q_in, &x, 3.0279148631962016e-05f, 0);
-        cycle_t1 = read_mcycle32();
-        delta = cycle_t0 - cycle_t1;
-        host_total += delta;
-        if (repeat_iter == 0) print_cycle_delta32("hostop.q_in", cycle_t0, cycle_t1);
-        if (repeat_iter == 0) printf("NpuSegment: segment_000\n");
-        if (repeat_iter == 0) fflush(stdout);
-        cycle_segment_t0 = read_mcycle32();
-        cycle_t0 = read_mcycle32();
-        write_tensor_to_npu(&q_in, 0x06b2u, "A", 2, 64);
-        cycle_t1 = read_mcycle32();
-        if (repeat_iter == 0) print_cycle_delta32("segment.segment_000.stage", cycle_t0, cycle_t1);
-        cycle_t0 = read_mcycle32();
-        if (npu_run(0x8000u) != 0) return EXIT_FAILURE;
-        cycle_t1 = read_mcycle32();
-        if (repeat_iter == 0) print_cycle_delta32("segment.segment_000.run", cycle_t0, cycle_t1);
-        cycle_t0 = read_mcycle32();
-        read_tensor_from_npu(&sigmoid, 0x06b2u, "C", 2);
-        cycle_t1 = read_mcycle32();
-        delta = cycle_segment_t0 - cycle_t1;
-        segment_npu_total += delta;
-        if (repeat_iter == 0) print_cycle_delta32("segment.segment_000.readback", cycle_t0, cycle_t1);
-        if (repeat_iter == 0) print_cycle_delta32("segment.segment_000.npu", cycle_segment_t0, cycle_t1);
-        if (repeat_iter == 0) printf("HostOp dequantize: dq_out\n");
-        if (repeat_iter == 0) fflush(stdout);
-        cycle_t0 = read_mcycle32();
-        host_dequantize(&dq_out, &sigmoid, 3.051850947599719e-05f, 0);
-        cycle_t1 = read_mcycle32();
-        delta = cycle_t0 - cycle_t1;
-        host_total += delta;
-        if (repeat_iter == 0) print_cycle_delta32("hostop.dq_out", cycle_t0, cycle_t1);
-    }
-    printf("repeat.count=%d\n", 10);
-    fflush(stdout);
-    printf("repeat.preload.total cycles=%lu\n", (unsigned long)preload_total);
-    fflush(stdout);
-    printf("repeat.host.shared.total cycles=%lu\n", (unsigned long)host_total);
-    fflush(stdout);
-    printf("repeat.segment.npu.total cycles=%lu\n", (unsigned long)segment_npu_total);
-    fflush(stdout);
-    printf("repeat.program.npu.hot.total cycles=%lu\n", (unsigned long)(host_total + segment_npu_total));
-    fflush(stdout);
-    printf("repeat.program.npu.cold.total cycles=%lu\n", (unsigned long)(preload_total + host_total + segment_npu_total));
-    fflush(stdout);
-    printf("repeat.program.npu.hot.avg cycles=%lu\n", (unsigned long)((host_total + segment_npu_total) / (uint32_t)10));
-    fflush(stdout);
+    printf("HostOp quantize: q_in\n");
+    cycle_t0 = read_mcycle32();
+    host_quantize(&q_in, &x, 3.0279148631962016e-05f, 0);
+    cycle_t1 = read_mcycle32();
+    print_cycle_delta32("hostop.q_in", cycle_t0, cycle_t1);
+    printf("NpuSegment: segment_000\n");
+    cycle_segment_t0 = read_mcycle32();
+    cycle_t0 = read_mcycle32();
+    write_tensor_to_npu(&q_in, 0x06b2u, "A", 2, 64);
+    cycle_t1 = read_mcycle32();
+    print_cycle_delta32("segment.segment_000.stage", cycle_t0, cycle_t1);
+    cycle_t0 = read_mcycle32();
+    if (npu_run(0x8000u) != 0) return EXIT_FAILURE;
+    cycle_t1 = read_mcycle32();
+    print_cycle_delta32("segment.segment_000.run", cycle_t0, cycle_t1);
+    cycle_t0 = read_mcycle32();
+    read_tensor_from_npu(&sigmoid, 0x06b2u, "C", 2);
+    cycle_t1 = read_mcycle32();
+    print_cycle_delta32("segment.segment_000.readback", cycle_t0, cycle_t1);
+    print_cycle_delta32("segment.segment_000.npu", cycle_segment_t0, cycle_t1);
+    printf("HostOp dequantize: dq_out\n");
+    cycle_t0 = read_mcycle32();
+    host_dequantize(&dq_out, &sigmoid, 3.051850947599719e-05f, 0);
+    cycle_t1 = read_mcycle32();
+    print_cycle_delta32("hostop.dq_out", cycle_t0, cycle_t1);
     printf("Final outputs:\n");
-    fflush(stdout);
     print_tensor(&dq_out);
     if (!tensor_matches_expected(&dq_out, &dq_out_expected)) {
         printf("verification failed: dq_out (dq_out)\n");
@@ -3268,6 +3171,5 @@ int main(void)
         return EXIT_FAILURE;
     }
     printf("All outputs matched expected tensors\n");
-    fflush(stdout);
     return EXIT_SUCCESS;
 }
