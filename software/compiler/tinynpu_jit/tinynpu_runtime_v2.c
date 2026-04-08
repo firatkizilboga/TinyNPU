@@ -16,12 +16,101 @@
 #undef __TINY_BUFFER_WORDS_32__
 #undef __TINY_ARRAY_SIZE__
 
+#define TNPU_ARRAY_SIZE 8
+
 static const char *tnpu_role_or_default(const char *role, const char *fallback)
 {
     if (role == NULL || role[0] == '\0') {
         return fallback;
     }
     return role;
+}
+
+static inline char tnpu_role_code(const char *role, char fallback)
+{
+    if (role == NULL || role[0] == '\0') {
+        return fallback;
+    }
+    return role[0];
+}
+
+static inline void tnpu_lanes_to_chunks_u16(const uint16_t lanes[8], uint32_t chunks[TNPU_MMVR_WORDS_32])
+{
+    chunks[0] = (uint32_t)lanes[0] | ((uint32_t)lanes[1] << 16);
+    chunks[1] = (uint32_t)lanes[2] | ((uint32_t)lanes[3] << 16);
+    chunks[2] = (uint32_t)lanes[4] | ((uint32_t)lanes[5] << 16);
+    chunks[3] = (uint32_t)lanes[6] | ((uint32_t)lanes[7] << 16);
+}
+
+static void tnpu_write_tensor_a_int16_fast(
+    const TinyTensor *tensor,
+    uint16_t base_addr,
+    uint16_t word_count)
+{
+    const int rows = tensor->rank == 1 ? 1 : tensor->shape[0];
+    const int cols = tensor->rank == 1 ? tensor->shape[0] : tensor->shape[1];
+    const int m_tiles = (rows + TNPU_ARRAY_SIZE - 1) / TNPU_ARRAY_SIZE;
+    const int k_tiles = (cols + TNPU_ARRAY_SIZE - 1) / TNPU_ARRAY_SIZE;
+    const int32_t *src = tensor_i32(tensor);
+    uint16_t addr = base_addr;
+    uint16_t lanes[TNPU_ARRAY_SIZE];
+    uint32_t chunks[TNPU_MMVR_WORDS_32];
+
+    runtime_assert(word_count == (uint16_t)(m_tiles * k_tiles * TNPU_ARRAY_SIZE), "role A int16 word count mismatch");
+
+    for (int mt = 0; mt < m_tiles; ++mt) {
+        for (int kt = 0; kt < k_tiles; ++kt) {
+            for (int lane_selector = 0; lane_selector < TNPU_ARRAY_SIZE; ++lane_selector) {
+                for (int lane = 0; lane < TNPU_ARRAY_SIZE; ++lane) {
+                    const int row = mt * TNPU_ARRAY_SIZE + lane;
+                    const int col = kt * TNPU_ARRAY_SIZE + lane_selector;
+                    int32_t value = 0;
+                    if (row < rows && col < cols) {
+                        value = src[row * cols + col];
+                    }
+                    lanes[lane] = (uint16_t)value;
+                }
+                tnpu_lanes_to_chunks_u16(lanes, chunks);
+                npu_write_mem_word(addr++, chunks);
+            }
+        }
+    }
+}
+
+static void tnpu_read_tensor_c_int16_fast(
+    TinyTensor *dst,
+    uint16_t addr)
+{
+    const int rows = dst->rank == 1 ? 1 : dst->shape[0];
+    const int cols = dst->rank == 1 ? dst->shape[0] : dst->shape[1];
+    const int m_tiles = (rows + TNPU_ARRAY_SIZE - 1) / TNPU_ARRAY_SIZE;
+    const int n_tiles = (cols + TNPU_ARRAY_SIZE - 1) / TNPU_ARRAY_SIZE;
+    int32_t *out = tensor_i32(dst);
+    uint32_t chunks[TNPU_MMVR_WORDS_32];
+
+    for (int mt = 0; mt < m_tiles; ++mt) {
+        for (int nt = 0; nt < n_tiles; ++nt) {
+            const uint16_t tile_addr =
+                (uint16_t)(addr + (mt * n_tiles * TNPU_ARRAY_SIZE) + (nt * TNPU_ARRAY_SIZE));
+            for (int row_in_tile = 0; row_in_tile < TNPU_ARRAY_SIZE; ++row_in_tile) {
+                runtime_assert(
+                    npu_read_mem_word((uint16_t)(tile_addr + row_in_tile), chunks) == 0,
+                    "readback failed");
+                for (int lane = 0; lane < TNPU_ARRAY_SIZE; ++lane) {
+                    const int row_idx = mt * TNPU_ARRAY_SIZE + row_in_tile;
+                    const int col_idx = nt * TNPU_ARRAY_SIZE + lane;
+                    uint16_t packed_lane;
+                    if (row_idx >= rows || col_idx >= cols) {
+                        continue;
+                    }
+                    packed_lane = (lane & 1)
+                        ? (uint16_t)(chunks[lane / 2] >> 16)
+                        : (uint16_t)(chunks[lane / 2] & 0xFFFFu);
+                    out[row_idx * cols + col_idx] = (int16_t)packed_lane;
+                }
+            }
+        }
+    }
 }
 
 static int tnpu_bind_inputs(
@@ -183,13 +272,18 @@ static int tnpu_execute_segment(TinyTensor *runtime_tensors, const TnpuSegment *
     cycle_t0 = read_mcycle32();
     for (uint32_t i = 0; i < segment->write_count; ++i) {
         const TnpuTensorWrite *write = &segment->writes[i];
-        const char *role = tnpu_role_or_default(write->role, "A");
-        write_tensor_to_npu(
-            &runtime_tensors[write->tensor_idx],
-            write->addr,
-            role,
-            (int)write->precision,
-            (int)write->word_count);
+        TinyTensor *tensor = &runtime_tensors[write->tensor_idx];
+        char role = tnpu_role_code(write->role, 'A');
+        if ((int)write->precision == 2 && role == 'A') {
+            tnpu_write_tensor_a_int16_fast(tensor, write->addr, write->word_count);
+        } else {
+            write_tensor_to_npu(
+                tensor,
+                write->addr,
+                tnpu_role_or_default(write->role, "A"),
+                (int)write->precision,
+                (int)write->word_count);
+        }
     }
     cycle_t1 = read_mcycle32();
     snprintf(label, sizeof(label), "segment.%s.stage", segment->name ? segment->name : "segment");
@@ -206,12 +300,17 @@ static int tnpu_execute_segment(TinyTensor *runtime_tensors, const TnpuSegment *
     cycle_t0 = read_mcycle32();
     for (uint32_t i = 0; i < segment->read_count; ++i) {
         const TnpuTensorRead *read = &segment->reads[i];
-        const char *role = tnpu_role_or_default(read->role, "C");
-        read_tensor_from_npu(
-            &runtime_tensors[read->tensor_idx],
-            read->addr,
-            role,
-            (int)read->precision);
+        TinyTensor *tensor = &runtime_tensors[read->tensor_idx];
+        char role = tnpu_role_code(read->role, 'C');
+        if ((int)read->precision == 2 && role == 'C') {
+            tnpu_read_tensor_c_int16_fast(tensor, read->addr);
+        } else {
+            read_tensor_from_npu(
+                tensor,
+                read->addr,
+                tnpu_role_or_default(read->role, "C"),
+                (int)read->precision);
+        }
     }
     cycle_t1 = read_mcycle32();
     snprintf(label, sizeof(label), "segment.%s.readback", segment->name ? segment->name : "segment");
