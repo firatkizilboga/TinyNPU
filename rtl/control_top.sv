@@ -30,10 +30,10 @@ module control_top #(
     output logic [`BUFFER_WIDTH-1:0]    ub_wdata,
     input  logic [`BUFFER_WIDTH-1:0]    ub_rdata,
     output logic                        conv_stream_gather_en,
-    output logic [`ADDR_WIDTH-1:0]      conv_stream_lane_word_addr[`ARRAY_SIZE-1:0],
-    output logic [$clog2(`ARRAY_SIZE)-1:0] conv_stream_lane_word_lane[`ARRAY_SIZE-1:0],
-    output logic [1:0]                  conv_stream_lane_subidx[`ARRAY_SIZE-1:0],
-    output logic [`ARRAY_SIZE-1:0]      conv_stream_lane_valid,
+    output logic [`ADDR_WIDTH-1:0]      conv_stream_lane_word_addr[`ARRAY_SIZE-1:0][3:0],
+    output logic [$clog2(`ARRAY_SIZE)-1:0] conv_stream_lane_word_lane[`ARRAY_SIZE-1:0][3:0],
+    output logic [1:0]                  conv_stream_lane_subidx[`ARRAY_SIZE-1:0][3:0],
+    output logic [3:0]                  conv_stream_lane_valid[`ARRAY_SIZE-1:0],
     output logic [1:0]                  conv_stream_in_precision,
 
     // Interface to Systolic Array & PPU

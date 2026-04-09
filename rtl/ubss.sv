@@ -35,10 +35,10 @@ module ubss #(
     input  logic                     sa_input_first,  // Marker
     input  logic                     sa_input_last,   // Marker
     input  logic                     conv_stream_gather_en,
-    input  logic [`ADDR_WIDTH-1:0]   conv_stream_lane_word_addr[`ARRAY_SIZE-1:0],
-    input  logic [$clog2(`ARRAY_SIZE)-1:0] conv_stream_lane_word_lane[`ARRAY_SIZE-1:0],
-    input  logic [1:0]               conv_stream_lane_subidx[`ARRAY_SIZE-1:0],
-    input  logic [`ARRAY_SIZE-1:0]   conv_stream_lane_valid,
+    input  logic [`ADDR_WIDTH-1:0]   conv_stream_lane_word_addr[`ARRAY_SIZE-1:0][3:0],
+    input  logic [$clog2(`ARRAY_SIZE)-1:0] conv_stream_lane_word_lane[`ARRAY_SIZE-1:0][3:0],
+    input  logic [1:0]               conv_stream_lane_subidx[`ARRAY_SIZE-1:0][3:0],
+    input  logic [3:0]               conv_stream_lane_valid[`ARRAY_SIZE-1:0],
     input  logic [1:0]               conv_stream_in_precision,
     
     input  logic [`ADDR_WIDTH-1:0]   sa_weight_addr,  // Base address for Weight Matrix
