@@ -409,7 +409,7 @@ Third, repeated-run runtime work is already justified by measured behavior. On a
     \end{tabularx}
 \end{table}
 
-Fourth, the Runtime V2 correctness baseline was re-checked after the packed conv-stream RTL fix. The updated matrix is shown in Table~\ref{tab:runtime-v2-refresh-interim}. INT16 and INT8 direct paths now pass end to end, and INT4 also passes when the fixture respects the valid INT4 signed range \([-8, 7]\). The remaining failing INT4 direct fixture is not a datapath failure; it is a test-quality issue because its input tensor contains out-of-range values (\([-14, 14]\)).
+Fourth, the Runtime V2 correctness baseline was re-checked after the packed conv-stream RTL fix. Table~\ref{tab:runtime-v2-refresh-interim} reports the refreshed matrix under one fixed build/run method. The practical result is clear: direct INT16 and direct packed INT8 are stable, and direct packed INT4 is also stable when fixtures obey signed INT4 range limits.
 
 \begin{table}[H]
     \centering
@@ -432,6 +432,8 @@ Fourth, the Runtime V2 correctness baseline was re-checked after the packed conv
         \hline
     \end{tabularx}
 \end{table}
+
+The one remaining INT4 failure in the table is a fixture-validity issue (\texttt{xmat} in \([-14,14]\), outside signed INT4 \([-8,7]\)) rather than a datapath mismatch.
 
 Fifth, the synthesis-oriented characterization confirms that the design is no longer trivial in hardware terms. Under the reproducible Yosys flow, the top-level design synthesized to an estimated 25117 logic cells when the major memories were abstracted and 33644 logic cells when the current memory implementation was kept, with 227 DSP48 blocks in both cases. These numbers are only rough synthesis proxies, not final silicon area, but they are enough to show that TinyNPU is a substantial compute block whose area and timing behavior now deserve serious attention.
 
