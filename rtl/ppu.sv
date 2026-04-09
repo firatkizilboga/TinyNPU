@@ -141,13 +141,17 @@ module ppu (
           if (activated > 7)       sat4 = 7;
           else if (activated < -8) sat4 = -8;
           else                     sat4 = activated[3:0];
-          result_val = (16'(unsigned'(sat4))) << (write_offset * 4);
+          // Keep packed offset handling in UB writeback path only.
+          // Shifting here as well would zero out non-zero write_offset lanes.
+          result_val = 16'(unsigned'(sat4));
         end
         2'b01: begin  // INT8: [-128, 127]
           if (activated > 127)       sat8 = 127;
           else if (activated < -128) sat8 = -128;
           else                       sat8 = activated[7:0];
-          result_val = (16'(unsigned'(sat8))) << (write_offset * 8);
+          // Keep packed offset handling in UB writeback path only.
+          // Shifting here as well would zero out non-zero write_offset lanes.
+          result_val = 16'(unsigned'(sat8));
         end
         default: begin  // INT16: [-32768, 32767]
           if (activated > 32767)       sat16 = 32767;

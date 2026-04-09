@@ -18,6 +18,10 @@
 
 #define TNPU_ARRAY_SIZE 8
 
+#ifndef TNPU_RUNTIME_V2_DUMP_FINAL_OUTPUTS
+#define TNPU_RUNTIME_V2_DUMP_FINAL_OUTPUTS 1
+#endif
+
 static const char *tnpu_role_or_default(const char *role, const char *fallback)
 {
     if (role == NULL || role[0] == '\0') {
@@ -42,33 +46,57 @@ static inline void tnpu_lanes_to_chunks_u16(const uint16_t lanes[8], uint32_t ch
     chunks[3] = (uint32_t)lanes[6] | ((uint32_t)lanes[7] << 16);
 }
 
-static void tnpu_write_tensor_a_int16_fast(
+static inline int tnpu_precision_to_packed_count(int precision)
+{
+    if (precision == 2) {
+        return 1;  // int16
+    }
+    if (precision == 1) {
+        return 2;  // int8
+    }
+    if (precision == 0) {
+        return 4;  // int4
+    }
+    return 0;
+}
+
+static void tnpu_write_tensor_a_fast(
     const TinyTensor *tensor,
     uint16_t base_addr,
+    int precision,
     uint16_t word_count)
 {
+    const int p = tnpu_precision_to_packed_count(precision);
+    const int bits = 16 / p;
+    const int mask = (1 << bits) - 1;
     const int rows = tensor->rank == 1 ? 1 : tensor->shape[0];
     const int cols = tensor->rank == 1 ? tensor->shape[0] : tensor->shape[1];
     const int m_tiles = (rows + TNPU_ARRAY_SIZE - 1) / TNPU_ARRAY_SIZE;
-    const int k_tiles = (cols + TNPU_ARRAY_SIZE - 1) / TNPU_ARRAY_SIZE;
+    const int k_tiles = ((cols / p) + TNPU_ARRAY_SIZE - 1) / TNPU_ARRAY_SIZE;
     const int32_t *src = tensor_i32(tensor);
     uint16_t addr = base_addr;
     uint16_t lanes[TNPU_ARRAY_SIZE];
     uint32_t chunks[TNPU_MMVR_WORDS_32];
 
-    runtime_assert(word_count == (uint16_t)(m_tiles * k_tiles * TNPU_ARRAY_SIZE), "role A int16 word count mismatch");
+    runtime_assert(p != 0, "unsupported precision in role A fast path");
+    runtime_assert(word_count == (uint16_t)(m_tiles * k_tiles * TNPU_ARRAY_SIZE), "role A word count mismatch");
 
     for (int mt = 0; mt < m_tiles; ++mt) {
         for (int kt = 0; kt < k_tiles; ++kt) {
             for (int lane_selector = 0; lane_selector < TNPU_ARRAY_SIZE; ++lane_selector) {
                 for (int lane = 0; lane < TNPU_ARRAY_SIZE; ++lane) {
                     const int row = mt * TNPU_ARRAY_SIZE + lane;
-                    const int col = kt * TNPU_ARRAY_SIZE + lane_selector;
-                    int32_t value = 0;
-                    if (row < rows && col < cols) {
-                        value = src[row * cols + col];
+                    const int start_k = (kt * TNPU_ARRAY_SIZE + lane_selector) * p;
+                    uint16_t subword = 0u;
+                    for (int bit_idx = 0; bit_idx < p; ++bit_idx) {
+                        const int col = start_k + bit_idx;
+                        int32_t value = 0;
+                        if (row < rows && col < cols) {
+                            value = src[row * cols + col];
+                        }
+                        subword |= (uint16_t)(((uint32_t)value & (uint32_t)mask) << (bit_idx * bits));
                     }
-                    lanes[lane] = (uint16_t)value;
+                    lanes[lane] = subword;
                 }
                 tnpu_lanes_to_chunks_u16(lanes, chunks);
                 npu_write_mem_word(addr++, chunks);
@@ -87,25 +115,23 @@ static void tnpu_read_tensor_c_int16_fast(
     const int n_tiles = (cols + TNPU_ARRAY_SIZE - 1) / TNPU_ARRAY_SIZE;
     int32_t *out = tensor_i32(dst);
     uint32_t chunks[TNPU_MMVR_WORDS_32];
-
     for (int mt = 0; mt < m_tiles; ++mt) {
         for (int nt = 0; nt < n_tiles; ++nt) {
             const uint16_t tile_addr =
                 (uint16_t)(addr + (mt * n_tiles * TNPU_ARRAY_SIZE) + (nt * TNPU_ARRAY_SIZE));
             for (int row_in_tile = 0; row_in_tile < TNPU_ARRAY_SIZE; ++row_in_tile) {
                 runtime_assert(
-                    npu_read_mem_word((uint16_t)(tile_addr + row_in_tile), chunks) == 0,
+                    npu_read_mem_word((uint16_t)(tile_addr + row_in_tile), chunks, 2) == 0,
                     "readback failed");
                 for (int lane = 0; lane < TNPU_ARRAY_SIZE; ++lane) {
                     const int row_idx = mt * TNPU_ARRAY_SIZE + row_in_tile;
                     const int col_idx = nt * TNPU_ARRAY_SIZE + lane;
-                    uint16_t packed_lane;
+                    const uint16_t packed_lane = (lane & 1)
+                        ? (uint16_t)(chunks[lane / 2] >> 16)
+                        : (uint16_t)(chunks[lane / 2] & 0xFFFFu);
                     if (row_idx >= rows || col_idx >= cols) {
                         continue;
                     }
-                    packed_lane = (lane & 1)
-                        ? (uint16_t)(chunks[lane / 2] >> 16)
-                        : (uint16_t)(chunks[lane / 2] & 0xFFFFu);
                     out[row_idx * cols + col_idx] = (int16_t)packed_lane;
                 }
             }
@@ -274,8 +300,8 @@ static int tnpu_execute_segment(TinyTensor *runtime_tensors, const TnpuSegment *
         const TnpuTensorWrite *write = &segment->writes[i];
         TinyTensor *tensor = &runtime_tensors[write->tensor_idx];
         char role = tnpu_role_code(write->role, 'A');
-        if ((int)write->precision == 2 && role == 'A') {
-            tnpu_write_tensor_a_int16_fast(tensor, write->addr, write->word_count);
+        if (role == 'A' && (int)write->precision == 2) {
+            tnpu_write_tensor_a_fast(tensor, write->addr, (int)write->precision, write->word_count);
         } else {
             write_tensor_to_npu(
                 tensor,
@@ -302,7 +328,7 @@ static int tnpu_execute_segment(TinyTensor *runtime_tensors, const TnpuSegment *
         const TnpuTensorRead *read = &segment->reads[i];
         TinyTensor *tensor = &runtime_tensors[read->tensor_idx];
         char role = tnpu_role_code(read->role, 'C');
-        if ((int)read->precision == 2 && role == 'C') {
+        if (role == 'C' && (int)read->precision == 2) {
             tnpu_read_tensor_c_int16_fast(tensor, read->addr);
         } else {
             read_tensor_from_npu(
@@ -339,6 +365,104 @@ static int tnpu_execute_verify(TinyTensor *runtime_tensors, const TnpuVerifyOp *
         print_tensor(actual);
         print_tensor(expected);
         return 1;
+    }
+    return 0;
+}
+
+static int tnpu_find_tensor_by_name(const TnpuProgram *program, const char *name)
+{
+    if (name == NULL || name[0] == '\0') {
+        return -1;
+    }
+    for (uint32_t i = 0; i < program->tensor_count; ++i) {
+        const char *candidate = program->tensors[i].name;
+        if (candidate != NULL && strcmp(candidate, name) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static int tnpu_program_uses_packed_precision(const TnpuProgram *program)
+{
+    for (uint32_t seg_idx = 0; seg_idx < program->segment_count; ++seg_idx) {
+        const TnpuSegment *segment = &program->segments[seg_idx];
+        for (uint32_t i = 0; i < segment->write_count; ++i) {
+            if (segment->writes[i].precision < 2u) {
+                return 1;
+            }
+        }
+        for (uint32_t i = 0; i < segment->read_count; ++i) {
+            if (segment->reads[i].precision < 2u) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static int tnpu_autoverify_outputs(TinyTensor *runtime_tensors, const TnpuProgram *program)
+{
+    for (uint32_t i = 0; i < program->output_count; ++i) {
+        char expected_name[128];
+        uint16_t out_idx = program->output_tensor_indices[i];
+        const TinyTensor *actual;
+        const TinyTensor *expected;
+        int expected_idx;
+
+        if ((uint32_t)out_idx >= program->tensor_count) {
+            continue;
+        }
+        actual = &runtime_tensors[out_idx];
+        if (actual->name == NULL || actual->name[0] == '\0') {
+            continue;
+        }
+        (void)snprintf(expected_name, sizeof(expected_name), "%s_expected", actual->name);
+        expected_idx = tnpu_find_tensor_by_name(program, expected_name);
+        if (expected_idx < 0) {
+            continue;
+        }
+        expected = &runtime_tensors[expected_idx];
+        if (!tensor_matches_expected(actual, expected)) {
+            int first_mismatch = -1;
+            printf("autoverify failed: %s\n", actual->name);
+            printf(
+                "meta actual dtype=%d elems=%d expected dtype=%d elems=%d\n",
+                actual->dtype,
+                actual->elem_count,
+                expected->dtype,
+                expected->elem_count);
+            if (actual->dtype == TINY_DTYPE_FLOAT32) {
+                for (int linear = 0; linear < actual->elem_count; ++linear) {
+                    float a = tensor_get_float(actual, linear);
+                    float b = tensor_get_float(expected, linear);
+                    if (fabsf(a - b) > 1e-5f) {
+                        first_mismatch = linear;
+                        printf("first mismatch @%d: actual=", linear);
+                        print_float_scalar(a);
+                        printf(" expected=");
+                        print_float_scalar(b);
+                        printf("\n");
+                        break;
+                    }
+                }
+            } else {
+                for (int linear = 0; linear < actual->elem_count; ++linear) {
+                    int32_t a = tensor_get_i32(actual, linear);
+                    int32_t b = tensor_get_i32(expected, linear);
+                    if (a != b) {
+                        first_mismatch = linear;
+                        printf("first mismatch @%d: actual=%ld expected=%ld\n", linear, (long)a, (long)b);
+                        break;
+                    }
+                }
+            }
+            if (first_mismatch < 0) {
+                printf("autoverify mismatch reported, but no differing element found\n");
+            }
+            return 1;
+        }
+        printf("autoverify ok: %s\n", actual->name);
     }
     return 0;
 }
@@ -386,6 +510,13 @@ int tinynpu_run(
     if (tnpu_bind_outputs(runtime_tensors, program, outputs) != 0) {
         free(runtime_tensors);
         return EXIT_FAILURE;
+    }
+
+    if (tnpu_program_uses_packed_precision(program)) {
+        tinynpu_set_force_mmio(1);
+        printf("runtime v2: packed precision detected, forcing MMIO transfer path\n");
+    } else {
+        tinynpu_set_force_mmio(0);
     }
 
     printf("TinyNPU runtime v2 program: %s\n", program->name ? program->name : "program_v2");
@@ -437,6 +568,12 @@ int tinynpu_run(
         }
     }
 
+    if (program->verify_op_count == 0u && tnpu_autoverify_outputs(runtime_tensors, program) != 0) {
+        free(runtime_tensors);
+        return EXIT_FAILURE;
+    }
+
+#if TNPU_RUNTIME_V2_DUMP_FINAL_OUTPUTS
     if (program->output_count > 0) {
         printf("Final outputs:\n");
         for (uint32_t i = 0; i < program->output_count; ++i) {
@@ -444,6 +581,7 @@ int tinynpu_run(
             print_tensor(&runtime_tensors[idx]);
         }
     }
+#endif
 
     free(runtime_tensors);
     return EXIT_SUCCESS;
