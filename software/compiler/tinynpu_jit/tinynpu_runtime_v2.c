@@ -383,24 +383,6 @@ static int tnpu_find_tensor_by_name(const TnpuProgram *program, const char *name
     return -1;
 }
 
-static int tnpu_program_uses_packed_precision(const TnpuProgram *program)
-{
-    for (uint32_t seg_idx = 0; seg_idx < program->segment_count; ++seg_idx) {
-        const TnpuSegment *segment = &program->segments[seg_idx];
-        for (uint32_t i = 0; i < segment->write_count; ++i) {
-            if (segment->writes[i].precision < 2u) {
-                return 1;
-            }
-        }
-        for (uint32_t i = 0; i < segment->read_count; ++i) {
-            if (segment->reads[i].precision < 2u) {
-                return 1;
-            }
-        }
-    }
-    return 0;
-}
-
 static int tnpu_autoverify_outputs(TinyTensor *runtime_tensors, const TnpuProgram *program)
 {
     for (uint32_t i = 0; i < program->output_count; ++i) {
@@ -512,12 +494,7 @@ int tinynpu_run(
         return EXIT_FAILURE;
     }
 
-    if (tnpu_program_uses_packed_precision(program)) {
-        tinynpu_set_force_mmio(1);
-        printf("runtime v2: packed precision detected, forcing MMIO transfer path\n");
-    } else {
-        tinynpu_set_force_mmio(0);
-    }
+    tinynpu_set_force_mmio(0);
 
     printf("TinyNPU runtime v2 program: %s\n", program->name ? program->name : "program_v2");
     tb_timer_reset_counter();

@@ -19,7 +19,7 @@
 #endif
 
 #ifndef TINYNPU_SHARED_PACKED_READ_MMIO_FALLBACK
-#define TINYNPU_SHARED_PACKED_READ_MMIO_FALLBACK 1
+#define TINYNPU_SHARED_PACKED_READ_MMIO_FALLBACK 0
 #endif
 
 enum {
@@ -1064,6 +1064,8 @@ static int npu_read_mem_word(uint16_t addr, uint32_t chunks[TINY_BUFFER_WORDS_32
     if (precision != 2) {
         return npu_read_mem_word_mmio(addr, chunks);
     }
+#else
+    (void)precision;
 #endif
     npu_shared_read_word(addr, chunks);
     return 0;
