@@ -50,7 +50,7 @@ digraph TinyNPUCompilerStack {
     Validate [label="HostOp\nvalidation", fillcolor="#FFF4E8", color="#C98A43", fontcolor="#4A3520"];
 
     subgraph cluster_lowering {
-        label="Lowering and Runtime V2 Packaging";
+        label="Lowering and Runtime Packaging";
         color="#4F9A6C";
         penwidth=2.1;
         style="filled";
@@ -60,12 +60,12 @@ digraph TinyNPUCompilerStack {
 
         Planner [label="Memory planner\nroles + layouts", fillcolor="#E7F6EC", color="#4F9A6C", fontcolor="#1f3328"];
         Compiler [label="SegmentCompiler\noutput_layout selection", fillcolor="#E7F6EC", color="#4F9A6C", fontcolor="#1f3328"];
-        Program [label="baremetal_emit_v2.py\nemit Runtime V2 descriptors", fillcolor="#E7F6EC", color="#4F9A6C", fontcolor="#1f3328", width=2.4];
-        Segment [label="generated *_program_v2.c\nIM image + UB image + op table", fillcolor="#E7F6EC", color="#4F9A6C", fontcolor="#1f3328", width=2.5];
+        Program [label="baremetal emitter\ngenerate runtime descriptors", fillcolor="#E7F6EC", color="#4F9A6C", fontcolor="#1f3328", width=2.4];
+        Segment [label="generated program C\nIM image + UB image + op table", fillcolor="#E7F6EC", color="#4F9A6C", fontcolor="#1f3328", width=2.5];
         Runner [label="generated *_runner.c\ninput/output binding", fillcolor="#E7F6EC", color="#4F9A6C", fontcolor="#1f3328"];
     }
 
-    Artifact [label="Runtime V2 package\nprogram C + runner C + expected tensors", fillcolor="#EFE8FF", color="#8B74BD", fontcolor="#2C2236", width=2.6];
+    Artifact [label="Runtime package\nprogram C + runner C + expected tensors", fillcolor="#EFE8FF", color="#8B74BD", fontcolor="#2C2236", width=2.6];
 
     subgraph cluster_runtime {
         label="Execution Backends";
@@ -76,7 +76,7 @@ digraph TinyNPUCompilerStack {
         fontcolor="#8F4F32";
         fontsize=16;
 
-        HostExec [label="tinynpu_runtime_v2.c\nshared executor", fillcolor="#FFE8DB", color="#D18A66", fontcolor="#40261d", width=2.2];
+        HostExec [label="shared runtime library\nexecutor", fillcolor="#FFE8DB", color="#D18A66", fontcolor="#40261d", width=2.2];
         SimExec [label="CV32 firmware + Verilator\nshared-SRAM default\nMMIO fallback", fillcolor="#FFE8DB", color="#D18A66", fontcolor="#40261d", width=2.4];
     }
 

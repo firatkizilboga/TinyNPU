@@ -272,7 +272,7 @@ The next major data structure is the execution plan. Rather than generating a mo
 
 Physical layout is also part of the data model. The current backend uses role-specific packings for tensors that feed the array horizontally, tensors that feed it vertically, output buffers that match the writeback layout, and packed bias vectors. These layouts are backend details rather than semantic tensor meanings, but they matter because the compiler must map logical tensors onto physical storage forms that match the datapath. A large part of the compiler work came from keeping this physical reality explicit without allowing it to leak upward and distort the logical semantics of the graph.
 \subsection{Structural Model}
-Structurally, TinyNPU is organized around a control path and a compute path. The control path is responsible for instruction orchestration and host service. In the current Runtime V2 path, data staging is primarily handled through the shared-SRAM host window, while MMIO commands remain the control path for launch/status and compatibility fallback. The compute path consists of the unified buffer, streamer logic, a parameterized $N \times N$ output-stationary systolic array, and the post-processing unit. During active computation, data is read from the unified buffer, transformed into the orientation expected by the array, consumed by the processing elements, and then drained through the post-processing unit before being written back in packed form.
+Structurally, TinyNPU is organized around a control path and a compute path. The control path is responsible for instruction orchestration and host service. In the current runtime path, data staging is primarily handled through the shared-SRAM host window, while MMIO commands remain the control path for launch/status and compatibility fallback. The compute path consists of the unified buffer, streamer logic, a parameterized $N \times N$ output-stationary systolic array, and the post-processing unit. During active computation, data is read from the unified buffer, transformed into the orientation expected by the array, consumed by the processing elements, and then drained through the post-processing unit before being written back in packed form.
 
 \begin{figure}[H]
     \centering
@@ -296,7 +296,7 @@ On the software side, the key structural idea is segmented execution. Instead of
     \label{fig:compiler-stack}
 \end{figure}
 
-Figure~\ref{fig:compiler-stack} summarizes the software flow implemented in the repository. A model enters either directly as a supported quantized PyTorch module or through a compiler-ready conversion path built around \texttt{tinynpu\_quant}. The JIT frontend traces the model with FX, partitions it into a mixed execution plan, validates host operations, and lowers each accelerator segment through the memory planner and \texttt{SegmentCompiler}. The resulting \texttt{CompiledArtifact} contains the execution plan, per-segment IM/UB binaries, expected tensors for verification, and memory-layout information required by the runtime. In Runtime V2, the generated artifact is intentionally static-data-heavy: emitted C files carry program tables and constants, while shared runtime code executes those tables through a fixed interpreter-style loop.
+Figure~\ref{fig:compiler-stack} summarizes the software flow implemented in the repository. A model enters either directly as a supported quantized PyTorch module or through a compiler-ready conversion path built around \texttt{tinynpu\_quant}. The JIT frontend traces the model with FX, partitions it into a mixed execution plan, validates host operations, and lowers each accelerator segment through the memory planner and \texttt{SegmentCompiler}. The resulting \texttt{CompiledArtifact} contains the execution plan, per-segment IM/UB binaries, expected tensors for verification, and memory-layout information required by the runtime. The current emitter/runtime boundary is intentionally static-data-heavy: generated C files carry program tables and constants, while shared runtime code executes those tables through a fixed interpreter-style loop.
 
 Another important structural choice is that benchmarking is built into the execution path. The runtime can collect hard RTL cycle counts for accelerator execution windows and keep separate accounting for software-side overhead such as buffer loading and packing. This allows the project to reason about compute efficiency without confusing it with prototype integration overhead.
 
@@ -362,7 +362,7 @@ The current empirical evidence is intentionally limited and should be described 
 
 The performance methodology separates different cost categories on purpose. Accelerator compute cycles are taken from RTL performance counters during the run window of a segment. Software-side overhead such as loading buffer images, issuing control transactions, packing and unpacking data, and executing host-only operations is accounted for separately. Several CPU reference models are also applied on the software side, but these are analytic comparison models rather than measurements from a physical reference processor. The purpose of those models is to bound and interpret the accelerator’s behavior, not to claim a definitive CPU-versus-NPU benchmark.
 
-For the refreshed Runtime V2 coverage runs in this report, all firmware binaries were built with \texttt{-march=rv32imfc -mabi=ilp32 -O3} and \texttt{-DTNPU\_RUNTIME\_V2\_DUMP\_FINAL\_OUTPUTS=0}. Runtime validation used \texttt{autoverify} against compiler-owned expected tensors when explicit verify ops were not emitted. The simulation command was fixed at \texttt{VERILATOR\_MAX\_TICKS=3000000000} with \texttt{+maxcycles=250000} to keep runs directly comparable.
+For the refreshed runtime-coverage runs in this report, all firmware binaries were built with \texttt{-march=rv32imfc -mabi=ilp32 -O3} and \texttt{-DTNPU\_RUNTIME\_V2\_DUMP\_FINAL\_OUTPUTS=0}. Runtime validation used \texttt{autoverify} against compiler-owned expected tensors when explicit verify ops were not emitted. The simulation command was fixed at \texttt{VERILATOR\_MAX\_TICKS=3000000000} with \texttt{+maxcycles=250000} to keep runs directly comparable.
 
 \newpage
 \section{Comparative Evaluation and Discussion}
@@ -409,13 +409,13 @@ Third, repeated-run runtime work is already justified by measured behavior. On a
     \end{tabularx}
 \end{table}
 
-Fourth, the Runtime V2 correctness baseline was re-checked after the packed conv-stream RTL fix. Table~\ref{tab:runtime-v2-refresh-interim} reports the refreshed matrix under one fixed build/run method. The practical result is clear: direct INT16 and direct packed INT8 are stable, and direct packed INT4 is also stable when fixtures obey signed INT4 range limits.
+Fourth, the current runtime correctness baseline was re-checked after the packed conv-stream RTL fix. Table~\ref{tab:runtime-coverage-refresh-interim} reports the refreshed matrix under one fixed build/run method. The practical result is clear: direct INT16 and direct packed INT8 are stable, and direct packed INT4 is also stable when fixtures obey signed INT4 range limits.
 
 \begin{table}[H]
     \centering
     \footnotesize
-    \caption{Runtime V2 coverage refresh after packed conv-stream RTL update.}
-    \label{tab:runtime-v2-refresh-interim}
+    \caption{Runtime coverage refresh after packed conv-stream RTL update.}
+    \label{tab:runtime-coverage-refresh-interim}
     \begin{tabularx}{\textwidth}{|>{\raggedright\arraybackslash}X|l|r|r|r|r|r|l|}
         \hline
         \textbf{Program} & \textbf{Path} & \textbf{Host Im2Col} & \textbf{Stage} & \textbf{Run} & \textbf{Readback} & \textbf{Seg.NPU} & \textbf{Verify} \\
