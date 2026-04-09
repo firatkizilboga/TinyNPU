@@ -390,7 +390,7 @@ This behavior is programmed through a fixed-width 256-bit instruction format in 
     \end{tabularx}
 \end{table}
 
-Instruction execution is paired with a small MMIO command interface on the host side. The host does not directly drive internal control states; instead it writes a command register to request memory access or to start execution from a given instruction-memory address. In the current runtime configuration used for the refreshed measurements, data-heavy preload/readback traffic is normally served by the shared-SRAM window, and this MMIO command path is primarily used for control and fallback memory service.
+Instruction execution is paired with a small MMIO command interface on the host side. The host does not directly drive internal control states; instead it writes a command register to request memory access or to start execution from a given instruction-memory address. In the current runtime configuration, data-heavy preload/readback traffic is normally served by the shared-SRAM window, and this MMIO command path is primarily used for control and fallback memory service.
 
 \begin{table}[H]
     \centering
@@ -475,15 +475,17 @@ Evaluation uses three evidence sources. Unit and regression tests verify correct
 
 Host emulation and RTL simulation execute the same compiled plan, so the same artifact can be checked both for tensor-level correctness and for hardware-visible cost. The control unit reports both total run-window cycles and per-state cycle and entry counts, which makes it possible to separate time spent in feed, wait, drain, writeback, and related control states.
 
+The evaluation platform is the CV32E40P example testbench wired to TinyNPU through two host interfaces. First, MMIO control registers are exposed at \texttt{0x3000\_0000} for command/status traffic (including \texttt{CMD\_RUN}). Second, a shared SRAM window is exposed for data movement: UB is mapped at \texttt{0x3100\_0000} and IM at \texttt{0x3200\_0000}, each as \(8192\) words \(\times\) \(16\) bytes. The testbench decode maps those CPU addresses to TinyNPU \texttt{host\_shared\_*} signals and converts IM accesses to internal IM word space starting at \texttt{0x8000}. In the current runtime configuration, UB/IM staging uses this shared window by default, while MMIO memory commands remain available as an explicit fallback path.
+
 The empirical results are organized around two benchmark views. The first is a controlled multi-tile GEMM chosen to force tiling on the current array and expose the split between array throughput and integration overhead. The second is a model-level case study built from two compiler-ready artifacts that expose how execution-plan shape changes delivered speedup.
 
 The reported metrics keep those cost categories separate. Accelerator cycles are taken from the RTL run window of the NPU segment itself. Packing, MMIO traffic, tensor movement, and host-only operators are accounted for outside that run window. The CPU baselines used later in the report are analytic reference models for the same logical work, not measurements from a physical comparison platform.
 
-For the refreshed runtime-coverage runs in this report, firmware binaries were built with \texttt{-march=rv32imfc -mabi=ilp32 -O3} and \texttt{-DTNPU\_RUNTIME\_V2\_DUMP\_FINAL\_OUTPUTS=0}. Runtime validation used \texttt{autoverify} against compiler-owned expected tensors when explicit verify ops were not emitted. Simulator runs used \texttt{VERILATOR\_MAX\_TICKS=3000000000} with \texttt{+maxcycles=250000} to keep measurements directly comparable.
+The runtime-coverage measurements use one fixed execution setup so the rows are directly comparable. Runtime validation uses \texttt{autoverify} against compiler-owned expected tensors when explicit verify steps are not emitted.
 
 \newpage
 \section{Comparative Evaluation and Discussion}
-This section focuses on two concrete artifacts: the controlled multi-tile GEMM benchmark in Table~\ref{tab:matmul-benchmark}, and the updated fair INT16 conv/linear runs in Tables~\ref{tab:fair-int16-phases} and \ref{tab:fair-int16-e2e}. The benchmark metrics are meant to separate core accelerator behavior from host-side cost; the benchmark-cost-model appendix defines the cost model and the reported speedup quantities in detail.
+This section focuses on two concrete artifacts: the controlled multi-tile GEMM benchmark in Table~\ref{tab:matmul-benchmark}, and the fair INT16 conv/linear runs in Tables~\ref{tab:fair-int16-phases} and \ref{tab:fair-int16-e2e}. The benchmark metrics are meant to separate core accelerator behavior from host-side cost; the benchmark-cost-model appendix defines the cost model and the reported speedup quantities in detail.
 
 \subsection{Kernel-Level Benchmark}
 
@@ -532,24 +534,60 @@ Table~\ref{tab:mixgemm-kernel-scaling} also makes one important limitation visib
 
 The same table can also be read against the array's theoretical peak. For the current $8 \times 8$ array, the peak issue rates are 64 INT16 MACs/cycle, 128 INT8 MACs/cycle, and 256 INT4 MACs/cycle. On the largest reported kernel, $128^3$, TinyNPU reaches 50.22, 82.65, and 122.06 MACs/cycle, which corresponds to 78.5\%, 64.6\%, and 47.7\% of those respective peaks. This makes the scaling story clearer than gain ratios alone: larger kernels improve utilization by amortizing fill and drain overhead, but utilization still drops as precision narrows because the fixed control and wavefront costs consume a larger fraction of the run while the logical MAC count per cycle rises.
 
-\subsection{Updated Fair INT16 Conv/Linear Runs}
+\subsection{Fair INT16 Conv/Linear Runs}
 
-The previous fair-run block was refreshed from the latest committed INT16 same-shape cycle logs (\texttt{runs/PERF\_2026-04-08\_INT16\_INT8\_INT4\_FAIR.md}). The comparison now uses three directly comparable programs: linear CPU-vs-NPU, convolution CPU-vs-NPU with \texttt{conv\_stream} disabled, and the same convolution shape with \texttt{conv\_stream} enabled.
+This comparison uses one linear variant and two convolution variants with the same shape. The only structural difference between the two convolution variants is where window generation happens: on the host (\texttt{im2col}, \texttt{conv\_stream}=off) or in hardware through the window-gather path (\texttt{conv\_stream}=on).
 
 \begin{table}[H]
     \centering
     \footnotesize
-    \caption{Phase-level cycle counts for updated fair INT16 runs (same-shape artifacts).}
+    \caption{Fair INT16 case-study comparison using forward definition and execution-plan structure.}
+    \label{tab:fair-int16-plan}
+    \begin{tabularx}{\textwidth}{|l|>{\raggedright\arraybackslash}X|>{\raggedright\arraybackslash}X|>{\raggedright\arraybackslash}X|}
+        \hline
+        \textbf{Item} & \textbf{Linear} & \textbf{Conv (gather off)} & \textbf{Conv (gather on)} \\
+        \hline
+        Forward definition &
+        {\ttfamily\small y = linear(x)} &
+        {\ttfamily\small y = conv2d(x, w,\par
+        \hspace*{1.3em}kernel=3, stride=1, pad=1)} &
+        {\ttfamily\small y = conv2d(x, w,\par
+        \hspace*{1.3em}kernel=3, stride=1, pad=1)} \\
+        \hline
+        Execution plan &
+        {\ttfamily\small NpuSegment(seg\_linear)} &
+        {\ttfamily\small HostOp(im2col)\par
+        NpuSegment(seg\_conv)} &
+        {\ttfamily\small NpuSegment(seg\_conv,\par
+        \hspace*{1.3em}conv\_stream=on)} \\
+        \hline
+        Window generation &
+        N/A &
+        Host \texttt{im2col} &
+        Hardware window gather \\
+        \hline
+        \(S_{\text{full}}\) &
+        \(6.72\times\) &
+        \(4.64\times\) &
+        -- \\
+        \hline
+    \end{tabularx}
+\end{table}
+
+\begin{table}[H]
+    \centering
+    \footnotesize
+    \caption{Phase-level cycle counts for fair INT16 runs (same-shape artifacts).}
     \label{tab:fair-int16-phases}
-    \begin{tabularx}{\textwidth}{|>{\raggedright\arraybackslash}X|l|r|r|r|r|r|r|}
+    \begin{tabularx}{\textwidth}{|l|r|r|r|r|r|r|}
         \hline
-        \textbf{Program} & \textbf{Path} & \textbf{Host Im2Col} & \textbf{Stage} & \textbf{Run} & \textbf{Readback} & \textbf{Seg.NPU} & \textbf{Seg.CPU} \\
+        \textbf{Variant} & \textbf{Host Im2Col} & \textbf{Stage} & \textbf{Run} & \textbf{Readback} & \textbf{Seg.NPU} & \textbf{Seg.CPU} \\
         \hline
-        \texttt{cv32e40p\_int16\_cpu\_vs\_npu\_linear\_demo} & linear & 0 & 30313 & 530 & 3319 & 38525 & 265001 \\
+        Linear & 0 & 30313 & 530 & 3319 & 38525 & 265001 \\
         \hline
-        \texttt{cv32e40p\_int16\_cpu\_vs\_npu\_conv\_demo} & conv (\texttt{conv\_stream}=off) & 16003 & 35616 & 529 & 3451 & 43838 & 265626 \\
+        Conv (gather off) & 16003 & 35616 & 529 & 3451 & 43838 & 265626 \\
         \hline
-        \texttt{cv32e40p\_int16\_convstream\_same\_shape\_demo} & conv (\texttt{conv\_stream}=on) & 0 & 4083 & 529 & 3292 & 12118 & -- \\
+        Conv (gather on) & 0 & 4083 & 529 & 3292 & 12118 & -- \\
         \hline
     \end{tabularx}
 \end{table}
@@ -559,29 +597,33 @@ The previous fair-run block was refreshed from the latest committed INT16 same-s
     \footnotesize
     \caption{End-to-end cycle comparison from the same fair INT16 artifacts.}
     \label{tab:fair-int16-e2e}
-    \begin{tabularx}{\textwidth}{|>{\raggedright\arraybackslash}X|r|r|l|>{\raggedright\arraybackslash}X|}
+    \begin{tabularx}{\textwidth}{|l|r|r|l|Y|}
         \hline
-        \textbf{Program} & \textbf{E2E NPU} & \textbf{E2E CPU} & \textbf{Speedup} & \textbf{Notes} \\
+        \textbf{Variant} & \textbf{E2E NPU} & \textbf{E2E CPU} & \textbf{Speedup} & \textbf{Notes} \\
         \hline
-        \texttt{int16\_cpu\_vs\_npu\_linear\_demo} & 39586 & 266062 & \(6.72\times\) & \(\texttt{1029}+\texttt{32}+\texttt{38525}\) versus \(\texttt{1029}+\texttt{32}+\texttt{265001}\). \\
+        Linear & 39586 & 266062 & \(6.72\times\) & \(\texttt{1029}+\texttt{32}+\texttt{38525}\) vs \(\texttt{1029}+\texttt{32}+\texttt{265001}\). \\
         \hline
-        \texttt{int16\_cpu\_vs\_npu\_conv\_demo} (\texttt{conv\_stream}=off) & 60903 & 282691 & \(4.64\times\) & Includes host \texttt{im2col} in both paths. \\
+        Conv (gather off) & 60903 & 282691 & \(4.64\times\) & Includes host \texttt{im2col} in both paths. \\
         \hline
-        \texttt{int16\_convstream\_same\_shape\_demo} (\texttt{conv\_stream}=on) & 13179 & -- & -- & Same conv shape; used to isolate staging/boundary impact. \\
+        Conv (gather on) & 13179 & -- & -- & Same conv shape; isolates window-gather effect on boundary cost. \\
         \hline
     \end{tabularx}
 \end{table}
 
 The key result is that \texttt{conv\_stream} does not materially change core arithmetic time for this shape (\texttt{run}=529 in both conv artifacts), but it removes most boundary cost. The same-shape conv stage term drops from 35616 to 4083 cycles (\(8.72\times\) reduction), and total segment NPU cycles drop from 43838 to 12118 (\(3.62\times\) reduction). This is exactly the expected signature of reducing host-visible layout work rather than changing the MAC datapath itself.
 
-\subsection{Current Runtime Coverage}
+Using the same CPU reference segment from the \texttt{conv\_stream}=off artifact (\texttt{segment.cpu}=265626), the same-shape hardware-gather variant reaches an implied \(21.92\times\) segment-level speedup (\(265626 / 12118\)). This is the clearest evidence in the current evaluation that the dominant cost in these small convolutions is not the array run itself, but the host-visible window-generation and layout-boundary work around it.
 
-The current runtime baseline was re-checked after the packed conv-stream RTL fix (\texttt{6ecf1e3}) using one fixed method: \texttt{-march=rv32imfc -mabi=ilp32 -O3}, \texttt{-DTNPU\_RUNTIME\_V2\_DUMP\_FINAL\_OUTPUTS=0}, runtime \texttt{autoverify} against compiler-owned expected tensors, and simulator launch with \texttt{VERILATOR\_MAX\_TICKS=3000000000} plus \texttt{+maxcycles=250000}. The table reports correctness and phase-level cycle counts under that single setup.
+Repeated-run behavior shows the same pattern on the linear case. In a dedicated cold-plus-two-warm run of the INT16 linear artifact, the cold NPU path measured 42083 cycles, while the warm NPU path stabilized at 37766 cycles. The matching CPU baseline remained essentially flat at 265345 cycles. Extrapolating those measurements to ten invocations after one preload gives 383040 cycles for the NPU path versus 2654511 cycles for the CPU path, or \(6.93\times\) end-to-end speedup. The warm steady-state segment comparison is approximately \(7.03\times\) (\(265345 / 37766\)).
+
+\subsection{Runtime Coverage}
+
+The table reports correctness and phase-level cycle counts under one consistent runtime setup with \texttt{autoverify}.
 
 \begin{table}[H]
     \centering
     \footnotesize
-    \caption{Post-fix runtime coverage refresh for representative INT16/INT8/INT4 artifacts.}
+    \caption{Runtime coverage for representative INT16/INT8/INT4 artifacts.}
     \label{tab:runtime-coverage-refresh}
     \begin{tabularx}{\textwidth}{|>{\raggedright\arraybackslash}X|l|r|r|r|r|r|l|}
         \hline
@@ -605,7 +647,7 @@ Three conclusions matter for the current runtime implementation: INT16 direct co
 \subsection{Activation Study}
 \label{sec:activation-study}
 
-The activation study used a small MNIST classifier with three hidden convolution layers followed by mean pooling and a final fully connected layer, then replaced the hidden GELU path with TinyNPU's hardware-friendly hard-GELU. The result was simple. \texttt{W8A8} hard-GELU was too lossy: the FP32 reference reached 71.54\%, the corresponding \texttt{W8A8} PTQ model fell to 12.14\%, and QAT recovered only to 54.44\%. Keeping the hard-GELU boundary at INT16 instead changed the outcome substantially: PTQ improved to 35.53\% and QAT recovered to 69.98\%, close to the FP32 reference. Hard-GELU is only viable when the post-activation boundary retains sufficient precision. The full INT16 variant then exposed the next limit by exceeding the current unified-buffer budget, so the practical next step is selective INT16 retention around sensitive GELU boundaries rather than blanket INT16 everywhere.
+To evaluate activation behavior, we ran a small MNIST classifier with three hidden convolution layers, mean pooling, and a final fully connected layer, then replaced the hidden GELU path with TinyNPU's hardware-friendly hard-GELU. The outcome is clear. In \texttt{W8A8}, hard-GELU is too lossy: the FP32 reference reached 71.54\%, the matching \texttt{W8A8} PTQ model fell to 12.14\%, and QAT recovered only to 54.44\%. Keeping the hard-GELU boundary at INT16 changed the picture: PTQ improved to 35.53\% and QAT recovered to 69.98\%, which is close to the FP32 reference. The practical conclusion is that hard-GELU needs higher post-activation precision to remain accurate.
 
 \subsection{Bottlenecks and Interpretation}
 
@@ -624,7 +666,7 @@ The activation study used a small MNIST classifier with three hidden convolution
     \label{fig:case-study-control-breakdown}
 \end{figure}
 
-Taken together, the updated fair-run tables and Figure~\ref{fig:case-study-control-breakdown} show a consistent bottleneck ranking. Inside the run window, state occupancy is still dominated by \texttt{MM\_FEED} and \texttt{MM\_WAIT}, with drain/writeback next and fetch/decode relatively small. The larger practical gains, however, come from boundary-service reduction: in the same-shape conv artifacts, \texttt{conv\_stream} preserves the run term (529 cycles) but collapses stage and total segment cost. That is why the highest-value optimization direction remains reducing avoidable staging/readback and layout-boundary work, not further increasing raw MAC throughput for these shapes.
+Taken together, the fair-run tables and Figure~\ref{fig:case-study-control-breakdown} show a consistent bottleneck ranking. Inside the run window, state occupancy is still dominated by \texttt{MM\_FEED} and \texttt{MM\_WAIT}, with drain/writeback next and fetch/decode relatively small. The larger practical gains, however, come from boundary-service reduction: in the same-shape conv artifacts, \texttt{conv\_stream} preserves the run term (529 cycles) but collapses stage and total segment cost. That is why the highest-value optimization direction remains reducing avoidable staging/readback and layout-boundary work, not further increasing raw MAC throughput for these shapes.
 
 A rough synthesis snapshot is included only for scale. Under the Yosys flow used in this report, the top-level design estimates 25464 logic cells when the major memories are abstracted and 33324 logic cells when the current memory implementation is kept, with 227 DSP48 blocks in both cases. In the full-memory run, Yosys also infers 8192 \texttt{RAM128X1D} and 944 \texttt{RAM256X1S} primitives. These figures are still FPGA-style synthesis proxies rather than final silicon area, but they are sufficient to place the design in a non-trivial hardware range.
 
