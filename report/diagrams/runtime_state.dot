@@ -43,10 +43,14 @@ digraph TinyNPURuntimeState {
         fontsize=16;
 
         Pack [label="pack runtime tensors\ninto role-specific layout", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
-        WriteUB [label="write vectors to UB\noverlay inputs / reload bias", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
-        Launch [label="issue RUN through MMIO\nset start address", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
+        WriteSel [shape=diamond, label="shared SRAM\nwrite path?", fillcolor="#F4F7FB", color="#6F8FB3", fontcolor="#233142"];
+        WriteShared [label="stage UB/IM through\nshared-SRAM word writes", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
+        WriteMMIO [label="MMIO WRITE_MEM fallback\npacked helper path", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
+        Launch [label="issue CMD_RUN via MMIO\nset start address", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
         Wait [label="poll status until HALT", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
-        ReadUB [label="read output vectors\nfrom UB", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
+        ReadSel [shape=diamond, label="shared SRAM\nread path?", fillcolor="#F4F7FB", color="#6F8FB3", fontcolor="#233142"];
+        ReadShared [label="read output vectors\nthrough shared-SRAM window", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
+        ReadMMIO [label="MMIO READ_MEM fallback", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
         Unpack [label="unpack vectors into\nlogical output tensors\n(layout-aware)", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
     }
 
@@ -67,7 +71,17 @@ digraph TinyNPURuntimeState {
     Kind -> HostOp [label="HostOp"];
     Kind -> Verify [label="VerifyTensor"];
 
-    Pack -> WriteUB -> Launch -> Wait -> ReadUB -> Unpack -> Dispatch [label="continue"];
+    Pack -> WriteSel;
+    WriteSel -> WriteShared [label="yes"];
+    WriteSel -> WriteMMIO [label="no"];
+    WriteShared -> Launch;
+    WriteMMIO -> Launch;
+    Launch -> Wait -> ReadSel;
+    ReadSel -> ReadShared [label="yes"];
+    ReadSel -> ReadMMIO [label="no"];
+    ReadShared -> Unpack;
+    ReadMMIO -> Unpack;
+    Unpack -> Dispatch [label="continue"];
     HostOp -> Dispatch [label="continue"];
     Verify -> Dispatch [label="continue"];
     Finalize -> Done;
