@@ -17,10 +17,10 @@ module unified_buffer #(
     input  logic                     input_last_in,    // Last data marker
     input  logic [  `ADDR_WIDTH-1:0] input_addr,
     input  logic                     conv_stream_gather_en,
-    input  logic [  `ADDR_WIDTH-1:0] conv_stream_lane_word_addr[`ARRAY_SIZE-1:0],
-    input  logic [$clog2(`ARRAY_SIZE)-1:0] conv_stream_lane_word_lane[`ARRAY_SIZE-1:0],
-    input  logic [1:0]               conv_stream_lane_subidx[`ARRAY_SIZE-1:0],
-    input  logic [  `ARRAY_SIZE-1:0] conv_stream_lane_valid,
+    input  logic [  `ADDR_WIDTH-1:0] conv_stream_lane_word_addr[`ARRAY_SIZE-1:0][3:0],
+    input  logic [$clog2(`ARRAY_SIZE)-1:0] conv_stream_lane_word_lane[`ARRAY_SIZE-1:0][3:0],
+    input  logic [1:0]               conv_stream_lane_subidx[`ARRAY_SIZE-1:0][3:0],
+    input  logic [3:0]               conv_stream_lane_valid[`ARRAY_SIZE-1:0],
     input  logic [1:0]               conv_stream_in_precision,
     output logic                     input_first_out,  // Delayed to match data
     output logic                     input_last_out,
@@ -45,6 +45,8 @@ module unified_buffer #(
   logic [`BUFFER_WIDTH-1:0] conv_stream_gather_word;
   logic [`BUFFER_WIDTH-1:0] conv_stream_lane_word;
   logic [15:0]              conv_stream_lane_elem16;
+  logic [15:0]              conv_stream_lane_elem_unpacked;
+  logic [15:0]              conv_stream_lane_packed;
 
   function automatic logic [15:0] conv_stream_unpack_elem(
       input logic [15:0] packed_word,
@@ -91,17 +93,55 @@ module unified_buffer #(
     conv_stream_gather_word = '0;
     conv_stream_lane_word = '0;
     conv_stream_lane_elem16 = '0;
+    conv_stream_lane_elem_unpacked = '0;
+    conv_stream_lane_packed = '0;
     for (int lane = 0; lane < `ARRAY_SIZE; lane++) begin
-      if (conv_stream_lane_valid[lane]) begin
-        conv_stream_lane_word = memory[conv_stream_lane_word_addr[lane]];
-        conv_stream_lane_elem16 =
-            conv_stream_lane_word[(conv_stream_lane_word_lane[lane] * 16) +: 16];
-        conv_stream_gather_word[(lane * 16) +: 16] = conv_stream_unpack_elem(
-            conv_stream_lane_elem16,
-            conv_stream_in_precision,
-            conv_stream_lane_subidx[lane]
-        );
-      end
+      conv_stream_lane_packed = '0;
+      unique case (conv_stream_in_precision)
+        2'b00: begin  // INT4: gather four logical K-elements into one packed lane
+          for (int comp = 0; comp < 4; comp++) begin
+            if (conv_stream_lane_valid[lane][comp]) begin
+              conv_stream_lane_word = memory[conv_stream_lane_word_addr[lane][comp]];
+              conv_stream_lane_elem16 =
+                  conv_stream_lane_word[(conv_stream_lane_word_lane[lane][comp] * 16) +: 16];
+              conv_stream_lane_elem_unpacked = conv_stream_unpack_elem(
+                  conv_stream_lane_elem16,
+                  conv_stream_in_precision,
+                  conv_stream_lane_subidx[lane][comp]
+              );
+              conv_stream_lane_packed[(comp * 4) +: 4] = conv_stream_lane_elem_unpacked[3:0];
+            end
+          end
+        end
+        2'b01: begin  // INT8: gather two logical K-elements into one packed lane
+          for (int comp = 0; comp < 2; comp++) begin
+            if (conv_stream_lane_valid[lane][comp]) begin
+              conv_stream_lane_word = memory[conv_stream_lane_word_addr[lane][comp]];
+              conv_stream_lane_elem16 =
+                  conv_stream_lane_word[(conv_stream_lane_word_lane[lane][comp] * 16) +: 16];
+              conv_stream_lane_elem_unpacked = conv_stream_unpack_elem(
+                  conv_stream_lane_elem16,
+                  conv_stream_in_precision,
+                  conv_stream_lane_subidx[lane][comp]
+              );
+              conv_stream_lane_packed[(comp * 8) +: 8] = conv_stream_lane_elem_unpacked[7:0];
+            end
+          end
+        end
+        default: begin  // INT16
+          if (conv_stream_lane_valid[lane][0]) begin
+            conv_stream_lane_word = memory[conv_stream_lane_word_addr[lane][0]];
+            conv_stream_lane_elem16 =
+                conv_stream_lane_word[(conv_stream_lane_word_lane[lane][0] * 16) +: 16];
+            conv_stream_lane_packed = conv_stream_unpack_elem(
+                conv_stream_lane_elem16,
+                conv_stream_in_precision,
+                conv_stream_lane_subidx[lane][0]
+            );
+          end
+        end
+      endcase
+      conv_stream_gather_word[(lane * 16) +: 16] = conv_stream_lane_packed;
     end
   end
 

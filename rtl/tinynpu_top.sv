@@ -35,10 +35,10 @@ module tinynpu_top #(
     logic [`BUFFER_WIDTH-1:0]    ub_wdata;
     logic [`BUFFER_WIDTH-1:0]    ub_rdata;
     logic                        conv_stream_gather_en;
-    logic [`ADDR_WIDTH-1:0]      conv_stream_lane_word_addr[`ARRAY_SIZE-1:0];
-    logic [$clog2(`ARRAY_SIZE)-1:0] conv_stream_lane_word_lane[`ARRAY_SIZE-1:0];
-    logic [1:0]                  conv_stream_lane_subidx[`ARRAY_SIZE-1:0];
-    logic [`ARRAY_SIZE-1:0]      conv_stream_lane_valid;
+    logic [`ADDR_WIDTH-1:0]      conv_stream_lane_word_addr[`ARRAY_SIZE-1:0][3:0];
+    logic [$clog2(`ARRAY_SIZE)-1:0] conv_stream_lane_word_lane[`ARRAY_SIZE-1:0][3:0];
+    logic [1:0]                  conv_stream_lane_subidx[`ARRAY_SIZE-1:0][3:0];
+    logic [3:0]                  conv_stream_lane_valid[`ARRAY_SIZE-1:0];
     logic [1:0]                  conv_stream_in_precision;
     logic                        acc_clear;
     logic                        compute_enable;
