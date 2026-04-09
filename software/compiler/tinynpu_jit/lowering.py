@@ -161,8 +161,10 @@ class SegmentCompiler:
                     op = seg.ops[0]
                     cols_name = step.outputs[0]
                     src_name = step.inputs[0]
-                    # Current RTL conv-stream gather path is only numerically aligned for INT16.
-                    # Packed INT8/INT4 can be re-enabled via env once packed gather is implemented.
+                    # Packed conv-stream (INT8/INT4) remains opt-in.
+                    # Current gather metadata carries one source element per lane/cycle,
+                    # which is sufficient for INT16 but not enough to synthesize packed
+                    # subwords for lower precisions without additional hardware support.
                     supports_conv_stream = (op.in_dtype == DType.INT16) or self.enable_conv_stream_packed
                     if (
                         op.lhs == cols_name
