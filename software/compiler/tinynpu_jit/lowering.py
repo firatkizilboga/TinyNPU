@@ -25,6 +25,8 @@ class SegmentCompiler:
             self.enable_conv_stream = env_value in {"1", "true", "yes", "on"}
         else:
             self.enable_conv_stream = bool(enable_conv_stream)
+        packed_env = os.getenv("TINYNPU_ENABLE_CONV_STREAM_PACKED", "0").strip().lower()
+        self.enable_conv_stream_packed = packed_env in {"1", "true", "yes", "on"}
 
     def compile(self, plan: ExecutionPlan, expected_tensors: dict[str, np.ndarray]) -> CompiledArtifact:
         _tmp = TinyNPUProgram(defines_path=self.defines_path)
@@ -159,10 +161,14 @@ class SegmentCompiler:
                     op = seg.ops[0]
                     cols_name = step.outputs[0]
                     src_name = step.inputs[0]
+                    # Current RTL conv-stream gather path is only numerically aligned for INT16.
+                    # Packed INT8/INT4 can be re-enabled via env once packed gather is implemented.
+                    supports_conv_stream = (op.in_dtype == DType.INT16) or self.enable_conv_stream_packed
                     if (
                         op.lhs == cols_name
                         and tensor_uses[cols_name] == 1
                         and src_name in plan.tensors
+                        and supports_conv_stream
                     ):
                         kernel = int(step.attrs.get("kernel_size", 0))
                         stride = int(step.attrs.get("stride", 1))

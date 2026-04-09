@@ -18,6 +18,10 @@
 #define TINYNPU_USE_SHARED_SRAM 1
 #endif
 
+#ifndef TINYNPU_SHARED_PACKED_READ_MMIO_FALLBACK
+#define TINYNPU_SHARED_PACKED_READ_MMIO_FALLBACK 1
+#endif
+
 enum {
     REG_STATUS = 0x00,
     REG_CMD = 0x04,
@@ -37,6 +41,13 @@ enum {
     STATUS_DATA_VALID = 0x02,
     STATUS_HALTED = 0xFF,
 };
+
+static int g_tinynpu_force_mmio_transfers = 0;
+
+static void tinynpu_set_force_mmio(int enabled)
+{
+    g_tinynpu_force_mmio_transfers = enabled ? 1 : 0;
+}
 
 typedef enum {
     TINY_DTYPE_INT4 = 0,
@@ -1002,23 +1013,28 @@ static void npu_shared_read_word(uint16_t addr, uint32_t chunks[TINY_BUFFER_WORD
 }
 #endif
 
-static void npu_write_mem_word(uint16_t addr, const uint32_t chunks[TINY_BUFFER_WORDS_32])
+static void npu_write_mem_word_mmio(uint16_t addr, const uint32_t chunks[TINY_BUFFER_WORDS_32])
 {
-#if TINYNPU_USE_SHARED_SRAM
-    npu_shared_write_word(addr, chunks);
-#else
     npu_write16(REG_ADDR, addr);
     npu_write8(REG_CMD, CMD_WRITE_MEM);
     npu_write_mmvr(chunks);
+}
+
+static void npu_write_mem_word(uint16_t addr, const uint32_t chunks[TINY_BUFFER_WORDS_32])
+{
+#if TINYNPU_USE_SHARED_SRAM
+    if (!g_tinynpu_force_mmio_transfers) {
+        npu_shared_write_word(addr, chunks);
+        return;
+    }
+    npu_write_mem_word_mmio(addr, chunks);
+#else
+    npu_write_mem_word_mmio(addr, chunks);
 #endif
 }
 
-static int npu_read_mem_word(uint16_t addr, uint32_t chunks[TINY_BUFFER_WORDS_32])
+static int npu_read_mem_word_mmio(uint16_t addr, uint32_t chunks[TINY_BUFFER_WORDS_32])
 {
-#if TINYNPU_USE_SHARED_SRAM
-    npu_shared_read_word(addr, chunks);
-    return 0;
-#else
     uint8_t status = 0;
     npu_write16(REG_ADDR, addr);
     npu_write8(REG_CMD, CMD_READ_MEM);
@@ -1036,6 +1052,24 @@ static int npu_read_mem_word(uint16_t addr, uint32_t chunks[TINY_BUFFER_WORDS_32
 
     printf("NPU read timeout at 0x%04x status=0x%02x\n", addr, (unsigned)status);
     return -1;
+}
+
+static int npu_read_mem_word(uint16_t addr, uint32_t chunks[TINY_BUFFER_WORDS_32], int precision)
+{
+#if TINYNPU_USE_SHARED_SRAM
+    if (g_tinynpu_force_mmio_transfers) {
+        return npu_read_mem_word_mmio(addr, chunks);
+    }
+#if TINYNPU_SHARED_PACKED_READ_MMIO_FALLBACK
+    if (precision != 2) {
+        return npu_read_mem_word_mmio(addr, chunks);
+    }
+#endif
+    npu_shared_read_word(addr, chunks);
+    return 0;
+#else
+    (void)precision;
+    return npu_read_mem_word_mmio(addr, chunks);
 #endif
 }
 
@@ -1228,7 +1262,7 @@ static void read_role_c_tensor(TinyTensor *dst, uint16_t addr, int precision)
         for (int nt = 0; nt < n_tiles; ++nt) {
             uint16_t tile_addr = (uint16_t)(addr + (mtp * n_tiles * TINY_ARRAY_SIZE) + (nt * TINY_ARRAY_SIZE));
             for (int row_in_tile = 0; row_in_tile < TINY_ARRAY_SIZE; ++row_in_tile) {
-                runtime_assert(npu_read_mem_word((uint16_t)(tile_addr + row_in_tile), chunks) == 0, "readback failed");
+                runtime_assert(npu_read_mem_word((uint16_t)(tile_addr + row_in_tile), chunks, precision) == 0, "readback failed");
                 for (int lane = 0; lane < TINY_ARRAY_SIZE; ++lane) {
                     uint32_t lane_word = chunks[lane / 2];
                     uint16_t packed_lane = (lane & 1) ? (uint16_t)(lane_word >> 16) : (uint16_t)(lane_word & 0xFFFFu);
@@ -1267,7 +1301,7 @@ static void read_role_a_tensor(TinyTensor *dst, uint16_t addr, int precision)
         for (int kt = 0; kt < k_tiles; ++kt) {
             uint16_t tile_addr = (uint16_t)(addr + (mt * k_tiles * TINY_ARRAY_SIZE) + (kt * TINY_ARRAY_SIZE));
             for (int col_in_tile = 0; col_in_tile < TINY_ARRAY_SIZE; ++col_in_tile) {
-                runtime_assert(npu_read_mem_word((uint16_t)(tile_addr + col_in_tile), chunks) == 0, "readback failed");
+                runtime_assert(npu_read_mem_word((uint16_t)(tile_addr + col_in_tile), chunks, precision) == 0, "readback failed");
                 for (int row_in_tile = 0; row_in_tile < TINY_ARRAY_SIZE; ++row_in_tile) {
                     uint32_t lane_word = chunks[row_in_tile / 2];
                     uint16_t packed_lane = (row_in_tile & 1) ? (uint16_t)(lane_word >> 16) : (uint16_t)(lane_word & 0xFFFFu);
@@ -1305,7 +1339,7 @@ static void read_role_b_tensor(TinyTensor *dst, uint16_t addr, int precision)
         for (int nt = 0; nt < n_tiles; ++nt) {
             uint16_t tile_addr = (uint16_t)(addr + (kt * n_tiles * TINY_ARRAY_SIZE) + (nt * TINY_ARRAY_SIZE));
             for (int row_word = 0; row_word < TINY_ARRAY_SIZE; ++row_word) {
-                runtime_assert(npu_read_mem_word((uint16_t)(tile_addr + row_word), chunks) == 0, "readback failed");
+                runtime_assert(npu_read_mem_word((uint16_t)(tile_addr + row_word), chunks, precision) == 0, "readback failed");
                 for (int col_in_tile = 0; col_in_tile < TINY_ARRAY_SIZE; ++col_in_tile) {
                     uint32_t lane_word = chunks[col_in_tile / 2];
                     uint16_t packed_lane = (col_in_tile & 1) ? (uint16_t)(lane_word >> 16) : (uint16_t)(lane_word & 0xFFFFu);
@@ -1346,23 +1380,27 @@ static void read_tensor_from_npu(TinyTensor *dst, uint16_t addr, const char *rol
 static void load_ub_image(uint16_t base_addr, const uint32_t image[][TINY_BUFFER_WORDS_32], int word_count)
 {
 #if TINYNPU_USE_SHARED_SRAM
-    npu_shared_write_image(base_addr, image, word_count);
-#else
+    if (!g_tinynpu_force_mmio_transfers) {
+        npu_shared_write_image(base_addr, image, word_count);
+        return;
+    }
+#endif
     for (int i = 0; i < word_count; ++i) {
         npu_write_mem_word((uint16_t)(base_addr + i), image[i]);
     }
-#endif
 }
 
 static void load_im_image(uint16_t base_addr, const uint32_t image[][TINY_BUFFER_WORDS_32], int word_count)
 {
 #if TINYNPU_USE_SHARED_SRAM
-    npu_shared_write_image(base_addr, image, word_count);
-#else
+    if (!g_tinynpu_force_mmio_transfers) {
+        npu_shared_write_image(base_addr, image, word_count);
+        return;
+    }
+#endif
     for (int i = 0; i < word_count; ++i) {
         npu_write_mem_word((uint16_t)(base_addr + i), image[i]);
     }
-#endif
 }
 
 static void print_float_scalar(float value)

@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -320,7 +321,101 @@ def test_compile_plan_converts_matrix_im2col_to_conv_stream():
     assert "HostOp im2col" not in source
 
 
-def test_compile_plan_converts_matrix_im2col_to_conv_stream_int8_with_padding():
+def test_compile_plan_keeps_matrix_im2col_for_int8_by_default():
+    xmat = np.arange(5 * 4 * 7, dtype=np.int8).reshape(20, 7)
+    cols = np.zeros((6, 63), dtype=np.int8)
+    w = np.ones((63, 5), dtype=np.int8)
+    y = np.zeros((6, 5), dtype=np.int8)
+
+    tensors = {
+        "xmat": TensorSpec("xmat", xmat.shape, DType.INT8, TensorKind.INPUT),
+        "cols": TensorSpec("cols", cols.shape, DType.INT8, TensorKind.INTERMEDIATE),
+        "w": TensorSpec("w", w.shape, DType.INT8, TensorKind.CONSTANT, data=w),
+        "y": TensorSpec("y", y.shape, DType.INT8, TensorKind.OUTPUT, is_final_output=True),
+    }
+    steps = [
+        HostOp(
+            "conv_im2col",
+            "im2col",
+            inputs=["xmat"],
+            outputs=["cols"],
+            attrs={
+                "kernel_size": 3,
+                "stride": 2,
+                "padding": 1,
+                "input_layout": "matrix_hwc",
+                "matrix_h": 5,
+                "matrix_w": 4,
+                "matrix_c": 7,
+            },
+        ),
+        NpuSegment(
+            "seg_conv",
+            [MatMulOp("op0", "cols", "w", "y", in_dtype=DType.INT8, out_dtype=DType.INT8)],
+            inputs=["cols", "w"],
+            outputs=["y"],
+        ),
+    ]
+    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=["xmat"], outputs=["y"])
+    artifact = compile_plan(plan, {"y": y})
+
+    host_im2col = [step for step in artifact.plan.steps if isinstance(step, HostOp) and step.kind == "im2col"]
+    assert len(host_im2col) == 1
+
+    seg = next(step for step in artifact.plan.steps if isinstance(step, NpuSegment))
+    assert seg.ops[0].lhs == "cols"
+    assert seg.ops[0].conv_stream is None
+
+
+def test_compile_plan_keeps_matrix_im2col_for_int4_by_default():
+    xmat = np.arange(4 * 4 * 10, dtype=np.int16).reshape(16, 10)
+    cols = np.zeros((4, 90), dtype=np.int16)
+    w = np.ones((90, 9), dtype=np.int16)
+    y = np.zeros((4, 9), dtype=np.int16)
+
+    tensors = {
+        "xmat": TensorSpec("xmat", xmat.shape, DType.INT4, TensorKind.INPUT),
+        "cols": TensorSpec("cols", cols.shape, DType.INT4, TensorKind.INTERMEDIATE),
+        "w": TensorSpec("w", w.shape, DType.INT4, TensorKind.CONSTANT, data=w),
+        "y": TensorSpec("y", y.shape, DType.INT4, TensorKind.OUTPUT, is_final_output=True),
+    }
+    steps = [
+        HostOp(
+            "conv_im2col",
+            "im2col",
+            inputs=["xmat"],
+            outputs=["cols"],
+            attrs={
+                "kernel_size": 3,
+                "stride": 1,
+                "padding": 0,
+                "input_layout": "matrix_hwc",
+                "matrix_h": 4,
+                "matrix_w": 4,
+                "matrix_c": 10,
+            },
+        ),
+        NpuSegment(
+            "seg_conv",
+            [MatMulOp("op0", "cols", "w", "y", in_dtype=DType.INT4, out_dtype=DType.INT4)],
+            inputs=["cols", "w"],
+            outputs=["y"],
+        ),
+    ]
+    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=["xmat"], outputs=["y"])
+    artifact = compile_plan(plan, {"y": y})
+
+    host_im2col = [step for step in artifact.plan.steps if isinstance(step, HostOp) and step.kind == "im2col"]
+    assert len(host_im2col) == 1
+
+    seg = next(step for step in artifact.plan.steps if isinstance(step, NpuSegment))
+    assert seg.ops[0].lhs == "cols"
+    assert seg.ops[0].conv_stream is None
+
+
+def test_compile_plan_can_opt_in_conv_stream_for_int8(monkeypatch):
+    monkeypatch.setenv("TINYNPU_ENABLE_CONV_STREAM_PACKED", "1")
+
     xmat = np.arange(5 * 4 * 7, dtype=np.int8).reshape(20, 7)
     cols = np.zeros((6, 63), dtype=np.int8)
     w = np.ones((63, 5), dtype=np.int8)
@@ -364,52 +459,63 @@ def test_compile_plan_converts_matrix_im2col_to_conv_stream_int8_with_padding():
     seg = next(step for step in artifact.plan.steps if isinstance(step, NpuSegment))
     assert seg.ops[0].lhs == "xmat"
     assert seg.ops[0].conv_stream is not None
-    assert seg.ops[0].conv_stream["padding"] == 1
-    assert seg.ops[0].conv_stream["input_c"] == 7
 
 
-def test_compile_plan_converts_matrix_im2col_to_conv_stream_int4_irregular_channels():
-    xmat = np.arange(4 * 4 * 10, dtype=np.int16).reshape(16, 10)
-    cols = np.zeros((4, 90), dtype=np.int16)
-    w = np.ones((90, 9), dtype=np.int16)
-    y = np.zeros((4, 9), dtype=np.int16)
+@pytest.mark.parametrize(
+    ("dtype", "dtype_enum", "precision"),
+    [
+        (DType.INT16, "TNPU_DTYPE_INT16", 2),
+        (DType.INT8, "TNPU_DTYPE_INT8", 1),
+        (DType.INT4, "TNPU_DTYPE_INT4", 0),
+    ],
+)
+def test_emit_cv32e40p_program_v2_emits_precision_and_verify_for_all_integer_modes(dtype, dtype_enum, precision):
+    x = np.array(
+        [
+            [1, -2, 3, -4],
+            [2, 1, -3, 0],
+            [-1, 4, -2, 3],
+            [0, -1, 2, -3],
+        ],
+        dtype=np.int16,
+    )
+    w = np.array(
+        [
+            [1, 0, -1, 2],
+            [2, -2, 1, 0],
+            [-1, 3, 0, -2],
+            [0, 1, 2, -1],
+        ],
+        dtype=np.int16,
+    )
+    y_i32 = x.astype(np.int32) @ w.astype(np.int32)
+    if dtype == DType.INT4:
+        y = np.clip(y_i32, -8, 7).astype(np.int16)
+    elif dtype == DType.INT8:
+        y = np.clip(y_i32, -128, 127).astype(np.int16)
+    else:
+        y = np.clip(y_i32, -32768, 32767).astype(np.int16)
 
     tensors = {
-        "xmat": TensorSpec("xmat", xmat.shape, DType.INT4, TensorKind.INPUT),
-        "cols": TensorSpec("cols", cols.shape, DType.INT4, TensorKind.INTERMEDIATE),
-        "w": TensorSpec("w", w.shape, DType.INT4, TensorKind.CONSTANT, data=w),
-        "y": TensorSpec("y", y.shape, DType.INT4, TensorKind.OUTPUT, is_final_output=True),
+        "x": TensorSpec("x", x.shape, dtype, TensorKind.INPUT),
+        "w": TensorSpec("w", w.shape, dtype, TensorKind.CONSTANT, data=w),
+        "y": TensorSpec("y", y.shape, dtype, TensorKind.OUTPUT, is_final_output=True),
     }
     steps = [
-        HostOp(
-            "conv_im2col",
-            "im2col",
-            inputs=["xmat"],
-            outputs=["cols"],
-            attrs={
-                "kernel_size": 3,
-                "stride": 1,
-                "padding": 0,
-                "input_layout": "matrix_hwc",
-                "matrix_h": 4,
-                "matrix_w": 4,
-                "matrix_c": 10,
-            },
-        ),
         NpuSegment(
-            "seg_conv",
-            [MatMulOp("op0", "cols", "w", "y", in_dtype=DType.INT4, out_dtype=DType.INT4)],
-            inputs=["cols", "w"],
+            "seg0",
+            [MatMulOp("op0", "x", "w", "y", in_dtype=dtype, out_dtype=dtype)],
+            inputs=["x", "w"],
             outputs=["y"],
-        ),
+        )
     ]
-    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=["xmat"], outputs=["y"])
+    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=["x"], outputs=["y"])
+    plan.add_verification_step("y", "final_y")
     artifact = compile_plan(plan, {"y": y})
 
-    host_kinds = [step.kind for step in artifact.plan.steps if isinstance(step, HostOp)]
-    assert "im2col" not in host_kinds
+    source = emit_cv32e40p_program_v2(artifact, {"x": x}, program_name=f"unit_test_v2_{dtype.value}")
 
-    seg = next(step for step in artifact.plan.steps if isinstance(step, NpuSegment))
-    assert seg.ops[0].lhs == "xmat"
-    assert seg.ops[0].conv_stream is not None
-    assert seg.ops[0].conv_stream["input_c"] == 10
+    assert dtype_enum in source
+    assert "TNPU_OP_VERIFY" in source
+    assert ".expected_tensor_idx" in source
+    assert f".precision = {precision}" in source
