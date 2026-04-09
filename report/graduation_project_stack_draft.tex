@@ -272,7 +272,7 @@ At a high level, the flow is straightforward. A model starts either as a quantiz
 That end-to-end view is important because the main design problem is not only to build a datapath. It is to maintain a clean contract between logical tensors, physical packed layouts, host-side fallback behavior, and the actual hardware pipeline. The rest of this section therefore explains the system in the same order: hardware first, then model preparation, then compilation, then runtime execution and verification.
 
 \subsection{NPU}
-The TinyNPU hardware is organized around a control path and a compute path. The control path is responsible for instruction sequencing, host service, and control-state progression. In the current Runtime V2 path, most UB/IM staging uses the shared-SRAM host window, while MMIO remains the launch/status control mechanism and compatibility fallback. The compute path consists of the unified buffer, streamer logic, a parameterized $N \times N$ output-stationary systolic array, and the post-processing unit. During active computation, data is read from the unified buffer, oriented by the streamers, consumed by the processing elements, and then drained through the post-processing unit before being written back in packed form.
+The TinyNPU hardware is organized around a control path and a compute path. The control path is responsible for instruction sequencing, host service, and control-state progression. In the current runtime path, most UB/IM staging uses the shared-SRAM host window, while MMIO remains the launch/status control mechanism and compatibility fallback. The compute path consists of the unified buffer, streamer logic, a parameterized $N \times N$ output-stationary systolic array, and the post-processing unit. During active computation, data is read from the unified buffer, oriented by the streamers, consumed by the processing elements, and then drained through the post-processing unit before being written back in packed form.
 
 \begin{figure}[H]
     \centering
@@ -390,7 +390,7 @@ This behavior is programmed through a fixed-width 256-bit instruction format in 
     \end{tabularx}
 \end{table}
 
-Instruction execution is paired with a small MMIO command interface on the host side. The host does not directly drive internal control states; instead it writes a command register to request memory access or to start execution from a given instruction-memory address. In the Runtime V2 configuration used for the refreshed measurements, data-heavy preload/readback traffic is normally served by the shared-SRAM window, and this MMIO command path is primarily used for control and fallback memory service.
+Instruction execution is paired with a small MMIO command interface on the host side. The host does not directly drive internal control states; instead it writes a command register to request memory access or to start execution from a given instruction-memory address. In the current runtime configuration used for the refreshed measurements, data-heavy preload/readback traffic is normally served by the shared-SRAM window, and this MMIO command path is primarily used for control and fallback memory service.
 
 \begin{table}[H]
     \centering
@@ -442,7 +442,7 @@ This representation is the main reason the stack remains analyzable. Unsupported
     \label{fig:compiler-stack}
 \end{figure}
 
-Figure~\ref{fig:compiler-stack} summarizes the implemented software flow. A model enters either directly as a supported quantized PyTorch module or through a compiler-ready conversion path built around \texttt{tinynpu\_quant}. The JIT frontend traces the model with FX, partitions it into a mixed execution plan, validates host operations, and lowers each accelerator segment through the memory planner and \texttt{SegmentCompiler}. The resulting \texttt{CompiledArtifact} contains the execution plan, per-segment IM/UB binaries, expected tensors for verification, and the memory-layout information required by the runtime. Runtime V2 keeps this boundary explicit by emitting mostly static tables in generated C while executing them through one shared runtime implementation.
+Figure~\ref{fig:compiler-stack} summarizes the implemented software flow. A model enters either directly as a supported quantized PyTorch module or through a compiler-ready conversion path built around \texttt{tinynpu\_quant}. The JIT frontend traces the model with FX, partitions it into a mixed execution plan, validates host operations, and lowers each accelerator segment through the memory planner and \texttt{SegmentCompiler}. The resulting \texttt{CompiledArtifact} contains the execution plan, per-segment IM/UB binaries, expected tensors for verification, and the memory-layout information required by the runtime. The current emitter/runtime boundary keeps this explicit by generating static program tables in C and executing them through one shared runtime implementation.
 
 Packing is part of the compiler contract as well. The backend uses role-specific physical layouts for activation-side tensors, weight-side tensors, output buffers, and bias payloads. These are physical storage forms rather than semantic tensor meanings, but they are essential because legal execution depends on matching memory layout to the real feed directions and writeback format of the NPU. A useful correction came late in the project: internal NPU outputs can no longer be treated as if ordinary C-style writeback were automatically consumable by a following A-side input. The compiler now annotates the required physical output layout explicitly, and the emitted instruction stream carries that selection into the RTL writeback path.
 
@@ -479,7 +479,7 @@ The empirical results are organized around two benchmark views. The first is a c
 
 The reported metrics keep those cost categories separate. Accelerator cycles are taken from the RTL run window of the NPU segment itself. Packing, MMIO traffic, tensor movement, and host-only operators are accounted for outside that run window. The CPU baselines used later in the report are analytic reference models for the same logical work, not measurements from a physical comparison platform.
 
-For the refreshed Runtime V2 coverage runs in this report, firmware binaries were built with \texttt{-march=rv32imfc -mabi=ilp32 -O3} and \texttt{-DTNPU\_RUNTIME\_V2\_DUMP\_FINAL\_OUTPUTS=0}. Runtime validation used \texttt{autoverify} against compiler-owned expected tensors when explicit verify ops were not emitted. Simulator runs used \texttt{VERILATOR\_MAX\_TICKS=3000000000} with \texttt{+maxcycles=250000} to keep measurements directly comparable.
+For the refreshed runtime-coverage runs in this report, firmware binaries were built with \texttt{-march=rv32imfc -mabi=ilp32 -O3} and \texttt{-DTNPU\_RUNTIME\_V2\_DUMP\_FINAL\_OUTPUTS=0}. Runtime validation used \texttt{autoverify} against compiler-owned expected tensors when explicit verify ops were not emitted. Simulator runs used \texttt{VERILATOR\_MAX\_TICKS=3000000000} with \texttt{+maxcycles=250000} to keep measurements directly comparable.
 
 \newpage
 \section{Comparative Evaluation and Discussion}
@@ -534,7 +534,7 @@ The same table can also be read against the array's theoretical peak. For the cu
 
 \subsection{Updated Fair INT16 Conv/Linear Runs}
 
-The previous fair-run block was refreshed with the newer committed cycle logs from the INT16 same-shape artifacts (\texttt{cfc64cd}). The comparison now uses three directly comparable programs: linear CPU-vs-NPU, convolution CPU-vs-NPU with \texttt{conv\_stream} disabled, and the same convolution shape with \texttt{conv\_stream} enabled.
+The previous fair-run block was refreshed from the latest committed INT16 same-shape cycle logs (\texttt{runs/PERF\_2026-04-08\_INT16\_INT8\_INT4\_FAIR.md}). The comparison now uses three directly comparable programs: linear CPU-vs-NPU, convolution CPU-vs-NPU with \texttt{conv\_stream} disabled, and the same convolution shape with \texttt{conv\_stream} enabled.
 
 \begin{table}[H]
     \centering
@@ -574,15 +574,15 @@ The previous fair-run block was refreshed with the newer committed cycle logs fr
 
 The key result is that \texttt{conv\_stream} does not materially change core arithmetic time for this shape (\texttt{run}=529 in both conv artifacts), but it removes most boundary cost. The same-shape conv stage term drops from 35616 to 4083 cycles (\(8.72\times\) reduction), and total segment NPU cycles drop from 43838 to 12118 (\(3.62\times\) reduction). This is exactly the expected signature of reducing host-visible layout work rather than changing the MAC datapath itself.
 
-\subsection{Runtime V2 Coverage Refresh}
+\subsection{Current Runtime Coverage}
 
-The Runtime V2 baseline was re-checked after the packed conv-stream RTL fix (\texttt{6ecf1e3}) using one fixed method: \texttt{-march=rv32imfc -mabi=ilp32 -O3}, \texttt{-DTNPU\_RUNTIME\_V2\_DUMP\_FINAL\_OUTPUTS=0}, runtime \texttt{autoverify} against compiler-owned expected tensors, and simulator launch with \texttt{VERILATOR\_MAX\_TICKS=3000000000} plus \texttt{+maxcycles=250000}. The table reports correctness and phase-level cycle counts under that single setup.
+The current runtime baseline was re-checked after the packed conv-stream RTL fix (\texttt{6ecf1e3}) using one fixed method: \texttt{-march=rv32imfc -mabi=ilp32 -O3}, \texttt{-DTNPU\_RUNTIME\_V2\_DUMP\_FINAL\_OUTPUTS=0}, runtime \texttt{autoverify} against compiler-owned expected tensors, and simulator launch with \texttt{VERILATOR\_MAX\_TICKS=3000000000} plus \texttt{+maxcycles=250000}. The table reports correctness and phase-level cycle counts under that single setup.
 
 \begin{table}[H]
     \centering
     \footnotesize
-    \caption{Post-fix Runtime V2 coverage refresh for representative INT16/INT8/INT4 artifacts.}
-    \label{tab:runtime-v2-refresh}
+    \caption{Post-fix runtime coverage refresh for representative INT16/INT8/INT4 artifacts.}
+    \label{tab:runtime-coverage-refresh}
     \begin{tabularx}{\textwidth}{|>{\raggedright\arraybackslash}X|l|r|r|r|r|r|l|}
         \hline
         \textbf{Program} & \textbf{Path} & \textbf{Host Im2Col} & \textbf{Stage} & \textbf{Run} & \textbf{Readback} & \textbf{Seg.NPU} & \textbf{Verify} \\
@@ -600,7 +600,7 @@ The Runtime V2 baseline was re-checked after the packed conv-stream RTL fix (\te
     \end{tabularx}
 \end{table}
 
-Three conclusions matter for Runtime V2: INT16 direct conv-stream is stable, INT8 direct packed conv-stream is stable, and INT4 direct packed conv-stream is stable when fixtures respect the signed INT4 contract. The one remaining INT4 failure in this matrix is a fixture-validity issue (\texttt{xmat} in \([-14,14]\) instead of \([-8,7]\)), not a datapath correctness issue.
+Three conclusions matter for the current runtime implementation: INT16 direct conv-stream is stable, INT8 direct packed conv-stream is stable, and INT4 direct packed conv-stream is stable when fixtures respect the signed INT4 contract. The one remaining INT4 failure in this matrix is a fixture-validity issue (\texttt{xmat} in \([-14,14]\) instead of \([-8,7]\)), not a datapath correctness issue.
 
 \subsection{Activation Study}
 \label{sec:activation-study}
