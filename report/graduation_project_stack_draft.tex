@@ -272,7 +272,7 @@ At a high level, the flow is straightforward. A model starts either as a quantiz
 That end-to-end view is important because the main design problem is not only to build a datapath. It is to maintain a clean contract between logical tensors, physical packed layouts, host-side fallback behavior, and the actual hardware pipeline. The rest of this section therefore explains the system in the same order: hardware first, then model preparation, then compilation, then runtime execution and verification.
 
 \subsection{NPU}
-The TinyNPU hardware is organized around a control path and a compute path. The control path is responsible for MMIO-driven loading, instruction sequencing, and control-state progression. The compute path consists of the unified buffer, streamer logic, a parameterized $N \times N$ output-stationary systolic array, and the post-processing unit. During active computation, data is read from the unified buffer, oriented by the streamers, consumed by the processing elements, and then drained through the post-processing unit before being written back in packed form.
+The TinyNPU hardware is organized around a control path and a compute path. The control path is responsible for instruction sequencing, host service, and control-state progression. In the current Runtime V2 path, most UB/IM staging uses the shared-SRAM host window, while MMIO remains the launch/status control mechanism and compatibility fallback. The compute path consists of the unified buffer, streamer logic, a parameterized $N \times N$ output-stationary systolic array, and the post-processing unit. During active computation, data is read from the unified buffer, oriented by the streamers, consumed by the processing elements, and then drained through the post-processing unit before being written back in packed form.
 
 \begin{figure}[H]
     \centering
@@ -390,7 +390,7 @@ This behavior is programmed through a fixed-width 256-bit instruction format in 
     \end{tabularx}
 \end{table}
 
-Instruction execution is paired with a small MMIO command interface on the host side. The host does not directly drive internal control states; instead it writes a command register to request memory access or to start execution from a given instruction-memory address.
+Instruction execution is paired with a small MMIO command interface on the host side. The host does not directly drive internal control states; instead it writes a command register to request memory access or to start execution from a given instruction-memory address. In the Runtime V2 configuration used for the refreshed measurements, data-heavy preload/readback traffic is normally served by the shared-SRAM window, and this MMIO command path is primarily used for control and fallback memory service.
 
 \begin{table}[H]
     \centering
@@ -442,7 +442,7 @@ This representation is the main reason the stack remains analyzable. Unsupported
     \label{fig:compiler-stack}
 \end{figure}
 
-Figure~\ref{fig:compiler-stack} summarizes the implemented software flow. A model enters either directly as a supported quantized PyTorch module or through a compiler-ready conversion path built around \texttt{tinynpu\_quant}. The JIT frontend traces the model with FX, partitions it into a mixed execution plan, validates host operations, and lowers each accelerator segment through the memory planner and \texttt{SegmentCompiler}. The resulting \texttt{CompiledArtifact} contains the execution plan, per-segment IM/UB binaries, expected tensors for verification, and the memory-layout information required by the runtime.
+Figure~\ref{fig:compiler-stack} summarizes the implemented software flow. A model enters either directly as a supported quantized PyTorch module or through a compiler-ready conversion path built around \texttt{tinynpu\_quant}. The JIT frontend traces the model with FX, partitions it into a mixed execution plan, validates host operations, and lowers each accelerator segment through the memory planner and \texttt{SegmentCompiler}. The resulting \texttt{CompiledArtifact} contains the execution plan, per-segment IM/UB binaries, expected tensors for verification, and the memory-layout information required by the runtime. Runtime V2 keeps this boundary explicit by emitting mostly static tables in generated C while executing them through one shared runtime implementation.
 
 Packing is part of the compiler contract as well. The backend uses role-specific physical layouts for activation-side tensors, weight-side tensors, output buffers, and bias payloads. These are physical storage forms rather than semantic tensor meanings, but they are essential because legal execution depends on matching memory layout to the real feed directions and writeback format of the NPU. A useful correction came late in the project: internal NPU outputs can no longer be treated as if ordinary C-style writeback were automatically consumable by a following A-side input. The compiler now annotates the required physical output layout explicitly, and the emitted instruction stream carries that selection into the RTL writeback path.
 
@@ -462,7 +462,7 @@ The runtime also owns repeated-run behavior. It can preserve reusable state such
     \label{fig:runtime-state}
 \end{figure}
 
-Figure~\ref{fig:runtime-state} shows the same loop from the host-side orchestration perspective. For accelerator segments, the runtime first packs logical tensors into the physical layouts expected by the datapath, writes the necessary vectors into the unified buffer, launches execution through MMIO, waits for completion, and then reads and unpacks the resulting vectors back into logical tensors. Host-side operations such as requantization, dequantization, softmax, mean, and shape movement appear explicitly in the same loop rather than being hidden behind the accelerator interface. With the newer output-layout support, the host-side runtime no longer has to repair certain internal layout mismatches itself: when the compiler marks a chained tensor as needing A-format storage, the hardware segment writes it back in that form directly.
+Figure~\ref{fig:runtime-state} shows the same loop from the host-side orchestration perspective. For accelerator segments, the runtime first packs logical tensors into the physical layouts expected by the datapath, stages vectors into the unified buffer (shared-SRAM path by default, MMIO fallback available), launches execution, waits for completion, and then reads and unpacks the resulting vectors back into logical tensors. Host-side operations such as requantization, dequantization, softmax, mean, and shape movement appear explicitly in the same loop rather than being hidden behind the accelerator interface. With the newer output-layout support, the host-side runtime no longer has to repair certain internal layout mismatches itself: when the compiler marks a chained tensor as needing A-format storage, the hardware segment writes it back in that form directly.
 
 Verification is built into this same path. Compiler-owned expected tensors can be checked during execution, which means correctness is not limited to end-of-run output comparison. Benchmarking is also integrated here: the runtime can record hard RTL cycle counts for accelerator run windows while separately accounting for software-side overhead such as packing, MMIO traffic, and readback.
 
@@ -478,6 +478,8 @@ Host emulation and RTL simulation execute the same compiled plan, so the same ar
 The empirical results are organized around two benchmark views. The first is a controlled multi-tile GEMM chosen to force tiling on the current array and expose the split between array throughput and integration overhead. The second is a model-level case study built from two compiler-ready artifacts that expose how execution-plan shape changes delivered speedup.
 
 The reported metrics keep those cost categories separate. Accelerator cycles are taken from the RTL run window of the NPU segment itself. Packing, MMIO traffic, tensor movement, and host-only operators are accounted for outside that run window. The CPU baselines used later in the report are analytic reference models for the same logical work, not measurements from a physical comparison platform.
+
+For the refreshed Runtime V2 coverage runs in this report, firmware binaries were built with \texttt{-march=rv32imfc -mabi=ilp32 -O3} and \texttt{-DTNPU\_RUNTIME\_V2\_DUMP\_FINAL\_OUTPUTS=0}. Runtime validation used \texttt{autoverify} against compiler-owned expected tensors when explicit verify ops were not emitted. Simulator runs used \texttt{VERILATOR\_MAX\_TICKS=3000000000} with \texttt{+maxcycles=250000} to keep measurements directly comparable.
 
 \newpage
 \section{Comparative Evaluation and Discussion}
@@ -598,6 +600,8 @@ The clearest way to interpret the current performance story is as a two-case com
 
 For the one-segment MLP, the full-model numerator is the same as the segment-replaced numerator because the persisted plan retains only accelerator-serving boundary helpers. In the conv path, by contrast, the CPU-only numerator excludes \texttt{im2col} and \texttt{layout\_restore}, because those helpers exist only to service the accelerator path rather than the logical CPU-only model.
 
+This case-study table intentionally uses the baseline conv-heavy artifact where each convolution still crosses a host-visible layout boundary. The newer direct packed conv-stream artifacts in Table~\ref{tab:runtime-v2-refresh} show the complementary path where host \texttt{im2col}/\texttt{layout\_restore} can be removed for supported shapes and padding contracts.
+
 This comparison explains why the conv-heavy path ``comes back to bite'' the delivered speedup even though the arithmetic core is strong. The convolution model is not slow because its MAC regions are intrinsically weak; it is slow because each convolution crosses the host/NPU boundary twice for layout reasons. The host must materialize sliding-window matrices through \texttt{im2col}, the NPU processes that matrix multiplication region, and then the host must rebuild feature-map layout through \texttt{layout\_restore} so the next convolution can start from a normal tensor again. Those helpers are real remaining work, and under the stricter benchmark split they count against the delivered speedup. The one-segment MLP avoids exactly those penalties because it never leaves the linear-native contract of the array.
 
 A repeated-run experiment on the one-segment MLP shows the clean best-case path. The compiled host and RTL paths matched on a balanced 30-sample sweep with 15 positive and 15 negative examples. Under the ideal issue-1 reference model, the reused accelerator run window stayed at 2551 cycles per inference, while NPU overhead dropped from 2919 cycles on the first run to a stable 2729 cycles on runs 2--30. Only the initial \texttt{quantize} helper remained in the persisted host plan, so the remaining-host bucket was also only 448 cycles per inference in both the cold and warm cases. This corresponds to a pure accelerator speedup of \(34.78\times\) in both cases and a full-model speedup improving from \(14.99\times\) on the first run to \(15.49\times\) in steady state.
@@ -605,6 +609,34 @@ A repeated-run experiment on the one-segment MLP shows the clean best-case path.
 The conv-heavy feature model provides the complementary result under the same INT16 / \texttt{is\_zero} setup. In that case the first run measured \(C_{\text{cpu}} = 391{,}466\), \(C_{\text{npu}} = 1{,}778\), \(C_{\text{ovh}} = 35{,}795\), and \(C_{\text{host}} = 23{,}644\) cycles. Runs 2--30 then stayed at the same warm averages for compute and remaining host work, while NPU overhead dropped slightly to 35{,}491 cycles. The pure accelerator speedup is still \(220.17\times\), but the full-model speedup is only \(6.05\times\) once accelerator-serving helpers such as \texttt{quantize}, \texttt{dequantize}, \texttt{im2col}, and \texttt{layout\_restore} are excluded from the CPU-only numerator.
 
 That pair of case studies is the most useful current performance result in the report. In the one-segment MLP, the host boundary is almost absent and the full-model speedup stays strong. In the conv-heavy path, by contrast, the pure accelerator number is misleadingly optimistic if taken alone. The host still executes \texttt{im2col}, \texttt{layout\_restore}, and the surrounding orchestration on every convolution boundary, so the full-model speedup is less than half the one-segment case even though the raw compute replacement number is much larger. This is why reducing host-visible layout work is now a more important next step than trying to make the core MAC datapath itself more aggressive.
+
+\subsection{Runtime V2 Coverage Refresh}
+
+The Runtime V2 coverage baseline was re-measured after the packed conv-stream RTL update (\texttt{6ecf1e3}). These runs used one fixed methodology: \texttt{-march=rv32imfc -mabi=ilp32 -O3}, \texttt{-DTNPU\_RUNTIME\_V2\_DUMP\_FINAL\_OUTPUTS=0}, runtime \texttt{autoverify} against compiler-owned expected tensors, and simulator launch with \texttt{VERILATOR\_MAX\_TICKS=3000000000} plus \texttt{+maxcycles=250000}. The purpose was to refresh correctness and phase-level cycle numbers with one consistent setup.
+
+\begin{table}[H]
+    \centering
+    \footnotesize
+    \caption{Post-fix Runtime V2 coverage refresh for representative INT16/INT8/INT4 artifacts.}
+    \label{tab:runtime-v2-refresh}
+    \begin{tabularx}{\textwidth}{|>{\raggedright\arraybackslash}X|l|r|r|r|r|r|l|}
+        \hline
+        \textbf{Program} & \textbf{Path} & \textbf{Host Im2Col} & \textbf{Stage} & \textbf{Run} & \textbf{Readback} & \textbf{Seg.NPU} & \textbf{Verify} \\
+        \hline
+        \texttt{cv32e40p\_int16\_convstream\_same\_shape\_v2} & conv-stream & 0 & 3810 & 530 & 3387 & 13707 & OK \\
+        \hline
+        \texttt{cv32e40p\_int8\_packed\_convstream\_default\_v2} & direct packed conv-stream & 0 & 7309 & 98 & 2931 & 16267 & OK \\
+        \hline
+        \texttt{cv32e40p\_int4\_convstream\_same\_shape\_v2} & host \texttt{im2col} + NPU & 52988 & 40004 & 290 & 9453 & 55821 & OK \\
+        \hline
+        \texttt{cv32e40p\_int4\_packed\_convstream\_default\_v2\_inrange} & direct packed conv-stream & 0 & 9176 & 82 & 3199 & 18386 & OK \\
+        \hline
+        \texttt{cv32e40p\_int4\_packed\_convstream\_default\_v2} & direct packed conv-stream & 0 & 9176 & 82 & 3195 & 18382 & FAIL (\texttt{@0}) \\
+        \hline
+    \end{tabularx}
+\end{table}
+
+The interpretation is straightforward: the packed direct conv-stream path is now validated for INT8 and for INT4 when the input fixture respects the INT4 signed range. The remaining failing direct INT4 fixture is a data-validity issue, not a hardware path issue: it uses \texttt{xmat} values in \([-14,14]\), while INT4 contracts require \([-8,7]\). With an in-range fixture of the same shape and instruction pattern, direct INT4 conv-stream passes.
 
 \subsection{Activation Study}
 \label{sec:activation-study}
