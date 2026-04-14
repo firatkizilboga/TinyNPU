@@ -203,6 +203,40 @@ def test_emit_cv32e40p_program_v2_structured_program():
     assert "TNPU_HOST_RELU" in source
 
 
+def test_compile_plan_marks_rhs_chaining_output_as_b_layout():
+    lhs0 = np.arange(1, 65, dtype=np.int16).reshape(8, 8)
+    rhs0 = np.eye(8, dtype=np.int16)
+    lhs1 = np.flipud(np.eye(8, dtype=np.int16))
+    expected_mid = np.clip(lhs0.astype(np.int32) @ rhs0.astype(np.int32), -32768, 32767).astype(np.int16)
+    expected_y = np.clip(lhs1.astype(np.int32) @ expected_mid.astype(np.int32), -32768, 32767).astype(np.int16)
+
+    tensors = {
+        "lhs0": TensorSpec("lhs0", lhs0.shape, DType.INT16, TensorKind.INPUT),
+        "rhs0": TensorSpec("rhs0", rhs0.shape, DType.INT16, TensorKind.CONSTANT, data=rhs0),
+        "lhs1": TensorSpec("lhs1", lhs1.shape, DType.INT16, TensorKind.CONSTANT, data=lhs1),
+        "mid": TensorSpec("mid", expected_mid.shape, DType.INT16, TensorKind.INTERMEDIATE),
+        "y": TensorSpec("y", expected_y.shape, DType.INT16, TensorKind.OUTPUT, is_final_output=True),
+    }
+    steps = [
+        NpuSegment(
+            "seg_b_chain",
+            [
+                MatMulOp("op0", "lhs0", "rhs0", "mid"),
+                MatMulOp("op1", "lhs1", "mid", "y"),
+            ],
+            inputs=["lhs0", "rhs0", "lhs1"],
+            outputs=["y"],
+        ),
+    ]
+    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=["lhs0"], outputs=["y"])
+    artifact = compile_plan(plan, {"y": expected_y})
+
+    seg = artifact.plan.steps[0]
+    assert seg.ops[0].output_layout == "b"
+    assert seg.ops[1].output_layout == "c"
+    assert artifact.segment_artifacts["seg_b_chain"].symbol_table["mid"]["role"] == "B"
+
+
 def test_compile_plan_keeps_layout_restore_then_im2col():
     a = np.arange(20, dtype=np.int16).reshape(4, 5)
     b = np.ones((5, 3), dtype=np.int16)
