@@ -69,6 +69,7 @@ class MatMulOp:
     out_dtype: DType = DType.INT16
     output_layout: str = "c"
     output_word_offset: int = 0
+    b_word_offset: int = 0
 
 
 @dataclass

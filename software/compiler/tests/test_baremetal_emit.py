@@ -262,6 +262,29 @@ def test_tinynpu_program_encodes_output_word_offset_in_matmul_instruction():
     assert ((inst >> 72) & 0x3) == int(OutputLayout.B)
 
 
+def test_tinynpu_program_encodes_b_word_offset_in_matmul_instruction():
+    program = TinyNPUProgram()
+    lhs = np.eye(8, dtype=np.int16)
+    rhs = np.eye(8, dtype=np.int16)
+    program.declare_data("lhs", lhs, precision=PrecisionMode.INT16, role="A")
+    program.declare_data("rhs", rhs, precision=PrecisionMode.INT16, role="B")
+    program.matmul(
+        "lhs",
+        "rhs",
+        "out",
+        in_precision=PrecisionMode.INT16,
+        out_precision=PrecisionMode.INT16,
+        output_layout=OutputLayout.C,
+        b_word_offset=9,
+    )
+    program.halt()
+    binary = program.compile()
+
+    inst = int(binary["im"][0])
+    assert ((inst >> 56) & 0xFFFF) == 9
+    assert ((inst >> 72) & 0x3) == int(OutputLayout.C)
+
+
 def test_compile_plan_preserves_output_word_offset_in_segment_binary():
     lhs = np.eye(8, dtype=np.int16)
     rhs = np.eye(8, dtype=np.int16)
@@ -295,6 +318,40 @@ def test_compile_plan_preserves_output_word_offset_in_segment_binary():
     assert artifact.plan.steps[0].ops[0].output_layout == "c"
     inst = int(artifact.segment_artifacts["seg_offset"].binary["im"][0])
     assert ((inst >> 184) & 0xFFFF) == 21
+    assert ((inst >> 72) & 0x3) == int(OutputLayout.C)
+
+
+def test_compile_plan_preserves_b_word_offset_in_segment_binary():
+    lhs = np.eye(8, dtype=np.int16)
+    rhs = np.eye(8, dtype=np.int16)
+    expected = np.eye(8, dtype=np.int16)
+
+    tensors = {
+        "lhs": TensorSpec("lhs", lhs.shape, DType.INT16, TensorKind.INPUT),
+        "rhs": TensorSpec("rhs", rhs.shape, DType.INT16, TensorKind.CONSTANT, data=rhs),
+        "out": TensorSpec("out", expected.shape, DType.INT16, TensorKind.OUTPUT, is_final_output=True),
+    }
+    steps = [
+        NpuSegment(
+            "seg_b_input_offset",
+            [
+                MatMulOp(
+                    "op0",
+                    "lhs",
+                    "rhs",
+                    "out",
+                    b_word_offset=17,
+                )
+            ],
+            inputs=["lhs", "rhs"],
+            outputs=["out"],
+        )
+    ]
+    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=["lhs"], outputs=["out"])
+    artifact = compile_plan(plan, {"out": expected})
+
+    inst = int(artifact.segment_artifacts["seg_b_input_offset"].binary["im"][0])
+    assert ((inst >> 56) & 0xFFFF) == 17
     assert ((inst >> 72) & 0x3) == int(OutputLayout.C)
 
 

@@ -44,6 +44,7 @@ class MatMul(Instruction):
         h_gelu_x_scale_shift=7,
         output_layout=OutputLayout.C,
         output_word_offset=0,
+        b_word_offset=0,
     ):
         self.a = a
         self.b = b
@@ -58,6 +59,7 @@ class MatMul(Instruction):
         self.h_gelu_x_scale_shift = h_gelu_x_scale_shift
         self.output_layout = output_layout
         self.output_word_offset = output_word_offset
+        self.b_word_offset = b_word_offset
         
         # Tile dimensions (logical) will be set by the compiler during inference
         self.m = 0
@@ -88,6 +90,7 @@ class MatMul(Instruction):
         instr |= (self.in_prec & 0x3) << 82
         instr |= (self.h_gelu_x_scale_shift & 0xFF) << 74
         instr |= (self.output_layout & 0x3) << 72
+        instr |= (self.b_word_offset & 0xFFFF) << 56
         return instr
 
 class Move(Instruction):
@@ -132,6 +135,7 @@ def pack_matmul(
     h_gelu_x_scale_shift=7,
     output_layout=OutputLayout.C,
     output_word_offset=0,
+    b_word_offset=0,
 ):
     instr = 0
     instr |= (opcode & 0xF) << 252
@@ -151,6 +155,7 @@ def pack_matmul(
     instr |= (in_precision & 0x3) << 82
     instr |= (h_gelu_x_scale_shift & 0xFF) << 74
     instr |= (output_layout & 0x3) << 72
+    instr |= (b_word_offset & 0xFFFF) << 56
     return instr
 
 def pack_move(opcode, src, dest, count):
