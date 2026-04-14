@@ -53,6 +53,7 @@ module control_unit #(
     output logic [ 1:0]                    ppu_out_precision,
     output logic [ 1:0]                    ppu_write_offset,
     output output_layout_t                 ppu_output_layout,
+    output writeback_mode_t                ppu_writeback_mode,
 
     input logic all_done_in
 );
@@ -109,6 +110,7 @@ module control_unit #(
   logic [ 1:0] mm_out_precision;
   logic [ 1:0] mm_write_offset;
   output_layout_t mm_output_layout;
+  writeback_mode_t mm_writeback_mode;
   logic [15:0] m_idx, n_idx, k_idx;
 
   // Flexible counter width for NxN support
@@ -142,6 +144,7 @@ module control_unit #(
       {mm_a_base, mm_b_base, mm_c_base, mm_bias_base, mm_output_word_offset, mm_b_word_offset, mm_m_total, mm_k_total, mm_n_total} <= '0;
       {mm_shift, mm_multiplier, mm_activation, mm_h_gelu_x_scale_shift, mm_in_precision, mm_out_precision, mm_write_offset} <= '0;
       mm_output_layout <= OUT_LAYOUT_C;
+      mm_writeback_mode <= WB_MODE_NORMAL;
       {m_idx, n_idx, k_idx, cycle_cnt} <= '0;
       perf_total_cycles <= '0;
       for (int perf_i = 0; perf_i < CTRL_STATE_COUNT; perf_i++) begin
@@ -176,6 +179,7 @@ module control_unit #(
 
       // MATMUL Latch from Instruction Memory
       if (state == CTRL_DECODE && im_rdata[255:252] == ISA_OP_MATMUL) begin
+        mm_writeback_mode <= writeback_mode_t'(im_rdata[251:248]);
         mm_a_base <= im_rdata[247:232];
         mm_b_base <= im_rdata[231:216];
         mm_c_base <= im_rdata[215:200];  // Load C Base
@@ -226,6 +230,7 @@ module control_unit #(
     logic [$clog2(`ARRAY_SIZE+1)-1:0] a_words_per_tile;
     logic [$clog2(`ARRAY_SIZE+1)-1:0] b_words_per_tile;
     logic        wb_valid_cycle;
+    logic [$clog2(`ARRAY_SIZE)-1:0] v_cache_row_in_block;
     logic [`ADDR_WIDTH-1:0] mm_c_effective_base;
 
     always_comb begin
@@ -264,11 +269,15 @@ module control_unit #(
                 b_words_per_tile = `ARRAY_SIZE;
             end
         endcase
+        v_cache_row_in_block = mm_output_word_offset[$clog2(`ARRAY_SIZE)-1:0];
         unique case (mm_output_layout)
             OUT_LAYOUT_A: wb_valid_cycle = (cycle_cnt < a_words_per_tile);
             OUT_LAYOUT_B: wb_valid_cycle = (cycle_cnt < b_words_per_tile);
             default:      wb_valid_cycle = 1'b1;
         endcase
+        if (mm_writeback_mode == WB_MODE_V_CACHE_APPEND_INT16) begin
+            wb_valid_cycle = (mm_out_precision == MODE_INT16) && (cycle_cnt == v_cache_row_in_block);
+        end
         mm_c_effective_base = mm_c_base + mm_output_word_offset;
     end
 
@@ -304,6 +313,7 @@ module control_unit #(
         ppu_out_precision = mm_out_precision;
         ppu_write_offset = (mm_output_layout == OUT_LAYOUT_C) ? packed_write_offset : 2'b0;
         ppu_output_layout = mm_output_layout;
+        ppu_writeback_mode = mm_writeback_mode;
         mmvr_wr_en = 1'b0;
         mmvr_out = '0;
 
@@ -527,17 +537,21 @@ module control_unit #(
         ub_wr_en = wb_valid_cycle;
         ppu_wb_en = wb_valid_cycle;
 
-        unique case (mm_output_layout)
-          OUT_LAYOUT_A: begin
-            ub_addr = mm_c_effective_base + (m_idx * n_total_packed * `ARRAY_SIZE) + (n_idx_packed * `ARRAY_SIZE) + a_word_base + cycle_cnt;
-          end
-          OUT_LAYOUT_B: begin
-            ub_addr = mm_c_effective_base + (m_idx_packed * mm_n_total * `ARRAY_SIZE) + (n_idx * `ARRAY_SIZE) + b_word_base + cycle_cnt;
-          end
-          default: begin
-            ub_addr = mm_c_effective_base + (m_idx_packed * mm_n_total * `ARRAY_SIZE) + (n_idx * `ARRAY_SIZE) + cycle_cnt;
-          end
-        endcase
+        if (mm_writeback_mode == WB_MODE_V_CACHE_APPEND_INT16) begin
+          ub_addr = mm_c_effective_base + (n_idx * `ARRAY_SIZE);
+        end else begin
+          unique case (mm_output_layout)
+            OUT_LAYOUT_A: begin
+              ub_addr = mm_c_effective_base + (m_idx * n_total_packed * `ARRAY_SIZE) + (n_idx_packed * `ARRAY_SIZE) + a_word_base + cycle_cnt;
+            end
+            OUT_LAYOUT_B: begin
+              ub_addr = mm_c_effective_base + (m_idx_packed * mm_n_total * `ARRAY_SIZE) + (n_idx * `ARRAY_SIZE) + b_word_base + cycle_cnt;
+            end
+            default: begin
+              ub_addr = mm_c_effective_base + (m_idx_packed * mm_n_total * `ARRAY_SIZE) + (n_idx * `ARRAY_SIZE) + cycle_cnt;
+            end
+          endcase
+        end
 
         if (cycle_cnt == (`ARRAY_SIZE - 1)) begin
           cycle_next = '0;

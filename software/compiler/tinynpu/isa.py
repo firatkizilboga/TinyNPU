@@ -24,6 +24,12 @@ class OutputLayout(IntEnum):
     A = 1
     B = 2
 
+
+class WritebackMode(IntEnum):
+    NORMAL = 0
+    V_CACHE_APPEND_INT16 = 1
+    K_CACHE_APPEND_INT16 = 2
+
 class Instruction:
     def encode(self, symbol_to_addr):
         raise NotImplementedError()
@@ -43,6 +49,7 @@ class MatMul(Instruction):
         write_offset=0,
         h_gelu_x_scale_shift=7,
         output_layout=OutputLayout.C,
+        writeback_mode=WritebackMode.NORMAL,
         output_word_offset=0,
         b_word_offset=0,
     ):
@@ -58,6 +65,7 @@ class MatMul(Instruction):
         self.write_offset = write_offset
         self.h_gelu_x_scale_shift = h_gelu_x_scale_shift
         self.output_layout = output_layout
+        self.writeback_mode = writeback_mode
         self.output_word_offset = output_word_offset
         self.b_word_offset = b_word_offset
         
@@ -74,6 +82,7 @@ class MatMul(Instruction):
         
         instr = 0
         instr |= (Opcode.MATMUL & 0xF) << 252
+        instr |= (self.writeback_mode & 0xF) << 248
         instr |= (a_addr & 0xFFFF) << 232
         instr |= (b_addr & 0xFFFF) << 216
         instr |= (c_addr & 0xFFFF) << 200
@@ -134,11 +143,13 @@ def pack_matmul(
     write_offset=0,
     h_gelu_x_scale_shift=7,
     output_layout=OutputLayout.C,
+    writeback_mode=WritebackMode.NORMAL,
     output_word_offset=0,
     b_word_offset=0,
 ):
     instr = 0
     instr |= (opcode & 0xF) << 252
+    instr |= (writeback_mode & 0xF) << 248
     instr |= (a_addr & 0xFFFF) << 232
     instr |= (b_addr & 0xFFFF) << 216
     instr |= (c_addr & 0xFFFF) << 200

@@ -2,7 +2,7 @@ import numpy as np
 import os
 import re
 import json
-from .isa import Opcode, HostCmd, PrecisionMode, MatMul, Move, Halt, OutputLayout, generate_host_messages
+from .isa import Opcode, HostCmd, PrecisionMode, MatMul, Move, Halt, OutputLayout, WritebackMode, generate_host_messages
 from .packer import Packer
 from .memory import MemoryManager
 
@@ -134,6 +134,7 @@ class TinyNPUProgram:
         write_offset=0,
         h_gelu_x_scale_shift=7,
         output_layout=OutputLayout.C,
+        writeback_mode=WritebackMode.NORMAL,
         output_word_offset=0,
         b_word_offset=0,
     ):
@@ -205,6 +206,7 @@ class TinyNPUProgram:
             write_offset,
             h_gelu_x_scale_shift,
             output_layout,
+            writeback_mode,
             out_total_word_offset,
             b_total_word_offset,
         )
