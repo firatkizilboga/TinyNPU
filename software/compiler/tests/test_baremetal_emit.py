@@ -16,6 +16,7 @@ from tinynpu_jit import (
     b_slot_word_stride,
     compile_plan,
     make_b_cache_specs,
+    make_kv_cache_specs,
 )
 from tinynpu import TinyNPUProgram
 from tinynpu.isa import OutputLayout, PrecisionMode
@@ -443,6 +444,24 @@ def test_make_b_cache_specs_computes_slot_offsets():
     assert specs["k_t2"].metadata["storage_word_offset"] == 2 * b_slot_word_stride((8, 8), DType.INT16)
     assert specs["k_t1"].metadata["cache_kind"] == "K"
     assert specs["k_t2"].metadata["cache_slot_index"] == 2
+
+
+def test_make_kv_cache_specs_tags_k_and_v_slots_separately():
+    specs = make_kv_cache_specs(
+        k_base_name="k_cache",
+        v_base_name="v_cache",
+        k_slot_shape=(8, 8),
+        v_slot_shape=(8, 8),
+        dtype=DType.INT16,
+        slot_suffixes=["t0", "t1"],
+    )
+
+    assert specs["k_cache"].shape == (16, 8)
+    assert specs["v_cache"].shape == (16, 8)
+    assert specs["k_cache_t1"].metadata["cache_kind"] == "K"
+    assert specs["v_cache_t1"].metadata["cache_kind"] == "V"
+    assert specs["k_cache_t1"].metadata["storage_word_offset"] == 8
+    assert specs["v_cache_t1"].metadata["storage_word_offset"] == 8
 
 
 def test_tinynpu_program_preserves_predeclared_b_cache_shape_for_append():

@@ -26,6 +26,7 @@ from .ir import (
     b_slot_word_stride,
     make_b_cache_specs,
     make_b_cache_view_spec,
+    make_kv_cache_specs,
 )
 from .markers import im2col_for_npu, mark_for_verify, npu_matmul, quantize_for_npu
 from .memory_planner import GlobalMemoryReport, SegmentMemoryPlan, plan_program_memory, plan_segment_memory
@@ -48,6 +49,7 @@ __all__ = [
     "MatMulOp",
     "make_b_cache_specs",
     "make_b_cache_view_spec",
+    "make_kv_cache_specs",
     "NpuSegment",
     "PrimitiveCounts",
     "five_stage_in_order_model",

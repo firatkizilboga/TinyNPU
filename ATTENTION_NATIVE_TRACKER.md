@@ -29,7 +29,7 @@ Non-goals for the first pass:
 
 ### 1. B-layout writeback
 
-Status: not implemented
+Status: implemented
 
 Need:
 
@@ -47,7 +47,7 @@ Primary files:
 
 ### 2. KV-cache append/write-offset support
 
-Status: not implemented
+Status: implemented for explicit slot offsets
 
 Need:
 
@@ -65,7 +65,7 @@ Primary files:
 
 ### 3. Decode-native cache layouts
 
-Status: conceptual only
+Status: partial software contract
 
 Need two separate layouts:
 
@@ -77,6 +77,11 @@ Notes:
 - do not force one universal cache format
 - both can be stored as packed/tiled words in the same unified buffer
 - this is mainly a storage contract problem, not a separate memory-structure problem
+- current JIT layer now has helper APIs for:
+  - B-cache slot stride computation
+  - named B-cache slot views
+  - paired `K`/`V` cache declarations with per-slot metadata
+- current hardware still treats these as ordinary B-packed cache regions; decode execution mode is still missing
 
 Primary files:
 
@@ -156,4 +161,3 @@ Primary files:
 - Whether current `B` packing can be reused directly or needs a variant
 - How write offsets should be encoded in ISA/runtime
 - Whether decode mode should expose one opcode or two (`QK^T` and `A @ V`)
-
