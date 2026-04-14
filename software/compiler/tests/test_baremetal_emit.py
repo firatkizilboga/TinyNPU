@@ -402,6 +402,63 @@ def test_tinynpu_program_preserves_predeclared_b_cache_shape_for_append():
     assert ((inst1 >> 72) & 0x3) == int(OutputLayout.B)
 
 
+def test_tinynpu_program_b_view_applies_output_and_rhs_offsets():
+    program = TinyNPUProgram()
+    lhs0 = np.eye(8, dtype=np.int16)
+    rhs0 = np.eye(8, dtype=np.int16)
+    lhs1 = np.flipud(np.eye(8, dtype=np.int16))
+    rhs1 = np.rot90(np.eye(8, dtype=np.int16), 2).astype(np.int16)
+    query = np.eye(8, dtype=np.int16)
+
+    program.declare_data("lhs0", lhs0, precision=PrecisionMode.INT16, role="A")
+    program.declare_data("rhs0", rhs0, precision=PrecisionMode.INT16, role="B")
+    program.declare_data("lhs1", lhs1, precision=PrecisionMode.INT16, role="A")
+    program.declare_data("rhs1", rhs1, precision=PrecisionMode.INT16, role="B")
+    program.declare_data("query", query, precision=PrecisionMode.INT16, role="A")
+    program.declare_data("cache", np.zeros((16, 8), dtype=np.int16), precision=PrecisionMode.INT16, role="B")
+    program.declare_b_view("cache_t0", "cache", (8, 8), word_offset=0)
+    program.declare_b_view("cache_t1", "cache", (8, 8), word_offset=8)
+
+    program.matmul(
+        "lhs0",
+        "rhs0",
+        "cache_t0",
+        in_precision=PrecisionMode.INT16,
+        out_precision=PrecisionMode.INT16,
+        output_layout=OutputLayout.B,
+    )
+    program.matmul(
+        "lhs1",
+        "rhs1",
+        "cache_t1",
+        in_precision=PrecisionMode.INT16,
+        out_precision=PrecisionMode.INT16,
+        output_layout=OutputLayout.B,
+    )
+    program.matmul(
+        "query",
+        "cache_t1",
+        "out",
+        in_precision=PrecisionMode.INT16,
+        out_precision=PrecisionMode.INT16,
+        output_layout=OutputLayout.C,
+    )
+    program.halt()
+    binary = program.compile()
+
+    cache = program.symbols["cache"]
+    cache_t1 = program.symbols["cache_t1"]
+    assert cache_t1.addr == cache.addr
+    assert cache_t1.word_offset == 8
+
+    inst0 = int(binary["im"][0])
+    inst1 = int(binary["im"][1])
+    inst2 = int(binary["im"][2])
+    assert ((inst0 >> 184) & 0xFFFF) == 0
+    assert ((inst1 >> 184) & 0xFFFF) == 8
+    assert ((inst2 >> 56) & 0xFFFF) == 8
+
+
 def test_tinynpu_program_rejects_predeclared_output_cache_that_is_too_small():
     program = TinyNPUProgram()
     lhs = np.eye(8, dtype=np.int16)
