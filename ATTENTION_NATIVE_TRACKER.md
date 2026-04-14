@@ -81,6 +81,11 @@ Notes:
   - B-cache slot stride computation
   - named B-cache slot views
   - paired `K`/`V` cache declarations with per-slot metadata
+- current INT16 append contracts are now explicit:
+  - `K` native layout is logical `K^T = [d_head, T]`
+  - `V` native layout is logical `V = [T, d_head]`
+  - `K` append requires lane-partial writes inside a token-block tile
+  - `V` append requires sparse whole-word writes within a token-block tile
 - current hardware still treats these as ordinary B-packed cache regions; decode execution mode is still missing
 
 Primary files:
