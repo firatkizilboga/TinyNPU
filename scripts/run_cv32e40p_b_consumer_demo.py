@@ -26,7 +26,7 @@ if str(REPO_ROOT / "software" / "compiler") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "software" / "compiler"))
 
 from tinynpu import TinyNPUProgram  # noqa: E402
-from tinynpu.isa import MatMul, OutputLayout, PrecisionMode  # noqa: E402
+from tinynpu.isa import OutputLayout, PrecisionMode  # noqa: E402
 
 
 def build_program() -> tuple[TinyNPUProgram, np.ndarray]:
@@ -107,41 +107,34 @@ def build_program() -> tuple[TinyNPUProgram, np.ndarray]:
     program.declare_data("rhs1", rhs1, precision=PrecisionMode.INT16, role="B")
     program.declare_data("query", query, precision=PrecisionMode.INT16, role="A")
     program.declare_data("cache", np.zeros((16, 8), dtype=np.int16), precision=PrecisionMode.INT16, role="B")
+    program.declare_b_view("cache_t0", "cache", (8, 8), word_offset=0)
+    program.declare_b_view("cache_t1", "cache", (8, 8), word_offset=8)
     program.declare_data("out", np.zeros((8, 8), dtype=np.int16), precision=PrecisionMode.INT16, role="C")
 
-    token_stride_words = 8
     program.matmul(
         "lhs0",
         "rhs0",
-        "cache",
+        "cache_t0",
         in_precision=PrecisionMode.INT16,
         out_precision=PrecisionMode.INT16,
         output_layout=OutputLayout.B,
-        output_word_offset=0,
     )
     program.matmul(
         "lhs1",
         "rhs1",
-        "cache",
+        "cache_t1",
         in_precision=PrecisionMode.INT16,
         out_precision=PrecisionMode.INT16,
         output_layout=OutputLayout.B,
-        output_word_offset=token_stride_words,
     )
-
-    consume = MatMul(
+    program.matmul(
         "query",
-        "cache",
+        "cache_t1",
         "out",
-        in_prec=PrecisionMode.INT16,
-        out_prec=PrecisionMode.INT16,
+        in_precision=PrecisionMode.INT16,
+        out_precision=PrecisionMode.INT16,
         output_layout=OutputLayout.C,
-        b_word_offset=token_stride_words,
     )
-    consume.m = 1
-    consume.k = 1
-    consume.n = 1
-    program.instructions.append(consume)
     program.halt()
     return program, expected_out
 

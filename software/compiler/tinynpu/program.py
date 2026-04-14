@@ -39,14 +39,20 @@ class HardwareConfig:
             self.params['BUFFER_WIDTH'] = self.params['DATA_WIDTH'] * self.params['ARRAY_SIZE']
 
 class Symbol:
-    def __init__(self, name, shape, precision=PrecisionMode.INT16, role='C', data=None):
+    def __init__(self, name, shape, precision=PrecisionMode.INT16, role='C', data=None, base_name=None, word_offset=0):
         self.name = name
         self.shape = shape
         self.precision = precision
         self.storage_role = role
         self.data = data
+        self.base_name = base_name
+        self.word_offset = word_offset
         self.addr = None
         self.word_count = 0
+
+    @property
+    def is_view(self):
+        return self.base_name is not None
 
 class TinyNPUProgram:
     def __init__(self, defines_path=None):
@@ -75,6 +81,27 @@ class TinyNPUProgram:
         if len(arr.shape) != 2:
             raise ValueError(f"Symbol '{name}' must be a 2D matrix.")
         self.symbols[name] = Symbol(name, arr.shape, precision, role=role, data=arr)
+
+    def declare_b_view(self, name, base_name, shape, precision=None, word_offset=0):
+        if name in self.symbols:
+            raise ValueError(f"Symbol '{name}' already declared.")
+        if base_name not in self.symbols:
+            raise ValueError(f"Base symbol '{base_name}' not found.")
+        base = self.symbols[base_name]
+        if base.storage_role != 'B':
+            raise ValueError(f"Base symbol '{base_name}' must have role 'B'.")
+        if len(shape) != 2:
+            raise ValueError(f"View symbol '{name}' must be a 2D matrix.")
+        view_precision = base.precision if precision is None else precision
+        self.symbols[name] = Symbol(
+            name,
+            tuple(shape),
+            view_precision,
+            role='B',
+            data=None,
+            base_name=base_name,
+            word_offset=word_offset,
+        )
 
     def declare_image(self, name, data, h, w, c, precision=PrecisionMode.INT16):
         """Declares a 3D image and stores its logical dimensions."""
@@ -113,6 +140,8 @@ class TinyNPUProgram:
         if a_name not in self.symbols: raise ValueError(f"Symbol '{a_name}' not found.")
         if b_name not in self.symbols: raise ValueError(f"Symbol '{b_name}' not found.")
         A, B = self.symbols[a_name], self.symbols[b_name]
+        if A.is_view:
+            raise ValueError("A-side tensor views are not supported yet.")
         # Keep generated/output tensors in Role C to preserve verification semantics.
         # Only coerce source tensors that are not Role C.
         if A.storage_role != 'C':
@@ -129,6 +158,16 @@ class TinyNPUProgram:
             out_role = 'B'
         else:
             out_role = 'C'
+        out_storage_name = out_name
+        out_total_word_offset = output_word_offset
+        if out_name in self.symbols and self.symbols[out_name].is_view:
+            out_view = self.symbols[out_name]
+            if out_role != out_view.storage_role:
+                raise ValueError(
+                    f"Output view '{out_name}' role {out_view.storage_role} does not match output layout role {out_role}."
+                )
+            out_storage_name = out_view.base_name
+            out_total_word_offset += int(out_view.word_offset)
         if out_name not in self.symbols:
             self.symbols[out_name] = Symbol(out_name, inferred_out_shape, out_precision, role=out_role)
         else:
@@ -148,10 +187,15 @@ class TinyNPUProgram:
                 self.symbols[bias_name] = Symbol(bias_name, bias_shape, PrecisionMode.INT16, role='BIAS')
             else:
                 self.symbols[bias_name].storage_role = 'BIAS'
+        rhs_storage_name = b_name
+        b_total_word_offset = b_word_offset
+        if B.is_view:
+            rhs_storage_name = B.base_name
+            b_total_word_offset += int(B.word_offset)
         instr = MatMul(
             a_name,
-            b_name,
-            out_name,
+            rhs_storage_name,
+            out_storage_name,
             bias_name,
             shift,
             multiplier,
@@ -161,8 +205,8 @@ class TinyNPUProgram:
             write_offset,
             h_gelu_x_scale_shift,
             output_layout,
-            output_word_offset,
-            b_word_offset,
+            out_total_word_offset,
+            b_total_word_offset,
         )
         p_in = 1 << (2 - in_precision)
         instr.m = (expected_out_rows + self.array_size - 1) // self.array_size
@@ -205,6 +249,8 @@ class TinyNPUProgram:
     def compile(self):
         for name in sorted(self.symbols.keys()):
             sym = self.symbols[name]
+            if sym.is_view:
+                continue
             p = 1 << (2 - sym.precision)
             sz = self.array_size
             m = (sym.shape[0] + sz - 1) // sz
@@ -222,13 +268,33 @@ class TinyNPUProgram:
             sym.word_count = self.packer.get_physical_word_count(sym.storage_role, sym.precision, m, k, n)
             if sym.addr is None:  # respect pre-assigned addresses from the memory planner
                 sym.addr = self.memory.allocate(name, sym.word_count)
+        for name in sorted(self.symbols.keys()):
+            sym = self.symbols[name]
+            if not sym.is_view:
+                continue
+            base = self.symbols[sym.base_name]
+            if base.precision != sym.precision:
+                raise ValueError(
+                    f"View symbol '{name}' precision {sym.precision} does not match base '{sym.base_name}' precision {base.precision}."
+                )
+            sym.addr = base.addr
+            p = 1 << (2 - sym.precision)
+            sz = self.array_size
+            if sym.storage_role == 'B':
+                k = (sym.shape[0] // p + sz - 1) // sz
+                n = (sym.shape[1] + sz - 1) // sz
+                sym.word_count = self.packer.get_physical_word_count(sym.storage_role, sym.precision, 1, k, n)
+            else:
+                raise ValueError(f"Unsupported view role '{sym.storage_role}' for symbol '{name}'.")
         for instr in self.instructions:
             if isinstance(instr, Move): instr.count = self.symbols[instr.src].word_count
         symbol_to_addr = {name: sym.addr for name, sym in self.symbols.items()}
         # Build UB image indexed by address so pre-assigned (non-sequential) addresses work.
-        total_ub_words = max((sym.addr + sym.word_count for sym in self.symbols.values()), default=0)
+        total_ub_words = max((sym.addr + sym.word_count for sym in self.symbols.values() if not sym.is_view), default=0)
         ub_image = [0] * total_ub_words
         for name, sym in self.symbols.items():
+            if sym.is_view:
+                continue
             p = 1 << (2 - sym.precision)
             sz = self.array_size
             m = (sym.shape[0] + sz - 1) // sz
@@ -252,7 +318,17 @@ class TinyNPUProgram:
         binary = self.last_compiled
         npu_data = {
             "config": {"array_size": self.array_size, "buffer_width": self.buffer_width, "im_base": self.im_base_addr},
-            "symbols": {name: {"addr": sym.addr, "shape": list(sym.shape), "role": sym.storage_role, "precision": int(sym.precision)} for name, sym in self.symbols.items()},
+            "symbols": {
+                name: {
+                    "addr": sym.addr,
+                    "shape": list(sym.shape),
+                    "role": sym.storage_role,
+                    "precision": int(sym.precision),
+                    "base_name": sym.base_name,
+                    "word_offset": sym.word_offset,
+                }
+                for name, sym in self.symbols.items()
+            },
             "im": [f"0x{inst:064x}" for inst in binary['im']],
             "ub": [f"0x{word:0{self.buffer_width//4}x}" for word in binary['ub']],
             "expected": {name: self.expected_results[name].tolist() for name in self.expected_results if name in self.symbols}
