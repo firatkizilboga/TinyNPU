@@ -99,6 +99,7 @@ module control_unit #(
   // --- Internal Registers for MATMUL ---
   logic [`ADDR_WIDTH-1:0] mm_a_base, mm_b_base, mm_c_base, mm_bias_base;
   logic [`ADDR_WIDTH-1:0] mm_output_word_offset;
+  logic [`ADDR_WIDTH-1:0] mm_b_word_offset;
   logic [15:0] mm_m_total, mm_k_total, mm_n_total;
   logic [ 7:0] mm_shift;
   logic [15:0] mm_multiplier;
@@ -138,7 +139,7 @@ module control_unit #(
       ub_rdata_reg <= '0;
       {latched_cmd, latched_addr, latched_mmvr, latched_arg} <= '0;
       {move_src, move_dest, move_count, move_phase} <= '0;
-      {mm_a_base, mm_b_base, mm_c_base, mm_bias_base, mm_output_word_offset, mm_m_total, mm_k_total, mm_n_total} <= '0;
+      {mm_a_base, mm_b_base, mm_c_base, mm_bias_base, mm_output_word_offset, mm_b_word_offset, mm_m_total, mm_k_total, mm_n_total} <= '0;
       {mm_shift, mm_multiplier, mm_activation, mm_h_gelu_x_scale_shift, mm_in_precision, mm_out_precision, mm_write_offset} <= '0;
       mm_output_layout <= OUT_LAYOUT_C;
       {m_idx, n_idx, k_idx, cycle_cnt} <= '0;
@@ -191,6 +192,7 @@ module control_unit #(
         mm_in_precision   <= im_rdata[83:82];
         mm_h_gelu_x_scale_shift <= im_rdata[81:74];
         mm_output_layout  <= output_layout_t'(im_rdata[73:72]);
+        mm_b_word_offset <= im_rdata[71:56];
         m_idx <= '0;
         n_idx <= '0;
         k_idx <= '0;
@@ -473,7 +475,7 @@ module control_unit #(
         status_out = `STATUS_BUSY;
         compute_enable = 1'b1;
         ub_addr = mm_a_base + (m_idx * mm_k_total * `ARRAY_SIZE) + (k_idx * `ARRAY_SIZE) + cycle_cnt;
-        ub_w_addr = mm_b_base + (k_idx * mm_n_total * `ARRAY_SIZE) + (n_idx * `ARRAY_SIZE) + cycle_cnt;
+        ub_w_addr = mm_b_base + mm_b_word_offset + (k_idx * mm_n_total * `ARRAY_SIZE) + (n_idx * `ARRAY_SIZE) + cycle_cnt;
 
         if (k_idx == 0 && cycle_cnt == 0) begin
           sa_input_first  = 1'b1;

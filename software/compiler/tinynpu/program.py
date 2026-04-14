@@ -108,6 +108,7 @@ class TinyNPUProgram:
         h_gelu_x_scale_shift=7,
         output_layout=OutputLayout.C,
         output_word_offset=0,
+        b_word_offset=0,
     ):
         if a_name not in self.symbols: raise ValueError(f"Symbol '{a_name}' not found.")
         if b_name not in self.symbols: raise ValueError(f"Symbol '{b_name}' not found.")
@@ -161,6 +162,7 @@ class TinyNPUProgram:
             h_gelu_x_scale_shift,
             output_layout,
             output_word_offset,
+            b_word_offset,
         )
         p_in = 1 << (2 - in_precision)
         instr.m = (expected_out_rows + self.array_size - 1) // self.array_size
