@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 
 from tinynpu.isa import PrecisionMode
+from tinynpu.packer import Packer
 
 
 class DType(str, Enum):
@@ -141,3 +142,65 @@ def numpy_dtype_for(dtype: DType) -> np.dtype:
     if dtype == DType.INT32:
         return np.int32
     return np.int16
+
+
+def b_slot_word_stride(shape: tuple[int, int], dtype: DType, array_size: int = 8) -> int:
+    precision = to_precision_mode(dtype)
+    pack_ratio = 1 << (2 - precision)
+    rows, cols = shape
+    k = (rows // pack_ratio + array_size - 1) // array_size
+    n = (cols + array_size - 1) // array_size
+    return Packer(array_size).get_physical_word_count("B", precision, 1, k, n)
+
+
+def make_b_cache_view_spec(
+    name: str,
+    base_name: str,
+    shape: tuple[int, int],
+    dtype: DType,
+    *,
+    kind: TensorKind = TensorKind.INTERMEDIATE,
+    word_offset: int,
+    cache_kind: str | None = None,
+    slot_index: int | None = None,
+) -> TensorSpec:
+    metadata: dict[str, Any] = {
+        "storage_view_of": base_name,
+        "storage_role": "B",
+        "storage_word_offset": int(word_offset),
+    }
+    if cache_kind is not None:
+        metadata["cache_kind"] = cache_kind
+    if slot_index is not None:
+        metadata["cache_slot_index"] = int(slot_index)
+    return TensorSpec(name, shape, dtype, kind, metadata=metadata)
+
+
+def make_b_cache_specs(
+    base_name: str,
+    slot_shape: tuple[int, int],
+    dtype: DType,
+    *,
+    slot_names: list[str],
+    kind: TensorKind = TensorKind.INTERMEDIATE,
+    cache_kind: str | None = None,
+    array_size: int = 8,
+) -> dict[str, TensorSpec]:
+    slot_stride_words = b_slot_word_stride(slot_shape, dtype, array_size=array_size)
+    base_shape = (slot_shape[0] * len(slot_names), slot_shape[1])
+    specs: dict[str, TensorSpec] = {
+        base_name: TensorSpec(base_name, base_shape, dtype, kind),
+    }
+    for slot_index, slot_name in enumerate(slot_names):
+        specs[slot_name] = make_b_cache_view_spec(
+            slot_name,
+            base_name,
+            slot_shape,
+            dtype,
+            kind=kind,
+            word_offset=slot_index * slot_stride_words,
+            cache_kind=cache_kind,
+            slot_index=slot_index,
+        )
+        specs[slot_name].metadata["cache_slot_stride_words"] = slot_stride_words
+    return specs
