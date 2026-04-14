@@ -241,3 +241,82 @@ def make_kv_cache_specs(
         )
     )
     return specs
+
+
+@dataclass(frozen=True)
+class Int16KCacheAppendContract:
+    cache_shape: tuple[int, int]
+    token_index: int
+    token_block: int
+    token_lane: int
+    k_tiles: int
+    block_word_base: int
+    block_word_count: int
+    scatter_word_addrs: tuple[int, ...]
+    lane_partial_write: bool = True
+
+
+@dataclass(frozen=True)
+class Int16VCacheAppendContract:
+    cache_shape: tuple[int, int]
+    token_index: int
+    token_block: int
+    row_in_block: int
+    n_tiles: int
+    block_word_base: int
+    block_word_count: int
+    scatter_word_addrs: tuple[int, ...]
+    lane_partial_write: bool = False
+
+
+def describe_int16_k_cache_append(d_head: int, token_capacity: int, token_index: int, array_size: int = 8) -> Int16KCacheAppendContract:
+    if d_head <= 0 or token_capacity <= 0:
+        raise ValueError("d_head and token_capacity must be positive.")
+    if token_index < 0 or token_index >= token_capacity:
+        raise ValueError("token_index out of range for K cache.")
+    k_tiles = (d_head + array_size - 1) // array_size
+    token_block = token_index // array_size
+    token_lane = token_index % array_size
+    block_word_count = k_tiles * array_size
+    block_word_base = token_block * block_word_count
+    scatter = tuple(
+        block_word_base + (k_tile * array_size) + row_idx
+        for k_tile in range(k_tiles)
+        for row_idx in range(array_size)
+    )
+    return Int16KCacheAppendContract(
+        cache_shape=(d_head, token_capacity),
+        token_index=token_index,
+        token_block=token_block,
+        token_lane=token_lane,
+        k_tiles=k_tiles,
+        block_word_base=block_word_base,
+        block_word_count=block_word_count,
+        scatter_word_addrs=scatter,
+    )
+
+
+def describe_int16_v_cache_append(d_head: int, token_capacity: int, token_index: int, array_size: int = 8) -> Int16VCacheAppendContract:
+    if d_head <= 0 or token_capacity <= 0:
+        raise ValueError("d_head and token_capacity must be positive.")
+    if token_index < 0 or token_index >= token_capacity:
+        raise ValueError("token_index out of range for V cache.")
+    n_tiles = (d_head + array_size - 1) // array_size
+    token_block = token_index // array_size
+    row_in_block = token_index % array_size
+    block_word_count = n_tiles * array_size
+    block_word_base = token_block * block_word_count
+    scatter = tuple(
+        block_word_base + (n_tile * array_size) + row_in_block
+        for n_tile in range(n_tiles)
+    )
+    return Int16VCacheAppendContract(
+        cache_shape=(token_capacity, d_head),
+        token_index=token_index,
+        token_block=token_block,
+        row_in_block=row_in_block,
+        n_tiles=n_tiles,
+        block_word_base=block_word_base,
+        block_word_count=block_word_count,
+        scatter_word_addrs=scatter,
+    )

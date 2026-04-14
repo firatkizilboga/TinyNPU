@@ -7,6 +7,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from tinynpu_jit import emit_cv32e40p_c, emit_cv32e40p_program_v2
 from tinynpu_jit import (
     DType,
+    describe_int16_k_cache_append,
+    describe_int16_v_cache_append,
     ExecutionPlan,
     HostOp,
     MatMulOp,
@@ -462,6 +464,32 @@ def test_make_kv_cache_specs_tags_k_and_v_slots_separately():
     assert specs["v_cache_t1"].metadata["cache_kind"] == "V"
     assert specs["k_cache_t1"].metadata["storage_word_offset"] == 8
     assert specs["v_cache_t1"].metadata["storage_word_offset"] == 8
+
+
+def test_describe_int16_k_cache_append_requires_lane_partial_writes():
+    contract = describe_int16_k_cache_append(d_head=16, token_capacity=16, token_index=9)
+
+    assert contract.cache_shape == (16, 16)
+    assert contract.token_block == 1
+    assert contract.token_lane == 1
+    assert contract.k_tiles == 2
+    assert contract.block_word_base == 16
+    assert contract.block_word_count == 16
+    assert contract.scatter_word_addrs == tuple(range(16, 32))
+    assert contract.lane_partial_write is True
+
+
+def test_describe_int16_v_cache_append_requires_sparse_word_writes():
+    contract = describe_int16_v_cache_append(d_head=16, token_capacity=16, token_index=9)
+
+    assert contract.cache_shape == (16, 16)
+    assert contract.token_block == 1
+    assert contract.row_in_block == 1
+    assert contract.n_tiles == 2
+    assert contract.block_word_base == 16
+    assert contract.block_word_count == 16
+    assert contract.scatter_word_addrs == (17, 25)
+    assert contract.lane_partial_write is False
 
 
 def test_tinynpu_program_preserves_predeclared_b_cache_shape_for_append():
