@@ -36,6 +36,9 @@ _HOST_KIND_ENUM = {
     "layout_restore": "TNPU_HOST_LAYOUT_RESTORE",
     "rmsnorm": "TNPU_HOST_RMSNORM",
     "rope": "TNPU_HOST_ROPE",
+    "silu": "TNPU_HOST_SILU",
+    "mul": "TNPU_HOST_MUL",
+    "add": "TNPU_HOST_ADD",
 }
 
 

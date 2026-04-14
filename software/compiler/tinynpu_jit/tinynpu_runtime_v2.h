@@ -33,6 +33,9 @@ typedef enum {
     TNPU_HOST_LAYOUT_RESTORE = 12,
     TNPU_HOST_RMSNORM = 13,
     TNPU_HOST_ROPE = 14,
+    TNPU_HOST_SILU = 15,
+    TNPU_HOST_MUL = 16,
+    TNPU_HOST_ADD = 17,
 } TnpuHostKind;
 
 typedef enum {

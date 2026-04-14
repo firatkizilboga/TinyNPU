@@ -293,6 +293,23 @@ static int tnpu_execute_host_op(TinyTensor *runtime_tensors, const TnpuHostOp *o
         case TNPU_HOST_ROPE:
             host_rope(out, in, op->attrs_i32[0], op->attrs_i32[1], op->attrs_f32[0]);
             return 0;
+        case TNPU_HOST_SILU:
+            host_silu(out, in);
+            return 0;
+        case TNPU_HOST_MUL:
+            if (in1 == NULL) {
+                printf("runtime v2: mul missing rhs input\n");
+                return 1;
+            }
+            host_mul(out, in, in1);
+            return 0;
+        case TNPU_HOST_ADD:
+            if (in1 == NULL) {
+                printf("runtime v2: add missing rhs input\n");
+                return 1;
+            }
+            host_add(out, in, in1);
+            return 0;
         default:
             printf("runtime v2: unsupported host op kind=%u (%s)\n", (unsigned)op->kind, op->name ? op->name : "?");
             return 1;

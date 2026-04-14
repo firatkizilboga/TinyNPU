@@ -347,6 +347,18 @@ static void host_sigmoid(TinyTensor *dst, const TinyTensor *src)
     }
 }
 
+static void host_silu(TinyTensor *dst, const TinyTensor *src)
+{
+    runtime_assert(dst->dtype == TINY_DTYPE_FLOAT32, "silu expects float output");
+    runtime_assert(dst->elem_count == src->elem_count, "silu size mismatch");
+    for (int i = 0; i < src->elem_count; ++i) {
+        float value = tensor_get_float(src, i);
+        float denom = 1.0f + host_exp_approx(-value);
+        float sigma = host_recip_approx(denom);
+        tensor_set_float(dst, i, value * sigma);
+    }
+}
+
 static float host_exp_approx_neg_unit(float x)
 {
     /* 5th-order Taylor on [-1, 0]. */
@@ -792,6 +804,26 @@ static void host_rmsnorm(TinyTensor *dst, const TinyTensor *src, const TinyTenso
                 tensor_set_float(dst, base + i, value * inv_rms * scale);
             }
         }
+    }
+}
+
+static void host_mul(TinyTensor *dst, const TinyTensor *lhs, const TinyTensor *rhs)
+{
+    runtime_assert(dst->dtype == TINY_DTYPE_FLOAT32, "mul expects float output");
+    runtime_assert(lhs->elem_count == rhs->elem_count, "mul input size mismatch");
+    runtime_assert(dst->elem_count == lhs->elem_count, "mul output size mismatch");
+    for (int i = 0; i < lhs->elem_count; ++i) {
+        tensor_set_float(dst, i, tensor_get_float(lhs, i) * tensor_get_float(rhs, i));
+    }
+}
+
+static void host_add(TinyTensor *dst, const TinyTensor *lhs, const TinyTensor *rhs)
+{
+    runtime_assert(dst->dtype == TINY_DTYPE_FLOAT32, "add expects float output");
+    runtime_assert(lhs->elem_count == rhs->elem_count, "add input size mismatch");
+    runtime_assert(dst->elem_count == lhs->elem_count, "add output size mismatch");
+    for (int i = 0; i < lhs->elem_count; ++i) {
+        tensor_set_float(dst, i, tensor_get_float(lhs, i) + tensor_get_float(rhs, i));
     }
 }
 
