@@ -178,6 +178,9 @@ class SegmentCompiler:
                 writeback_mode = 1
             elif op.writeback_mode == "k_cache_append_int16":
                 writeback_mode = 2
+            b_read_mode = 0
+            if op.b_read_mode == "k_cache_int16":
+                b_read_mode = 1
             program.matmul(
                 op.lhs,
                 op.rhs,
@@ -194,6 +197,7 @@ class SegmentCompiler:
                 writeback_mode=writeback_mode,
                 output_word_offset=int(op.output_word_offset),
                 b_word_offset=int(op.b_word_offset),
+                b_read_mode=b_read_mode,
             )
 
         # Pre-assign globally planned addresses before compile() runs so that

@@ -21,7 +21,7 @@ from tinynpu_jit import (
     make_kv_cache_specs,
 )
 from tinynpu import TinyNPUProgram
-from tinynpu.isa import OutputLayout, PrecisionMode, WritebackMode
+from tinynpu.isa import BReadMode, OutputLayout, PrecisionMode, WritebackMode
 
 
 def test_emit_cv32e40p_c_for_two_segment_relu_chain():
@@ -299,6 +299,27 @@ def test_tinynpu_program_encodes_b_word_offset_in_matmul_instruction():
     assert ((inst >> 72) & 0x3) == int(OutputLayout.C)
 
 
+def test_tinynpu_program_encodes_b_read_mode_in_matmul_instruction():
+    program = TinyNPUProgram()
+    lhs = np.eye(8, dtype=np.int16)
+    rhs = np.eye(8, dtype=np.int16)
+    program.declare_data("lhs", lhs, precision=PrecisionMode.INT16, role="A")
+    program.declare_data("rhs", rhs, precision=PrecisionMode.INT16, role="B")
+    program.matmul(
+        "lhs",
+        "rhs",
+        "out",
+        in_precision=PrecisionMode.INT16,
+        out_precision=PrecisionMode.INT16,
+        b_read_mode=BReadMode.K_CACHE_INT16,
+    )
+    program.halt()
+    binary = program.compile()
+
+    inst = int(binary["im"][0])
+    assert ((inst >> 52) & 0xF) == int(BReadMode.K_CACHE_INT16)
+
+
 def test_tinynpu_program_encodes_writeback_mode_in_matmul_instruction():
     program = TinyNPUProgram()
     lhs = np.ones((1, 8), dtype=np.int16)
@@ -417,6 +438,39 @@ def test_compile_plan_preserves_b_word_offset_in_segment_binary():
     inst = int(artifact.segment_artifacts["seg_b_input_offset"].binary["im"][0])
     assert ((inst >> 56) & 0xFFFF) == 17
     assert ((inst >> 72) & 0x3) == int(OutputLayout.C)
+
+
+def test_compile_plan_preserves_b_read_mode_in_segment_binary():
+    lhs = np.eye(8, dtype=np.int16)
+    rhs = np.eye(8, dtype=np.int16)
+    expected = np.eye(8, dtype=np.int16)
+
+    tensors = {
+        "lhs": TensorSpec("lhs", lhs.shape, DType.INT16, TensorKind.INPUT),
+        "rhs": TensorSpec("rhs", rhs.shape, DType.INT16, TensorKind.CONSTANT, data=rhs),
+        "out": TensorSpec("out", expected.shape, DType.INT16, TensorKind.OUTPUT, is_final_output=True),
+    }
+    steps = [
+        NpuSegment(
+            "seg_k_read_mode",
+            [
+                MatMulOp(
+                    "op0",
+                    "lhs",
+                    "rhs",
+                    "out",
+                    b_read_mode="k_cache_int16",
+                )
+            ],
+            inputs=["lhs", "rhs"],
+            outputs=["out"],
+        )
+    ]
+    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=["lhs"], outputs=["out"])
+    artifact = compile_plan(plan, {"out": expected})
+
+    inst = int(artifact.segment_artifacts["seg_k_read_mode"].binary["im"][0])
+    assert ((inst >> 52) & 0xF) == int(BReadMode.K_CACHE_INT16)
 
 
 def test_compile_plan_preserves_writeback_mode_in_segment_binary():

@@ -72,6 +72,7 @@ class MatMulOp:
     writeback_mode: str = "normal"
     output_word_offset: int = 0
     b_word_offset: int = 0
+    b_read_mode: str = "normal"
 
 
 @dataclass
