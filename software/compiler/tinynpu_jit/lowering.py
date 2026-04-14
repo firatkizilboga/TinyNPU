@@ -138,6 +138,7 @@ class SegmentCompiler:
                 write_offset=0,
                 h_gelu_x_scale_shift=int(op.h_gelu_x_scale_shift),
                 output_layout=output_layout,
+                output_word_offset=int(op.output_word_offset),
             )
 
         # Pre-assign globally planned addresses before compile() runs so that

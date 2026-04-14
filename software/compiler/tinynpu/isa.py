@@ -43,6 +43,7 @@ class MatMul(Instruction):
         write_offset=0,
         h_gelu_x_scale_shift=7,
         output_layout=OutputLayout.C,
+        output_word_offset=0,
     ):
         self.a = a
         self.b = b
@@ -56,6 +57,7 @@ class MatMul(Instruction):
         self.write_offset = write_offset
         self.h_gelu_x_scale_shift = h_gelu_x_scale_shift
         self.output_layout = output_layout
+        self.output_word_offset = output_word_offset
         
         # Tile dimensions (logical) will be set by the compiler during inference
         self.m = 0
@@ -73,6 +75,7 @@ class MatMul(Instruction):
         instr |= (a_addr & 0xFFFF) << 232
         instr |= (b_addr & 0xFFFF) << 216
         instr |= (c_addr & 0xFFFF) << 200
+        instr |= (self.output_word_offset & 0xFFFF) << 184
         instr |= (self.m & 0xFFFF) << 168
         instr |= (self.k & 0xFFFF) << 152
         instr |= (self.n & 0xFFFF) << 136
@@ -128,12 +131,14 @@ def pack_matmul(
     write_offset=0,
     h_gelu_x_scale_shift=7,
     output_layout=OutputLayout.C,
+    output_word_offset=0,
 ):
     instr = 0
     instr |= (opcode & 0xF) << 252
     instr |= (a_addr & 0xFFFF) << 232
     instr |= (b_addr & 0xFFFF) << 216
     instr |= (c_addr & 0xFFFF) << 200
+    instr |= (output_word_offset & 0xFFFF) << 184
     instr |= (m & 0xFFFF) << 168
     instr |= (k & 0xFFFF) << 152
     instr |= (n & 0xFFFF) << 136
