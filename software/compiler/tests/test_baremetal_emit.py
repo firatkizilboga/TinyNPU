@@ -6,6 +6,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from tinynpu_jit import emit_cv32e40p_c, emit_cv32e40p_program_v2
 from tinynpu_jit import DType, ExecutionPlan, HostOp, MatMulOp, NpuSegment, TensorKind, TensorSpec, compile_plan
+from tinynpu import TinyNPUProgram
+from tinynpu.isa import OutputLayout, PrecisionMode
 
 
 def test_emit_cv32e40p_c_for_two_segment_relu_chain():
@@ -235,6 +237,65 @@ def test_compile_plan_marks_rhs_chaining_output_as_b_layout():
     assert seg.ops[0].output_layout == "b"
     assert seg.ops[1].output_layout == "c"
     assert artifact.segment_artifacts["seg_b_chain"].symbol_table["mid"]["role"] == "B"
+
+
+def test_tinynpu_program_encodes_output_word_offset_in_matmul_instruction():
+    program = TinyNPUProgram()
+    lhs = np.eye(8, dtype=np.int16)
+    rhs = np.eye(8, dtype=np.int16)
+    program.declare_data("lhs", lhs, precision=PrecisionMode.INT16, role="A")
+    program.declare_data("rhs", rhs, precision=PrecisionMode.INT16, role="B")
+    program.matmul(
+        "lhs",
+        "rhs",
+        "out",
+        in_precision=PrecisionMode.INT16,
+        out_precision=PrecisionMode.INT16,
+        output_layout=OutputLayout.B,
+        output_word_offset=13,
+    )
+    program.halt()
+    binary = program.compile()
+
+    inst = int(binary["im"][0])
+    assert ((inst >> 184) & 0xFFFF) == 13
+    assert ((inst >> 72) & 0x3) == int(OutputLayout.B)
+
+
+def test_compile_plan_preserves_output_word_offset_in_segment_binary():
+    lhs = np.eye(8, dtype=np.int16)
+    rhs = np.eye(8, dtype=np.int16)
+    expected = np.eye(8, dtype=np.int16)
+
+    tensors = {
+        "lhs": TensorSpec("lhs", lhs.shape, DType.INT16, TensorKind.INPUT),
+        "rhs": TensorSpec("rhs", rhs.shape, DType.INT16, TensorKind.CONSTANT, data=rhs),
+        "out": TensorSpec("out", expected.shape, DType.INT16, TensorKind.OUTPUT, is_final_output=True),
+    }
+    steps = [
+        NpuSegment(
+            "seg_offset",
+            [
+                MatMulOp(
+                    "op0",
+                    "lhs",
+                    "rhs",
+                    "out",
+                    output_layout="b",
+                    output_word_offset=21,
+                )
+            ],
+            inputs=["lhs", "rhs"],
+            outputs=["out"],
+        )
+    ]
+    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=["lhs"], outputs=["out"])
+    artifact = compile_plan(plan, {"out": expected})
+
+    assert artifact.plan.steps[0].ops[0].output_layout == "c"
+    inst = int(artifact.segment_artifacts["seg_offset"].binary["im"][0])
+    assert ((inst >> 184) & 0xFFFF) == 21
+    assert ((inst >> 72) & 0x3) == int(OutputLayout.C)
 
 
 def test_compile_plan_keeps_layout_restore_then_im2col():
