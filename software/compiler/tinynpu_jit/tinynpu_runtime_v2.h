@@ -31,6 +31,8 @@ typedef enum {
     TNPU_HOST_MEAN = 10,
     TNPU_HOST_IM2COL = 11,
     TNPU_HOST_LAYOUT_RESTORE = 12,
+    TNPU_HOST_RMSNORM = 13,
+    TNPU_HOST_ROPE = 14,
 } TnpuHostKind;
 
 typedef enum {
@@ -92,6 +94,7 @@ typedef struct {
     const char *name;
     uint8_t kind;
     uint16_t input_idx;
+    uint16_t input1_idx;
     uint16_t output_idx;
     int32_t attrs_i32[8];
     float attrs_f32[2];

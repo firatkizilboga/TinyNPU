@@ -6,6 +6,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from tinynpu_jit import emit_cv32e40p_c, emit_cv32e40p_program_v2
 from tinynpu_jit.golden import GoldenModel
+from tinynpu_jit.host_ops import execute_host_op
 from tinynpu_jit import (
     DType,
     describe_int16_k_cache_append,
@@ -1279,3 +1280,58 @@ def test_emit_cv32e40p_program_v2_emits_precision_and_verify_for_all_integer_mod
     assert "TNPU_OP_VERIFY" in source
     assert ".expected_tensor_idx" in source
     assert f".precision = {precision}" in source
+
+
+def test_host_op_rmsnorm_emulation_and_v2_emit():
+    x = np.array([[1.0, -2.0, 3.0, -4.0]], dtype=np.float32)
+    weight = np.array([1.5, 0.5, 2.0, 1.0], dtype=np.float32)
+    eps = 1.0e-6
+    mean_sq = np.mean(np.square(x), axis=-1, keepdims=True)
+    expected = (x / np.sqrt(mean_sq + eps)) * weight
+
+    values = {"x": x, "w": weight, "y": np.zeros_like(x)}
+    step = HostOp("rms0", "rmsnorm", inputs=["x", "w"], outputs=["y"], attrs={"eps": eps})
+    execute_host_op(step, values, golden=GoldenModel())
+    np.testing.assert_allclose(values["y"], expected, rtol=1e-5, atol=1e-5)
+
+    tensors = {
+        "x": TensorSpec("x", x.shape, DType.FLOAT32, TensorKind.CONSTANT, data=x),
+        "w": TensorSpec("w", weight.shape, DType.FLOAT32, TensorKind.CONSTANT, data=weight),
+        "y": TensorSpec("y", x.shape, DType.FLOAT32, TensorKind.OUTPUT, is_final_output=True),
+    }
+    plan = ExecutionPlan(tensors=tensors, steps=[step], inputs=[], outputs=["y"])
+    plan.add_verification_step("y", "y")
+    artifact = compile_plan(plan, {"y": expected.astype(np.float32)})
+    source = emit_cv32e40p_program_v2(artifact, {}, program_name="unit_test_rmsnorm_v2")
+    assert "TNPU_HOST_RMSNORM" in source
+    assert ".input1_idx =" in source
+
+
+def test_host_op_rope_emulation_and_v2_emit():
+    x = np.array([[1.0, 2.0, 3.0, 4.0]], dtype=np.float32)
+    head_dim = 4
+    position = 3
+    theta = 10000.0
+    half = head_dim // 2
+    inv_freq = 1.0 / (theta ** (np.arange(0, half, dtype=np.float32) / np.float32(half)))
+    angles = np.float32(position) * inv_freq
+    cos = np.cos(angles).astype(np.float32)
+    sin = np.sin(angles).astype(np.float32)
+    expected = np.array(x, copy=True)
+    expected[..., :half] = x[..., :half] * cos - x[..., half:] * sin
+    expected[..., half:] = x[..., half:] * cos + x[..., :half] * sin
+
+    values = {"x": x, "y": np.zeros_like(x)}
+    step = HostOp("rope0", "rope", inputs=["x"], outputs=["y"], attrs={"head_dim": head_dim, "position": position, "theta": theta})
+    execute_host_op(step, values, golden=GoldenModel())
+    np.testing.assert_allclose(values["y"], expected, rtol=1e-5, atol=1e-5)
+
+    tensors = {
+        "x": TensorSpec("x", x.shape, DType.FLOAT32, TensorKind.CONSTANT, data=x),
+        "y": TensorSpec("y", x.shape, DType.FLOAT32, TensorKind.OUTPUT, is_final_output=True),
+    }
+    plan = ExecutionPlan(tensors=tensors, steps=[step], inputs=[], outputs=["y"])
+    plan.add_verification_step("y", "y")
+    artifact = compile_plan(plan, {"y": expected.astype(np.float32)})
+    source = emit_cv32e40p_program_v2(artifact, {}, program_name="unit_test_rope_v2")
+    assert "TNPU_HOST_ROPE" in source

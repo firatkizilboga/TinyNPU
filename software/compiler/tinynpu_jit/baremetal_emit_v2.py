@@ -34,6 +34,8 @@ _HOST_KIND_ENUM = {
     "mean": "TNPU_HOST_MEAN",
     "im2col": "TNPU_HOST_IM2COL",
     "layout_restore": "TNPU_HOST_LAYOUT_RESTORE",
+    "rmsnorm": "TNPU_HOST_RMSNORM",
+    "rope": "TNPU_HOST_ROPE",
 }
 
 
@@ -422,11 +424,19 @@ def emit_cv32e40p_program_v2(
                 attrs_i32[2] = int(step.attrs["out_h"])
                 attrs_i32[3] = int(step.attrs["out_w"])
                 attrs_i32[4] = int(step.attrs["out_channels"])
+            elif step.kind == "rmsnorm":
+                attrs_f32[0] = float(step.attrs.get("eps", 1.0e-6))
+            elif step.kind == "rope":
+                attrs_i32[0] = int(step.attrs.get("head_dim", 0))
+                attrs_i32[1] = int(step.attrs.get("position", 0))
+                attrs_f32[0] = float(step.attrs.get("theta", 10000.0))
 
             host_entries.append(
                 "    {"
                 f'.name = "{step.name}", .kind = {_HOST_KIND_ENUM[step.kind]}, '
-                f".input_idx = {tensor_index[step.inputs[0]]}, .output_idx = {tensor_index[step.outputs[0]]}, "
+                f".input_idx = {tensor_index[step.inputs[0]]}, "
+                f".input1_idx = {tensor_index[step.inputs[1]] if len(step.inputs) > 1 else 0xFFFF}, "
+                f".output_idx = {tensor_index[step.outputs[0]]}, "
                 ".attrs_i32 = {"
                 + ", ".join(str(v) for v in attrs_i32)
                 + "}, .attrs_f32 = {"

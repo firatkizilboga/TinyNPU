@@ -157,6 +157,10 @@ static void runtime_assert(int condition, const char *message)
     }
 }
 
+static float host_absf(float x);
+static int32_t host_round_to_i32(float x);
+static int64_t host_round_to_i64(float x);
+
 static int32_t *tensor_i32(const TinyTensor *tensor)
 {
     runtime_assert(tensor->dtype != TINY_DTYPE_FLOAT32, "expected integer tensor");
@@ -225,8 +229,8 @@ static int32_t tensor_get_i32(const TinyTensor *tensor, int linear)
 {
     if (tensor->dtype == TINY_DTYPE_FLOAT32) {
         float value = tensor_f32(tensor)[linear];
-        float rounded = roundf(value);
-        if (fabsf(value - rounded) > 1e-6f) {
+        float rounded = (float)host_round_to_i32(value);
+        if (host_absf(value - rounded) > 1e-6f) {
             printf("non-integral float reached NPU boundary in tensor %s\n", tensor->name);
             exit(EXIT_FAILURE);
         }
@@ -323,6 +327,14 @@ static void host_relu(TinyTensor *dst, const TinyTensor *src)
 
 static float host_exp_approx(float x);
 static float host_recip_approx(float x);
+static float host_log_approx(float x);
+static float host_rsqrt_approx(float x);
+static float host_sin_approx(float x);
+static float host_cos_approx(float x);
+static float host_absf(float x);
+static int32_t host_round_to_i32(float x);
+static int64_t host_round_to_i64(float x);
+static float host_erf_approx(float x);
 
 static void host_sigmoid(TinyTensor *dst, const TinyTensor *src)
 {
@@ -344,6 +356,21 @@ static float host_exp_approx_neg_unit(float x)
                 0.16666667f + x * (
                     0.04166667f + x * 0.0083333333f))));
     return y > 0.0f ? y : 0.0f;
+}
+
+static float host_absf(float x)
+{
+    return x < 0.0f ? -x : x;
+}
+
+static int32_t host_round_to_i32(float x)
+{
+    return x >= 0.0f ? (int32_t)(x + 0.5f) : (int32_t)(x - 0.5f);
+}
+
+static int64_t host_round_to_i64(float x)
+{
+    return x >= 0.0f ? (int64_t)(x + 0.5f) : (int64_t)(x - 0.5f);
 }
 
 static float host_exp_approx(float x)
@@ -413,13 +440,129 @@ static float host_recip_approx(float x)
     return y;
 }
 
+static float host_log_approx(float x)
+{
+    const float ln2 = 0.69314718f;
+    runtime_assert(x > 0.0f, "log input must be positive");
+
+    int exp2 = 0;
+    while (x > 1.5f) {
+        x *= 0.5f;
+        exp2 += 1;
+    }
+    while (x < 0.75f) {
+        x *= 2.0f;
+        exp2 -= 1;
+    }
+
+    {
+        float y = (x - 1.0f) * host_recip_approx(x + 1.0f);
+        float y2 = y * y;
+        float y3 = y * y2;
+        float y5 = y3 * y2;
+        float y7 = y5 * y2;
+        float ln_m = 2.0f * (y + y3 * 0.33333333f + y5 * 0.2f + y7 * 0.14285715f);
+        return ((float)exp2 * ln2) + ln_m;
+    }
+}
+
+static float host_rsqrt_approx(float x)
+{
+    runtime_assert(x > 0.0f, "rsqrt input must be positive");
+
+    float scale = 1.0f;
+    while (x > 2.0f) {
+        x *= 0.25f;
+        scale *= 0.5f;
+    }
+    while (x < 0.5f) {
+        x *= 4.0f;
+        scale *= 2.0f;
+    }
+
+    float y = 1.25f - 0.25f * x;
+    for (int i = 0; i < 4; ++i) {
+        y = y * (1.5f - 0.5f * x * y * y);
+    }
+    return y * scale;
+}
+
+static float host_wrap_pi(float x)
+{
+    const float pi = 3.14159265f;
+    const float two_pi = 6.28318531f;
+    while (x > pi) {
+        x -= two_pi;
+    }
+    while (x < -pi) {
+        x += two_pi;
+    }
+    return x;
+}
+
+static float host_sin_approx(float x)
+{
+    const float half_pi = 1.57079633f;
+    x = host_wrap_pi(x);
+    if (x > half_pi) {
+        x = 3.14159265f - x;
+    } else if (x < -half_pi) {
+        x = -3.14159265f - x;
+    }
+
+    {
+        float x2 = x * x;
+        return x * (1.0f + x2 * (-0.16666667f + x2 * (0.0083333333f + x2 * -0.00019841270f)));
+    }
+}
+
+static float host_cos_approx(float x)
+{
+    const float half_pi = 1.57079633f;
+    float sign = 1.0f;
+    x = host_wrap_pi(x);
+    if (x > half_pi) {
+        x = 3.14159265f - x;
+        sign = -1.0f;
+    } else if (x < -half_pi) {
+        x = -3.14159265f - x;
+        sign = -1.0f;
+    }
+
+    {
+        float x2 = x * x;
+        float y = 1.0f + x2 * (-0.5f + x2 * (0.04166667f + x2 * -0.0013888889f));
+        return sign * y;
+    }
+}
+
+static float host_erf_approx(float x)
+{
+    const float p = 0.3275911f;
+    const float a1 = 0.25482959f;
+    const float a2 = -0.28449672f;
+    const float a3 = 1.4214138f;
+    const float a4 = -1.4531521f;
+    const float a5 = 1.0614054f;
+    float sign = 1.0f;
+    if (x < 0.0f) {
+        sign = -1.0f;
+        x = -x;
+    }
+    {
+        float t = host_recip_approx(1.0f + p * x);
+        float poly = (((((a5 * t) + a4) * t + a3) * t + a2) * t + a1) * t;
+        return sign * (1.0f - poly * host_exp_approx(-(x * x)));
+    }
+}
+
 static void host_gelu(TinyTensor *dst, const TinyTensor *src)
 {
     runtime_assert(dst->dtype == TINY_DTYPE_FLOAT32, "gelu expects float output");
     runtime_assert(dst->elem_count == src->elem_count, "gelu size mismatch");
     for (int i = 0; i < src->elem_count; ++i) {
         float value = tensor_get_float(src, i);
-        float erf_term = erff(value / sqrtf(2.0f));
+        float erf_term = host_erf_approx(value * 0.70710678f);
         tensor_set_float(dst, i, 0.5f * value * (1.0f + erf_term));
     }
 }
@@ -431,7 +574,7 @@ static void host_quantize(TinyTensor *dst, const TinyTensor *src, float inv_scal
     runtime_assert(dst->elem_count == src->elem_count, "quantize size mismatch");
     for (int i = 0; i < src->elem_count; ++i) {
         float source = tensor_get_float(src, i);
-        int64_t quantized = (int64_t)lrintf(source * inv_scale) + (int64_t)zero_point;
+        int64_t quantized = host_round_to_i64(source * inv_scale) + (int64_t)zero_point;
         tensor_set_i32(dst, i, clip_for_dtype(quantized, dst->dtype));
     }
 }
@@ -453,7 +596,7 @@ static void host_requantize(TinyTensor *dst, const TinyTensor *src, float scale,
     runtime_assert(dst->elem_count == src->elem_count, "requantize size mismatch");
     for (int i = 0; i < src->elem_count; ++i) {
         float source = tensor_get_float(src, i);
-        int64_t quantized = (int64_t)lrintf(source * scale) + (int64_t)zero_point;
+        int64_t quantized = host_round_to_i64(source * scale) + (int64_t)zero_point;
         tensor_set_i32(dst, i, clip_for_dtype(quantized, dst->dtype));
     }
 }
@@ -619,6 +762,79 @@ static void host_mean(
     for (int i = 0; i < dst->elem_count; ++i) {
         runtime_assert(counts[i] > 0, "mean produced empty output bucket");
         out[i] /= (float)counts[i];
+    }
+}
+
+static void host_rmsnorm(TinyTensor *dst, const TinyTensor *src, const TinyTensor *weight, float eps)
+{
+    runtime_assert(eps > 0.0f, "rmsnorm eps must be positive");
+    runtime_assert(dst->dtype == TINY_DTYPE_FLOAT32, "rmsnorm output must be float");
+    runtime_assert(src->rank >= 1, "rmsnorm expects rank >= 1");
+    runtime_assert(dst->elem_count == src->elem_count, "rmsnorm size mismatch");
+
+    const int hidden = src->shape[src->rank - 1];
+    runtime_assert(weight->elem_count == hidden, "rmsnorm weight size mismatch");
+    const int outer = src->elem_count / hidden;
+
+    for (int outer_idx = 0; outer_idx < outer; ++outer_idx) {
+        float mean_sq = 0.0f;
+        const int base = outer_idx * hidden;
+        for (int i = 0; i < hidden; ++i) {
+            float value = tensor_get_float(src, base + i);
+            mean_sq += value * value;
+        }
+        mean_sq *= host_recip_approx((float)hidden);
+        {
+            float inv_rms = host_rsqrt_approx(mean_sq + eps);
+            for (int i = 0; i < hidden; ++i) {
+                float value = tensor_get_float(src, base + i);
+                float scale = tensor_get_float(weight, i);
+                tensor_set_float(dst, base + i, value * inv_rms * scale);
+            }
+        }
+    }
+}
+
+static void host_rope(TinyTensor *dst, const TinyTensor *src, int head_dim, int position, float theta)
+{
+    runtime_assert(dst->dtype == TINY_DTYPE_FLOAT32, "rope output must be float");
+    runtime_assert(src->rank >= 2, "rope expects rank >= 2");
+    runtime_assert(theta > 0.0f, "rope theta must be positive");
+    runtime_assert(head_dim > 0 && (head_dim % 2) == 0, "rope head_dim must be positive and even");
+    runtime_assert(src->shape[src->rank - 1] == head_dim, "rope last dimension mismatch");
+    runtime_assert(dst->elem_count == src->elem_count, "rope size mismatch");
+
+    const int half = head_dim / 2;
+    const float inv_half = host_recip_approx((float)half);
+    const float rope_base = host_exp_approx(-host_log_approx(theta) * inv_half);
+    int outer = 1;
+    int seq_len = 1;
+    if (src->rank == 2) {
+        outer = src->shape[0];
+        seq_len = 1;
+    } else {
+        for (int axis = 0; axis < src->rank - 2; ++axis) {
+            outer *= src->shape[axis];
+        }
+        seq_len = src->shape[src->rank - 2];
+    }
+
+    for (int outer_idx = 0; outer_idx < outer; ++outer_idx) {
+        for (int seq_idx = 0; seq_idx < seq_len; ++seq_idx) {
+            int logical_pos = position + (src->rank == 2 ? 0 : seq_idx);
+            int base = ((outer_idx * seq_len) + seq_idx) * head_dim;
+            float inv_freq = 1.0f;
+            for (int i = 0; i < half; ++i) {
+                float angle = (float)logical_pos * inv_freq;
+                float c = host_cos_approx(angle);
+                float s = host_sin_approx(angle);
+                float first = tensor_get_float(src, base + i);
+                float second = tensor_get_float(src, base + half + i);
+                tensor_set_float(dst, base + i, first * c - second * s);
+                tensor_set_float(dst, base + half + i, second * c + first * s);
+                inv_freq *= rope_base;
+            }
+        }
     }
 }
 
@@ -1593,7 +1809,7 @@ static int tensor_matches_expected(const TinyTensor *actual, const TinyTensor *e
     }
     if (actual->dtype == TINY_DTYPE_FLOAT32) {
         for (int i = 0; i < actual->elem_count; ++i) {
-            if (fabsf(tensor_get_float(actual, i) - tensor_get_float(expected, i)) > 1e-5f) {
+            if (host_absf(tensor_get_float(actual, i) - tensor_get_float(expected, i)) > 1e-3f) {
                 return 0;
             }
         }
