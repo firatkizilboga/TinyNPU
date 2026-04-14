@@ -396,7 +396,7 @@ def test_compile_plan_supports_b_cache_views_for_append_and_consume():
                 MatMulOp("op1", "lhs1", "rhs1", "cache_t1"),
                 MatMulOp("op2", "query", "cache_t1", "out"),
             ],
-            inputs=["cache"],
+            inputs=[],
             outputs=["out"],
         ),
     ]
@@ -414,6 +414,10 @@ def test_compile_plan_supports_b_cache_views_for_append_and_consume():
     assert ((inst1 >> 72) & 0x3) == int(OutputLayout.B)
     assert seg.symbol_table["cache_t1"]["base_name"] == "cache"
     assert seg.symbol_table["cache_t1"]["word_offset"] == 8
+    memory_names = {entry.name for entry in seg.memory_plan.entries}
+    assert "cache" in memory_names
+    assert "cache_t0" not in memory_names
+    assert "cache_t1" not in memory_names
 
 
 def test_tinynpu_program_preserves_predeclared_b_cache_shape_for_append():

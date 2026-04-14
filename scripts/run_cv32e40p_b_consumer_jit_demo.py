@@ -135,7 +135,7 @@ def build_artifact():
                 MatMulOp("op1", "lhs1", "rhs1", "cache_t1"),
                 MatMulOp("op2", "query", "cache_t1", "out"),
             ],
-            inputs=["cache"],
+            inputs=[],
             outputs=["out"],
         ),
     ]
