@@ -121,6 +121,7 @@ class TinyNPUProgram:
         if A.shape[1] != B.shape[0]:
             raise ValueError(f"Dimension mismatch: {A.shape} and {B.shape}")
         expected_out_rows = A.shape[0]
+        inferred_out_shape = (expected_out_rows, B.shape[1])
         if output_layout == OutputLayout.A:
             out_role = 'A'
         elif output_layout == OutputLayout.B:
@@ -128,14 +129,18 @@ class TinyNPUProgram:
         else:
             out_role = 'C'
         if out_name not in self.symbols:
-            out_rows = expected_out_rows
-            out_shape = (out_rows, B.shape[1])
-            self.symbols[out_name] = Symbol(out_name, out_shape, out_precision, role=out_role)
+            self.symbols[out_name] = Symbol(out_name, inferred_out_shape, out_precision, role=out_role)
         else:
-            out_rows = expected_out_rows
-            self.symbols[out_name].shape = (out_rows, B.shape[1])
-            self.symbols[out_name].storage_role = out_role
-            self.symbols[out_name].precision = out_precision
+            existing = self.symbols[out_name]
+            if len(existing.shape) != 2:
+                raise ValueError(f"Output symbol '{out_name}' must be a 2D matrix.")
+            if existing.shape[0] < inferred_out_shape[0] or existing.shape[1] < inferred_out_shape[1]:
+                raise ValueError(
+                    f"Predeclared output symbol '{out_name}' shape {existing.shape} is too small "
+                    f"for matmul result {inferred_out_shape}."
+                )
+            existing.storage_role = out_role
+            existing.precision = out_precision
         if bias_name:
             if bias_name not in self.symbols:
                 bias_shape = (1, B.shape[1])

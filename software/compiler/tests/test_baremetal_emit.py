@@ -298,6 +298,73 @@ def test_compile_plan_preserves_output_word_offset_in_segment_binary():
     assert ((inst >> 72) & 0x3) == int(OutputLayout.C)
 
 
+def test_tinynpu_program_preserves_predeclared_b_cache_shape_for_append():
+    program = TinyNPUProgram()
+    lhs0 = np.eye(8, dtype=np.int16)
+    rhs0 = np.eye(8, dtype=np.int16)
+    lhs1 = np.flipud(np.eye(8, dtype=np.int16))
+    rhs1 = np.rot90(np.eye(8, dtype=np.int16), 2).astype(np.int16)
+
+    program.declare_data("lhs0", lhs0, precision=PrecisionMode.INT16, role="A")
+    program.declare_data("rhs0", rhs0, precision=PrecisionMode.INT16, role="B")
+    program.declare_data("lhs1", lhs1, precision=PrecisionMode.INT16, role="A")
+    program.declare_data("rhs1", rhs1, precision=PrecisionMode.INT16, role="B")
+    program.declare_data("cache", np.zeros((16, 8), dtype=np.int16), precision=PrecisionMode.INT16, role="B")
+
+    program.matmul(
+        "lhs0",
+        "rhs0",
+        "cache",
+        in_precision=PrecisionMode.INT16,
+        out_precision=PrecisionMode.INT16,
+        output_layout=OutputLayout.B,
+        output_word_offset=0,
+    )
+    program.matmul(
+        "lhs1",
+        "rhs1",
+        "cache",
+        in_precision=PrecisionMode.INT16,
+        out_precision=PrecisionMode.INT16,
+        output_layout=OutputLayout.B,
+        output_word_offset=8,
+    )
+    program.halt()
+    binary = program.compile()
+
+    cache = program.symbols["cache"]
+    assert cache.shape == (16, 8)
+    assert cache.storage_role == "B"
+    assert cache.word_count == 16
+
+    inst0 = int(binary["im"][0])
+    inst1 = int(binary["im"][1])
+    assert ((inst0 >> 184) & 0xFFFF) == 0
+    assert ((inst1 >> 184) & 0xFFFF) == 8
+    assert ((inst0 >> 72) & 0x3) == int(OutputLayout.B)
+    assert ((inst1 >> 72) & 0x3) == int(OutputLayout.B)
+
+
+def test_tinynpu_program_rejects_predeclared_output_cache_that_is_too_small():
+    program = TinyNPUProgram()
+    lhs = np.eye(8, dtype=np.int16)
+    rhs = np.eye(8, dtype=np.int16)
+    program.declare_data("lhs", lhs, precision=PrecisionMode.INT16, role="A")
+    program.declare_data("rhs", rhs, precision=PrecisionMode.INT16, role="B")
+    program.declare_data("cache", np.zeros((4, 8), dtype=np.int16), precision=PrecisionMode.INT16, role="B")
+
+    with pytest.raises(ValueError, match="too small"):
+        program.matmul(
+            "lhs",
+            "rhs",
+            "cache",
+            in_precision=PrecisionMode.INT16,
+            out_precision=PrecisionMode.INT16,
+            output_layout=OutputLayout.B,
+            output_word_offset=0,
+        )
+
+
 def test_compile_plan_keeps_layout_restore_then_im2col():
     a = np.arange(20, dtype=np.int16).reshape(4, 5)
     b = np.ones((5, 3), dtype=np.int16)
