@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -37,127 +38,124 @@ from run_cv32e40p_b_append_demo import (  # noqa: E402
 )
 
 
-def build_artifact():
-    lhs_k0 = np.array([[1, 2, -1, 0, 3, -2, 1, 4]], dtype=np.int16)
-    rhs_k0 = np.array(
-        [
-            [1, 0, 1, 0, -1, 2, 0, 1],
-            [0, 1, 0, 1, 2, -1, 1, 0],
-            [1, -1, 1, 0, 0, 1, 2, 1],
-            [2, 0, -1, 1, 1, 0, -1, 2],
-            [0, 2, 1, -1, 1, 1, 0, 0],
-            [1, 1, 0, 2, -1, 0, 1, -1],
-            [0, -1, 2, 1, 0, 1, 1, 2],
-            [1, 0, 1, 1, 2, 0, -1, 1],
-        ],
-        dtype=np.int16,
-    )
-    lhs_k1 = np.array([[2, 1, 0, -1, 1, 2, 0, 1]], dtype=np.int16)
-    rhs_k1 = np.array(
-        [
-            [0, 1, 1, 0, 2, 1, 0, -1],
-            [1, 0, 2, 1, -1, 0, 1, 2],
-            [2, 1, 0, -1, 1, 2, 1, 0],
-            [1, -1, 1, 2, 0, 1, 2, 1],
-            [0, 2, 1, 0, 1, -1, 1, 2],
-            [1, 1, -1, 1, 2, 0, 0, 1],
-            [2, 0, 1, 1, 0, 2, -1, 1],
-            [1, 2, 0, 1, -1, 1, 2, 0],
-        ],
-        dtype=np.int16,
-    )
-    lhs_v0 = np.array([[1, 0, 2, -1, 1, 0, 1, 2]], dtype=np.int16)
-    rhs_v0 = np.array(
-        [
-            [1, 2, 0, 1, -1, 0, 2, 1],
-            [0, 1, 2, 0, 1, 2, -1, 1],
-            [2, 0, 1, 2, 0, 1, 1, -1],
-            [1, -1, 0, 1, 2, 1, 0, 2],
-            [0, 2, 1, 0, 1, -1, 2, 1],
-            [1, 0, -1, 2, 1, 0, 1, 2],
-            [2, 1, 0, 1, -1, 2, 0, 1],
-            [1, 2, 1, 0, 2, 1, -1, 0],
-        ],
-        dtype=np.int16,
-    )
-    lhs_v1 = np.array([[0, 1, 1, 2, -1, 1, 0, 1]], dtype=np.int16)
-    rhs_v1 = np.array(
-        [
-            [2, 0, 1, -1, 2, 1, 0, 1],
-            [1, 2, 0, 1, 0, -1, 2, 1],
-            [0, 1, 2, 1, -1, 0, 1, 2],
-            [1, -1, 1, 0, 2, 1, 2, 0],
-            [2, 1, 0, 2, 1, 0, -1, 1],
-            [0, 2, 1, 1, 0, 2, 1, -1],
-            [1, 0, 2, 1, 1, -1, 0, 2],
-            [2, 1, -1, 0, 1, 2, 1, 0],
-        ],
-        dtype=np.int16,
-    )
-    query = np.array([[1, -1, 2, 0, 1, 3, -2, 1]], dtype=np.int16)
-    attn_scale = 1.0 / 256.0
+def _parse_token_indices(raw: str | None, token_capacity: int) -> list[int]:
+    if raw is None or raw.strip() == "":
+        return [idx for idx in (1, 9) if idx < token_capacity]
+    values = [int(part.strip()) for part in raw.split(",") if part.strip()]
+    if not values:
+        raise ValueError("token index list must not be empty")
+    if len(set(values)) != len(values):
+        raise ValueError("token indices must be unique")
+    for idx in values:
+        if idx < 0 or idx >= token_capacity:
+            raise ValueError(f"token index {idx} is outside token capacity {token_capacity}")
+    return values
+
+
+def _rand_i16(rng: np.random.Generator, shape: tuple[int, ...], low: int = -2, high: int = 3) -> np.ndarray:
+    return rng.integers(low, high, size=shape, endpoint=False, dtype=np.int16)
+
+
+def build_artifact(
+    *,
+    d_head: int = 8,
+    token_capacity: int = 16,
+    token_indices: list[int] | None = None,
+    seed: int = 0,
+    attn_scale: float = 1.0 / 256.0,
+):
+    if d_head <= 0 or d_head % 8 != 0:
+        raise ValueError("d_head must be a positive multiple of 8")
+    if token_capacity <= 0 or token_capacity % 8 != 0:
+        raise ValueError("token_capacity must be a positive multiple of 8")
+
+    indices = token_indices or [idx for idx in (1, 9) if idx < token_capacity]
+    if not indices:
+        raise ValueError("at least one token index is required")
+
+    rng = np.random.default_rng(seed)
     golden = GoldenModel()
 
-    k0 = np.clip(lhs_k0.astype(np.int32) @ rhs_k0.astype(np.int32), -32768, 32767).astype(np.int16)
-    k1 = np.clip(lhs_k1.astype(np.int32) @ rhs_k1.astype(np.int32), -32768, 32767).astype(np.int16)
-    v0 = np.clip(lhs_v0.astype(np.int32) @ rhs_v0.astype(np.int32), -32768, 32767).astype(np.int16)
-    v1 = np.clip(lhs_v1.astype(np.int32) @ rhs_v1.astype(np.int32), -32768, 32767).astype(np.int16)
+    tensors: dict[str, TensorSpec] = {}
+    seg_score_ops: list[MatMulOp] = []
+    token_names = [f"t{idx}" for idx in indices]
 
-    k_cache = np.zeros((8, 16), dtype=np.int16)
-    k_cache[:, 1] = k0[0]
-    k_cache[:, 9] = k1[0]
+    k_cache = np.zeros((d_head, token_capacity), dtype=np.int16)
+    v_cache = np.zeros((token_capacity, d_head), dtype=np.int16)
+
+    for tok_idx, token_name in zip(indices, token_names):
+        lhs_k = _rand_i16(rng, (1, d_head))
+        rhs_k = _rand_i16(rng, (d_head, d_head))
+        lhs_v = _rand_i16(rng, (1, d_head))
+        rhs_v = _rand_i16(rng, (d_head, d_head))
+
+        k_val = np.clip(lhs_k.astype(np.int32) @ rhs_k.astype(np.int32), -32768, 32767).astype(np.int16)
+        v_val = np.clip(lhs_v.astype(np.int32) @ rhs_v.astype(np.int32), -32768, 32767).astype(np.int16)
+        k_cache[:, tok_idx] = k_val[0]
+        v_cache[tok_idx, :] = v_val[0]
+
+        tensors[f"lhs_k_{token_name}"] = TensorSpec(
+            f"lhs_k_{token_name}", lhs_k.shape, DType.INT16, TensorKind.CONSTANT, data=lhs_k
+        )
+        tensors[f"rhs_k_{token_name}"] = TensorSpec(
+            f"rhs_k_{token_name}", rhs_k.shape, DType.INT16, TensorKind.CONSTANT, data=rhs_k
+        )
+        tensors[f"lhs_v_{token_name}"] = TensorSpec(
+            f"lhs_v_{token_name}", lhs_v.shape, DType.INT16, TensorKind.CONSTANT, data=lhs_v
+        )
+        tensors[f"rhs_v_{token_name}"] = TensorSpec(
+            f"rhs_v_{token_name}", rhs_v.shape, DType.INT16, TensorKind.CONSTANT, data=rhs_v
+        )
+
+        seg_score_ops.append(
+            MatMulOp(
+                f"op_k_{token_name}",
+                f"lhs_k_{token_name}",
+                f"rhs_k_{token_name}",
+                f"k_cache_{token_name}",
+            )
+        )
+        seg_score_ops.append(
+            MatMulOp(
+                f"op_v_{token_name}",
+                f"lhs_v_{token_name}",
+                f"rhs_v_{token_name}",
+                f"v_cache_{token_name}",
+            )
+        )
+
+    query = _rand_i16(rng, (1, d_head))
     scores = np.clip(query.astype(np.int32) @ k_cache.astype(np.int32), -32768, 32767).astype(np.int16)
     probs = golden.softmax(scores, axis=-1).astype(np.float32)
     attn_q = golden.quantize(probs, scale=attn_scale, out_dtype=DType.INT16)
-    v_cache = np.zeros((16, 8), dtype=np.int16)
-    v_cache[1, :] = v0[0]
-    v_cache[9, :] = v1[0]
     expected = golden.matmul(attn_q, v_cache, shift=8, out_dtype=DType.INT16)
 
-    tensors = {
-        "lhs_k0": TensorSpec("lhs_k0", lhs_k0.shape, DType.INT16, TensorKind.CONSTANT, data=lhs_k0),
-        "rhs_k0": TensorSpec("rhs_k0", rhs_k0.shape, DType.INT16, TensorKind.CONSTANT, data=rhs_k0),
-        "lhs_k1": TensorSpec("lhs_k1", lhs_k1.shape, DType.INT16, TensorKind.CONSTANT, data=lhs_k1),
-        "rhs_k1": TensorSpec("rhs_k1", rhs_k1.shape, DType.INT16, TensorKind.CONSTANT, data=rhs_k1),
-        "lhs_v0": TensorSpec("lhs_v0", lhs_v0.shape, DType.INT16, TensorKind.CONSTANT, data=lhs_v0),
-        "rhs_v0": TensorSpec("rhs_v0", rhs_v0.shape, DType.INT16, TensorKind.CONSTANT, data=rhs_v0),
-        "lhs_v1": TensorSpec("lhs_v1", lhs_v1.shape, DType.INT16, TensorKind.CONSTANT, data=lhs_v1),
-        "rhs_v1": TensorSpec("rhs_v1", rhs_v1.shape, DType.INT16, TensorKind.CONSTANT, data=rhs_v1),
-        "query": TensorSpec("query", query.shape, DType.INT16, TensorKind.CONSTANT, data=query),
-        "scores": TensorSpec("scores", scores.shape, DType.INT16, TensorKind.INTERMEDIATE),
-        "probs": TensorSpec("probs", probs.shape, DType.FLOAT32, TensorKind.INTERMEDIATE),
-        "attn_q": TensorSpec(
-            "attn_q",
-            attn_q.shape,
-            DType.INT16,
-            TensorKind.INTERMEDIATE,
-            metadata={"storage_role": "A"},
-        ),
-        "out": TensorSpec("out", expected.shape, DType.INT16, TensorKind.OUTPUT, is_final_output=True),
-    }
+    tensors["query"] = TensorSpec("query", query.shape, DType.INT16, TensorKind.CONSTANT, data=query)
+    tensors["scores"] = TensorSpec("scores", scores.shape, DType.INT16, TensorKind.INTERMEDIATE)
+    tensors["probs"] = TensorSpec("probs", probs.shape, DType.FLOAT32, TensorKind.INTERMEDIATE)
+    tensors["attn_q"] = TensorSpec(
+        "attn_q",
+        attn_q.shape,
+        DType.INT16,
+        TensorKind.INTERMEDIATE,
+        metadata={"storage_role": "A"},
+    )
+    tensors["out"] = TensorSpec("out", expected.shape, DType.INT16, TensorKind.OUTPUT, is_final_output=True)
     tensors.update(
         make_native_int16_kv_cache_specs(
             k_base_name="k_cache",
             v_base_name="v_cache",
-            d_head=8,
-            token_capacity=16,
-            token_names=["t1", "t9"],
-            token_indices=[1, 9],
+            d_head=d_head,
+            token_capacity=token_capacity,
+            token_names=token_names,
+            token_indices=indices,
         )
     )
+
+    seg_score_ops.append(MatMulOp("op_qk", "query", "k_cache", "scores"))
+
     steps = [
-        NpuSegment(
-            "seg_score",
-            [
-                MatMulOp("op_k0", "lhs_k0", "rhs_k0", "k_cache_t1"),
-                MatMulOp("op_k1", "lhs_k1", "rhs_k1", "k_cache_t9"),
-                MatMulOp("op_v0", "lhs_v0", "rhs_v0", "v_cache_t1"),
-                MatMulOp("op_v1", "lhs_v1", "rhs_v1", "v_cache_t9"),
-                MatMulOp("op_qk", "query", "k_cache", "scores"),
-            ],
-            inputs=[],
-            outputs=["scores"],
-        ),
+        NpuSegment("seg_score", seg_score_ops, inputs=[], outputs=["scores"]),
         HostOp("softmax_scores", "softmax", inputs=["scores"], outputs=["probs"], attrs={"axis": -1}),
         HostOp(
             "quantize_probs",
@@ -168,9 +166,7 @@ def build_artifact():
         ),
         NpuSegment(
             "seg_value",
-            [
-                MatMulOp("op_av", "attn_q", "v_cache", "out", shift=8),
-            ],
+            [MatMulOp("op_av", "attn_q", "v_cache", "out", shift=8)],
             inputs=["attn_q"],
             outputs=["out"],
         ),
@@ -191,12 +187,29 @@ def build_artifact():
 
 
 def main() -> int:
-    program_name = "cv32e40p_decode_attention_jit_demo_v2"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--d-head", type=int, default=8)
+    parser.add_argument("--token-capacity", type=int, default=16)
+    parser.add_argument("--token-indices", type=str, default="1,9")
+    parser.add_argument("--seed", type=int, default=0)
+    args = parser.parse_args()
+
+    token_indices = _parse_token_indices(args.token_indices, args.token_capacity)
+    artifact, expected = build_artifact(
+        d_head=args.d_head,
+        token_capacity=args.token_capacity,
+        token_indices=token_indices,
+        seed=args.seed,
+    )
+
+    program_name = (
+        f"cv32e40p_decode_attention_d{args.d_head}_t{args.token_capacity}"
+        f"_n{len(token_indices)}_s{args.seed}_v2"
+    )
     program_symbol = _sanitize(program_name)
     program_path = GENERATED_DIR / f"{program_name}_program.c"
     runner_path = GENERATED_DIR / f"{program_name}_runner.c"
 
-    artifact, expected = build_artifact()
     source = emit_cv32e40p_program_v2(artifact, {}, program_name=program_name)
     GENERATED_DIR.mkdir(exist_ok=True)
     program_path.write_text(source)
@@ -261,13 +274,14 @@ def main() -> int:
             str(CORE_DIR / "obj_dir" / "cv32e40p_tb_vlt_npu"),
             "+verilator+noassert",
             f"+firmware={hex_path}",
-            "+maxcycles=500000",
+            "+maxcycles=1000000",
         ],
         cwd=CORE_DIR,
         env=env,
         capture=True,
     )
     print(f"program={program_name}")
+    print(f"d_head={args.d_head} token_capacity={args.token_capacity} token_indices={token_indices} seed={args.seed}")
     print(f"expected_checksum={int(expected.astype(np.int64).sum())}")
     print(proc.stdout)
     return 0
