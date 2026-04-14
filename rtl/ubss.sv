@@ -58,6 +58,7 @@ module ubss #(
     input  logic [ 1:0]                    ppu_write_offset,
     input  output_layout_t                 ppu_output_layout,
     input  writeback_mode_t                ppu_writeback_mode,
+    input  logic [$clog2(`ARRAY_SIZE)-1:0] ppu_cache_lane_idx,
 
     // ------------------------------------------------------------------------
     // Outputs
@@ -79,7 +80,10 @@ module ubss #(
     always_comb begin
         ub_wr_mask = '1; // Default: Write all bits (for MMIO/Load)
         if (ppu_wb_en) begin
-            if (ppu_output_layout == OUT_LAYOUT_A || ppu_output_layout == OUT_LAYOUT_B) begin
+            if (ppu_writeback_mode == WB_MODE_K_CACHE_APPEND_INT16) begin
+                ub_wr_mask = '0;
+                ub_wr_mask[ppu_cache_lane_idx*16 +: 16] = 16'hFFFF;
+            end else if (ppu_output_layout == OUT_LAYOUT_A || ppu_output_layout == OUT_LAYOUT_B) begin
                 ub_wr_mask = '1;
             end else begin
                 unique case (ppu_out_precision)
@@ -285,6 +289,7 @@ module ubss #(
         .write_offset(ppu_write_offset),
         .output_layout(ppu_output_layout),
         .writeback_mode(ppu_writeback_mode),
+        .cache_lane_idx(ppu_cache_lane_idx),
         .bias_in(cu_rdata),
         .acc_in(bottom_row_acc),
         .ub_wdata(ppu_wdata)

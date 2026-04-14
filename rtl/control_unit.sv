@@ -54,6 +54,7 @@ module control_unit #(
     output logic [ 1:0]                    ppu_write_offset,
     output output_layout_t                 ppu_output_layout,
     output writeback_mode_t                ppu_writeback_mode,
+    output logic [$clog2(`ARRAY_SIZE)-1:0] ppu_cache_lane_idx,
 
     input logic all_done_in
 );
@@ -230,7 +231,7 @@ module control_unit #(
     logic [$clog2(`ARRAY_SIZE+1)-1:0] a_words_per_tile;
     logic [$clog2(`ARRAY_SIZE+1)-1:0] b_words_per_tile;
     logic        wb_valid_cycle;
-    logic [$clog2(`ARRAY_SIZE)-1:0] v_cache_row_in_block;
+    logic [$clog2(`ARRAY_SIZE)-1:0] cache_lane_idx;
     logic [`ADDR_WIDTH-1:0] mm_c_effective_base;
 
     always_comb begin
@@ -269,14 +270,14 @@ module control_unit #(
                 b_words_per_tile = `ARRAY_SIZE;
             end
         endcase
-        v_cache_row_in_block = mm_output_word_offset[$clog2(`ARRAY_SIZE)-1:0];
+        cache_lane_idx = mm_output_word_offset[$clog2(`ARRAY_SIZE)-1:0];
         unique case (mm_output_layout)
             OUT_LAYOUT_A: wb_valid_cycle = (cycle_cnt < a_words_per_tile);
             OUT_LAYOUT_B: wb_valid_cycle = (cycle_cnt < b_words_per_tile);
             default:      wb_valid_cycle = 1'b1;
         endcase
         if (mm_writeback_mode == WB_MODE_V_CACHE_APPEND_INT16) begin
-            wb_valid_cycle = (mm_out_precision == MODE_INT16) && (cycle_cnt == v_cache_row_in_block);
+            wb_valid_cycle = (mm_out_precision == MODE_INT16) && (cycle_cnt == cache_lane_idx);
         end
         mm_c_effective_base = mm_c_base + mm_output_word_offset;
     end
@@ -314,6 +315,7 @@ module control_unit #(
         ppu_write_offset = (mm_output_layout == OUT_LAYOUT_C) ? packed_write_offset : 2'b0;
         ppu_output_layout = mm_output_layout;
         ppu_writeback_mode = mm_writeback_mode;
+        ppu_cache_lane_idx = cache_lane_idx;
         mmvr_wr_en = 1'b0;
         mmvr_out = '0;
 
@@ -539,6 +541,8 @@ module control_unit #(
 
         if (mm_writeback_mode == WB_MODE_V_CACHE_APPEND_INT16) begin
           ub_addr = mm_c_effective_base + (n_idx * `ARRAY_SIZE);
+        end else if (mm_writeback_mode == WB_MODE_K_CACHE_APPEND_INT16) begin
+          ub_addr = mm_c_base + (mm_output_word_offset & ~(`ARRAY_SIZE - 1)) + (n_idx * `ARRAY_SIZE) + cycle_cnt;
         end else begin
           unique case (mm_output_layout)
             OUT_LAYOUT_A: begin

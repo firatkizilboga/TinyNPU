@@ -17,6 +17,7 @@ module ppu (
     input logic [                    1:0] write_offset,
     input output_layout_t                 output_layout,
     input writeback_mode_t                writeback_mode,
+    input logic [$clog2(`ARRAY_SIZE)-1:0] cache_lane_idx,
 
     // Data from Unified Buffer (for Bias Loading)
     input logic [`BUFFER_WIDTH-1:0] bias_in,
@@ -216,6 +217,8 @@ module ppu (
       for (int col = 0; col < `ARRAY_SIZE; col++) begin
         ub_wdata[col*16 +: 16] = storage[0][col];
       end
+    end else if (writeback_mode == WB_MODE_K_CACHE_APPEND_INT16) begin
+      ub_wdata[cache_lane_idx*16 +: 16] = storage[0][ppu_cycle_idx];
     end else if (output_layout == OUT_LAYOUT_A) begin
       unique case (precision)
         2'b00: begin
