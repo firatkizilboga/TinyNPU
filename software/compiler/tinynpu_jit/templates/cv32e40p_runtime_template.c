@@ -321,14 +321,96 @@ static void host_relu(TinyTensor *dst, const TinyTensor *src)
     }
 }
 
+static float host_exp_approx(float x);
+static float host_recip_approx(float x);
+
 static void host_sigmoid(TinyTensor *dst, const TinyTensor *src)
 {
     runtime_assert(dst->dtype == TINY_DTYPE_FLOAT32, "sigmoid expects float output");
     runtime_assert(dst->elem_count == src->elem_count, "sigmoid size mismatch");
     for (int i = 0; i < src->elem_count; ++i) {
         float value = tensor_get_float(src, i);
-        tensor_set_float(dst, i, 1.0f / (1.0f + expf(-value)));
+        float denom = 1.0f + host_exp_approx(-value);
+        tensor_set_float(dst, i, host_recip_approx(denom));
     }
+}
+
+static float host_exp_approx_neg_unit(float x)
+{
+    /* 5th-order Taylor on [-1, 0]. */
+    float y = 1.0f + x * (
+        1.0f + x * (
+            0.5f + x * (
+                0.16666667f + x * (
+                    0.04166667f + x * 0.0083333333f))));
+    return y > 0.0f ? y : 0.0f;
+}
+
+static float host_exp_approx(float x)
+{
+    static const float exp_neg_int[17] = {
+        1.0f,
+        0.36787945f,
+        0.13533528f,
+        0.049787067f,
+        0.018315639f,
+        0.0067379470f,
+        0.0024787522f,
+        0.00091188195f,
+        0.00033546263f,
+        0.00012340980f,
+        0.000045399930f,
+        0.000016701700f,
+        0.0000061442124f,
+        0.0000022603294f,
+        0.00000083152872f,
+        0.00000030590232f,
+        0.00000011253518f,
+    };
+
+    if (x == 0.0f) {
+        return 1.0f;
+    }
+    if (x > 0.0f) {
+        return host_recip_approx(host_exp_approx(-x));
+    }
+    if (x <= -16.0f) {
+        return 0.0f;
+    }
+
+    int k = (int)(-x);
+    float r = x + (float)k; /* r in [-1, 0] */
+    return exp_neg_int[k] * host_exp_approx_neg_unit(r);
+}
+
+static float host_recip_approx(float x)
+{
+    runtime_assert(x > 0.0f, "reciprocal input must be positive");
+
+    int exp2 = 0;
+    while (x > 1.0f) {
+        x *= 0.5f;
+        exp2 += 1;
+    }
+    while (x < 0.5f) {
+        x *= 2.0f;
+        exp2 -= 1;
+    }
+
+    /* Linear seed for 1/x on [0.5, 1.0]. */
+    float y = 2.8235295f - 1.8823529f * x;
+    y = y * (2.0f - x * y);
+    y = y * (2.0f - x * y);
+
+    while (exp2 > 0) {
+        y *= 0.5f;
+        exp2 -= 1;
+    }
+    while (exp2 < 0) {
+        y *= 2.0f;
+        exp2 += 1;
+    }
+    return y;
 }
 
 static void host_gelu(TinyTensor *dst, const TinyTensor *src)
@@ -458,14 +540,18 @@ static void host_softmax(TinyTensor *dst, const TinyTensor *src, int axis)
             float sum = 0.0f;
             for (int axis_idx = 0; axis_idx < extent; ++axis_idx) {
                 int linear = ((outer_idx * extent) + axis_idx) * inner + inner_idx;
-                float exp_value = expf(tensor_get_float(src, linear) - max_value);
+                float exp_value = host_exp_approx(tensor_get_float(src, linear) - max_value);
                 tensor_set_float(dst, linear, exp_value);
                 sum += exp_value;
             }
             runtime_assert(sum != 0.0f, "softmax sum is zero");
-            for (int axis_idx = 0; axis_idx < extent; ++axis_idx) {
-                int linear = ((outer_idx * extent) + axis_idx) * inner + inner_idx;
-                tensor_set_float(dst, linear, tensor_get_float(dst, linear) / sum);
+            {
+                float inv_sum = host_recip_approx(sum);
+                for (int axis_idx = 0; axis_idx < extent; ++axis_idx) {
+                    int linear = ((outer_idx * extent) + axis_idx) * inner + inner_idx;
+                    float normalized = tensor_get_float(dst, linear) * inv_sum;
+                    tensor_set_float(dst, linear, normalized);
+                }
             }
         }
     }
