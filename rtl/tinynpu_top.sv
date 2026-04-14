@@ -58,6 +58,7 @@ module tinynpu_top #(
     logic [ 1:0]                 ppu_out_precision;
     logic [ 1:0]                 ppu_write_offset;
     output_layout_t              ppu_output_layout;
+    writeback_mode_t             ppu_writeback_mode;
     logic                        sa_input_first, sa_input_last;
     logic                        sa_weight_first, sa_weight_last;
 
@@ -112,6 +113,7 @@ module tinynpu_top #(
         .ppu_out_precision(ppu_out_precision),
         .ppu_write_offset(ppu_write_offset),
         .ppu_output_layout(ppu_output_layout),
+        .ppu_writeback_mode(ppu_writeback_mode),
         .all_done_in    (all_done)
     );
 
@@ -157,6 +159,7 @@ module tinynpu_top #(
         .ppu_out_precision(ppu_out_precision),
         .ppu_write_offset(ppu_write_offset),
         .ppu_output_layout(ppu_output_layout),
+        .ppu_writeback_mode(ppu_writeback_mode),
         .results_flat   (results_flat),
         .result_valid   (result_valid),
         .all_done       (all_done)

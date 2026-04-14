@@ -21,7 +21,7 @@ from tinynpu_jit import (
     make_kv_cache_specs,
 )
 from tinynpu import TinyNPUProgram
-from tinynpu.isa import OutputLayout, PrecisionMode
+from tinynpu.isa import OutputLayout, PrecisionMode, WritebackMode
 
 
 def test_emit_cv32e40p_c_for_two_segment_relu_chain():
@@ -299,6 +299,31 @@ def test_tinynpu_program_encodes_b_word_offset_in_matmul_instruction():
     assert ((inst >> 72) & 0x3) == int(OutputLayout.C)
 
 
+def test_tinynpu_program_encodes_writeback_mode_in_matmul_instruction():
+    program = TinyNPUProgram()
+    lhs = np.ones((1, 8), dtype=np.int16)
+    rhs = np.ones((8, 16), dtype=np.int16)
+    program.declare_data("lhs", lhs, precision=PrecisionMode.INT16, role="A")
+    program.declare_data("rhs", rhs, precision=PrecisionMode.INT16, role="B")
+    program.declare_data("cache", np.zeros((16, 16), dtype=np.int16), precision=PrecisionMode.INT16, role="B")
+    program.matmul(
+        "lhs",
+        "rhs",
+        "cache",
+        in_precision=PrecisionMode.INT16,
+        out_precision=PrecisionMode.INT16,
+        output_layout=OutputLayout.B,
+        writeback_mode=WritebackMode.V_CACHE_APPEND_INT16,
+        output_word_offset=17,
+    )
+    program.halt()
+    binary = program.compile()
+
+    inst = int(binary["im"][0])
+    assert ((inst >> 248) & 0xF) == int(WritebackMode.V_CACHE_APPEND_INT16)
+    assert ((inst >> 184) & 0xFFFF) == 17
+
+
 def test_compile_plan_preserves_output_word_offset_in_segment_binary():
     lhs = np.eye(8, dtype=np.int16)
     rhs = np.eye(8, dtype=np.int16)
@@ -367,6 +392,43 @@ def test_compile_plan_preserves_b_word_offset_in_segment_binary():
     inst = int(artifact.segment_artifacts["seg_b_input_offset"].binary["im"][0])
     assert ((inst >> 56) & 0xFFFF) == 17
     assert ((inst >> 72) & 0x3) == int(OutputLayout.C)
+
+
+def test_compile_plan_preserves_writeback_mode_in_segment_binary():
+    lhs = np.ones((1, 8), dtype=np.int16)
+    rhs = np.ones((8, 16), dtype=np.int16)
+    expected = np.zeros((16, 16), dtype=np.int16)
+
+    tensors = {
+        "lhs": TensorSpec("lhs", lhs.shape, DType.INT16, TensorKind.CONSTANT, data=lhs),
+        "rhs": TensorSpec("rhs", rhs.shape, DType.INT16, TensorKind.CONSTANT, data=rhs),
+        "cache": TensorSpec("cache", expected.shape, DType.INT16, TensorKind.INTERMEDIATE),
+    }
+    steps = [
+        NpuSegment(
+            "seg_v_append_mode",
+            [
+                MatMulOp(
+                    "op0",
+                    "lhs",
+                    "rhs",
+                    "cache",
+                    output_layout="b",
+                    writeback_mode="v_cache_append_int16",
+                    output_word_offset=17,
+                )
+            ],
+            inputs=[],
+            outputs=[],
+        )
+    ]
+    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=[], outputs=[])
+    artifact = compile_plan(plan, {})
+
+    inst = int(artifact.segment_artifacts["seg_v_append_mode"].binary["im"][0])
+    assert ((inst >> 248) & 0xF) == int(WritebackMode.V_CACHE_APPEND_INT16)
+    assert ((inst >> 184) & 0xFFFF) == 17
+    assert ((inst >> 72) & 0x3) == int(OutputLayout.B)
 
 
 def test_compile_plan_supports_b_cache_views_for_append_and_consume():

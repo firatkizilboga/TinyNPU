@@ -57,6 +57,7 @@ module ubss #(
     input  logic [ 1:0]                    ppu_out_precision,
     input  logic [ 1:0]                    ppu_write_offset,
     input  output_layout_t                 ppu_output_layout,
+    input  writeback_mode_t                ppu_writeback_mode,
 
     // ------------------------------------------------------------------------
     // Outputs
@@ -283,6 +284,7 @@ module ubss #(
         .precision(ppu_out_precision),
         .write_offset(ppu_write_offset),
         .output_layout(ppu_output_layout),
+        .writeback_mode(ppu_writeback_mode),
         .bias_in(cu_rdata),
         .acc_in(bottom_row_acc),
         .ub_wdata(ppu_wdata)

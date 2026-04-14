@@ -64,6 +64,8 @@ class SegmentCompiler:
                 continue
             for index, op in enumerate(step.ops):
                 out_spec = plan.tensors[op.out]
+                if op.writeback_mode != "normal":
+                    continue
                 if out_spec.metadata.get("storage_view_of") and out_spec.metadata.get("storage_role", "B") == "B":
                     op.output_layout = "b"
                     continue
@@ -171,6 +173,11 @@ class SegmentCompiler:
                 output_layout = 1
             elif op.output_layout == "b":
                 output_layout = 2
+            writeback_mode = 0
+            if op.writeback_mode == "v_cache_append_int16":
+                writeback_mode = 1
+            elif op.writeback_mode == "k_cache_append_int16":
+                writeback_mode = 2
             program.matmul(
                 op.lhs,
                 op.rhs,
@@ -184,6 +191,7 @@ class SegmentCompiler:
                 write_offset=0,
                 h_gelu_x_scale_shift=int(op.h_gelu_x_scale_shift),
                 output_layout=output_layout,
+                writeback_mode=writeback_mode,
                 output_word_offset=int(op.output_word_offset),
                 b_word_offset=int(op.b_word_offset),
             )
