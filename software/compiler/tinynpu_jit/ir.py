@@ -204,3 +204,40 @@ def make_b_cache_specs(
         )
         specs[slot_name].metadata["cache_slot_stride_words"] = slot_stride_words
     return specs
+
+
+def make_kv_cache_specs(
+    *,
+    k_base_name: str,
+    v_base_name: str,
+    k_slot_shape: tuple[int, int],
+    v_slot_shape: tuple[int, int],
+    dtype: DType,
+    slot_suffixes: list[str],
+    kind: TensorKind = TensorKind.INTERMEDIATE,
+    array_size: int = 8,
+) -> dict[str, TensorSpec]:
+    specs: dict[str, TensorSpec] = {}
+    specs.update(
+        make_b_cache_specs(
+            k_base_name,
+            k_slot_shape,
+            dtype,
+            slot_names=[f"{k_base_name}_{suffix}" for suffix in slot_suffixes],
+            kind=kind,
+            cache_kind="K",
+            array_size=array_size,
+        )
+    )
+    specs.update(
+        make_b_cache_specs(
+            v_base_name,
+            v_slot_shape,
+            dtype,
+            slot_names=[f"{v_base_name}_{suffix}" for suffix in slot_suffixes],
+            kind=kind,
+            cache_kind="V",
+            array_size=array_size,
+        )
+    )
+    return specs
