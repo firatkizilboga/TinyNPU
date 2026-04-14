@@ -298,20 +298,7 @@ def estimate_matmul_cpu_counts(op: MatMulOp, tensors: dict[str, TensorSpec]) -> 
     if len(lhs_shape) != 2 or len(rhs_shape) != 2 or len(out_shape) != 2:
         raise ValueError(f"Expected rank-2 tensors for matmul cost model, got {lhs_shape}, {rhs_shape}, {out_shape}.")
 
-    if op.conv_stream is not None:
-        attrs = op.conv_stream
-        in_h = int(attrs["input_h"])
-        in_w = int(attrs["input_w"])
-        in_c = int(attrs["input_c"])
-        kernel = int(attrs["kernel_size"])
-        stride = int(attrs["stride"])
-        padding = int(attrs["padding"])
-        out_h = ((in_h + 2 * padding - kernel) // stride) + 1
-        out_w = ((in_w + 2 * padding - kernel) // stride) + 1
-        m = out_h * out_w
-        k = kernel * kernel * in_c
-    else:
-        m, k = lhs_shape
+    m, k = lhs_shape
 
     k_rhs, n = rhs_shape
     if k_rhs != k:

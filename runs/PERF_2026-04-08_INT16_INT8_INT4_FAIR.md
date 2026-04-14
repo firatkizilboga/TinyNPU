@@ -57,13 +57,15 @@ Shape used: `H=6, W=6, C=7, K=3, S=1, P=1, OC=7`
   `segment.cpu=265626`, giving an implied same-shape speedup of `21.92x`
   at the segment boundary (`265626 / 12118`).
 
-## INT16 linear CPU-vs-NPU (`cv32e40p_int16_cpu_vs_npu_linear_demo`)
+## INT16 single-matmul linear CPU-vs-NPU (`cv32e40p_int16_cpu_vs_npu_linear_demo`)
 
 - preload.ub=`1029`, preload.im=`32`
 - segment.stage=`30313`, segment.run=`530`, segment.readback=`3319`, segment.npu=`38525`
 - segment.cpu=`265001`
 
-## INT16 linear cold + 2 warm (`cv32e40p_int16_cpu_vs_npu_linear_cold2warm_demo`)
+## INT16 single-matmul linear cold + 2 warm (`cv32e40p_int16_cpu_vs_npu_linear_cold2warm_demo`)
+
+Note: this artifact is one matmul (`x[36,63] @ w[63,6] -> y[36,6]`). It is not the four-layer MLP used in the final report comparison.
 
 - Firmware: `-O3`, `TINYNPU_USE_SHARED_SRAM=1`
 - Simulator rebuild used: `--threads 4`, `OPT_FAST=-O3`, `-march=native -flto`,
@@ -77,7 +79,105 @@ Shape used: `H=6, W=6, C=7, K=3, S=1, P=1, OC=7`
 - extrapolated.10x.e2e.cpu=`2654511`
 - extrapolated.10x.speedup=`6.93x`
 
+## INT16 four-layer MLP, Runtime V2 repeat3 (`cv32e40p_iszero_mlp_multilayer_v2_repeat3`)
+
+- Plan: `quantize -> NpuSegment(segment_000, 4 ops) -> dequantize`
+- Segment contents: `fc1+relu`, `fc2+relu`, `fc3+hard-gelu`, `fc4+sigmoid`
+- Firmware: `-O3 -march=rv32imfc -DTINYNPU_USE_SHARED_SRAM=1 -DTNPU_RUNTIME_V2_DUMP_FINAL_OUTPUTS=0`
+- Log: `/tmp/mlp_multilayer_v2_repeat3.log`
+- Verification: `EXIT SUCCESS`
+- preload.ub=`26422`, preload.im=`183`, preload.total=`26605`
+- cold.npu=`23239`, cold.e2e.npu=`49844`
+- warm1.npu=`23239`
+- warm2.npu=`23239`
+- warm.avg.npu=`23239`
+- extrapolated.10x.e2e.npu=`258995`
+
+## INT16 four-layer MLP CPU-only baseline (`cv32e40p_iszero_mlp_multilayer_cpu_only_demo`)
+
+- Plan: `quantize -> cpu_matmul(fc1+relu, fc2+relu, fc3+hard-gelu, fc4+sigmoid) -> dequantize`
+- Firmware: `-O3 -march=rv32imfc -DTINYNPU_USE_SHARED_SRAM=1`
+- Log: `/tmp/mlp_multilayer_cpu_only.log`
+- Verification: `All outputs matched expected tensors`, `EXIT SUCCESS`
+- hostop.q_in=`13479`
+- segment.segment_000.cpu=`239229`
+- hostop.dq_out=`23`
+- e2e.cpu.1x=`252731`
+- extrapolated.10x.e2e.cpu=`2527310`
+- extrapolated.10x.speedup=`9.76x`
+
+## INT16 multi-layer conv gather ON, Runtime V2 repeat3 (`cv32e40p_fair_conv_multilayer_on_v2_repeat3`)
+
+- Plan: `quantize -> im2col(first conv input) -> NpuSegment(segment_000, 4 ops) -> layout_restore(final output) -> dequantize`
+- Segment contents: `conv1+relu`, `conv2+relu` with gather, `conv3+relu` with gather, `conv4+sigmoid` with gather
+- Firmware: `-O3 -march=rv32imfc -DTINYNPU_USE_SHARED_SRAM=1 -DTNPU_RUNTIME_V2_DUMP_FINAL_OUTPUTS=0`
+- Simulator: optimized Verilator path with `threads=4`, `OPT_FAST=-O3`, `-march=native -flto`,
+  `--x-assign fast`, `--x-initial fast`, `--inline-mult 0`, `+verilator+noassert`
+- Timing boundary: preloads are paid once; each repeat measures the full NPU-path body
+  (`q_in`, first `im2col`, merged NPU segment, final `layout_restore`, `dq_out`).
+  Verification/autoverify runs outside the timed body window.
+- preload.ub=`10998`, preload.im=`183`, preload.total=`11181`
+- cold.npu=`35087`, cold.e2e.npu=`46268`
+- warm1.npu=`35087`
+- warm2.npu=`35087`
+- warm.avg.npu=`35087`
+- extrapolated.10x.e2e.npu=`362051`
+
+## INT16 multi-layer conv gather OFF, Runtime V2 repeat3 (`cv32e40p_fair_conv_multilayer_off_v2_repeat3`)
+
+- Plan: `quantize -> im2col1 -> NpuSegment(segment_000) -> im2col2 -> NpuSegment(segment_001) -> im2col3 -> NpuSegment(segment_002) -> im2col4 -> NpuSegment(segment_003) -> layout_restore -> dequantize`
+- Firmware: `-O3 -march=rv32imfc -DTINYNPU_USE_SHARED_SRAM=1 -DTNPU_RUNTIME_V2_DUMP_FINAL_OUTPUTS=0`
+- Simulator: optimized Verilator path with `threads=4`, `OPT_FAST=-O3`, `-march=native -flto`,
+  `--x-assign fast`, `--x-initial fast`, `--inline-mult 0`, `+verilator+noassert`
+- Log: `/tmp/multilayer_conv_off_v2_repeat3.log`
+- Verification: `EXIT SUCCESS`
+- preload.ub=`10998`
+- preload.im_segment_000=`87`
+- preload.im_segment_001=`87`
+- preload.im_segment_002=`87`
+- preload.im_segment_003=`87`
+- preload.total=`11346`
+- cold.npu=`159182`, cold.e2e.npu=`170528`
+- warm1.npu=`159182`
+- warm2.npu=`159182`
+- warm.avg.npu=`159182`
+- extrapolated.10x.e2e.npu=`1603166`
+
+## INT16 multi-layer conv CPU-only no-gather baseline (`cv32e40p_fair_conv_multilayer_off_cpu_only_demo`)
+
+- Plan: `quantize -> im2col1 -> cpu_matmul1+relu -> im2col2 -> cpu_matmul2+relu -> im2col3 -> cpu_matmul3+relu -> im2col4 -> cpu_matmul4+sigmoid -> layout_restore -> dequantize`
+- Firmware: `-O3 -march=rv32imfc -DTINYNPU_USE_SHARED_SRAM=1`
+- Simulator: optimized Verilator path with `threads=4`, `OPT_FAST=-O3`, `-march=native -flto`,
+  `--x-assign fast`, `--x-initial fast`, `--inline-mult 0`, `+verilator+noassert`
+- Log: `/tmp/multilayer_conv_cpu_only_1x.log`
+- Verification: `All outputs matched expected tensors`, `EXIT SUCCESS`
+- hostop.q_in=`13723`
+- hostop.inner_conv1_im2col=`2230`
+- segment.segment_000.cpu=`141064`
+- hostop.inner_conv2_im2col=`31880`
+- segment.segment_001.cpu=`684205`
+- hostop.inner_conv3_im2col=`8046`
+- segment.segment_002.cpu=`170587`
+- hostop.inner_conv4_im2col=`1294`
+- segment.segment_003.cpu=`1660`
+- hostop.inner_conv4_layout_restore=`16`
+- hostop.dq_out=`31`
+- cpu_segments.total=`997516`
+- host_boundary.total=`57220`
+- e2e.cpu.1x=`1054736`
+- extrapolated.10x.e2e.cpu=`10547360`
+
+## INT16 model-level E2E comparisons
+
+- Four-layer MLP CPU-only 10x vs four-layer MLP NPU 10x E2E: `2527310 / 258995 = 9.76x`
+- CPU-only no-gather 1x vs gather OFF NPU cold E2E: `1054736 / 170528 = 6.18x`
+- CPU-only no-gather 1x vs gather ON NPU cold E2E: `1054736 / 46268 = 22.79x`
+- CPU-only no-gather 10x vs gather OFF NPU 10x E2E: `10547360 / 1603166 = 6.58x`
+- CPU-only no-gather 10x vs gather ON NPU 10x E2E: `10547360 / 362051 = 29.13x`
+- Gather ON vs gather OFF NPU 10x E2E: `1603166 / 362051 = 4.43x`
+
 ## Notes
 
-- The runs above were generated through Runtime V1 emit (`emit_cv32e40p_c`) with `TINYNPU_USE_SHARED_SRAM=1`.
+- Unless a section explicitly says `Runtime V2`, the runs above were generated through Runtime V1 emit
+  (`emit_cv32e40p_c`) with `TINYNPU_USE_SHARED_SRAM=1`.
 - These measurements include readback in `segment.*.npu` (stage + run + readback).

@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-from collections import Counter
-import os
-
 import numpy as np
 
 from tinynpu import TinyNPUProgram
@@ -18,22 +15,13 @@ from .memory_planner import (
 
 
 class SegmentCompiler:
-    def __init__(self, defines_path: str | None = None, enable_conv_stream: bool | None = None):
+    def __init__(self, defines_path: str | None = None):
         self.defines_path = defines_path
-        if enable_conv_stream is None:
-            env_value = os.getenv("TINYNPU_ENABLE_CONV_STREAM", "1").strip().lower()
-            self.enable_conv_stream = env_value in {"1", "true", "yes", "on"}
-        else:
-            self.enable_conv_stream = bool(enable_conv_stream)
-        packed_env = os.getenv("TINYNPU_ENABLE_CONV_STREAM_PACKED", "0").strip().lower()
-        self.enable_conv_stream_packed = packed_env in {"1", "true", "yes", "on"}
 
     def compile(self, plan: ExecutionPlan, expected_tensors: dict[str, np.ndarray]) -> CompiledArtifact:
         _tmp = TinyNPUProgram(defines_path=self.defines_path)
         array_size = int(_tmp.hw.params.get("ARRAY_SIZE", 8))
         self._fuse_layout_restore_im2col(plan)
-        if self.enable_conv_stream:
-            self._materialize_conv_stream_im2col(plan, array_size=array_size)
         self._annotate_output_layouts(plan)
         # Read UB capacity from hardware config
         ub_capacity = int(_tmp.hw.params.get("BUFFER_DEPTH", 0))
@@ -67,145 +55,8 @@ class SegmentCompiler:
             static_ub_image=memory_report.static_ub_image,
         )
 
-    @staticmethod
-    def _is_matrix_hwc_source_shape(shape: tuple[int, ...], out_h: int, out_w: int, out_c: int) -> bool:
-        if len(shape) != 2:
-            return False
-        return int(shape[0]) == (out_h * out_w) and int(shape[1]) == out_c
-
     def _fuse_layout_restore_im2col(self, plan: ExecutionPlan) -> None:
-        tensor_uses: Counter[str] = Counter()
-        for step in plan.steps:
-            if isinstance(step, HostOp):
-                for name in step.inputs:
-                    tensor_uses[name] += 1
-            elif isinstance(step, NpuSegment):
-                for op in step.ops:
-                    tensor_uses[op.lhs] += 1
-                    tensor_uses[op.rhs] += 1
-                    if op.bias:
-                        tensor_uses[op.bias] += 1
-            elif isinstance(step, VerifyTensor):
-                tensor_uses[step.tensor_name] += 1
-        for out_name in plan.outputs:
-            tensor_uses[out_name] += 1
-
-        rewritten_steps = []
-        i = 0
-        while i < len(plan.steps):
-            step = plan.steps[i]
-            if (
-                isinstance(step, HostOp)
-                and step.kind == "layout_restore"
-                and i + 1 < len(plan.steps)
-                and isinstance(plan.steps[i + 1], HostOp)
-                and plan.steps[i + 1].kind == "im2col"
-            ):
-                next_step = plan.steps[i + 1]
-                restored_name = step.outputs[0]
-                if next_step.inputs and next_step.inputs[0] == restored_name and tensor_uses[restored_name] == 1:
-                    out_h = int(step.attrs["out_h"])
-                    out_w = int(step.attrs["out_w"])
-                    out_channels = int(step.attrs["out_channels"])
-                    src_name = step.inputs[0]
-                    src_spec = plan.tensors.get(src_name)
-                    if src_spec and self._is_matrix_hwc_source_shape(src_spec.shape, out_h, out_w, out_channels):
-                        fused_attrs = dict(next_step.attrs)
-                        fused_attrs["input_layout"] = "matrix_hwc"
-                        fused_attrs["matrix_h"] = out_h
-                        fused_attrs["matrix_w"] = out_w
-                        fused_attrs["matrix_c"] = out_channels
-                        next_step.inputs = [src_name]
-                        next_step.attrs = fused_attrs
-                        rewritten_steps.append(next_step)
-                        i += 2
-                        continue
-            rewritten_steps.append(step)
-            i += 1
-
-        plan.steps = rewritten_steps
-
-    def _materialize_conv_stream_im2col(self, plan: ExecutionPlan, *, array_size: int) -> None:
-        def physical_per_word(dtype: DType) -> int:
-            if dtype == DType.INT4:
-                return 4
-            if dtype == DType.INT8:
-                return 2
-            return 1
-
-        tensor_uses: Counter[str] = Counter()
-        for step in plan.steps:
-            if isinstance(step, HostOp):
-                for name in step.inputs:
-                    tensor_uses[name] += 1
-            elif isinstance(step, NpuSegment):
-                for op in step.ops:
-                    tensor_uses[op.lhs] += 1
-                    tensor_uses[op.rhs] += 1
-                    if op.bias:
-                        tensor_uses[op.bias] += 1
-
-        rewritten_steps = []
-        i = 0
-        while i < len(plan.steps):
-            step = plan.steps[i]
-            if (
-                isinstance(step, HostOp)
-                and step.kind == "im2col"
-                and str(step.attrs.get("input_layout")) == "matrix_hwc"
-                and i + 1 < len(plan.steps)
-                and isinstance(plan.steps[i + 1], NpuSegment)
-            ):
-                seg = plan.steps[i + 1]
-                if seg.ops:
-                    op = seg.ops[0]
-                    cols_name = step.outputs[0]
-                    src_name = step.inputs[0]
-                    # Packed conv-stream (INT8/INT4) remains opt-in.
-                    # Current gather metadata carries one source element per lane/cycle,
-                    # which is sufficient for INT16 but not enough to synthesize packed
-                    # subwords for lower precisions without additional hardware support.
-                    supports_conv_stream = (op.in_dtype == DType.INT16) or self.enable_conv_stream_packed
-                    if (
-                        op.lhs == cols_name
-                        and tensor_uses[cols_name] == 1
-                        and src_name in plan.tensors
-                        and supports_conv_stream
-                    ):
-                        kernel = int(step.attrs.get("kernel_size", 0))
-                        stride = int(step.attrs.get("stride", 1))
-                        padding = int(step.attrs.get("padding", 0))
-                        in_h = int(step.attrs.get("matrix_h", 0))
-                        in_w = int(step.attrs.get("matrix_w", 0))
-                        in_c = int(step.attrs.get("matrix_c", 0))
-                        src_shape = tuple(int(dim) for dim in plan.tensors[src_name].shape)
-                        source_is_matrix = len(src_shape) == 2 and src_shape[0] == (in_h * in_w) and src_shape[1] == in_c
-                        if (
-                            source_is_matrix
-                            and kernel > 0
-                            and stride > 0
-                        ):
-                            p_in = physical_per_word(op.in_dtype)
-                            c_phys = (in_c + p_in - 1) // p_in
-                            if c_phys > 0:
-                                op.lhs = src_name
-                                op.conv_stream = {
-                                    "input_h": in_h,
-                                    "input_w": in_w,
-                                    "input_c": in_c,
-                                    "kernel_size": kernel,
-                                    "stride": stride,
-                                    "padding": padding,
-                                }
-                                seg.inputs = sorted({name for name in seg.inputs if name != cols_name} | {src_name})
-                                rewritten_steps.append(seg)
-                                i += 2
-                                continue
-
-            rewritten_steps.append(step)
-            i += 1
-
-        plan.steps = rewritten_steps
+        return
 
     def _annotate_output_layouts(self, plan: ExecutionPlan) -> None:
         for step in plan.steps:
@@ -287,7 +138,6 @@ class SegmentCompiler:
                 write_offset=0,
                 h_gelu_x_scale_shift=int(op.h_gelu_x_scale_shift),
                 output_layout=output_layout,
-                conv_stream=op.conv_stream,
             )
 
         # Pre-assign globally planned addresses before compile() runs so that

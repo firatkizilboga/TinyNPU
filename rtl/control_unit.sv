@@ -29,13 +29,6 @@ module control_unit #(
     output logic [  `ADDR_WIDTH-1:0] ub_w_addr,
     output logic [`BUFFER_WIDTH-1:0] ub_wdata,
     input  logic [`BUFFER_WIDTH-1:0] ub_rdata,
-    // Conv-stream gather path (lane-wise UB reads for on-the-fly windowing)
-    output logic                     conv_stream_gather_en,
-    output logic [  `ADDR_WIDTH-1:0] conv_stream_lane_word_addr[`ARRAY_SIZE-1:0][3:0],
-    output logic [$clog2(`ARRAY_SIZE)-1:0] conv_stream_lane_word_lane[`ARRAY_SIZE-1:0][3:0],
-    output logic [1:0]               conv_stream_lane_subidx[`ARRAY_SIZE-1:0][3:0],
-    output logic [3:0]               conv_stream_lane_valid[`ARRAY_SIZE-1:0],
-    output logic [1:0]               conv_stream_in_precision,
 
     // Systolic Control & Markers
     output logic acc_clear,
@@ -114,13 +107,6 @@ module control_unit #(
   logic [ 1:0] mm_out_precision;
   logic [ 1:0] mm_write_offset;
   output_layout_t mm_output_layout;
-  logic        mm_conv_stream_en;
-  logic [ 7:0] mm_conv_kernel;
-  logic [ 7:0] mm_conv_stride;
-  logic [ 7:0] mm_conv_padding;
-  logic [15:0] mm_conv_in_h;
-  logic [15:0] mm_conv_in_w;
-  logic [14:0] mm_conv_in_c;
   logic [15:0] m_idx, n_idx, k_idx;
 
   // Flexible counter width for NxN support
@@ -154,13 +140,6 @@ module control_unit #(
       {mm_a_base, mm_b_base, mm_c_base, mm_bias_base, mm_m_total, mm_k_total, mm_n_total} <= '0;
       {mm_shift, mm_multiplier, mm_activation, mm_h_gelu_x_scale_shift, mm_in_precision, mm_out_precision, mm_write_offset} <= '0;
       mm_output_layout <= OUT_LAYOUT_C;
-      mm_conv_stream_en <= 1'b0;
-      mm_conv_kernel <= '0;
-      mm_conv_stride <= '0;
-      mm_conv_padding <= '0;
-      mm_conv_in_h <= '0;
-      mm_conv_in_w <= '0;
-      mm_conv_in_c <= '0;
       {m_idx, n_idx, k_idx, cycle_cnt} <= '0;
       perf_total_cycles <= '0;
       for (int perf_i = 0; perf_i < CTRL_STATE_COUNT; perf_i++) begin
@@ -210,13 +189,6 @@ module control_unit #(
         mm_in_precision   <= im_rdata[83:82];
         mm_h_gelu_x_scale_shift <= im_rdata[81:74];
         mm_output_layout  <= output_layout_t'(im_rdata[73:72]);
-        mm_conv_stream_en <= im_rdata[71];
-        mm_conv_kernel <= im_rdata[70:63];
-        mm_conv_stride <= im_rdata[62:55];
-        mm_conv_padding <= im_rdata[54:47];
-        mm_conv_in_h <= im_rdata[46:31];
-        mm_conv_in_w <= im_rdata[30:15];
-        mm_conv_in_c <= im_rdata[14:0];
         m_idx <= '0;
         n_idx <= '0;
         k_idx <= '0;
@@ -248,49 +220,6 @@ module control_unit #(
     logic [$clog2(`ARRAY_SIZE)-1:0]   a_word_base;
     logic [$clog2(`ARRAY_SIZE+1)-1:0] a_words_per_tile;
     logic        wb_valid_cycle;
-    logic [15:0] conv_row_lin;
-    logic [15:0] conv_out_h;
-    logic [15:0] conv_out_w;
-    logic [31:0] conv_out_elems;
-    logic [15:0] conv_c_phys;
-    logic [15:0] conv_c_tiles;
-    logic [15:0] conv_k_window_idx;
-    logic [15:0] conv_c_tile_idx;
-    logic [15:0] conv_oy;
-    logic [15:0] conv_ox;
-    logic [15:0] conv_ky;
-    logic [15:0] conv_kx;
-    logic [15:0] conv_in_y;
-    logic [15:0] conv_in_x;
-    logic [15:0] conv_in_row_lin;
-    logic [15:0] conv_input_addr;
-    logic        conv_row_valid;
-    logic [2:0]  conv_pack_factor;
-    logic [31:0] conv_window_elems;
-    logic [31:0] conv_k_logical_base;
-    logic [31:0] conv_k_limit;
-    int signed conv_num_h_i;
-    int signed conv_num_w_i;
-    logic [15:0] conv_lane_row_lin;
-    logic [15:0] conv_lane_oy;
-    logic [15:0] conv_lane_ox;
-    logic [15:0] conv_lane_in_y;
-    logic [15:0] conv_lane_in_x;
-    logic [15:0] conv_lane_in_row_lin;
-    logic [15:0] conv_lane_col_tile;
-    logic [15:0] conv_lane_col_lane;
-    logic [15:0] conv_lane_row_tile;
-    logic [$clog2(`ARRAY_SIZE)-1:0] conv_lane_row_lane;
-    logic [15:0] conv_lane_window_idx;
-    logic [15:0] conv_lane_kx;
-    logic [15:0] conv_lane_ky;
-    logic [31:0] conv_lane_k_logical;
-    logic [15:0] conv_lane_k_channel;
-    logic [15:0] conv_lane_k_channel_phys;
-    logic [1:0]  conv_lane_fetch_subidx;
-    int signed conv_lane_in_y_i;
-    int signed conv_lane_in_x_i;
-    logic conv_lane_valid_i;
 
     always_comb begin
         unique case (mm_out_precision)
@@ -323,100 +252,6 @@ module control_unit #(
             end
         endcase
         wb_valid_cycle = (mm_output_layout != OUT_LAYOUT_A) || (cycle_cnt < a_words_per_tile);
-
-        conv_row_lin = (m_idx * `ARRAY_SIZE) + cycle_cnt;
-        conv_out_h = 16'd0;
-        conv_out_w = 16'd0;
-        conv_num_h_i = int'(mm_conv_in_h) + (int'(mm_conv_padding) * 2) - int'(mm_conv_kernel);
-        conv_num_w_i = int'(mm_conv_in_w) + (int'(mm_conv_padding) * 2) - int'(mm_conv_kernel);
-        if (mm_conv_stride != 0 && mm_conv_kernel != 0 && conv_num_h_i >= 0 && conv_num_w_i >= 0) begin
-            conv_out_h = (conv_num_h_i / int'(mm_conv_stride)) + 1;
-            conv_out_w = (conv_num_w_i / int'(mm_conv_stride)) + 1;
-        end
-        conv_out_elems = conv_out_h * conv_out_w;
-        unique case (mm_in_precision)
-            2'b00: conv_pack_factor = 3'd4; // INT4
-            2'b01: conv_pack_factor = 3'd2; // INT8
-            default: conv_pack_factor = 3'd1; // INT16
-        endcase
-        conv_c_phys = (mm_conv_in_c + conv_pack_factor - 1) / conv_pack_factor;
-        conv_c_tiles = (conv_c_phys + `ARRAY_SIZE - 1) / `ARRAY_SIZE;
-        conv_k_window_idx = (conv_c_tiles != 0) ? (k_idx / conv_c_tiles) : 16'd0;
-        conv_c_tile_idx = (conv_c_tiles != 0) ? (k_idx % conv_c_tiles) : 16'd0;
-        conv_ky = (mm_conv_kernel != 0) ? (conv_k_window_idx / mm_conv_kernel) : 16'd0;
-        conv_kx = (mm_conv_kernel != 0) ? (conv_k_window_idx % mm_conv_kernel) : 16'd0;
-        conv_oy = (conv_out_w != 0) ? (conv_row_lin / conv_out_w) : 16'd0;
-        conv_ox = (conv_out_w != 0) ? (conv_row_lin % conv_out_w) : 16'd0;
-        conv_in_y = (conv_oy * mm_conv_stride) + conv_ky - mm_conv_padding;
-        conv_in_x = (conv_ox * mm_conv_stride) + conv_kx - mm_conv_padding;
-        conv_in_row_lin = (conv_in_y * mm_conv_in_w) + conv_in_x;
-        conv_input_addr = mm_a_base
-            + ((conv_in_row_lin / `ARRAY_SIZE) * (conv_c_tiles * `ARRAY_SIZE))
-            + (conv_c_tile_idx * `ARRAY_SIZE)
-            + (conv_in_row_lin % `ARRAY_SIZE);
-        conv_row_valid = (conv_row_lin < conv_out_elems);
-
-        conv_window_elems = mm_conv_kernel * mm_conv_kernel;
-        conv_k_logical_base = ((k_idx * `ARRAY_SIZE) + cycle_cnt) * conv_pack_factor;
-        conv_k_limit = conv_window_elems * mm_conv_in_c;
-
-        // Lane-wise gather metadata for conv_stream on raw matrix_hwc input.
-        // This matches software im2col logical order: channel -> ky -> kx.
-        conv_stream_gather_en = mm_conv_stream_en && (mm_conv_stride != 0) && (mm_conv_kernel != 0);
-        conv_stream_in_precision = mm_in_precision;
-        for (int lane = 0; lane < `ARRAY_SIZE; lane++) begin
-            conv_stream_lane_valid[lane] = '0;
-            for (int comp = 0; comp < 4; comp++) begin
-                conv_stream_lane_word_addr[lane][comp] = '0;
-                conv_stream_lane_word_lane[lane][comp] = '0;
-                conv_stream_lane_subidx[lane][comp] = '0;
-            end
-            if (conv_stream_gather_en && conv_window_elems != 0) begin
-                conv_lane_row_lin = (m_idx * `ARRAY_SIZE) + lane;
-                if (conv_lane_row_lin < conv_out_elems) begin
-                    conv_lane_oy = (conv_out_w != 0) ? (conv_lane_row_lin / conv_out_w) : 16'd0;
-                    conv_lane_ox = (conv_out_w != 0) ? (conv_lane_row_lin % conv_out_w) : 16'd0;
-                    for (int comp = 0; comp < 4; comp++) begin
-                        if (comp < conv_pack_factor) begin
-                            conv_lane_k_logical = conv_k_logical_base + comp;
-                            conv_lane_valid_i = (conv_lane_k_logical < conv_k_limit);
-                            if (conv_lane_valid_i) begin
-                                conv_lane_k_channel = conv_lane_k_logical / conv_window_elems;
-                                conv_lane_valid_i = (conv_lane_k_channel < mm_conv_in_c);
-                            end
-                            if (conv_lane_valid_i) begin
-                                conv_lane_window_idx = conv_lane_k_logical % conv_window_elems;
-                                conv_lane_kx = conv_lane_window_idx % mm_conv_kernel;
-                                conv_lane_ky = conv_lane_window_idx / mm_conv_kernel;
-                                conv_lane_in_y_i = int'(conv_lane_oy) * int'(mm_conv_stride)
-                                    + int'(conv_lane_ky) - int'(mm_conv_padding);
-                                conv_lane_in_x_i = int'(conv_lane_ox) * int'(mm_conv_stride)
-                                    + int'(conv_lane_kx) - int'(mm_conv_padding);
-                                conv_lane_valid_i = (conv_lane_in_y_i >= 0) && (conv_lane_in_y_i < int'(mm_conv_in_h))
-                                    && (conv_lane_in_x_i >= 0) && (conv_lane_in_x_i < int'(mm_conv_in_w));
-                            end
-                            if (conv_lane_valid_i) begin
-                                conv_lane_in_y = conv_lane_in_y_i[15:0];
-                                conv_lane_in_x = conv_lane_in_x_i[15:0];
-                                conv_lane_in_row_lin = (conv_lane_in_y * mm_conv_in_w) + conv_lane_in_x;
-                                conv_lane_row_tile = conv_lane_in_row_lin / `ARRAY_SIZE;
-                                conv_lane_row_lane = conv_lane_in_row_lin % `ARRAY_SIZE;
-                                conv_lane_k_channel_phys = conv_lane_k_channel / conv_pack_factor;
-                                conv_lane_fetch_subidx = conv_lane_k_channel % conv_pack_factor;
-                                conv_lane_col_tile = conv_lane_k_channel_phys / `ARRAY_SIZE;
-                                conv_lane_col_lane = conv_lane_k_channel_phys % `ARRAY_SIZE;
-                                conv_stream_lane_word_addr[lane][comp] = mm_a_base
-                                    + ((conv_lane_row_tile * conv_c_tiles + conv_lane_col_tile) * `ARRAY_SIZE)
-                                    + conv_lane_col_lane;
-                                conv_stream_lane_word_lane[lane][comp] = conv_lane_row_lane;
-                                conv_stream_lane_subidx[lane][comp] = conv_lane_fetch_subidx;
-                                conv_stream_lane_valid[lane][comp] = 1'b1;
-                            end
-                        end
-                    end
-                end
-            end
-        end
     end
 
     always_comb begin
@@ -621,15 +456,7 @@ module control_unit #(
       CTRL_MM_FEED: begin
         status_out = `STATUS_BUSY;
         compute_enable = 1'b1;
-
-        if (mm_conv_stream_en) begin
-          // Conv-stream gather drives UB reads lane-wise. Keep Port-A address
-          // parked on a valid base row to avoid out-of-range combinational
-          // lookups when padding introduces negative coordinates.
-          ub_addr = mm_a_base;
-        end else begin
-          ub_addr = mm_a_base + (m_idx * mm_k_total * `ARRAY_SIZE) + (k_idx * `ARRAY_SIZE) + cycle_cnt;
-        end
+        ub_addr = mm_a_base + (m_idx * mm_k_total * `ARRAY_SIZE) + (k_idx * `ARRAY_SIZE) + cycle_cnt;
         ub_w_addr = mm_b_base + (k_idx * mm_n_total * `ARRAY_SIZE) + (n_idx * `ARRAY_SIZE) + cycle_cnt;
 
         if (k_idx == 0 && cycle_cnt == 0) begin

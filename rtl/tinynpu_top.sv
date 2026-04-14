@@ -34,12 +34,6 @@ module tinynpu_top #(
     logic [`ADDR_WIDTH-1:0]      ub_w_addr;
     logic [`BUFFER_WIDTH-1:0]    ub_wdata;
     logic [`BUFFER_WIDTH-1:0]    ub_rdata;
-    logic                        conv_stream_gather_en;
-    logic [`ADDR_WIDTH-1:0]      conv_stream_lane_word_addr[`ARRAY_SIZE-1:0][3:0];
-    logic [$clog2(`ARRAY_SIZE)-1:0] conv_stream_lane_word_lane[`ARRAY_SIZE-1:0][3:0];
-    logic [1:0]                  conv_stream_lane_subidx[`ARRAY_SIZE-1:0][3:0];
-    logic [3:0]                  conv_stream_lane_valid[`ARRAY_SIZE-1:0];
-    logic [1:0]                  conv_stream_in_precision;
     logic                        acc_clear;
     logic                        compute_enable;
     logic                        drain_enable;
@@ -97,12 +91,6 @@ module tinynpu_top #(
         .ub_w_addr      (ub_w_addr),
         .ub_wdata       (ub_wdata),
         .ub_rdata       (ub_rdata),
-        .conv_stream_gather_en(conv_stream_gather_en),
-        .conv_stream_lane_word_addr(conv_stream_lane_word_addr),
-        .conv_stream_lane_word_lane(conv_stream_lane_word_lane),
-        .conv_stream_lane_subidx(conv_stream_lane_subidx),
-        .conv_stream_lane_valid(conv_stream_lane_valid),
-        .conv_stream_in_precision(conv_stream_in_precision),
         .acc_clear      (acc_clear),
         .compute_enable (compute_enable),
         .drain_enable   (drain_enable),
@@ -149,12 +137,6 @@ module tinynpu_top #(
         .sa_input_addr  (ub_addr),
         .sa_input_first (sa_input_first),
         .sa_input_last  (sa_input_last),
-        .conv_stream_gather_en(conv_stream_gather_en),
-        .conv_stream_lane_word_addr(conv_stream_lane_word_addr),
-        .conv_stream_lane_word_lane(conv_stream_lane_word_lane),
-        .conv_stream_lane_subidx(conv_stream_lane_subidx),
-        .conv_stream_lane_valid(conv_stream_lane_valid),
-        .conv_stream_in_precision(conv_stream_in_precision),
         .sa_weight_addr (ub_w_addr),
         .sa_weight_first(sa_weight_first),
         .sa_weight_last (sa_weight_last),

@@ -107,7 +107,6 @@ class TinyNPUProgram:
         write_offset=0,
         h_gelu_x_scale_shift=7,
         output_layout=OutputLayout.C,
-        conv_stream=None,
     ):
         if a_name not in self.symbols: raise ValueError(f"Symbol '{a_name}' not found.")
         if b_name not in self.symbols: raise ValueError(f"Symbol '{b_name}' not found.")
@@ -118,30 +117,9 @@ class TinyNPUProgram:
             A.storage_role = 'A'
         if B.storage_role != 'C':
             B.storage_role = 'B'
-        if conv_stream is None and A.shape[1] != B.shape[0]:
+        if A.shape[1] != B.shape[0]:
             raise ValueError(f"Dimension mismatch: {A.shape} and {B.shape}")
-        if conv_stream is not None:
-            in_h = int(conv_stream["input_h"])
-            in_w = int(conv_stream["input_w"])
-            in_c = int(conv_stream["input_c"])
-            kernel = int(conv_stream["kernel_size"])
-            stride = int(conv_stream["stride"])
-            padding = int(conv_stream["padding"])
-            if A.shape != (in_h * in_w, in_c):
-                raise ValueError(f"conv_stream expects lhs shape {(in_h * in_w, in_c)}, got {A.shape}.")
-            if kernel <= 0 or stride <= 0:
-                raise ValueError("conv_stream requires kernel_size > 0 and stride > 0.")
-            out_h = ((in_h + 2 * padding - kernel) // stride) + 1
-            out_w = ((in_w + 2 * padding - kernel) // stride) + 1
-            if out_h <= 0 or out_w <= 0:
-                raise ValueError("conv_stream produced non-positive output spatial dimensions.")
-            expected_out_rows = out_h * out_w
-            if B.shape[0] != (kernel * kernel * in_c):
-                raise ValueError(
-                    f"conv_stream expects rhs rows {kernel * kernel * in_c}, got {B.shape[0]}."
-                )
-        else:
-            expected_out_rows = A.shape[0]
+        expected_out_rows = A.shape[0]
         if output_layout == OutputLayout.A:
             out_role = 'A'
         elif output_layout == OutputLayout.B:
@@ -149,11 +127,11 @@ class TinyNPUProgram:
         else:
             out_role = 'C'
         if out_name not in self.symbols:
-            out_rows = expected_out_rows if conv_stream is not None else A.shape[0]
+            out_rows = expected_out_rows
             out_shape = (out_rows, B.shape[1])
             self.symbols[out_name] = Symbol(out_name, out_shape, out_precision, role=out_role)
         else:
-            out_rows = expected_out_rows if conv_stream is not None else A.shape[0]
+            out_rows = expected_out_rows
             self.symbols[out_name].shape = (out_rows, B.shape[1])
             self.symbols[out_name].storage_role = out_role
             self.symbols[out_name].precision = out_precision
@@ -176,11 +154,10 @@ class TinyNPUProgram:
             write_offset,
             h_gelu_x_scale_shift,
             output_layout,
-            conv_stream=conv_stream,
         )
         p_in = 1 << (2 - in_precision)
         instr.m = (expected_out_rows + self.array_size - 1) // self.array_size
-        logical_k = B.shape[0] if conv_stream is not None else A.shape[1]
+        logical_k = A.shape[1]
         k_phys = (logical_k + p_in - 1) // p_in
         instr.k = (k_phys + self.array_size - 1) // self.array_size
         instr.n = (B.shape[1] + self.array_size - 1) // self.array_size

@@ -285,14 +285,16 @@ static int tnpu_execute_host_op(TinyTensor *runtime_tensors, const TnpuHostOp *o
     }
 }
 
-static int tnpu_execute_segment(TinyTensor *runtime_tensors, const TnpuSegment *segment)
+static int tnpu_execute_segment(TinyTensor *runtime_tensors, const TnpuSegment *segment, int verbose)
 {
     uint32_t cycle_t0;
     uint32_t cycle_t1;
     uint32_t cycle_segment_t0;
     char label[96];
 
-    printf("NpuSegment: %s\n", segment->name ? segment->name : "segment");
+    if (verbose) {
+        printf("NpuSegment: %s\n", segment->name ? segment->name : "segment");
+    }
 
     cycle_segment_t0 = read_mcycle32();
     cycle_t0 = read_mcycle32();
@@ -312,16 +314,20 @@ static int tnpu_execute_segment(TinyTensor *runtime_tensors, const TnpuSegment *
         }
     }
     cycle_t1 = read_mcycle32();
-    snprintf(label, sizeof(label), "segment.%s.stage", segment->name ? segment->name : "segment");
-    print_cycle_delta32(label, cycle_t0, cycle_t1);
+    if (verbose) {
+        snprintf(label, sizeof(label), "segment.%s.stage", segment->name ? segment->name : "segment");
+        print_cycle_delta32(label, cycle_t0, cycle_t1);
+    }
 
     cycle_t0 = read_mcycle32();
     if (npu_run((uint32_t)segment->im_start_addr) != 0) {
         return 1;
     }
     cycle_t1 = read_mcycle32();
-    snprintf(label, sizeof(label), "segment.%s.run", segment->name ? segment->name : "segment");
-    print_cycle_delta32(label, cycle_t0, cycle_t1);
+    if (verbose) {
+        snprintf(label, sizeof(label), "segment.%s.run", segment->name ? segment->name : "segment");
+        print_cycle_delta32(label, cycle_t0, cycle_t1);
+    }
 
     cycle_t0 = read_mcycle32();
     for (uint32_t i = 0; i < segment->read_count; ++i) {
@@ -339,10 +345,12 @@ static int tnpu_execute_segment(TinyTensor *runtime_tensors, const TnpuSegment *
         }
     }
     cycle_t1 = read_mcycle32();
-    snprintf(label, sizeof(label), "segment.%s.readback", segment->name ? segment->name : "segment");
-    print_cycle_delta32(label, cycle_t0, cycle_t1);
-    snprintf(label, sizeof(label), "segment.%s.npu", segment->name ? segment->name : "segment");
-    print_cycle_delta32(label, cycle_segment_t0, cycle_t1);
+    if (verbose) {
+        snprintf(label, sizeof(label), "segment.%s.readback", segment->name ? segment->name : "segment");
+        print_cycle_delta32(label, cycle_t0, cycle_t1);
+        snprintf(label, sizeof(label), "segment.%s.npu", segment->name ? segment->name : "segment");
+        print_cycle_delta32(label, cycle_segment_t0, cycle_t1);
+    }
 
     return 0;
 }
@@ -449,26 +457,22 @@ static int tnpu_autoverify_outputs(TinyTensor *runtime_tensors, const TnpuProgra
     return 0;
 }
 
-int tinynpu_run(
+static TinyTensor *tnpu_prepare_runtime_tensors(
     const TnpuProgram *program,
     const TnpuTensor *const *inputs,
-    const TnpuTensor *const *outputs,
-    void *scratch,
-    uint32_t scratch_words)
+    const TnpuTensor *const *outputs)
 {
     TinyTensor *runtime_tensors;
-    (void)scratch;
-    (void)scratch_words;
 
     if (program == NULL || program->tensors == NULL) {
         printf("runtime v2: null program\n");
-        return EXIT_FAILURE;
+        return NULL;
     }
 
     runtime_tensors = (TinyTensor *)calloc(program->tensor_count, sizeof(TinyTensor));
     if (runtime_tensors == NULL) {
         printf("runtime v2: out of memory\n");
-        return EXIT_FAILURE;
+        return NULL;
     }
 
     for (uint32_t i = 0; i < program->tensor_count; ++i) {
@@ -487,17 +491,19 @@ int tinynpu_run(
 
     if (tnpu_bind_inputs(runtime_tensors, program, inputs) != 0) {
         free(runtime_tensors);
-        return EXIT_FAILURE;
+        return NULL;
     }
     if (tnpu_bind_outputs(runtime_tensors, program, outputs) != 0) {
         free(runtime_tensors);
-        return EXIT_FAILURE;
+        return NULL;
     }
 
-    tinynpu_set_force_mmio(0);
+    return runtime_tensors;
+}
 
-    printf("TinyNPU runtime v2 program: %s\n", program->name ? program->name : "program_v2");
-    tb_timer_reset_counter();
+static int tnpu_execute_preloads(const TnpuProgram *program, uint32_t *preload_total_out)
+{
+    uint32_t preload_total = 0;
 
     for (uint32_t op_idx = 0; op_idx < program->op_count; ++op_idx) {
         const TnpuOp *op = &program->ops[op_idx];
@@ -507,6 +513,7 @@ int tinynpu_run(
             uint32_t t1;
             load_ub_image(load->base_addr, load->image, (int)load->word_count);
             t1 = read_mcycle32();
+            preload_total += (t0 - t1);
             print_cycle_delta32(load->label ? load->label : "preload.ub_image", t0, t1);
         } else if (op->kind == TNPU_OP_PRELOAD_IM) {
             const TnpuImageLoad *load = &program->im_preloads[op->index];
@@ -514,42 +521,72 @@ int tinynpu_run(
             uint32_t t1;
             load_im_image(load->base_addr, load->image, (int)load->word_count);
             t1 = read_mcycle32();
+            preload_total += (t0 - t1);
             print_cycle_delta32(load->label ? load->label : "preload.im_image", t0, t1);
-        } else if (op->kind == TNPU_OP_HOST) {
+        }
+    }
+
+    if (preload_total_out != NULL) {
+        *preload_total_out = preload_total;
+    }
+    return 0;
+}
+
+static int tnpu_execute_body(TinyTensor *runtime_tensors, const TnpuProgram *program, int verbose_steps)
+{
+    for (uint32_t op_idx = 0; op_idx < program->op_count; ++op_idx) {
+        const TnpuOp *op = &program->ops[op_idx];
+        if (op->kind == TNPU_OP_PRELOAD_UB || op->kind == TNPU_OP_PRELOAD_IM || op->kind == TNPU_OP_VERIFY) {
+            continue;
+        }
+        if (op->kind == TNPU_OP_HOST) {
             const TnpuHostOp *host_op = &program->host_ops[op->index];
             uint32_t t0 = read_mcycle32();
             uint32_t t1;
             char label[96];
-            printf("HostOp: %s\n", host_op->name ? host_op->name : "host");
+            if (verbose_steps) {
+                printf("HostOp: %s\n", host_op->name ? host_op->name : "host");
+            }
             if (tnpu_execute_host_op(runtime_tensors, host_op) != 0) {
-                free(runtime_tensors);
-                return EXIT_FAILURE;
+                return 1;
             }
             t1 = read_mcycle32();
-            snprintf(label, sizeof(label), "hostop.%s", host_op->name ? host_op->name : "host");
-            print_cycle_delta32(label, t0, t1);
-        } else if (op->kind == TNPU_OP_SEGMENT) {
-            if (tnpu_execute_segment(runtime_tensors, &program->segments[op->index]) != 0) {
-                free(runtime_tensors);
-                return EXIT_FAILURE;
+            if (verbose_steps) {
+                snprintf(label, sizeof(label), "hostop.%s", host_op->name ? host_op->name : "host");
+                print_cycle_delta32(label, t0, t1);
             }
-        } else if (op->kind == TNPU_OP_VERIFY) {
-            if (tnpu_execute_verify(runtime_tensors, &program->verify_ops[op->index]) != 0) {
-                free(runtime_tensors);
-                return EXIT_FAILURE;
+        } else if (op->kind == TNPU_OP_SEGMENT) {
+            if (tnpu_execute_segment(runtime_tensors, &program->segments[op->index], verbose_steps) != 0) {
+                return 1;
             }
         } else {
             printf("runtime v2: unsupported op kind=%u\n", (unsigned)op->kind);
-            free(runtime_tensors);
-            return EXIT_FAILURE;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int tnpu_execute_verifies(TinyTensor *runtime_tensors, const TnpuProgram *program)
+{
+    for (uint32_t op_idx = 0; op_idx < program->op_count; ++op_idx) {
+        const TnpuOp *op = &program->ops[op_idx];
+        if (op->kind == TNPU_OP_VERIFY) {
+            if (tnpu_execute_verify(runtime_tensors, &program->verify_ops[op->index]) != 0) {
+                return 1;
+            }
         }
     }
 
     if (program->verify_op_count == 0u && tnpu_autoverify_outputs(runtime_tensors, program) != 0) {
-        free(runtime_tensors);
-        return EXIT_FAILURE;
+        return 1;
     }
 
+    return 0;
+}
+
+static void tnpu_dump_final_outputs(TinyTensor *runtime_tensors, const TnpuProgram *program)
+{
 #if TNPU_RUNTIME_V2_DUMP_FINAL_OUTPUTS
     if (program->output_count > 0) {
         printf("Final outputs:\n");
@@ -558,8 +595,125 @@ int tinynpu_run(
             print_tensor(&runtime_tensors[idx]);
         }
     }
+#else
+    (void)runtime_tensors;
+    (void)program;
 #endif
+}
 
+int tinynpu_run(
+    const TnpuProgram *program,
+    const TnpuTensor *const *inputs,
+    const TnpuTensor *const *outputs,
+    void *scratch,
+    uint32_t scratch_words)
+{
+    TinyTensor *runtime_tensors;
+    (void)scratch;
+    (void)scratch_words;
+    runtime_tensors = tnpu_prepare_runtime_tensors(program, inputs, outputs);
+    if (runtime_tensors == NULL) {
+        return EXIT_FAILURE;
+    }
+
+    tinynpu_set_force_mmio(0);
+
+    printf("TinyNPU runtime v2 program: %s\n", program->name ? program->name : "program_v2");
+    tb_timer_reset_counter();
+
+    if (tnpu_execute_preloads(program, NULL) != 0) {
+        free(runtime_tensors);
+        return EXIT_FAILURE;
+    }
+    if (tnpu_execute_body(runtime_tensors, program, 1) != 0) {
+        free(runtime_tensors);
+        return EXIT_FAILURE;
+    }
+    if (tnpu_execute_verifies(runtime_tensors, program) != 0) {
+        free(runtime_tensors);
+        return EXIT_FAILURE;
+    }
+    tnpu_dump_final_outputs(runtime_tensors, program);
+
+    free(runtime_tensors);
+    return EXIT_SUCCESS;
+}
+
+int tinynpu_run_repeat(
+    const TnpuProgram *program,
+    const TnpuTensor *const *inputs,
+    const TnpuTensor *const *outputs,
+    void *scratch,
+    uint32_t scratch_words,
+    uint32_t repeat_count)
+{
+    TinyTensor *runtime_tensors;
+    uint32_t preload_total = 0;
+    uint32_t cold_npu = 0;
+    uint32_t warm_sum = 0;
+    uint32_t warm_avg = 0;
+    uint32_t e2e_npu_10 = 0;
+    (void)scratch;
+    (void)scratch_words;
+
+    if (repeat_count == 0u) {
+        printf("runtime v2: repeat_count must be > 0\n");
+        return EXIT_FAILURE;
+    }
+
+    runtime_tensors = tnpu_prepare_runtime_tensors(program, inputs, outputs);
+    if (runtime_tensors == NULL) {
+        return EXIT_FAILURE;
+    }
+
+    tinynpu_set_force_mmio(0);
+
+    printf("TinyNPU runtime v2 program: %s\n", program->name ? program->name : "program_v2");
+    tb_timer_reset_counter();
+
+    if (tnpu_execute_preloads(program, &preload_total) != 0) {
+        free(runtime_tensors);
+        return EXIT_FAILURE;
+    }
+    printf("preload.total cycles=%lu\n", (unsigned long)preload_total);
+
+    for (uint32_t iter = 0; iter < repeat_count; ++iter) {
+        uint32_t t0;
+        uint32_t t1;
+        uint32_t delta;
+
+        printf("repeat.iter=%lu\n", (unsigned long)(iter + 1u));
+        fflush(stdout);
+        t0 = read_mcycle32();
+        if (tnpu_execute_body(runtime_tensors, program, 0) != 0) {
+            free(runtime_tensors);
+            return EXIT_FAILURE;
+        }
+        t1 = read_mcycle32();
+        delta = (t0 - t1);
+        if (tnpu_execute_verifies(runtime_tensors, program) != 0) {
+            free(runtime_tensors);
+            return EXIT_FAILURE;
+        }
+
+        if (iter == 0u) {
+            cold_npu = delta;
+            printf("cold.npu cycles=%lu\n", (unsigned long)cold_npu);
+            printf("cold.e2e.npu cycles=%lu\n", (unsigned long)(preload_total + cold_npu));
+        } else {
+            warm_sum += delta;
+            printf("warm%lu.npu cycles=%lu\n", (unsigned long)iter, (unsigned long)delta);
+        }
+    }
+
+    if (repeat_count > 1u) {
+        warm_avg = (warm_sum + ((repeat_count - 1u) / 2u)) / (repeat_count - 1u);
+        printf("warm.avg.npu cycles=%lu\n", (unsigned long)warm_avg);
+    }
+    e2e_npu_10 = preload_total + cold_npu + (9u * (repeat_count > 1u ? warm_avg : cold_npu));
+    printf("extrapolated.10x.e2e.npu cycles=%lu\n", (unsigned long)e2e_npu_10);
+
+    tnpu_dump_final_outputs(runtime_tensors, program);
     free(runtime_tensors);
     return EXIT_SUCCESS;
 }

@@ -55,11 +55,14 @@ digraph TinyNPUArchitecture {
         fontsize=20;
 
         UB [label="Unified Buffer", fillcolor="#efe8ff", color="#8b74bd", fontcolor="#2c2236", width=2.2, height=1.1];
+        WinGather [label="Window Gather\n(conv\\_stream)", shape=parallelogram, skew=0.4, fillcolor="#e7f6ec", color="#4f9a6c", fontcolor="#1f3328", width=2.1, height=1.1];
         InStream [label="Input\nStreamer", shape=parallelogram, skew=0.4, fillcolor="#e7f6ec", color="#4f9a6c", fontcolor="#1f3328", width=2.0, height=1.1];
         WtStream [label="Weight\nStreamer", shape=parallelogram, skew=0.4, fillcolor="#e7f6ec", color="#4f9a6c", fontcolor="#1f3328", width=2.0, height=1.1];
         SA [label="N x N\nSystolic\nArray", shape=box, width=2.1, height=2.1, fixedsize=true, fillcolor="#e7f6ec", color="#4f9a6c", fontcolor="#1f3328"];
 
-        UB -> InStream:w [label="activations"];
+        UB -> WinGather:w [label="lane reads"];
+        WinGather -> InStream:w [label="gathered A word"];
+        UB -> InStream:n [style=dashed, label="direct A read\n(conv\\_stream off)", fontcolor="#6e6e6e", color="#7a7a7a"];
         UB -> WtStream:w [label="weights"];
         InStream -> SA:w [label="horizontal feed"];
         WtStream -> SA:n [label="vertical feed"];

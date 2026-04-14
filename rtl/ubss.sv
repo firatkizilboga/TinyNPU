@@ -34,13 +34,6 @@ module ubss #(
     input  logic [`ADDR_WIDTH-1:0]   sa_input_addr,   // Base address for Input Matrix
     input  logic                     sa_input_first,  // Marker
     input  logic                     sa_input_last,   // Marker
-    input  logic                     conv_stream_gather_en,
-    input  logic [`ADDR_WIDTH-1:0]   conv_stream_lane_word_addr[`ARRAY_SIZE-1:0][3:0],
-    input  logic [$clog2(`ARRAY_SIZE)-1:0] conv_stream_lane_word_lane[`ARRAY_SIZE-1:0][3:0],
-    input  logic [1:0]               conv_stream_lane_subidx[`ARRAY_SIZE-1:0][3:0],
-    input  logic [3:0]               conv_stream_lane_valid[`ARRAY_SIZE-1:0],
-    input  logic [1:0]               conv_stream_in_precision,
-    
     input  logic [`ADDR_WIDTH-1:0]   sa_weight_addr,  // Base address for Weight Matrix
     input  logic                     sa_weight_first, // Marker
     input  logic                     sa_weight_last,  // Marker
@@ -184,12 +177,6 @@ module ubss #(
         .input_first_in  (ub_port_a_first_in),
         .input_last_in   (ub_port_a_last_in),
         .input_addr      (ub_port_a_addr),
-        .conv_stream_gather_en(conv_stream_gather_en),
-        .conv_stream_lane_word_addr(conv_stream_lane_word_addr),
-        .conv_stream_lane_word_lane(conv_stream_lane_word_lane),
-        .conv_stream_lane_subidx(conv_stream_lane_subidx),
-        .conv_stream_lane_valid(conv_stream_lane_valid),
-        .conv_stream_in_precision(conv_stream_in_precision),
         .input_first_out (skewer_input_first),
         .input_last_out  (skewer_input_last),
         .input_data      (skewer_input_data),

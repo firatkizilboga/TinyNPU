@@ -144,6 +144,14 @@ int tinynpu_run(
     void *scratch,
     uint32_t scratch_words);
 
+int tinynpu_run_repeat(
+    const TnpuProgram *program,
+    const TnpuTensor *const *inputs,
+    const TnpuTensor *const *outputs,
+    void *scratch,
+    uint32_t scratch_words,
+    uint32_t repeat_count);
+
 #ifdef __cplusplus
 }
 #endif
