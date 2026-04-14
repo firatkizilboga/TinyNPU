@@ -210,15 +210,17 @@ module control_unit #(
     end
   end
 
-    // Tile packing: derive physical address and byte lane from m_idx and precision.
-    // This aligns Row-Major Output C with Row-Major Input B for chaining.
+    // Packed writeback: A layout compresses the N dimension, B layout compresses
+    // the M dimension, and C layout uses packed write_offset updates in-place.
     logic [ 1:0] packed_write_offset;
     logic [15:0] m_idx_packed;
     logic [15:0] m_total_packed;
     logic [15:0] n_idx_packed;
     logic [15:0] n_total_packed;
     logic [$clog2(`ARRAY_SIZE)-1:0]   a_word_base;
+    logic [$clog2(`ARRAY_SIZE)-1:0]   b_word_base;
     logic [$clog2(`ARRAY_SIZE+1)-1:0] a_words_per_tile;
+    logic [$clog2(`ARRAY_SIZE+1)-1:0] b_words_per_tile;
     logic        wb_valid_cycle;
 
     always_comb begin
@@ -230,7 +232,9 @@ module control_unit #(
                 n_idx_packed     = n_idx >> 2;
                 n_total_packed   = (mm_n_total + 16'd3) >> 2;
                 a_word_base      = (n_idx[1:0] * (`ARRAY_SIZE / 4));
+                b_word_base      = (m_idx[1:0] * (`ARRAY_SIZE / 4));
                 a_words_per_tile = (`ARRAY_SIZE / 4);
+                b_words_per_tile = (`ARRAY_SIZE / 4);
             end
             2'b01: begin // INT8: 2 tiles per word
                 m_idx_packed     = m_idx >> 1;
@@ -239,7 +243,9 @@ module control_unit #(
                 n_idx_packed     = n_idx >> 1;
                 n_total_packed   = (mm_n_total + 16'd1) >> 1;
                 a_word_base      = (n_idx[0] * (`ARRAY_SIZE / 2));
+                b_word_base      = (m_idx[0] * (`ARRAY_SIZE / 2));
                 a_words_per_tile = (`ARRAY_SIZE / 2);
+                b_words_per_tile = (`ARRAY_SIZE / 2);
             end
             default: begin // INT16: 1 tile per word
                 m_idx_packed     = m_idx;
@@ -248,10 +254,16 @@ module control_unit #(
                 n_idx_packed     = n_idx;
                 n_total_packed   = mm_n_total;
                 a_word_base      = '0;
+                b_word_base      = '0;
                 a_words_per_tile = `ARRAY_SIZE;
+                b_words_per_tile = `ARRAY_SIZE;
             end
         endcase
-        wb_valid_cycle = (mm_output_layout != OUT_LAYOUT_A) || (cycle_cnt < a_words_per_tile);
+        unique case (mm_output_layout)
+            OUT_LAYOUT_A: wb_valid_cycle = (cycle_cnt < a_words_per_tile);
+            OUT_LAYOUT_B: wb_valid_cycle = (cycle_cnt < b_words_per_tile);
+            default:      wb_valid_cycle = 1'b1;
+        endcase
     end
 
     always_comb begin
@@ -284,7 +296,7 @@ module control_unit #(
         ppu_h_gelu_x_scale_shift = mm_h_gelu_x_scale_shift;
         ppu_in_precision = mm_in_precision;
         ppu_out_precision = mm_out_precision;
-        ppu_write_offset = (mm_output_layout == OUT_LAYOUT_A) ? 2'b0 : packed_write_offset;
+        ppu_write_offset = (mm_output_layout == OUT_LAYOUT_C) ? packed_write_offset : 2'b0;
         ppu_output_layout = mm_output_layout;
         mmvr_wr_en = 1'b0;
         mmvr_out = '0;
@@ -509,11 +521,17 @@ module control_unit #(
         ub_wr_en = wb_valid_cycle;
         ppu_wb_en = wb_valid_cycle;
 
-        if (mm_output_layout == OUT_LAYOUT_A) begin
-          ub_addr = mm_c_base + (m_idx * n_total_packed * `ARRAY_SIZE) + (n_idx_packed * `ARRAY_SIZE) + a_word_base + cycle_cnt;
-        end else begin
-          ub_addr = mm_c_base + (m_idx_packed * mm_n_total * `ARRAY_SIZE) + (n_idx * `ARRAY_SIZE) + cycle_cnt;
-        end
+        unique case (mm_output_layout)
+          OUT_LAYOUT_A: begin
+            ub_addr = mm_c_base + (m_idx * n_total_packed * `ARRAY_SIZE) + (n_idx_packed * `ARRAY_SIZE) + a_word_base + cycle_cnt;
+          end
+          OUT_LAYOUT_B: begin
+            ub_addr = mm_c_base + (m_idx_packed * mm_n_total * `ARRAY_SIZE) + (n_idx * `ARRAY_SIZE) + b_word_base + cycle_cnt;
+          end
+          default: begin
+            ub_addr = mm_c_base + (m_idx_packed * mm_n_total * `ARRAY_SIZE) + (n_idx * `ARRAY_SIZE) + cycle_cnt;
+          end
+        endcase
 
         if (cycle_cnt == (`ARRAY_SIZE - 1)) begin
           cycle_next = '0;

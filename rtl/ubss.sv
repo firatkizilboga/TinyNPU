@@ -78,7 +78,7 @@ module ubss #(
     always_comb begin
         ub_wr_mask = '1; // Default: Write all bits (for MMIO/Load)
         if (ppu_wb_en) begin
-            if (ppu_output_layout == OUT_LAYOUT_A) begin
+            if (ppu_output_layout == OUT_LAYOUT_A || ppu_output_layout == OUT_LAYOUT_B) begin
                 ub_wr_mask = '1;
             end else begin
                 unique case (ppu_out_precision)

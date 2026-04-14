@@ -242,6 +242,37 @@ module ppu (
           end
         end
       endcase
+    end else if (output_layout == OUT_LAYOUT_B) begin
+      unique case (precision)
+        2'b00: begin
+          if (ppu_cycle_idx < INT4_WORDS_PER_TILE) begin
+            for (int col = 0; col < `ARRAY_SIZE; col++) begin
+              logic [15:0] packed_word;
+              packed_word = '0;
+              for (int nib = 0; nib < 4; nib++) begin
+                packed_word |= (storage[(ppu_cycle_idx * 4) + nib][col] & 16'h000F) << (nib * 4);
+              end
+              ub_wdata[col*16 +: 16] = packed_word;
+            end
+          end
+        end
+        2'b01: begin
+          if (ppu_cycle_idx < INT8_WORDS_PER_TILE) begin
+            for (int col = 0; col < `ARRAY_SIZE; col++) begin
+              logic [15:0] packed_word;
+              packed_word = '0;
+              packed_word[7:0]  = storage[(ppu_cycle_idx * 2)][col][7:0];
+              packed_word[15:8] = storage[(ppu_cycle_idx * 2) + 1][col][7:0];
+              ub_wdata[col*16 +: 16] = packed_word;
+            end
+          end
+        end
+        default: begin
+          for (int col = 0; col < `ARRAY_SIZE; col++) begin
+            ub_wdata[col*16 +: 16] = storage[ppu_cycle_idx][col];
+          end
+        end
+      endcase
     end else begin
       unique case (precision)
         2'b00: begin
