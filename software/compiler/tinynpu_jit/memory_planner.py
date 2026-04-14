@@ -95,6 +95,51 @@ def infer_roles(segment: NpuSegment) -> dict[str, str]:
     return roles
 
 
+def _collect_referenced_tensor_names(segment: NpuSegment) -> set[str]:
+    names: set[str] = set(segment.inputs + segment.outputs)
+    for op in segment.ops:
+        names.update([op.lhs, op.rhs, op.out])
+        if op.bias:
+            names.add(op.bias)
+    return names
+
+
+def _augment_storage_view_bases(
+    segment: NpuSegment,
+    plan: ExecutionPlan,
+    roles: dict[str, str],
+    liveness: dict[str, TensorLiveness],
+) -> tuple[dict[str, str], dict[str, TensorLiveness]]:
+    augmented_roles = dict(roles)
+    augmented_liveness = dict(liveness)
+    views_by_base: dict[str, list[str]] = defaultdict(list)
+
+    for name in _collect_referenced_tensor_names(segment):
+        spec = plan.tensors.get(name)
+        if spec is None:
+            continue
+        base_name = spec.metadata.get("storage_view_of")
+        if base_name:
+            views_by_base[str(base_name)].append(name)
+
+    for base_name, view_names in views_by_base.items():
+        role = str(plan.tensors[view_names[0]].metadata.get("storage_role", "B"))
+        augmented_roles[base_name] = role
+
+        birth_op = min(augmented_liveness[view].birth_op for view in view_names if view in augmented_liveness)
+        death_op = max(augmented_liveness[view].death_op for view in view_names if view in augmented_liveness)
+        if base_name in augmented_liveness:
+            birth_op = min(birth_op, augmented_liveness[base_name].birth_op)
+            death_op = max(death_op, augmented_liveness[base_name].death_op)
+        augmented_liveness[base_name] = TensorLiveness(
+            name=base_name,
+            birth_op=birth_op,
+            death_op=death_op,
+        )
+
+    return augmented_roles, augmented_liveness
+
+
 # ---------------------------------------------------------------------------
 # Liveness analysis
 # ---------------------------------------------------------------------------
@@ -111,11 +156,7 @@ def compute_liveness(segment: NpuSegment) -> dict[str, TensorLiveness]:
     ops = segment.ops
     n = len(ops)
 
-    all_names: set[str] = set(segment.inputs + segment.outputs)
-    for op in ops:
-        all_names.update([op.lhs, op.rhs, op.out])
-        if op.bias:
-            all_names.add(op.bias)
+    all_names = _collect_referenced_tensor_names(segment)
 
     # Default: born before segment, outlives segment
     birth: dict[str, int] = {name: -1 for name in all_names}
@@ -272,7 +313,7 @@ def _linear_scan_dynamic(
     events: list[tuple[int, int, str, str]] = []
     for name, live in liveness.items():
         spec = plan.tensors.get(name)
-        if spec is None or spec.kind == TensorKind.CONSTANT:
+        if spec is None or spec.kind == TensorKind.CONSTANT or spec.metadata.get("storage_view_of"):
             continue
         alloc_at = max(0, live.birth_op)
         events.append((alloc_at, 1, name, "alloc"))
@@ -345,13 +386,14 @@ def plan_segment_memory(
     packer, array_size = _get_packer()
     roles = infer_roles(segment)
     liveness = compute_liveness(segment)
+    roles, liveness = _augment_storage_view_bases(segment, plan, roles, liveness)
 
     # Bump-allocate static tensors from address 0
     static_addr = 0
     static_entries: dict[str, MemoryPlanEntry] = {}
     for name in sorted(roles):
         spec = plan.tensors.get(name)
-        if spec is None or spec.kind != TensorKind.CONSTANT:
+        if spec is None or spec.kind != TensorKind.CONSTANT or spec.metadata.get("storage_view_of"):
             continue
         wc = _compute_word_count(spec, roles[name], packer, array_size)
         static_entries[name] = MemoryPlanEntry(name=name, address=static_addr, word_count=wc)
@@ -410,10 +452,12 @@ def plan_program_memory(
 
     for seg in segments:
         roles = infer_roles(seg)
+        liveness = compute_liveness(seg)
+        roles, liveness = _augment_storage_view_bases(seg, plan, roles, liveness)
         roles_by_seg[seg.name] = roles
         for name, role in roles.items():
             spec = plan.tensors.get(name)
-            if spec is not None and spec.kind == TensorKind.CONSTANT:
+            if spec is not None and spec.kind == TensorKind.CONSTANT and not spec.metadata.get("storage_view_of"):
                 static_key = (name, role)
                 static_keys_by_seg[seg.name][name] = static_key
                 static_specs[static_key] = spec
@@ -448,6 +492,7 @@ def plan_program_memory(
     for seg in segments:
         roles = roles_by_seg[seg.name]
         liveness = compute_liveness(seg)
+        roles, liveness = _augment_storage_view_bases(seg, plan, roles, liveness)
 
         dynamic_entries = _linear_scan_dynamic(
             seg, plan, roles, liveness, packer, array_size, static_zone_end, ub_capacity
@@ -478,8 +523,11 @@ def plan_program_memory(
     # ------------------------------------------------------------------
     tensor_seg_usage: dict[str, set[str]] = defaultdict(set)
     for seg in segments:
-        for name in seg.inputs + seg.outputs:
+        for name in _collect_referenced_tensor_names(seg):
             tensor_seg_usage[name].add(seg.name)
+            spec = plan.tensors.get(name)
+            if spec is not None and spec.metadata.get("storage_view_of"):
+                tensor_seg_usage[str(spec.metadata["storage_view_of"])].add(seg.name)
     cross_segment = sorted(name for name, segs in tensor_seg_usage.items() if len(segs) > 1)
 
     total_ub_peak = max((sp.total_words for sp in segment_plans), default=0)
