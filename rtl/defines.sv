@@ -56,6 +56,11 @@ typedef enum logic [3:0] {
     WB_MODE_K_CACHE_APPEND_INT16 = 4'b0010
 } writeback_mode_t;
 
+typedef enum logic [3:0] {
+    B_READ_MODE_NORMAL           = 4'b0000,
+    B_READ_MODE_K_CACHE_INT16    = 4'b0001
+} b_read_mode_t;
+
 // Instruction register field definitions
 typedef struct packed {
     precision_mode_t mode;        // [15:14] Bit-width mode

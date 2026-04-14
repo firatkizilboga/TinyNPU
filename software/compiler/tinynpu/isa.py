@@ -30,6 +30,10 @@ class WritebackMode(IntEnum):
     V_CACHE_APPEND_INT16 = 1
     K_CACHE_APPEND_INT16 = 2
 
+class BReadMode(IntEnum):
+    NORMAL = 0
+    K_CACHE_INT16 = 1
+
 class Instruction:
     def encode(self, symbol_to_addr):
         raise NotImplementedError()
@@ -52,6 +56,7 @@ class MatMul(Instruction):
         writeback_mode=WritebackMode.NORMAL,
         output_word_offset=0,
         b_word_offset=0,
+        b_read_mode=BReadMode.NORMAL,
     ):
         self.a = a
         self.b = b
@@ -68,6 +73,7 @@ class MatMul(Instruction):
         self.writeback_mode = writeback_mode
         self.output_word_offset = output_word_offset
         self.b_word_offset = b_word_offset
+        self.b_read_mode = b_read_mode
         
         # Tile dimensions (logical) will be set by the compiler during inference
         self.m = 0
@@ -100,6 +106,7 @@ class MatMul(Instruction):
         instr |= (self.h_gelu_x_scale_shift & 0xFF) << 74
         instr |= (self.output_layout & 0x3) << 72
         instr |= (self.b_word_offset & 0xFFFF) << 56
+        instr |= (self.b_read_mode & 0xF) << 52
         return instr
 
 class Move(Instruction):
@@ -146,6 +153,7 @@ def pack_matmul(
     writeback_mode=WritebackMode.NORMAL,
     output_word_offset=0,
     b_word_offset=0,
+    b_read_mode=BReadMode.NORMAL,
 ):
     instr = 0
     instr |= (opcode & 0xF) << 252
@@ -167,6 +175,7 @@ def pack_matmul(
     instr |= (h_gelu_x_scale_shift & 0xFF) << 74
     instr |= (output_layout & 0x3) << 72
     instr |= (b_word_offset & 0xFFFF) << 56
+    instr |= (b_read_mode & 0xF) << 52
     return instr
 
 def pack_move(opcode, src, dest, count):

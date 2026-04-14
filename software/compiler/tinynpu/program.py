@@ -2,7 +2,7 @@ import numpy as np
 import os
 import re
 import json
-from .isa import Opcode, HostCmd, PrecisionMode, MatMul, Move, Halt, OutputLayout, WritebackMode, generate_host_messages
+from .isa import Opcode, HostCmd, PrecisionMode, MatMul, Move, Halt, OutputLayout, WritebackMode, BReadMode, generate_host_messages
 from .packer import Packer
 from .memory import MemoryManager
 
@@ -137,6 +137,7 @@ class TinyNPUProgram:
         writeback_mode=WritebackMode.NORMAL,
         output_word_offset=0,
         b_word_offset=0,
+        b_read_mode=BReadMode.NORMAL,
     ):
         if a_name not in self.symbols: raise ValueError(f"Symbol '{a_name}' not found.")
         if b_name not in self.symbols: raise ValueError(f"Symbol '{b_name}' not found.")
@@ -209,6 +210,7 @@ class TinyNPUProgram:
             writeback_mode,
             out_total_word_offset,
             b_total_word_offset,
+            b_read_mode,
         )
         p_in = 1 << (2 - in_precision)
         instr.m = (expected_out_rows + self.array_size - 1) // self.array_size

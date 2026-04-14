@@ -102,6 +102,7 @@ module control_unit #(
   logic [`ADDR_WIDTH-1:0] mm_a_base, mm_b_base, mm_c_base, mm_bias_base;
   logic [`ADDR_WIDTH-1:0] mm_output_word_offset;
   logic [`ADDR_WIDTH-1:0] mm_b_word_offset;
+  b_read_mode_t mm_b_read_mode;
   logic [15:0] mm_m_total, mm_k_total, mm_n_total;
   logic [ 7:0] mm_shift;
   logic [15:0] mm_multiplier;
@@ -146,6 +147,7 @@ module control_unit #(
       {mm_shift, mm_multiplier, mm_activation, mm_h_gelu_x_scale_shift, mm_in_precision, mm_out_precision, mm_write_offset} <= '0;
       mm_output_layout <= OUT_LAYOUT_C;
       mm_writeback_mode <= WB_MODE_NORMAL;
+      mm_b_read_mode <= B_READ_MODE_NORMAL;
       {m_idx, n_idx, k_idx, cycle_cnt} <= '0;
       perf_total_cycles <= '0;
       for (int perf_i = 0; perf_i < CTRL_STATE_COUNT; perf_i++) begin
@@ -198,6 +200,7 @@ module control_unit #(
         mm_h_gelu_x_scale_shift <= im_rdata[81:74];
         mm_output_layout  <= output_layout_t'(im_rdata[73:72]);
         mm_b_word_offset <= im_rdata[71:56];
+        mm_b_read_mode <= b_read_mode_t'(im_rdata[55:52]);
         m_idx <= '0;
         n_idx <= '0;
         k_idx <= '0;
@@ -487,7 +490,11 @@ module control_unit #(
         status_out = `STATUS_BUSY;
         compute_enable = 1'b1;
         ub_addr = mm_a_base + (m_idx * mm_k_total * `ARRAY_SIZE) + (k_idx * `ARRAY_SIZE) + cycle_cnt;
-        ub_w_addr = mm_b_base + mm_b_word_offset + (k_idx * mm_n_total * `ARRAY_SIZE) + (n_idx * `ARRAY_SIZE) + cycle_cnt;
+        if (mm_b_read_mode == B_READ_MODE_K_CACHE_INT16) begin
+          ub_w_addr = mm_b_base + mm_b_word_offset + (n_idx * mm_k_total * `ARRAY_SIZE) + (k_idx * `ARRAY_SIZE) + cycle_cnt;
+        end else begin
+          ub_w_addr = mm_b_base + mm_b_word_offset + (k_idx * mm_n_total * `ARRAY_SIZE) + (n_idx * `ARRAY_SIZE) + cycle_cnt;
+        end
 
         if (k_idx == 0 && cycle_cnt == 0) begin
           sa_input_first  = 1'b1;
