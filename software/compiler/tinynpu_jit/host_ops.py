@@ -152,6 +152,10 @@ def _validate_rope(step: HostOp) -> None:
         raise ValueError(f"Host op 'rope' requires theta > 0, got {theta}.")
 
 
+def _validate_binary_same_shape(step: HostOp) -> None:
+    return
+
+
 def _softmax_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
     axis = int(step.attrs.get("axis", -1))
     values[step.outputs[0]] = golden.softmax(values[step.inputs[0]], axis=axis)
@@ -244,6 +248,25 @@ def _gelu_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, A
         reads=source_elements,
         adds=elems * 3,
         muls=elems * 2,
+        nonlinear=elems,
+        writes=elems,
+        branches=elems,
+    )
+
+
+def _silu_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
+    source = np.array(values[step.inputs[0]], dtype=np.float32, copy=False)
+    values[step.outputs[0]] = (source / (np.float32(1.0) + np.exp(-source))).astype(np.float32)
+
+
+def _silu_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
+    source_elements = int(np.array(values[step.inputs[0]], copy=False).size)
+    elems = int(np.array(values[step.outputs[0]], copy=False).size)
+    return "host_intrinsic", _counts(
+        reads=source_elements,
+        adds=elems * 2,
+        muls=elems,
+        divs=elems,
         nonlinear=elems,
         writes=elems,
         branches=elems,
@@ -430,6 +453,42 @@ def _rmsnorm_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str
     )
 
 
+def _mul_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
+    lhs = np.array(values[step.inputs[0]], dtype=np.float32, copy=False)
+    rhs = np.array(values[step.inputs[1]], dtype=np.float32, copy=False)
+    if lhs.shape != rhs.shape:
+        raise ValueError(f"mul requires same-shape inputs, got {lhs.shape} and {rhs.shape}.")
+    values[step.outputs[0]] = (lhs * rhs).astype(np.float32)
+
+
+def _mul_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
+    elems = int(np.array(values[step.outputs[0]], copy=False).size)
+    return "host_intrinsic", _counts(
+        reads=elems * 2,
+        muls=elems,
+        writes=elems,
+        branches=elems,
+    )
+
+
+def _add_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
+    lhs = np.array(values[step.inputs[0]], dtype=np.float32, copy=False)
+    rhs = np.array(values[step.inputs[1]], dtype=np.float32, copy=False)
+    if lhs.shape != rhs.shape:
+        raise ValueError(f"add requires same-shape inputs, got {lhs.shape} and {rhs.shape}.")
+    values[step.outputs[0]] = (lhs + rhs).astype(np.float32)
+
+
+def _add_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
+    elems = int(np.array(values[step.outputs[0]], copy=False).size)
+    return "host_intrinsic", _counts(
+        reads=elems * 2,
+        adds=elems,
+        writes=elems,
+        branches=elems,
+    )
+
+
 def _rope_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
     x = np.array(values[step.inputs[0]], dtype=np.float32, copy=False)
     out = np.array(x, copy=True)
@@ -504,6 +563,7 @@ def benchmark_host_op(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str,
 
 
 for _spec in (
+    HostOpSpec("add", _add_eval, _add_benchmark, input_arity=2, semantic_validator=_validate_binary_same_shape),
     HostOpSpec("alias", _alias_eval, _movement_benchmark),
     HostOpSpec(
         "dequantize",
@@ -531,6 +591,7 @@ for _spec in (
         semantic_validator=_validate_layout_restore,
     ),
     HostOpSpec("mean", _mean_eval, _mean_benchmark, semantic_validator=_validate_mean),
+    HostOpSpec("mul", _mul_eval, _mul_benchmark, input_arity=2, semantic_validator=_validate_binary_same_shape),
     HostOpSpec(
         "quantize",
         _quantize_eval,
@@ -559,6 +620,7 @@ for _spec in (
     HostOpSpec("reshape", _reshape_eval, _movement_benchmark, required_attrs=("shape",), semantic_validator=_validate_reshape),
     HostOpSpec("rope", _rope_eval, _rope_benchmark, required_attrs=("head_dim",), semantic_validator=_validate_rope),
     HostOpSpec("sigmoid", _sigmoid_eval, _sigmoid_benchmark),
+    HostOpSpec("silu", _silu_eval, _silu_benchmark),
     HostOpSpec("softmax", _softmax_eval, _softmax_benchmark),
     HostOpSpec("transpose", _transpose_eval, _movement_benchmark, semantic_validator=_validate_transpose),
 ):

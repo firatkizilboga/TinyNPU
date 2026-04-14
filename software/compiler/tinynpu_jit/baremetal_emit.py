@@ -263,6 +263,14 @@ def _emit_host_step_attrs(step: HostOp) -> tuple[list[str], list[str]]:
         lines.append(
             f"    host_rope({out_ref}, {in_ref}, {head_dim}, {position}, {_format_scalar(theta, dtype=DType.FLOAT32)});"
         )
+    elif step.kind == "silu":
+        lines.append(f"    host_silu({out_ref}, {in_ref});")
+    elif step.kind == "mul":
+        rhs_ref = _tensor_ref(step.inputs[1])
+        lines.append(f"    host_mul({out_ref}, {in_ref}, {rhs_ref});")
+    elif step.kind == "add":
+        rhs_ref = _tensor_ref(step.inputs[1])
+        lines.append(f"    host_add({out_ref}, {in_ref}, {rhs_ref});")
     else:
         raise NotImplementedError(f"Bare-metal runtime emitter does not support host op '{step.kind}'.")
     return decls, lines

@@ -1335,3 +1335,60 @@ def test_host_op_rope_emulation_and_v2_emit():
     artifact = compile_plan(plan, {"y": expected.astype(np.float32)})
     source = emit_cv32e40p_program_v2(artifact, {}, program_name="unit_test_rope_v2")
     assert "TNPU_HOST_ROPE" in source
+
+
+def test_host_op_silu_emulation_and_v2_emit():
+    x = np.array([[-1.0, 0.0, 1.5, 3.0]], dtype=np.float32)
+    expected = x / (1.0 + np.exp(-x))
+
+    values = {"x": x, "y": np.zeros_like(x)}
+    step = HostOp("silu0", "silu", inputs=["x"], outputs=["y"])
+    execute_host_op(step, values, golden=GoldenModel())
+    np.testing.assert_allclose(values["y"], expected.astype(np.float32), rtol=1e-5, atol=1e-5)
+
+    tensors = {
+        "x": TensorSpec("x", x.shape, DType.FLOAT32, TensorKind.CONSTANT, data=x),
+        "y": TensorSpec("y", x.shape, DType.FLOAT32, TensorKind.OUTPUT, is_final_output=True),
+    }
+    plan = ExecutionPlan(tensors=tensors, steps=[step], inputs=[], outputs=["y"])
+    plan.add_verification_step("y", "y")
+    artifact = compile_plan(plan, {"y": expected.astype(np.float32)})
+    source = emit_cv32e40p_program_v2(artifact, {}, program_name="unit_test_silu_v2")
+    assert "TNPU_HOST_SILU" in source
+
+
+def test_host_op_mul_add_emulation_and_v2_emit():
+    x = np.array([[1.0, -2.0, 3.0, -4.0]], dtype=np.float32)
+    y = np.array([[0.5, 2.0, -1.0, -0.5]], dtype=np.float32)
+    mul_expected = x * y
+    add_expected = x + y
+
+    mul_values = {"x": x, "y": y, "z": np.zeros_like(x)}
+    mul_step = HostOp("mul0", "mul", inputs=["x", "y"], outputs=["z"])
+    execute_host_op(mul_step, mul_values, golden=GoldenModel())
+    np.testing.assert_allclose(mul_values["z"], mul_expected.astype(np.float32), rtol=1e-5, atol=1e-5)
+
+    add_values = {"x": x, "y": y, "z": np.zeros_like(x)}
+    add_step = HostOp("add0", "add", inputs=["x", "y"], outputs=["z"])
+    execute_host_op(add_step, add_values, golden=GoldenModel())
+    np.testing.assert_allclose(add_values["z"], add_expected.astype(np.float32), rtol=1e-5, atol=1e-5)
+
+    tensors = {
+        "x": TensorSpec("x", x.shape, DType.FLOAT32, TensorKind.CONSTANT, data=x),
+        "y": TensorSpec("y", y.shape, DType.FLOAT32, TensorKind.CONSTANT, data=y),
+        "z": TensorSpec("z", x.shape, DType.FLOAT32, TensorKind.OUTPUT, is_final_output=True),
+    }
+
+    mul_plan = ExecutionPlan(tensors=tensors, steps=[mul_step], inputs=[], outputs=["z"])
+    mul_plan.add_verification_step("z", "z")
+    mul_artifact = compile_plan(mul_plan, {"z": mul_expected.astype(np.float32)})
+    mul_source = emit_cv32e40p_program_v2(mul_artifact, {}, program_name="unit_test_mul_v2")
+    assert "TNPU_HOST_MUL" in mul_source
+    assert ".input1_idx =" in mul_source
+
+    add_plan = ExecutionPlan(tensors=tensors, steps=[add_step], inputs=[], outputs=["z"])
+    add_plan.add_verification_step("z", "z")
+    add_artifact = compile_plan(add_plan, {"z": add_expected.astype(np.float32)})
+    add_source = emit_cv32e40p_program_v2(add_artifact, {}, program_name="unit_test_add_v2")
+    assert "TNPU_HOST_ADD" in add_source
+    assert ".input1_idx =" in add_source
