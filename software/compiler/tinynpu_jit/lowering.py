@@ -58,32 +58,50 @@ class SegmentCompiler:
     def _fuse_layout_restore_im2col(self, plan: ExecutionPlan) -> None:
         return
 
+    @staticmethod
+    def _cache_kind_for_tensor(plan: ExecutionPlan, tensor_name: str) -> str | None:
+        spec = plan.tensors[tensor_name]
+        cache_kind = spec.metadata.get("cache_kind")
+        if cache_kind is not None:
+            return str(cache_kind)
+        base_name = spec.metadata.get("storage_view_of")
+        if base_name:
+            return LoweringPass._cache_kind_for_tensor(plan, str(base_name))
+        return None
+
     def _annotate_output_layouts(self, plan: ExecutionPlan) -> None:
         for step in plan.steps:
             if not isinstance(step, NpuSegment):
                 continue
             for index, op in enumerate(step.ops):
                 out_spec = plan.tensors[op.out]
-                if op.writeback_mode != "normal":
-                    continue
-                if out_spec.metadata.get("storage_view_of") and out_spec.metadata.get("storage_role", "B") == "B":
-                    op.output_layout = "b"
-                    continue
-                if op.out in step.outputs:
-                    op.output_layout = "c"
-                    continue
-                later_uses: set[str] = set()
-                for later in step.ops[index + 1 :]:
-                    if later.lhs == op.out:
-                        later_uses.add("lhs")
-                    if later.rhs == op.out:
-                        later_uses.add("rhs")
-                if later_uses == {"lhs"}:
-                    op.output_layout = "a"
-                elif later_uses == {"rhs"}:
-                    op.output_layout = "b"
-                else:
-                    op.output_layout = "c"
+                out_cache_kind = self._cache_kind_for_tensor(plan, op.out)
+                rhs_cache_kind = self._cache_kind_for_tensor(plan, op.rhs)
+                if op.writeback_mode == "normal":
+                    if out_spec.metadata.get("storage_view_of") and out_spec.metadata.get("storage_role", "B") == "B":
+                        if out_cache_kind == "K" and op.in_dtype == DType.INT16 and op.out_dtype == DType.INT16:
+                            op.writeback_mode = "k_cache_append_int16"
+                        elif out_cache_kind == "V" and op.in_dtype == DType.INT16 and op.out_dtype == DType.INT16:
+                            op.writeback_mode = "v_cache_append_int16"
+                        op.output_layout = "b"
+                    else:
+                        if op.out in step.outputs:
+                            op.output_layout = "c"
+                        else:
+                            later_uses: set[str] = set()
+                            for later in step.ops[index + 1 :]:
+                                if later.lhs == op.out:
+                                    later_uses.add("lhs")
+                                if later.rhs == op.out:
+                                    later_uses.add("rhs")
+                            if later_uses == {"lhs"}:
+                                op.output_layout = "a"
+                            elif later_uses == {"rhs"}:
+                                op.output_layout = "b"
+                            else:
+                                op.output_layout = "c"
+                if op.b_read_mode == "normal" and rhs_cache_kind == "K" and op.in_dtype == DType.INT16:
+                    op.b_read_mode = "k_cache_int16"
 
     @staticmethod
     def _fallback_role(plan: ExecutionPlan, tensor_name: str) -> str:
