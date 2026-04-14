@@ -205,12 +205,16 @@ static int tnpu_execute_host_op(TinyTensor *runtime_tensors, const TnpuHostOp *o
 {
     TinyTensor *out;
     const TinyTensor *in;
+    const TinyTensor *in1 = NULL;
     if (op->input_idx >= 0xFFFFu || op->output_idx >= 0xFFFFu) {
         printf("runtime v2: invalid host tensor indices\n");
         return 1;
     }
     out = &runtime_tensors[op->output_idx];
     in = &runtime_tensors[op->input_idx];
+    if (op->input1_idx < 0xFFFFu) {
+        in1 = &runtime_tensors[op->input1_idx];
+    }
 
     switch (op->kind) {
         case TNPU_HOST_ALIAS:
@@ -278,6 +282,16 @@ static int tnpu_execute_host_op(TinyTensor *runtime_tensors, const TnpuHostOp *o
                 op->attrs_i32[2],
                 op->attrs_i32[3],
                 op->attrs_i32[4]);
+            return 0;
+        case TNPU_HOST_RMSNORM:
+            if (in1 == NULL) {
+                printf("runtime v2: rmsnorm missing weight input\n");
+                return 1;
+            }
+            host_rmsnorm(out, in, in1, op->attrs_f32[0]);
+            return 0;
+        case TNPU_HOST_ROPE:
+            host_rope(out, in, op->attrs_i32[0], op->attrs_i32[1], op->attrs_f32[0]);
             return 0;
         default:
             printf("runtime v2: unsupported host op kind=%u (%s)\n", (unsigned)op->kind, op->name ? op->name : "?");

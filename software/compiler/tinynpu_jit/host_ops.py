@@ -137,6 +137,21 @@ def _validate_transpose(step: HostOp) -> None:
         raise ValueError(f"Host op 'transpose' axes must be unique, got {normalized}.")
 
 
+def _validate_rmsnorm(step: HostOp) -> None:
+    eps = float(step.attrs.get("eps", 1.0e-6))
+    if eps <= 0.0:
+        raise ValueError(f"Host op 'rmsnorm' requires eps > 0, got {eps}.")
+
+
+def _validate_rope(step: HostOp) -> None:
+    head_dim = int(step.attrs["head_dim"])
+    theta = float(step.attrs.get("theta", 10000.0))
+    if head_dim <= 0 or head_dim % 2 != 0:
+        raise ValueError(f"Host op 'rope' requires positive even head_dim, got {head_dim}.")
+    if theta <= 0.0:
+        raise ValueError(f"Host op 'rope' requires theta > 0, got {theta}.")
+
+
 def _softmax_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
     axis = int(step.attrs.get("axis", -1))
     values[step.outputs[0]] = golden.softmax(values[step.inputs[0]], axis=axis)
@@ -388,6 +403,76 @@ def _requantize_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[
     )
 
 
+def _rmsnorm_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
+    x = np.array(values[step.inputs[0]], dtype=np.float32, copy=False)
+    weight = np.array(values[step.inputs[1]], dtype=np.float32, copy=False).reshape(-1)
+    hidden = x.shape[-1]
+    if weight.size != hidden:
+        raise ValueError(f"rmsnorm weight size mismatch: hidden={hidden}, weight={weight.size}.")
+    eps = np.float32(step.attrs.get("eps", 1.0e-6))
+    mean_sq = np.mean(np.square(x, dtype=np.float32), axis=-1, keepdims=True, dtype=np.float32)
+    rms = np.sqrt(mean_sq + eps).astype(np.float32)
+    values[step.outputs[0]] = ((x / rms) * weight.reshape((1,) * (x.ndim - 1) + (hidden,))).astype(np.float32)
+
+
+def _rmsnorm_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
+    x = np.array(values[step.inputs[0]], copy=False)
+    elems = int(x.size)
+    rows = int(elems // x.shape[-1])
+    return "host_intrinsic", _counts(
+        reads=elems * 2,
+        muls=elems * 3,
+        adds=elems + rows,
+        divs=elems,
+        nonlinear=rows,
+        writes=elems,
+        branches=elems,
+    )
+
+
+def _rope_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
+    x = np.array(values[step.inputs[0]], dtype=np.float32, copy=False)
+    out = np.array(x, copy=True)
+    head_dim = int(step.attrs["head_dim"])
+    position = int(step.attrs.get("position", 0))
+    theta = float(step.attrs.get("theta", 10000.0))
+    if x.shape[-1] != head_dim:
+        raise ValueError(f"rope expects last dimension {head_dim}, got {x.shape[-1]}.")
+    half = head_dim // 2
+    inv_freq = 1.0 / (theta ** (np.arange(0, half, dtype=np.float32) / np.float32(half)))
+
+    if x.ndim == 2:
+        positions = np.full((x.shape[0],), position, dtype=np.float32)
+        reshape = (x.shape[0], 1)
+    elif x.ndim >= 3:
+        positions = np.arange(position, position + x.shape[-2], dtype=np.float32)
+        reshape = (1,) * (x.ndim - 2) + (x.shape[-2], 1)
+    else:
+        raise ValueError(f"rope expects rank >= 2, got rank {x.ndim}.")
+
+    angles = positions.reshape(reshape) * inv_freq.reshape((1,) * len(reshape[:-1]) + (half,))
+    cos = np.cos(angles).astype(np.float32)
+    sin = np.sin(angles).astype(np.float32)
+    first = x[..., :half]
+    second = x[..., half:head_dim]
+    out[..., :half] = first * cos - second * sin
+    out[..., half:head_dim] = second * cos + first * sin
+    values[step.outputs[0]] = out.astype(np.float32)
+
+
+def _rope_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
+    x = np.array(values[step.inputs[0]], copy=False)
+    elems = int(x.size)
+    return "host_intrinsic", _counts(
+        reads=elems,
+        muls=elems * 2,
+        adds=elems,
+        nonlinear=elems,
+        writes=elems,
+        branches=elems,
+    )
+
+
 def register_host_op(spec: HostOpSpec, *, replace: bool = False) -> HostOpSpec:
     if spec.kind in _HOST_OP_REGISTRY and not replace:
         raise ValueError(f"Host op {spec.kind!r} is already registered.")
@@ -456,6 +541,14 @@ for _spec in (
     ),
     HostOpSpec("relu", _relu_eval, _relu_benchmark),
     HostOpSpec(
+        "rmsnorm",
+        _rmsnorm_eval,
+        _rmsnorm_benchmark,
+        input_arity=2,
+        required_attrs=("eps",),
+        semantic_validator=_validate_rmsnorm,
+    ),
+    HostOpSpec(
         "requantize",
         _requantize_eval,
         _requantize_benchmark,
@@ -464,6 +557,7 @@ for _spec in (
         semantic_validator=_require_positive_scale,
     ),
     HostOpSpec("reshape", _reshape_eval, _movement_benchmark, required_attrs=("shape",), semantic_validator=_validate_reshape),
+    HostOpSpec("rope", _rope_eval, _rope_benchmark, required_attrs=("head_dim",), semantic_validator=_validate_rope),
     HostOpSpec("sigmoid", _sigmoid_eval, _sigmoid_benchmark),
     HostOpSpec("softmax", _softmax_eval, _softmax_benchmark),
     HostOpSpec("transpose", _transpose_eval, _movement_benchmark, semantic_validator=_validate_transpose),

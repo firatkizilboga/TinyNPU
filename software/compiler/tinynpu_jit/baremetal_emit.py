@@ -250,6 +250,19 @@ def _emit_host_step_attrs(step: HostOp) -> tuple[list[str], list[str]]:
         lines.append(
             f"    host_layout_restore({out_ref}, {in_ref}, {layout_is_chw}, {original_rank}, {out_h}, {out_w}, {out_channels});"
         )
+    elif step.kind == "rmsnorm":
+        weight_ref = _emit_tensor_reference(step.inputs[1])
+        eps = float(step.attrs.get("eps", 1.0e-6))
+        lines.append(
+            f"    host_rmsnorm({out_ref}, {in_ref}, {weight_ref}, {_format_scalar(eps, dtype=DType.FLOAT32)});"
+        )
+    elif step.kind == "rope":
+        head_dim = int(step.attrs["head_dim"])
+        position = int(step.attrs.get("position", 0))
+        theta = float(step.attrs.get("theta", 10000.0))
+        lines.append(
+            f"    host_rope({out_ref}, {in_ref}, {head_dim}, {position}, {_format_scalar(theta, dtype=DType.FLOAT32)});"
+        )
     else:
         raise NotImplementedError(f"Bare-metal runtime emitter does not support host op '{step.kind}'.")
     return decls, lines
