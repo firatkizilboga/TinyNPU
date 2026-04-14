@@ -1341,7 +1341,9 @@ static void read_role_b_tensor(TinyTensor *dst, uint16_t addr, int precision)
         for (int nt = 0; nt < n_tiles; ++nt) {
             uint16_t tile_addr = (uint16_t)(addr + (kt * n_tiles * TINY_ARRAY_SIZE) + (nt * TINY_ARRAY_SIZE));
             for (int row_word = 0; row_word < TINY_ARRAY_SIZE; ++row_word) {
-                runtime_assert(npu_read_mem_word((uint16_t)(tile_addr + row_word), chunks, precision) == 0, "readback failed");
+                /* B-layout host readback is mainly a verification/debug path. Use MMIO reads here
+                 * to avoid shared-window lane selection issues in the example testbench wrapper. */
+                runtime_assert(npu_read_mem_word_mmio((uint16_t)(tile_addr + row_word), chunks) == 0, "readback failed");
                 for (int col_in_tile = 0; col_in_tile < TINY_ARRAY_SIZE; ++col_in_tile) {
                     uint32_t lane_word = chunks[col_in_tile / 2];
                     uint16_t packed_lane = (col_in_tile & 1) ? (uint16_t)(lane_word >> 16) : (uint16_t)(lane_word & 0xFFFFu);
