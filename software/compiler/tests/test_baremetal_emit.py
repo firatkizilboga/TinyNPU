@@ -5,6 +5,7 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from tinynpu_jit import emit_cv32e40p_c, emit_cv32e40p_program_v2
+from tinynpu_jit.golden import GoldenModel
 from tinynpu_jit import (
     DType,
     describe_int16_k_cache_append,
@@ -20,6 +21,7 @@ from tinynpu_jit import (
     make_b_cache_specs,
     make_kv_cache_specs,
     make_native_int16_k_cache_specs,
+    make_native_int16_kv_cache_specs,
     make_native_int16_v_cache_specs,
 )
 from tinynpu import TinyNPUProgram
@@ -767,6 +769,158 @@ def test_compile_plan_supports_native_v_cache_append_and_consume():
     assert ((inst1 >> 248) & 0xF) == int(WritebackMode.V_CACHE_APPEND_INT16)
     assert ((inst2 >> 52) & 0xF) == int(BReadMode.NORMAL)
     assert plan.tensors["v_cache"].metadata["cache_kind"] == "V"
+
+
+def test_compile_plan_supports_decode_attention_bridge():
+    lhs_k0 = np.array([[1, 2, -1, 0, 3, -2, 1, 4]], dtype=np.int16)
+    rhs_k0 = np.array(
+        [
+            [1, 0, 1, 0, -1, 2, 0, 1],
+            [0, 1, 0, 1, 2, -1, 1, 0],
+            [1, -1, 1, 0, 0, 1, 2, 1],
+            [2, 0, -1, 1, 1, 0, -1, 2],
+            [0, 2, 1, -1, 1, 1, 0, 0],
+            [1, 1, 0, 2, -1, 0, 1, -1],
+            [0, -1, 2, 1, 0, 1, 1, 2],
+            [1, 0, 1, 1, 2, 0, -1, 1],
+        ],
+        dtype=np.int16,
+    )
+    lhs_k1 = np.array([[2, 1, 0, -1, 1, 2, 0, 1]], dtype=np.int16)
+    rhs_k1 = np.array(
+        [
+            [0, 1, 1, 0, 2, 1, 0, -1],
+            [1, 0, 2, 1, -1, 0, 1, 2],
+            [2, 1, 0, -1, 1, 2, 1, 0],
+            [1, -1, 1, 2, 0, 1, 2, 1],
+            [0, 2, 1, 0, 1, -1, 1, 2],
+            [1, 1, -1, 1, 2, 0, 0, 1],
+            [2, 0, 1, 1, 0, 2, -1, 1],
+            [1, 2, 0, 1, -1, 1, 2, 0],
+        ],
+        dtype=np.int16,
+    )
+    lhs_v0 = np.array([[1, 0, 2, -1, 1, 0, 1, 2]], dtype=np.int16)
+    rhs_v0 = np.array(
+        [
+            [1, 2, 0, 1, -1, 0, 2, 1],
+            [0, 1, 2, 0, 1, 2, -1, 1],
+            [2, 0, 1, 2, 0, 1, 1, -1],
+            [1, -1, 0, 1, 2, 1, 0, 2],
+            [0, 2, 1, 0, 1, -1, 2, 1],
+            [1, 0, -1, 2, 1, 0, 1, 2],
+            [2, 1, 0, 1, -1, 2, 0, 1],
+            [1, 2, 1, 0, 2, 1, -1, 0],
+        ],
+        dtype=np.int16,
+    )
+    lhs_v1 = np.array([[0, 1, 1, 2, -1, 1, 0, 1]], dtype=np.int16)
+    rhs_v1 = np.array(
+        [
+            [2, 0, 1, -1, 2, 1, 0, 1],
+            [1, 2, 0, 1, 0, -1, 2, 1],
+            [0, 1, 2, 1, -1, 0, 1, 2],
+            [1, -1, 1, 0, 2, 1, 2, 0],
+            [2, 1, 0, 2, 1, 0, -1, 1],
+            [0, 2, 1, 1, 0, 2, 1, -1],
+            [1, 0, 2, 1, 1, -1, 0, 2],
+            [2, 1, -1, 0, 1, 2, 1, 0],
+        ],
+        dtype=np.int16,
+    )
+    query = np.array([[1, -1, 2, 0, 1, 3, -2, 1]], dtype=np.int16)
+    golden = GoldenModel()
+    attn_scale = 1.0 / 256.0
+
+    k0 = np.clip(lhs_k0.astype(np.int32) @ rhs_k0.astype(np.int32), -32768, 32767).astype(np.int16)
+    k1 = np.clip(lhs_k1.astype(np.int32) @ rhs_k1.astype(np.int32), -32768, 32767).astype(np.int16)
+    v0 = np.clip(lhs_v0.astype(np.int32) @ rhs_v0.astype(np.int32), -32768, 32767).astype(np.int16)
+    v1 = np.clip(lhs_v1.astype(np.int32) @ rhs_v1.astype(np.int32), -32768, 32767).astype(np.int16)
+
+    k_cache = np.zeros((8, 16), dtype=np.int16)
+    k_cache[:, 1] = k0[0]
+    k_cache[:, 9] = k1[0]
+    scores = np.clip(query.astype(np.int32) @ k_cache.astype(np.int32), -32768, 32767).astype(np.int16)
+    probs = golden.softmax(scores, axis=-1).astype(np.float32)
+    attn_q = golden.quantize(probs, scale=attn_scale, out_dtype=DType.INT16)
+    v_cache = np.zeros((16, 8), dtype=np.int16)
+    v_cache[1, :] = v0[0]
+    v_cache[9, :] = v1[0]
+    expected = golden.matmul(attn_q, v_cache, shift=8, out_dtype=DType.INT16)
+
+    tensors = {
+        "lhs_k0": TensorSpec("lhs_k0", lhs_k0.shape, DType.INT16, TensorKind.CONSTANT, data=lhs_k0),
+        "rhs_k0": TensorSpec("rhs_k0", rhs_k0.shape, DType.INT16, TensorKind.CONSTANT, data=rhs_k0),
+        "lhs_k1": TensorSpec("lhs_k1", lhs_k1.shape, DType.INT16, TensorKind.CONSTANT, data=lhs_k1),
+        "rhs_k1": TensorSpec("rhs_k1", rhs_k1.shape, DType.INT16, TensorKind.CONSTANT, data=rhs_k1),
+        "lhs_v0": TensorSpec("lhs_v0", lhs_v0.shape, DType.INT16, TensorKind.CONSTANT, data=lhs_v0),
+        "rhs_v0": TensorSpec("rhs_v0", rhs_v0.shape, DType.INT16, TensorKind.CONSTANT, data=rhs_v0),
+        "lhs_v1": TensorSpec("lhs_v1", lhs_v1.shape, DType.INT16, TensorKind.CONSTANT, data=lhs_v1),
+        "rhs_v1": TensorSpec("rhs_v1", rhs_v1.shape, DType.INT16, TensorKind.CONSTANT, data=rhs_v1),
+        "query": TensorSpec("query", query.shape, DType.INT16, TensorKind.CONSTANT, data=query),
+        "scores": TensorSpec("scores", scores.shape, DType.INT16, TensorKind.INTERMEDIATE),
+        "probs": TensorSpec("probs", probs.shape, DType.FLOAT32, TensorKind.INTERMEDIATE),
+        "attn_q": TensorSpec(
+            "attn_q",
+            attn_q.shape,
+            DType.INT16,
+            TensorKind.INTERMEDIATE,
+            metadata={"storage_role": "A"},
+        ),
+        "out": TensorSpec("out", expected.shape, DType.INT16, TensorKind.OUTPUT, is_final_output=True),
+    }
+    tensors.update(
+        make_native_int16_kv_cache_specs(
+            k_base_name="k_cache",
+            v_base_name="v_cache",
+            d_head=8,
+            token_capacity=16,
+            token_names=["t1", "t9"],
+            token_indices=[1, 9],
+        )
+    )
+    steps = [
+        NpuSegment(
+            "seg_score",
+            [
+                MatMulOp("op_k0", "lhs_k0", "rhs_k0", "k_cache_t1"),
+                MatMulOp("op_k1", "lhs_k1", "rhs_k1", "k_cache_t9"),
+                MatMulOp("op_v0", "lhs_v0", "rhs_v0", "v_cache_t1"),
+                MatMulOp("op_v1", "lhs_v1", "rhs_v1", "v_cache_t9"),
+                MatMulOp("op_qk", "query", "k_cache", "scores"),
+            ],
+            inputs=[],
+            outputs=["scores"],
+        ),
+        HostOp("softmax_scores", "softmax", inputs=["scores"], outputs=["probs"], attrs={"axis": -1}),
+        HostOp(
+            "quantize_probs",
+            "quantize",
+            inputs=["probs"],
+            outputs=["attn_q"],
+            attrs={"scale": attn_scale, "zero_point": 0, "dtype": DType.INT16},
+        ),
+        NpuSegment(
+            "seg_value",
+            [
+                MatMulOp("op_av", "attn_q", "v_cache", "out", shift=8),
+            ],
+            inputs=["attn_q"],
+            outputs=["out"],
+        ),
+    ]
+    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=[], outputs=["out"])
+    artifact = compile_plan(plan, {"out": expected})
+
+    seg_score = artifact.segment_artifacts["seg_score"]
+    inst_qk = int(seg_score.binary["im"][4])
+    assert ((inst_qk >> 52) & 0xF) == int(BReadMode.K_CACHE_INT16)
+    host_kinds = [step.kind for step in artifact.plan.steps if isinstance(step, HostOp)]
+    assert host_kinds == ["softmax", "quantize"]
+    seg_value = artifact.segment_artifacts["seg_value"]
+    inst_av = int(seg_value.binary["im"][0])
+    assert ((inst_av >> 52) & 0xF) == int(BReadMode.NORMAL)
+    assert ((inst_av >> 112) & 0xFF) == 8
 
 
 def test_describe_int16_k_cache_append_requires_lane_partial_writes():

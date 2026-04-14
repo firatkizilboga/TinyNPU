@@ -301,11 +301,14 @@ def _linear_scan_dynamic(
     array_size: int,
     dynamic_start: int,
     ub_capacity: int,
+    skip_names: set[str] | None = None,
 ) -> dict[str, MemoryPlanEntry]:
     """
     Allocate dynamic (non-CONSTANT) tensors in [dynamic_start, ub_capacity)
     using a linear-scan allocator that reuses slots after tensors die.
     """
+    if skip_names is None:
+        skip_names = set()
     n = len(segment.ops)
 
     # Build sorted event list: (step, priority, name, kind)
@@ -313,7 +316,12 @@ def _linear_scan_dynamic(
     events: list[tuple[int, int, str, str]] = []
     for name, live in liveness.items():
         spec = plan.tensors.get(name)
-        if spec is None or spec.kind == TensorKind.CONSTANT or spec.metadata.get("storage_view_of"):
+        if (
+            name in skip_names
+            or spec is None
+            or spec.kind == TensorKind.CONSTANT
+            or spec.metadata.get("storage_view_of")
+        ):
             continue
         alloc_at = max(0, live.birth_op)
         events.append((alloc_at, 1, name, "alloc"))
@@ -485,7 +493,49 @@ def plan_program_memory(
             static_ub_image[entry.address + i] = word
 
     # ------------------------------------------------------------------
-    # Phase 2: per-segment dynamic allocation (shared dynamic zone)
+    # Phase 2: globally pin cross-segment dynamic tensors
+    # ------------------------------------------------------------------
+    tensor_seg_usage: dict[str, set[str]] = defaultdict(set)
+    for seg in segments:
+        for name in _collect_referenced_tensor_names(seg):
+            tensor_seg_usage[name].add(seg.name)
+            spec = plan.tensors.get(name)
+            if spec is not None and spec.metadata.get("storage_view_of"):
+                tensor_seg_usage[str(spec.metadata["storage_view_of"])].add(seg.name)
+
+    persistent_dynamic_names = sorted(
+        name
+        for name, segs in tensor_seg_usage.items()
+        if len(segs) > 1
+        and (spec := plan.tensors.get(name)) is not None
+        and spec.kind != TensorKind.CONSTANT
+        and not spec.metadata.get("storage_view_of")
+    )
+
+    persistent_entries: dict[str, MemoryPlanEntry] = {}
+    persistent_addr = static_zone_end
+    for name in persistent_dynamic_names:
+        spec = plan.tensors[name]
+        roles_seen = {
+            roles_by_seg[seg.name][name]
+            for seg in segments
+            if name in roles_by_seg[seg.name]
+        }
+        if not roles_seen:
+            continue
+        if len(roles_seen) != 1:
+            raise ValueError(
+                f"Cross-segment tensor '{name}' is used with multiple hardware roles: {sorted(roles_seen)}"
+            )
+        role = next(iter(roles_seen))
+        wc = _compute_word_count(spec, role, packer, array_size)
+        persistent_entries[name] = MemoryPlanEntry(name=name, address=persistent_addr, word_count=wc)
+        persistent_addr += wc
+
+    dynamic_zone_start = persistent_addr
+
+    # ------------------------------------------------------------------
+    # Phase 3: per-segment local dynamic allocation (shared remaining zone)
     # ------------------------------------------------------------------
     segment_plans: list[SegmentMemoryPlan] = []
 
@@ -495,7 +545,15 @@ def plan_program_memory(
         roles, liveness = _augment_storage_view_bases(seg, plan, roles, liveness)
 
         dynamic_entries = _linear_scan_dynamic(
-            seg, plan, roles, liveness, packer, array_size, static_zone_end, ub_capacity
+            seg,
+            plan,
+            roles,
+            liveness,
+            packer,
+            array_size,
+            dynamic_zone_start,
+            ub_capacity,
+            skip_names=set(persistent_entries),
         )
 
         # Collect static entries that are referenced by this segment
@@ -504,7 +562,12 @@ def plan_program_memory(
             for name in roles
             if name in static_keys_by_seg[seg.name]
         ]
-        all_entries = seg_static + list(dynamic_entries.values())
+        seg_persistent = [
+            persistent_entries[name]
+            for name in roles
+            if name in persistent_entries
+        ]
+        all_entries = seg_static + seg_persistent + list(dynamic_entries.values())
 
         total_words = max((e.address + e.word_count for e in all_entries), default=0)
         reused_words = sum(e.word_count for e in all_entries if e.reuses_from is not None)
@@ -519,22 +582,15 @@ def plan_program_memory(
         ))
 
     # ------------------------------------------------------------------
-    # Phase 3: cross-segment analysis
+    # Phase 4: cross-segment analysis
     # ------------------------------------------------------------------
-    tensor_seg_usage: dict[str, set[str]] = defaultdict(set)
-    for seg in segments:
-        for name in _collect_referenced_tensor_names(seg):
-            tensor_seg_usage[name].add(seg.name)
-            spec = plan.tensors.get(name)
-            if spec is not None and spec.metadata.get("storage_view_of"):
-                tensor_seg_usage[str(spec.metadata["storage_view_of"])].add(seg.name)
     cross_segment = sorted(name for name, segs in tensor_seg_usage.items() if len(segs) > 1)
 
     total_ub_peak = max((sp.total_words for sp in segment_plans), default=0)
     max_dynamic = max(
-        (sp.total_words - static_zone_end for sp in segment_plans), default=0
+        (sp.total_words - dynamic_zone_start for sp in segment_plans), default=0
     )
-    theoretical_min = static_zone_end + max_dynamic
+    theoretical_min = dynamic_zone_start + max_dynamic
 
     return GlobalMemoryReport(
         segments=segment_plans,
