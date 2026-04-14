@@ -355,6 +355,67 @@ def test_compile_plan_preserves_b_word_offset_in_segment_binary():
     assert ((inst >> 72) & 0x3) == int(OutputLayout.C)
 
 
+def test_compile_plan_supports_b_cache_views_for_append_and_consume():
+    lhs0 = np.eye(8, dtype=np.int16)
+    rhs0 = np.eye(8, dtype=np.int16)
+    lhs1 = np.flipud(np.eye(8, dtype=np.int16))
+    rhs1 = np.rot90(np.eye(8, dtype=np.int16), 2).astype(np.int16)
+    query = np.eye(8, dtype=np.int16)
+    token0 = np.clip(lhs0.astype(np.int32) @ rhs0.astype(np.int32), -32768, 32767).astype(np.int16)
+    token1 = np.clip(lhs1.astype(np.int32) @ rhs1.astype(np.int32), -32768, 32767).astype(np.int16)
+    expected = np.clip(query.astype(np.int32) @ token1.astype(np.int32), -32768, 32767).astype(np.int16)
+
+    tensors = {
+        "lhs0": TensorSpec("lhs0", lhs0.shape, DType.INT16, TensorKind.CONSTANT, data=lhs0),
+        "rhs0": TensorSpec("rhs0", rhs0.shape, DType.INT16, TensorKind.CONSTANT, data=rhs0),
+        "lhs1": TensorSpec("lhs1", lhs1.shape, DType.INT16, TensorKind.CONSTANT, data=lhs1),
+        "rhs1": TensorSpec("rhs1", rhs1.shape, DType.INT16, TensorKind.CONSTANT, data=rhs1),
+        "query": TensorSpec("query", query.shape, DType.INT16, TensorKind.CONSTANT, data=query),
+        "cache": TensorSpec("cache", (16, 8), DType.INT16, TensorKind.INTERMEDIATE),
+        "cache_t0": TensorSpec(
+            "cache_t0",
+            (8, 8),
+            DType.INT16,
+            TensorKind.INTERMEDIATE,
+            metadata={"storage_view_of": "cache", "storage_role": "B", "storage_word_offset": 0},
+        ),
+        "cache_t1": TensorSpec(
+            "cache_t1",
+            (8, 8),
+            DType.INT16,
+            TensorKind.INTERMEDIATE,
+            metadata={"storage_view_of": "cache", "storage_role": "B", "storage_word_offset": 8},
+        ),
+        "out": TensorSpec("out", expected.shape, DType.INT16, TensorKind.OUTPUT, is_final_output=True),
+    }
+    steps = [
+        NpuSegment(
+            "seg_cache_views",
+            [
+                MatMulOp("op0", "lhs0", "rhs0", "cache_t0"),
+                MatMulOp("op1", "lhs1", "rhs1", "cache_t1"),
+                MatMulOp("op2", "query", "cache_t1", "out"),
+            ],
+            inputs=["cache"],
+            outputs=["out"],
+        ),
+    ]
+    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=[], outputs=["out"])
+    artifact = compile_plan(plan, {"out": expected})
+
+    seg = artifact.segment_artifacts["seg_cache_views"]
+    inst0 = int(seg.binary["im"][0])
+    inst1 = int(seg.binary["im"][1])
+    inst2 = int(seg.binary["im"][2])
+    assert ((inst0 >> 184) & 0xFFFF) == 0
+    assert ((inst1 >> 184) & 0xFFFF) == 8
+    assert ((inst2 >> 56) & 0xFFFF) == 8
+    assert ((inst0 >> 72) & 0x3) == int(OutputLayout.B)
+    assert ((inst1 >> 72) & 0x3) == int(OutputLayout.B)
+    assert seg.symbol_table["cache_t1"]["base_name"] == "cache"
+    assert seg.symbol_table["cache_t1"]["word_offset"] == 8
+
+
 def test_tinynpu_program_preserves_predeclared_b_cache_shape_for_append():
     program = TinyNPUProgram()
     lhs0 = np.eye(8, dtype=np.int16)

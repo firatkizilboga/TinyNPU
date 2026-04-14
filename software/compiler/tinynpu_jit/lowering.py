@@ -63,6 +63,10 @@ class SegmentCompiler:
             if not isinstance(step, NpuSegment):
                 continue
             for index, op in enumerate(step.ops):
+                out_spec = plan.tensors[op.out]
+                if out_spec.metadata.get("storage_view_of") and out_spec.metadata.get("storage_role", "B") == "B":
+                    op.output_layout = "b"
+                    continue
                 if op.out in step.outputs:
                     op.output_layout = "c"
                     continue
@@ -78,6 +82,16 @@ class SegmentCompiler:
                     op.output_layout = "b"
                 else:
                     op.output_layout = "c"
+
+    @staticmethod
+    def _fallback_role(plan: ExecutionPlan, tensor_name: str) -> str:
+        spec = plan.tensors[tensor_name]
+        if spec.metadata.get("storage_role"):
+            return str(spec.metadata["storage_role"])
+        for candidate in plan.tensors.values():
+            if candidate.metadata.get("storage_view_of") == tensor_name:
+                return str(candidate.metadata.get("storage_role", "B"))
+        return "C"
 
     def _compile_npu_segment(
         self,
@@ -96,9 +110,41 @@ class SegmentCompiler:
             referenced.add(op.out)
             if op.bias:
                 referenced.add(op.bias)
+        for name in list(referenced):
+            spec = plan.tensors[name]
+            base_name = spec.metadata.get("storage_view_of")
+            if base_name:
+                referenced.add(str(base_name))
 
         for name in sorted(referenced):
             spec = plan.tensors[name]
+            if name in program.symbols:
+                continue
+            base_name = spec.metadata.get("storage_view_of")
+            if base_name:
+                base_spec = plan.tensors[str(base_name)]
+                base_precision = to_precision_mode(
+                    base_spec.dtype if base_spec.dtype in (DType.INT4, DType.INT8, DType.INT16) else DType.INT16
+                )
+                if str(base_name) not in program.symbols:
+                    if base_spec.kind == TensorKind.OUTPUT and base_spec.data is None:
+                        base_data = np.zeros(base_spec.shape, dtype=np.int16)
+                    elif base_spec.kind == TensorKind.INTERMEDIATE and base_spec.data is None:
+                        base_data = np.zeros(base_spec.shape, dtype=np.int16)
+                    elif base_spec.kind == TensorKind.INPUT and base_spec.data is None:
+                        base_data = np.zeros(base_spec.shape, dtype=np.int16)
+                    else:
+                        base_data = np.array(base_spec.data if base_spec.data is not None else np.zeros(base_spec.shape), copy=True)
+                    program.declare_data(str(base_name), base_data, precision=base_precision, role="B")
+                precision = to_precision_mode(spec.dtype if spec.dtype in (DType.INT4, DType.INT8, DType.INT16) else DType.INT16)
+                program.declare_b_view(
+                    name,
+                    str(base_name),
+                    spec.shape,
+                    precision=precision,
+                    word_offset=int(spec.metadata.get("storage_word_offset", 0)),
+                )
+                continue
             if spec.kind == TensorKind.OUTPUT and spec.data is None:
                 data = np.zeros(spec.shape, dtype=np.int16)
             elif spec.kind == TensorKind.INTERMEDIATE and spec.data is None:
@@ -108,7 +154,7 @@ class SegmentCompiler:
             else:
                 data = np.array(spec.data if spec.data is not None else np.zeros(spec.shape), copy=True)
 
-            role = roles[name]
+            role = roles.get(name, self._fallback_role(plan, name))
             precision = to_precision_mode(spec.dtype if spec.dtype in (DType.INT4, DType.INT8, DType.INT16) else DType.INT16)
             program.declare_data(name, data, precision=precision, role=role)
 
@@ -164,6 +210,8 @@ class SegmentCompiler:
                 "role": symbol.storage_role,
                 "precision": int(symbol.precision),
                 "word_count": symbol.word_count,
+                "base_name": symbol.base_name,
+                "word_offset": int(symbol.word_offset),
             }
 
         return SegmentArtifact(
