@@ -13,7 +13,20 @@ from .benchmark import (
 )
 from .host_ops import HostOpSpec, get_host_op_spec, register_host_op, registered_host_op_kinds
 from .inspect import inspect_artifact
-from .ir import DType, ExecutionPlan, HostOp, MatMulOp, NpuSegment, TensorKind, TensorSpec, VerificationMode, VerifyTensor
+from .ir import (
+    DType,
+    ExecutionPlan,
+    HostOp,
+    MatMulOp,
+    NpuSegment,
+    TensorKind,
+    TensorSpec,
+    VerificationMode,
+    VerifyTensor,
+    b_slot_word_stride,
+    make_b_cache_specs,
+    make_b_cache_view_spec,
+)
 from .markers import im2col_for_npu, mark_for_verify, npu_matmul, quantize_for_npu
 from .memory_planner import GlobalMemoryReport, SegmentMemoryPlan, plan_program_memory, plan_segment_memory
 from .runtime import run
@@ -22,6 +35,7 @@ from .simulator import SimulatorExecutor, run_sim
 __all__ = [
     "CompiledArtifact",
     "BenchmarkEntry",
+    "b_slot_word_stride",
     "BenchmarkReport",
     "CostModel",
     "DType",
@@ -32,6 +46,8 @@ __all__ = [
     "HostOpSpec",
     "im2col_for_npu",
     "MatMulOp",
+    "make_b_cache_specs",
+    "make_b_cache_view_spec",
     "NpuSegment",
     "PrimitiveCounts",
     "five_stage_in_order_model",

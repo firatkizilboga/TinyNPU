@@ -19,6 +19,7 @@ from tinynpu_jit import (  # noqa: E402
     TensorSpec,
     compile_plan,
     emit_cv32e40p_program_v2,
+    make_b_cache_specs,
 )
 
 from run_cv32e40p_b_append_demo import (  # noqa: E402
@@ -110,23 +111,17 @@ def build_artifact():
         "lhs1": TensorSpec("lhs1", lhs1.shape, DType.INT16, TensorKind.CONSTANT, data=lhs1),
         "rhs1": TensorSpec("rhs1", rhs1.shape, DType.INT16, TensorKind.CONSTANT, data=rhs1),
         "query": TensorSpec("query", query.shape, DType.INT16, TensorKind.CONSTANT, data=query),
-        "cache": TensorSpec("cache", (16, 8), DType.INT16, TensorKind.INTERMEDIATE),
-        "cache_t0": TensorSpec(
-            "cache_t0",
-            (8, 8),
-            DType.INT16,
-            TensorKind.INTERMEDIATE,
-            metadata={"storage_view_of": "cache", "storage_role": "B", "storage_word_offset": 0},
-        ),
-        "cache_t1": TensorSpec(
-            "cache_t1",
-            (8, 8),
-            DType.INT16,
-            TensorKind.INTERMEDIATE,
-            metadata={"storage_view_of": "cache", "storage_role": "B", "storage_word_offset": 8},
-        ),
         "out": TensorSpec("out", expected.shape, DType.INT16, TensorKind.OUTPUT, is_final_output=True),
     }
+    tensors.update(
+        make_b_cache_specs(
+            "cache",
+            (8, 8),
+            DType.INT16,
+            slot_names=["cache_t0", "cache_t1"],
+            cache_kind="K",
+        )
+    )
     steps = [
         NpuSegment(
             "seg_cache_views",

@@ -5,7 +5,18 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from tinynpu_jit import emit_cv32e40p_c, emit_cv32e40p_program_v2
-from tinynpu_jit import DType, ExecutionPlan, HostOp, MatMulOp, NpuSegment, TensorKind, TensorSpec, compile_plan
+from tinynpu_jit import (
+    DType,
+    ExecutionPlan,
+    HostOp,
+    MatMulOp,
+    NpuSegment,
+    TensorKind,
+    TensorSpec,
+    b_slot_word_stride,
+    compile_plan,
+    make_b_cache_specs,
+)
 from tinynpu import TinyNPUProgram
 from tinynpu.isa import OutputLayout, PrecisionMode
 
@@ -371,23 +382,17 @@ def test_compile_plan_supports_b_cache_views_for_append_and_consume():
         "lhs1": TensorSpec("lhs1", lhs1.shape, DType.INT16, TensorKind.CONSTANT, data=lhs1),
         "rhs1": TensorSpec("rhs1", rhs1.shape, DType.INT16, TensorKind.CONSTANT, data=rhs1),
         "query": TensorSpec("query", query.shape, DType.INT16, TensorKind.CONSTANT, data=query),
-        "cache": TensorSpec("cache", (16, 8), DType.INT16, TensorKind.INTERMEDIATE),
-        "cache_t0": TensorSpec(
-            "cache_t0",
-            (8, 8),
-            DType.INT16,
-            TensorKind.INTERMEDIATE,
-            metadata={"storage_view_of": "cache", "storage_role": "B", "storage_word_offset": 0},
-        ),
-        "cache_t1": TensorSpec(
-            "cache_t1",
-            (8, 8),
-            DType.INT16,
-            TensorKind.INTERMEDIATE,
-            metadata={"storage_view_of": "cache", "storage_role": "B", "storage_word_offset": 8},
-        ),
         "out": TensorSpec("out", expected.shape, DType.INT16, TensorKind.OUTPUT, is_final_output=True),
     }
+    tensors.update(
+        make_b_cache_specs(
+            "cache",
+            (8, 8),
+            DType.INT16,
+            slot_names=["cache_t0", "cache_t1"],
+            cache_kind="K",
+        )
+    )
     steps = [
         NpuSegment(
             "seg_cache_views",
@@ -418,6 +423,26 @@ def test_compile_plan_supports_b_cache_views_for_append_and_consume():
     assert "cache" in memory_names
     assert "cache_t0" not in memory_names
     assert "cache_t1" not in memory_names
+    assert plan.tensors["cache_t1"].metadata["cache_kind"] == "K"
+    assert plan.tensors["cache_t1"].metadata["cache_slot_stride_words"] == 8
+
+
+def test_make_b_cache_specs_computes_slot_offsets():
+    specs = make_b_cache_specs(
+        "k_cache",
+        (8, 8),
+        DType.INT16,
+        slot_names=["k_t0", "k_t1", "k_t2"],
+        cache_kind="K",
+    )
+
+    assert specs["k_cache"].shape == (24, 8)
+    assert specs["k_t0"].metadata["storage_view_of"] == "k_cache"
+    assert specs["k_t0"].metadata["storage_word_offset"] == 0
+    assert specs["k_t1"].metadata["storage_word_offset"] == b_slot_word_stride((8, 8), DType.INT16)
+    assert specs["k_t2"].metadata["storage_word_offset"] == 2 * b_slot_word_stride((8, 8), DType.INT16)
+    assert specs["k_t1"].metadata["cache_kind"] == "K"
+    assert specs["k_t2"].metadata["cache_slot_index"] == 2
 
 
 def test_tinynpu_program_preserves_predeclared_b_cache_shape_for_append():
