@@ -19,6 +19,8 @@ from tinynpu_jit import (
     compile_plan,
     make_b_cache_specs,
     make_kv_cache_specs,
+    make_native_int16_k_cache_specs,
+    make_native_int16_v_cache_specs,
 )
 from tinynpu import TinyNPUProgram
 from tinynpu.isa import BReadMode, OutputLayout, PrecisionMode, WritebackMode
@@ -596,6 +598,9 @@ def test_compile_plan_supports_b_cache_views_for_append_and_consume():
     assert ((inst0 >> 184) & 0xFFFF) == 0
     assert ((inst1 >> 184) & 0xFFFF) == 8
     assert ((inst2 >> 56) & 0xFFFF) == 8
+    assert ((inst0 >> 248) & 0xF) == int(WritebackMode.K_CACHE_APPEND_INT16)
+    assert ((inst1 >> 248) & 0xF) == int(WritebackMode.K_CACHE_APPEND_INT16)
+    assert ((inst2 >> 52) & 0xF) == int(BReadMode.K_CACHE_INT16)
     assert ((inst0 >> 72) & 0x3) == int(OutputLayout.B)
     assert ((inst1 >> 72) & 0x3) == int(OutputLayout.B)
     assert seg.symbol_table["cache_t1"]["base_name"] == "cache"
@@ -604,6 +609,7 @@ def test_compile_plan_supports_b_cache_views_for_append_and_consume():
     assert "cache" in memory_names
     assert "cache_t0" not in memory_names
     assert "cache_t1" not in memory_names
+    assert plan.tensors["cache"].metadata["cache_kind"] == "K"
     assert plan.tensors["cache_t1"].metadata["cache_kind"] == "K"
     assert plan.tensors["cache_t1"].metadata["cache_slot_stride_words"] == 8
 
@@ -618,6 +624,8 @@ def test_make_b_cache_specs_computes_slot_offsets():
     )
 
     assert specs["k_cache"].shape == (24, 8)
+    assert specs["k_cache"].metadata["cache_kind"] == "K"
+    assert specs["k_cache"].metadata["cache_slot_stride_words"] == b_slot_word_stride((8, 8), DType.INT16)
     assert specs["k_t0"].metadata["storage_view_of"] == "k_cache"
     assert specs["k_t0"].metadata["storage_word_offset"] == 0
     assert specs["k_t1"].metadata["storage_word_offset"] == b_slot_word_stride((8, 8), DType.INT16)
@@ -638,10 +646,127 @@ def test_make_kv_cache_specs_tags_k_and_v_slots_separately():
 
     assert specs["k_cache"].shape == (16, 8)
     assert specs["v_cache"].shape == (16, 8)
+    assert specs["k_cache"].metadata["cache_kind"] == "K"
+    assert specs["v_cache"].metadata["cache_kind"] == "V"
     assert specs["k_cache_t1"].metadata["cache_kind"] == "K"
     assert specs["v_cache_t1"].metadata["cache_kind"] == "V"
     assert specs["k_cache_t1"].metadata["storage_word_offset"] == 8
     assert specs["v_cache_t1"].metadata["storage_word_offset"] == 8
+
+
+def test_make_native_int16_k_cache_specs_uses_column_append_offsets():
+    specs = make_native_int16_k_cache_specs(
+        "k_cache",
+        d_head=16,
+        token_capacity=16,
+        token_names=["k_t1", "k_t9"],
+        token_indices=[1, 9],
+    )
+
+    assert specs["k_cache"].shape == (16, 16)
+    assert specs["k_cache"].metadata["cache_kind"] == "K"
+    assert specs["k_t1"].metadata["storage_word_offset"] == 1
+    assert specs["k_t9"].metadata["storage_word_offset"] == 17
+    assert specs["k_t9"].metadata["cache_scatter_word_addrs"] == tuple(range(16, 32))
+
+
+def test_make_native_int16_v_cache_specs_uses_sparse_row_offsets():
+    specs = make_native_int16_v_cache_specs(
+        "v_cache",
+        d_head=16,
+        token_capacity=16,
+        token_names=["v_t1", "v_t9"],
+        token_indices=[1, 9],
+    )
+
+    assert specs["v_cache"].shape == (16, 16)
+    assert specs["v_cache"].metadata["cache_kind"] == "V"
+    assert specs["v_t1"].metadata["storage_word_offset"] == 1
+    assert specs["v_t9"].metadata["storage_word_offset"] == 17
+    assert specs["v_t9"].metadata["cache_scatter_word_addrs"] == (17, 25)
+
+
+def test_compile_plan_supports_native_v_cache_append_and_consume():
+    lhs0 = np.array([[1, 2, -1, 0, 3, -2, 1, 4]], dtype=np.int16)
+    rhs0 = np.array(
+        [
+            [1, 0, 1, 0, -1, 2, 0, 1],
+            [0, 1, 0, 1, 2, -1, 1, 0],
+            [1, -1, 1, 0, 0, 1, 2, 1],
+            [2, 0, -1, 1, 1, 0, -1, 2],
+            [0, 2, 1, -1, 1, 1, 0, 0],
+            [1, 1, 0, 2, -1, 0, 1, -1],
+            [0, -1, 2, 1, 0, 1, 1, 2],
+            [1, 0, 1, 1, 2, 0, -1, 1],
+        ],
+        dtype=np.int16,
+    )
+    lhs1 = np.array([[2, 1, 0, -1, 1, 2, 0, 1]], dtype=np.int16)
+    rhs1 = np.array(
+        [
+            [0, 1, 1, 0, 2, 1, 0, -1],
+            [1, 0, 2, 1, -1, 0, 1, 2],
+            [2, 1, 0, -1, 1, 2, 1, 0],
+            [1, -1, 1, 2, 0, 1, 2, 1],
+            [0, 2, 1, 0, 1, -1, 1, 2],
+            [1, 1, -1, 1, 2, 0, 0, 1],
+            [2, 0, 1, 1, 0, 2, -1, 1],
+            [1, 2, 0, 1, -1, 1, 2, 0],
+        ],
+        dtype=np.int16,
+    )
+    attn = np.zeros((1, 16), dtype=np.int16)
+    attn[0, 1] = 2
+    attn[0, 9] = -1
+    token0 = np.clip(lhs0.astype(np.int32) @ rhs0.astype(np.int32), -32768, 32767).astype(np.int16)
+    token1 = np.clip(lhs1.astype(np.int32) @ rhs1.astype(np.int32), -32768, 32767).astype(np.int16)
+    full_cache = np.zeros((16, 8), dtype=np.int16)
+    full_cache[1, :] = token0[0]
+    full_cache[9, :] = token1[0]
+    expected = np.clip(attn.astype(np.int32) @ full_cache.astype(np.int32), -32768, 32767).astype(np.int16)
+
+    tensors = {
+        "lhs0": TensorSpec("lhs0", lhs0.shape, DType.INT16, TensorKind.CONSTANT, data=lhs0),
+        "rhs0": TensorSpec("rhs0", rhs0.shape, DType.INT16, TensorKind.CONSTANT, data=rhs0),
+        "lhs1": TensorSpec("lhs1", lhs1.shape, DType.INT16, TensorKind.CONSTANT, data=lhs1),
+        "rhs1": TensorSpec("rhs1", rhs1.shape, DType.INT16, TensorKind.CONSTANT, data=rhs1),
+        "attn": TensorSpec("attn", attn.shape, DType.INT16, TensorKind.CONSTANT, data=attn),
+        "out": TensorSpec("out", expected.shape, DType.INT16, TensorKind.OUTPUT, is_final_output=True),
+    }
+    tensors.update(
+        make_native_int16_v_cache_specs(
+            "v_cache",
+            d_head=8,
+            token_capacity=16,
+            token_names=["v_cache_t1", "v_cache_t9"],
+            token_indices=[1, 9],
+        )
+    )
+    steps = [
+        NpuSegment(
+            "seg_v_cache_views",
+            [
+                MatMulOp("op0", "lhs0", "rhs0", "v_cache_t1"),
+                MatMulOp("op1", "lhs1", "rhs1", "v_cache_t9"),
+                MatMulOp("op2", "attn", "v_cache", "out"),
+            ],
+            inputs=[],
+            outputs=["out"],
+        ),
+    ]
+    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=[], outputs=["out"])
+    artifact = compile_plan(plan, {"out": expected})
+
+    seg = artifact.segment_artifacts["seg_v_cache_views"]
+    inst0 = int(seg.binary["im"][0])
+    inst1 = int(seg.binary["im"][1])
+    inst2 = int(seg.binary["im"][2])
+    assert ((inst0 >> 184) & 0xFFFF) == 1
+    assert ((inst1 >> 184) & 0xFFFF) == 9
+    assert ((inst0 >> 248) & 0xF) == int(WritebackMode.V_CACHE_APPEND_INT16)
+    assert ((inst1 >> 248) & 0xF) == int(WritebackMode.V_CACHE_APPEND_INT16)
+    assert ((inst2 >> 52) & 0xF) == int(BReadMode.NORMAL)
+    assert plan.tensors["v_cache"].metadata["cache_kind"] == "V"
 
 
 def test_describe_int16_k_cache_append_requires_lane_partial_writes():

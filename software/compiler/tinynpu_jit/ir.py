@@ -189,9 +189,13 @@ def make_b_cache_specs(
     array_size: int = 8,
 ) -> dict[str, TensorSpec]:
     slot_stride_words = b_slot_word_stride(slot_shape, dtype, array_size=array_size)
+    base_metadata: dict[str, Any] = {}
+    if cache_kind is not None:
+        base_metadata["cache_kind"] = cache_kind
+        base_metadata["cache_slot_stride_words"] = slot_stride_words
     base_shape = (slot_shape[0] * len(slot_names), slot_shape[1])
     specs: dict[str, TensorSpec] = {
-        base_name: TensorSpec(base_name, base_shape, dtype, kind),
+        base_name: TensorSpec(base_name, base_shape, dtype, kind, metadata=base_metadata),
     }
     for slot_index, slot_name in enumerate(slot_names):
         specs[slot_name] = make_b_cache_view_spec(
@@ -239,6 +243,117 @@ def make_kv_cache_specs(
             slot_names=[f"{v_base_name}_{suffix}" for suffix in slot_suffixes],
             kind=kind,
             cache_kind="V",
+            array_size=array_size,
+        )
+    )
+    return specs
+
+
+def make_native_int16_k_cache_specs(
+    base_name: str,
+    *,
+    d_head: int,
+    token_capacity: int,
+    token_names: list[str],
+    token_indices: list[int],
+    kind: TensorKind = TensorKind.INTERMEDIATE,
+    array_size: int = 8,
+) -> dict[str, TensorSpec]:
+    if len(token_names) != len(token_indices):
+        raise ValueError("token_names and token_indices must have the same length.")
+    base_metadata: dict[str, Any] = {
+        "cache_kind": "K",
+        "cache_d_head": int(d_head),
+        "cache_token_capacity": int(token_capacity),
+    }
+    specs: dict[str, TensorSpec] = {
+        base_name: TensorSpec(base_name, (d_head, token_capacity), DType.INT16, kind, metadata=base_metadata),
+    }
+    for token_name, token_index in zip(token_names, token_indices):
+        contract = describe_int16_k_cache_append(d_head, token_capacity, token_index, array_size=array_size)
+        specs[token_name] = make_b_cache_view_spec(
+            token_name,
+            base_name,
+            (1, d_head),
+            DType.INT16,
+            kind=kind,
+            word_offset=contract.block_word_base + contract.token_lane,
+            cache_kind="K",
+            slot_index=token_index,
+        )
+        specs[token_name].metadata["cache_token_index"] = int(token_index)
+        specs[token_name].metadata["cache_scatter_word_addrs"] = contract.scatter_word_addrs
+    return specs
+
+
+def make_native_int16_v_cache_specs(
+    base_name: str,
+    *,
+    d_head: int,
+    token_capacity: int,
+    token_names: list[str],
+    token_indices: list[int],
+    kind: TensorKind = TensorKind.INTERMEDIATE,
+    array_size: int = 8,
+) -> dict[str, TensorSpec]:
+    if len(token_names) != len(token_indices):
+        raise ValueError("token_names and token_indices must have the same length.")
+    base_metadata: dict[str, Any] = {
+        "cache_kind": "V",
+        "cache_d_head": int(d_head),
+        "cache_token_capacity": int(token_capacity),
+    }
+    specs: dict[str, TensorSpec] = {
+        base_name: TensorSpec(base_name, (token_capacity, d_head), DType.INT16, kind, metadata=base_metadata),
+    }
+    for token_name, token_index in zip(token_names, token_indices):
+        contract = describe_int16_v_cache_append(d_head, token_capacity, token_index, array_size=array_size)
+        specs[token_name] = make_b_cache_view_spec(
+            token_name,
+            base_name,
+            (1, d_head),
+            DType.INT16,
+            kind=kind,
+            word_offset=contract.block_word_base + contract.row_in_block,
+            cache_kind="V",
+            slot_index=token_index,
+        )
+        specs[token_name].metadata["cache_token_index"] = int(token_index)
+        specs[token_name].metadata["cache_scatter_word_addrs"] = contract.scatter_word_addrs
+    return specs
+
+
+def make_native_int16_kv_cache_specs(
+    *,
+    k_base_name: str,
+    v_base_name: str,
+    d_head: int,
+    token_capacity: int,
+    token_names: list[str],
+    token_indices: list[int],
+    kind: TensorKind = TensorKind.INTERMEDIATE,
+    array_size: int = 8,
+) -> dict[str, TensorSpec]:
+    specs: dict[str, TensorSpec] = {}
+    specs.update(
+        make_native_int16_k_cache_specs(
+            k_base_name,
+            d_head=d_head,
+            token_capacity=token_capacity,
+            token_names=[f"{k_base_name}_{name}" for name in token_names],
+            token_indices=token_indices,
+            kind=kind,
+            array_size=array_size,
+        )
+    )
+    specs.update(
+        make_native_int16_v_cache_specs(
+            v_base_name,
+            d_head=d_head,
+            token_capacity=token_capacity,
+            token_names=[f"{v_base_name}_{name}" for name in token_names],
+            token_indices=token_indices,
+            kind=kind,
             array_size=array_size,
         )
     )
