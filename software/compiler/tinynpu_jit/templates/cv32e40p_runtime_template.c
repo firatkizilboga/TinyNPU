@@ -1364,6 +1364,42 @@ static void read_role_b_tensor(TinyTensor *dst, uint16_t addr, int precision)
     }
 }
 
+static void read_role_k_tensor(TinyTensor *dst, uint16_t addr, int precision)
+{
+    runtime_assert(precision == 2, "K-cache readback currently supports INT16 only");
+    runtime_assert(dst->dtype != TINY_DTYPE_FLOAT32, "NPU readback expects integer output tensor");
+    const int rows = dst->rank == 1 ? 1 : dst->shape[0];
+    const int cols = dst->rank == 1 ? dst->shape[0] : dst->shape[1];
+    const int k_tiles = (rows + TINY_ARRAY_SIZE - 1) / TINY_ARRAY_SIZE;
+    const int token_blocks = (cols + TINY_ARRAY_SIZE - 1) / TINY_ARRAY_SIZE;
+    const int block_word_count = k_tiles * TINY_ARRAY_SIZE;
+    uint32_t chunks[TINY_BUFFER_WORDS_32];
+
+    for (int token_block = 0; token_block < token_blocks; ++token_block) {
+        uint16_t block_base = (uint16_t)(addr + (token_block * block_word_count));
+        for (int k_tile = 0; k_tile < k_tiles; ++k_tile) {
+            uint16_t tile_addr = (uint16_t)(block_base + (k_tile * TINY_ARRAY_SIZE));
+            for (int row_in_tile = 0; row_in_tile < TINY_ARRAY_SIZE; ++row_in_tile) {
+                runtime_assert(npu_read_mem_word_mmio((uint16_t)(tile_addr + row_in_tile), chunks) == 0, "readback failed");
+                int row_idx = k_tile * TINY_ARRAY_SIZE + row_in_tile;
+                if (row_idx >= rows) {
+                    continue;
+                }
+                for (int token_lane = 0; token_lane < TINY_ARRAY_SIZE; ++token_lane) {
+                    int col_idx = token_block * TINY_ARRAY_SIZE + token_lane;
+                    if (col_idx >= cols) {
+                        continue;
+                    }
+                    uint32_t lane_word = chunks[token_lane / 2];
+                    uint16_t packed_lane = (token_lane & 1) ? (uint16_t)(lane_word >> 16) : (uint16_t)(lane_word & 0xFFFFu);
+                    int16_t value = (int16_t)packed_lane;
+                    tensor_set_i32(dst, row_idx * cols + col_idx, (int32_t)value);
+                }
+            }
+        }
+    }
+}
+
 static void read_tensor_from_npu(TinyTensor *dst, uint16_t addr, const char *role, int precision)
 {
     if (strcmp(role, "A") == 0) {
@@ -1376,6 +1412,10 @@ static void read_tensor_from_npu(TinyTensor *dst, uint16_t addr, const char *rol
     }
     if (strcmp(role, "C") == 0) {
         read_role_c_tensor(dst, addr, precision);
+        return;
+    }
+    if (strcmp(role, "K") == 0) {
+        read_role_k_tensor(dst, addr, precision);
         return;
     }
     runtime_fail("unsupported NPU readback role");
