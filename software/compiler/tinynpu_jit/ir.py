@@ -68,7 +68,6 @@ class MatMulOp:
     in_dtype: DType = DType.INT16
     out_dtype: DType = DType.INT16
     output_layout: str = "c"
-    conv_stream: dict[str, int] | None = None
 
 
 @dataclass

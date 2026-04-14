@@ -203,7 +203,7 @@ def test_emit_cv32e40p_program_v2_structured_program():
     assert "TNPU_HOST_RELU" in source
 
 
-def test_compile_plan_fuses_layout_restore_into_matrix_im2col():
+def test_compile_plan_keeps_layout_restore_then_im2col():
     a = np.arange(20, dtype=np.int16).reshape(4, 5)
     b = np.ones((5, 3), dtype=np.int16)
     mat = np.clip(a.astype(np.int32) @ b.astype(np.int32), -32768, 32767).astype(np.int16)
@@ -242,83 +242,23 @@ def test_compile_plan_fuses_layout_restore_into_matrix_im2col():
     artifact = compile_plan(plan, {"y": y})
 
     kinds = [step.kind for step in artifact.plan.steps if isinstance(step, HostOp)]
-    assert "layout_restore" not in kinds
-    if "im2col" in kinds:
-        fused_im2col = next(step for step in artifact.plan.steps if isinstance(step, HostOp) and step.kind == "im2col")
-        assert fused_im2col.inputs == ["mat"]
-        assert fused_im2col.attrs["input_layout"] == "matrix_hwc"
-        assert fused_im2col.attrs["matrix_h"] == 2
-        assert fused_im2col.attrs["matrix_w"] == 2
-        assert fused_im2col.attrs["matrix_c"] == 3
+    assert kinds == ["layout_restore", "im2col"]
 
-        source_v1 = emit_cv32e40p_c(artifact, {}, program_name="unit_test_matrix_hwc")
-        assert "host_im2col_matrix(&cols, &mat, 2, 2, 3, 2, 1, 0);" in source_v1
+    restore = next(step for step in artifact.plan.steps if isinstance(step, HostOp) and step.kind == "layout_restore")
+    assert restore.inputs == ["mat"]
+    assert restore.outputs == ["restored"]
 
-        source_v2 = emit_cv32e40p_program_v2(artifact, {}, program_name="unit_test_matrix_hwc_v2")
-        assert ".kind = TNPU_HOST_IM2COL" in source_v2
-        assert ".attrs_i32 = {2, 1, 0, 2, 2, 2, 3, 0}" in source_v2
-    else:
-        seg = next(step for step in artifact.plan.steps if isinstance(step, NpuSegment) and step.name == "seg1")
-        assert seg.ops[0].lhs == "mat"
-        assert seg.ops[0].conv_stream is not None
-        assert seg.ops[0].conv_stream["input_h"] == 2
-        assert seg.ops[0].conv_stream["input_w"] == 2
-        assert seg.ops[0].conv_stream["input_c"] == 3
+    im2col = next(step for step in artifact.plan.steps if isinstance(step, HostOp) and step.kind == "im2col")
+    assert im2col.inputs == ["restored"]
+    assert im2col.attrs["input_layout"] == "hwc"
 
+    source_v1 = emit_cv32e40p_c(artifact, {}, program_name="unit_test_matrix_hwc")
+    assert "host_layout_restore" in source_v1
+    assert "host_im2col" in source_v1
 
-def test_compile_plan_converts_matrix_im2col_to_conv_stream():
-    xmat = np.arange(16 * 8, dtype=np.int16).reshape(16, 8)
-    cols = np.zeros((9, 32), dtype=np.int16)
-    w = np.ones((32, 4), dtype=np.int16)
-    y = np.zeros((9, 4), dtype=np.int16)
-
-    tensors = {
-        "xmat": TensorSpec("xmat", xmat.shape, DType.INT16, TensorKind.INPUT),
-        "cols": TensorSpec("cols", cols.shape, DType.INT16, TensorKind.INTERMEDIATE),
-        "w": TensorSpec("w", w.shape, DType.INT16, TensorKind.CONSTANT, data=w),
-        "y": TensorSpec("y", y.shape, DType.INT16, TensorKind.OUTPUT, is_final_output=True),
-    }
-    steps = [
-        HostOp(
-            "conv2_im2col",
-            "im2col",
-            inputs=["xmat"],
-            outputs=["cols"],
-            attrs={
-                "kernel_size": 2,
-                "stride": 1,
-                "padding": 0,
-                "input_layout": "matrix_hwc",
-                "matrix_h": 4,
-                "matrix_w": 4,
-                "matrix_c": 8,
-            },
-        ),
-        NpuSegment(
-            "seg_conv",
-            [MatMulOp("op0", "cols", "w", "y", in_dtype=DType.INT16, out_dtype=DType.INT16)],
-            inputs=["cols", "w"],
-            outputs=["y"],
-        ),
-    ]
-    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=["xmat"], outputs=["y"])
-    artifact = compile_plan(plan, {"y": y})
-
-    host_kinds = [step.kind for step in artifact.plan.steps if isinstance(step, HostOp)]
-    assert "im2col" not in host_kinds
-
-    seg = next(step for step in artifact.plan.steps if isinstance(step, NpuSegment))
-    assert seg.ops[0].lhs == "xmat"
-    assert seg.ops[0].conv_stream is not None
-    assert seg.ops[0].conv_stream["input_h"] == 4
-    assert seg.ops[0].conv_stream["input_w"] == 4
-    assert seg.ops[0].conv_stream["input_c"] == 8
-    assert seg.ops[0].conv_stream["kernel_size"] == 2
-    first_instr = artifact.segment_artifacts["seg_conv"].binary["im"][0]
-    assert ((first_instr >> 71) & 0x1) == 1
-
-    source = emit_cv32e40p_c(artifact, {"xmat": xmat}, program_name="unit_test_conv_stream")
-    assert "HostOp im2col" not in source
+    source_v2 = emit_cv32e40p_program_v2(artifact, {}, program_name="unit_test_matrix_hwc_v2")
+    assert source_v2.count(".kind = TNPU_HOST_LAYOUT_RESTORE") == 1
+    assert source_v2.count(".kind = TNPU_HOST_IM2COL") == 1
 
 
 def test_compile_plan_keeps_matrix_im2col_for_int8_by_default():
@@ -364,7 +304,6 @@ def test_compile_plan_keeps_matrix_im2col_for_int8_by_default():
 
     seg = next(step for step in artifact.plan.steps if isinstance(step, NpuSegment))
     assert seg.ops[0].lhs == "cols"
-    assert seg.ops[0].conv_stream is None
 
 
 def test_compile_plan_keeps_matrix_im2col_for_int4_by_default():
@@ -410,55 +349,6 @@ def test_compile_plan_keeps_matrix_im2col_for_int4_by_default():
 
     seg = next(step for step in artifact.plan.steps if isinstance(step, NpuSegment))
     assert seg.ops[0].lhs == "cols"
-    assert seg.ops[0].conv_stream is None
-
-
-def test_compile_plan_can_opt_in_conv_stream_for_int8(monkeypatch):
-    monkeypatch.setenv("TINYNPU_ENABLE_CONV_STREAM_PACKED", "1")
-
-    xmat = np.arange(5 * 4 * 7, dtype=np.int8).reshape(20, 7)
-    cols = np.zeros((6, 63), dtype=np.int8)
-    w = np.ones((63, 5), dtype=np.int8)
-    y = np.zeros((6, 5), dtype=np.int8)
-
-    tensors = {
-        "xmat": TensorSpec("xmat", xmat.shape, DType.INT8, TensorKind.INPUT),
-        "cols": TensorSpec("cols", cols.shape, DType.INT8, TensorKind.INTERMEDIATE),
-        "w": TensorSpec("w", w.shape, DType.INT8, TensorKind.CONSTANT, data=w),
-        "y": TensorSpec("y", y.shape, DType.INT8, TensorKind.OUTPUT, is_final_output=True),
-    }
-    steps = [
-        HostOp(
-            "conv_im2col",
-            "im2col",
-            inputs=["xmat"],
-            outputs=["cols"],
-            attrs={
-                "kernel_size": 3,
-                "stride": 2,
-                "padding": 1,
-                "input_layout": "matrix_hwc",
-                "matrix_h": 5,
-                "matrix_w": 4,
-                "matrix_c": 7,
-            },
-        ),
-        NpuSegment(
-            "seg_conv",
-            [MatMulOp("op0", "cols", "w", "y", in_dtype=DType.INT8, out_dtype=DType.INT8)],
-            inputs=["cols", "w"],
-            outputs=["y"],
-        ),
-    ]
-    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=["xmat"], outputs=["y"])
-    artifact = compile_plan(plan, {"y": y})
-
-    host_kinds = [step.kind for step in artifact.plan.steps if isinstance(step, HostOp)]
-    assert "im2col" not in host_kinds
-
-    seg = next(step for step in artifact.plan.steps if isinstance(step, NpuSegment))
-    assert seg.ops[0].lhs == "xmat"
-    assert seg.ops[0].conv_stream is not None
 
 
 @pytest.mark.parametrize(

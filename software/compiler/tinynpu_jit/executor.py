@@ -137,28 +137,8 @@ class HostEmulationExecutor:
     def _run_npu_segment(self, step: NpuSegment, values: dict[str, np.ndarray]) -> None:
         for op in step.ops:
             bias = values.get(op.bias) if op.bias else None
-            lhs = values[op.lhs]
-            if op.conv_stream is not None:
-                attrs = op.conv_stream
-                in_h = int(attrs["input_h"])
-                in_w = int(attrs["input_w"])
-                in_c = int(attrs["input_c"])
-                kernel = int(attrs["kernel_size"])
-                stride = int(attrs["stride"])
-                padding = int(attrs["padding"])
-                lhs_arr = np.array(lhs, copy=False)
-                if lhs_arr.shape != (in_h * in_w, in_c):
-                    raise ValueError(
-                        f"conv_stream lhs shape mismatch for {op.name}: expected {(in_h * in_w, in_c)}, got {tuple(lhs_arr.shape)}."
-                    )
-                lhs = self.golden.im2col(
-                    lhs_arr.reshape(in_h, in_w, in_c),
-                    kernel_size=kernel,
-                    stride=stride,
-                    padding=padding,
-                )
             values[op.out] = self.golden.matmul(
-                lhs,
+                values[op.lhs],
                 values[op.rhs],
                 bias=bias,
                 multiplier=op.multiplier,

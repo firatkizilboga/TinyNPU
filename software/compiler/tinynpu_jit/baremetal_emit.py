@@ -269,9 +269,12 @@ def emit_cv32e40p_c(
     emit_cpu_baseline: bool = False,
     verify_cpu_baseline: bool = False,
     repeat_count: int = 1,
+    cpu_only_baseline: bool = False,
 ) -> str:
     if verify_cpu_baseline and not emit_cpu_baseline:
         raise ValueError("verify_cpu_baseline requires emit_cpu_baseline=True.")
+    if cpu_only_baseline and emit_cpu_baseline:
+        raise ValueError("cpu_only_baseline replaces emit_cpu_baseline; do not enable both.")
     if repeat_count < 1:
         raise ValueError("repeat_count must be >= 1.")
 
@@ -342,7 +345,7 @@ def emit_cv32e40p_c(
                 decls.append(storage_decl)
                 decls.append(tensor_decl)
 
-    if artifact.static_ub_image:
+    if artifact.static_ub_image and not cpu_only_baseline:
         decls.append(_emit_u32x4_image("tinynpu_static_ub_image", [int(word) for word in artifact.static_ub_image]))
         main_lines.append("    cycle_t0 = read_mcycle32();")
         main_lines.append(
@@ -356,29 +359,30 @@ def emit_cv32e40p_c(
 
     im_start_addrs: dict[str, int] = {}
     next_im_addr = im_base_addr
-    for step in artifact.plan.steps:
-        if not isinstance(step, NpuSegment):
-            continue
-        segment = artifact.segment_artifacts[step.name]
-        flattened_chunks: list[int] = []
-        for inst in segment.binary["im"]:
-            inst_int = int(inst)
-            for chunk_idx in range(im_chunks_per_inst):
-                chunk = (inst_int >> (chunk_idx * buffer_width)) & ((1 << buffer_width) - 1)
-                flattened_chunks.append(int(chunk))
-        image_name = f"im_{_sanitize(step.name)}"
-        im_start_addrs[step.name] = next_im_addr
-        decls.append(_emit_u32x4_image(image_name, flattened_chunks))
-        main_lines.append("    cycle_t0 = read_mcycle32();")
-        main_lines.append(
-            f"    load_im_image(0x{next_im_addr:04x}u, {image_name}, {len(flattened_chunks)});"
-        )
-        main_lines.append("    cycle_t1 = read_mcycle32();")
-        if repeat_count > 1:
-            main_lines.append("    delta = cycle_t0 - cycle_t1;")
-            main_lines.append("    preload_total += delta;")
-        main_lines.append(f'    print_cycle_delta32("preload.{image_name}", cycle_t0, cycle_t1);')
-        next_im_addr += len(flattened_chunks)
+    if not cpu_only_baseline:
+        for step in artifact.plan.steps:
+            if not isinstance(step, NpuSegment):
+                continue
+            segment = artifact.segment_artifacts[step.name]
+            flattened_chunks: list[int] = []
+            for inst in segment.binary["im"]:
+                inst_int = int(inst)
+                for chunk_idx in range(im_chunks_per_inst):
+                    chunk = (inst_int >> (chunk_idx * buffer_width)) & ((1 << buffer_width) - 1)
+                    flattened_chunks.append(int(chunk))
+            image_name = f"im_{_sanitize(step.name)}"
+            im_start_addrs[step.name] = next_im_addr
+            decls.append(_emit_u32x4_image(image_name, flattened_chunks))
+            main_lines.append("    cycle_t0 = read_mcycle32();")
+            main_lines.append(
+                f"    load_im_image(0x{next_im_addr:04x}u, {image_name}, {len(flattened_chunks)});"
+            )
+            main_lines.append("    cycle_t1 = read_mcycle32();")
+            if repeat_count > 1:
+                main_lines.append("    delta = cycle_t0 - cycle_t1;")
+                main_lines.append("    preload_total += delta;")
+            main_lines.append(f'    print_cycle_delta32("preload.{image_name}", cycle_t0, cycle_t1);')
+            next_im_addr += len(flattened_chunks)
 
     body_lines: list[str] = []
 
@@ -405,7 +409,6 @@ def emit_cv32e40p_c(
             continue
 
         if isinstance(step, NpuSegment):
-            segment = artifact.segment_artifacts[step.name]
             produced_inside = {op.out for op in step.ops}
             cpu_suffix = f"__cpu_{_sanitize(step.name)}"
             cpu_outputs = {op.out for op in step.ops}
@@ -416,6 +419,31 @@ def emit_cv32e40p_c(
                 if emit_cpu_baseline and name in cpu_outputs:
                     return _emit_tensor_reference(name, cpu_suffix)
                 return _emit_tensor_reference(name)
+
+            if cpu_only_baseline:
+                if repeat_count > 1:
+                    body_lines.append(f'    if (repeat_iter == 0) printf("CpuSegment: {step.name}\\n");')
+                else:
+                    body_lines.append(f'    printf("CpuSegment: {step.name}\\n");')
+                body_lines.append("    cycle_t0 = read_mcycle32();")
+                for op in step.ops:
+                    body_lines.append(
+                        "    host_matmul("
+                        f"{_segment_ref(op.out)}, {_segment_ref(op.lhs)}, {_segment_ref(op.rhs)}, {_segment_ref(op.bias)}, "
+                        f"{int(op.multiplier)}, {int(op.shift)}, {_activation_code(op.activation)}, {int(op.h_gelu_x_scale_shift)});"
+                    )
+                body_lines.append("    cycle_t1 = read_mcycle32();")
+                if repeat_count > 1:
+                    body_lines.append("    delta = cycle_t0 - cycle_t1;")
+                    body_lines.append("    segment_cpu_total += delta;")
+                    body_lines.append(
+                        f'    if (repeat_iter == 0) print_cycle_delta32("segment.{_sanitize(step.name)}.cpu", cycle_t0, cycle_t1);'
+                    )
+                else:
+                    body_lines.append(f'    print_cycle_delta32("segment.{_sanitize(step.name)}.cpu", cycle_t0, cycle_t1);')
+                continue
+
+            segment = artifact.segment_artifacts[step.name]
 
             if repeat_count > 1:
                 body_lines.append(f'    if (repeat_iter == 0) printf("NpuSegment: {step.name}\\n");')
@@ -543,28 +571,42 @@ def emit_cv32e40p_c(
         main_lines.append(f'    printf("repeat.count=%d\\n", {repeat_count});')
         main_lines.append('    printf("repeat.preload.total cycles=%lu\\n", (unsigned long)preload_total);')
         main_lines.append('    printf("repeat.host.shared.total cycles=%lu\\n", (unsigned long)host_total);')
-        main_lines.append('    printf("repeat.segment.npu.total cycles=%lu\\n", (unsigned long)segment_npu_total);')
-        main_lines.append(
-            '    printf("repeat.program.npu.hot.total cycles=%lu\\n", (unsigned long)(host_total + segment_npu_total));'
-        )
-        main_lines.append(
-            '    printf("repeat.program.npu.cold.total cycles=%lu\\n", (unsigned long)(preload_total + host_total + segment_npu_total));'
-        )
-        main_lines.append(
-            '    printf("repeat.program.npu.hot.avg cycles=%lu\\n", (unsigned long)((host_total + segment_npu_total) / (uint32_t)'
-            f"{repeat_count}"
-            '));'
-        )
-        if emit_cpu_baseline:
+        if cpu_only_baseline:
             main_lines.append('    printf("repeat.segment.cpu.total cycles=%lu\\n", (unsigned long)segment_cpu_total);')
             main_lines.append(
                 '    printf("repeat.program.cpu.hot.total cycles=%lu\\n", (unsigned long)(host_total + segment_cpu_total));'
+            )
+            main_lines.append(
+                '    printf("repeat.program.cpu.cold.total cycles=%lu\\n", (unsigned long)(preload_total + host_total + segment_cpu_total));'
             )
             main_lines.append(
                 '    printf("repeat.program.cpu.hot.avg cycles=%lu\\n", (unsigned long)((host_total + segment_cpu_total) / (uint32_t)'
                 f"{repeat_count}"
                 '));'
             )
+        else:
+            main_lines.append('    printf("repeat.segment.npu.total cycles=%lu\\n", (unsigned long)segment_npu_total);')
+            main_lines.append(
+                '    printf("repeat.program.npu.hot.total cycles=%lu\\n", (unsigned long)(host_total + segment_npu_total));'
+            )
+            main_lines.append(
+                '    printf("repeat.program.npu.cold.total cycles=%lu\\n", (unsigned long)(preload_total + host_total + segment_npu_total));'
+            )
+            main_lines.append(
+                '    printf("repeat.program.npu.hot.avg cycles=%lu\\n", (unsigned long)((host_total + segment_npu_total) / (uint32_t)'
+                f"{repeat_count}"
+                '));'
+            )
+            if emit_cpu_baseline:
+                main_lines.append('    printf("repeat.segment.cpu.total cycles=%lu\\n", (unsigned long)segment_cpu_total);')
+                main_lines.append(
+                    '    printf("repeat.program.cpu.hot.total cycles=%lu\\n", (unsigned long)(host_total + segment_cpu_total));'
+                )
+                main_lines.append(
+                    '    printf("repeat.program.cpu.hot.avg cycles=%lu\\n", (unsigned long)((host_total + segment_cpu_total) / (uint32_t)'
+                    f"{repeat_count}"
+                    '));'
+                )
     else:
         main_lines.extend(body_lines)
 
@@ -594,6 +636,7 @@ def write_cv32e40p_c(
     emit_cpu_baseline: bool = False,
     verify_cpu_baseline: bool = False,
     repeat_count: int = 1,
+    cpu_only_baseline: bool = False,
 ) -> Path:
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -606,6 +649,7 @@ def write_cv32e40p_c(
             emit_cpu_baseline=emit_cpu_baseline,
             verify_cpu_baseline=verify_cpu_baseline,
             repeat_count=repeat_count,
+            cpu_only_baseline=cpu_only_baseline,
         )
     )
     return output
