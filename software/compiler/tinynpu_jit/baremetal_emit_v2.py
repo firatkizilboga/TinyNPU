@@ -430,9 +430,23 @@ def emit_cv32e40p_program_v2(
             elif step.kind == "rmsnorm":
                 attrs_f32[0] = float(step.attrs.get("eps", 1.0e-6))
             elif step.kind == "rope":
-                attrs_i32[0] = int(step.attrs.get("head_dim", 0))
+                head_dim = int(step.attrs.get("head_dim", 0))
+                attrs_i32[0] = head_dim
                 attrs_i32[1] = int(step.attrs.get("position", 0))
-                attrs_f32[0] = float(step.attrs.get("theta", 10000.0))
+                theta = float(step.attrs.get("theta", 10000.0))
+                attrs_f32[0] = theta
+                half = head_dim // 2
+                if half > 0:
+                    inv_freq = 1.0 / (theta ** (np.arange(0, half, dtype=np.float32) / np.float32(half)))
+                    inv_freq_bits = np.asarray(inv_freq, dtype=np.float32).view(np.int32)
+                    arr0_name = f"{symbol}_host_{_sanitize(step.name)}_inv_freq_bits"
+                    arr0_len = int(inv_freq_bits.size)
+                    decls.append(
+                        f"static const int {arr0_name}[{arr0_len}] = "
+                        + "{"
+                        + ", ".join(str(int(v)) for v in inv_freq_bits.tolist())
+                        + "};"
+                    )
 
             host_entries.append(
                 "    {"

@@ -291,7 +291,17 @@ static int tnpu_execute_host_op(TinyTensor *runtime_tensors, const TnpuHostOp *o
             host_rmsnorm(out, in, in1, op->attrs_f32[0]);
             return 0;
         case TNPU_HOST_ROPE:
-            host_rope(out, in, op->attrs_i32[0], op->attrs_i32[1], op->attrs_f32[0]);
+            if (op->arr0 != NULL && op->arr0_len > 0u) {
+                host_rope_precomputed(
+                    out,
+                    in,
+                    op->attrs_i32[0],
+                    op->attrs_i32[1],
+                    op->arr0,
+                    (int)op->arr0_len);
+            } else {
+                host_rope(out, in, op->attrs_i32[0], op->attrs_i32[1], op->attrs_f32[0]);
+            }
             return 0;
         case TNPU_HOST_SILU:
             host_silu(out, in);
