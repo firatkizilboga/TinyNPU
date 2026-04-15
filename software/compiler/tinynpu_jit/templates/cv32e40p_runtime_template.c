@@ -827,18 +827,83 @@ static void host_add(TinyTensor *dst, const TinyTensor *lhs, const TinyTensor *r
     }
 }
 
-static void host_rope(TinyTensor *dst, const TinyTensor *src, int head_dim, int position, float theta)
+static float host_float_from_bits(int32_t bits)
+{
+    union {
+        int32_t i;
+        float f;
+    } value;
+    value.i = bits;
+    return value.f;
+}
+
+#ifndef TNPU_ROPE_CACHE_MAX_POS
+#define TNPU_ROPE_CACHE_MAX_POS 256
+#endif
+
+#ifndef TNPU_ROPE_CACHE_MAX_HALF
+#define TNPU_ROPE_CACHE_MAX_HALF 64
+#endif
+
+static int g_rope_cache_valid = 0;
+static int g_rope_cache_head_dim = 0;
+static float g_rope_cache_theta = 0.0f;
+static int g_rope_cache_max_pos = -1;
+static float g_rope_cache_inv_freq[TNPU_ROPE_CACHE_MAX_HALF] __attribute__((section(".noinit")));
+static float g_rope_cache_cos[TNPU_ROPE_CACHE_MAX_POS][TNPU_ROPE_CACHE_MAX_HALF] __attribute__((section(".noinit")));
+static float g_rope_cache_sin[TNPU_ROPE_CACHE_MAX_POS][TNPU_ROPE_CACHE_MAX_HALF] __attribute__((section(".noinit")));
+
+static int host_rope_cache_prepare(int head_dim, float theta, int max_pos)
+{
+    const int half = head_dim / 2;
+    if (half > TNPU_ROPE_CACHE_MAX_HALF || max_pos >= TNPU_ROPE_CACHE_MAX_POS) {
+        return 0;
+    }
+
+    if (!g_rope_cache_valid || g_rope_cache_head_dim != head_dim || g_rope_cache_theta != theta) {
+        const float rope_base = powf(theta, -1.0f / (float)half);
+        float inv_freq = 1.0f;
+        for (int i = 0; i < half; ++i) {
+            g_rope_cache_inv_freq[i] = inv_freq;
+            inv_freq *= rope_base;
+        }
+        g_rope_cache_valid = 1;
+        g_rope_cache_head_dim = head_dim;
+        g_rope_cache_theta = theta;
+        g_rope_cache_max_pos = -1;
+    }
+
+    for (int pos = g_rope_cache_max_pos + 1; pos <= max_pos; ++pos) {
+        for (int i = 0; i < half; ++i) {
+            float angle = (float)pos * g_rope_cache_inv_freq[i];
+            g_rope_cache_cos[pos][i] = cosf(angle);
+            g_rope_cache_sin[pos][i] = sinf(angle);
+        }
+    }
+    if (max_pos > g_rope_cache_max_pos) {
+        g_rope_cache_max_pos = max_pos;
+    }
+    return 1;
+}
+
+static void host_rope_precomputed(
+    TinyTensor *dst,
+    const TinyTensor *src,
+    int head_dim,
+    int position,
+    const int *inv_freq_bits,
+    int inv_freq_len)
 {
     runtime_assert(dst->dtype == TINY_DTYPE_FLOAT32, "rope output must be float");
     runtime_assert(src->rank >= 2, "rope expects rank >= 2");
-    runtime_assert(theta > 0.0f, "rope theta must be positive");
     runtime_assert(head_dim > 0 && (head_dim % 2) == 0, "rope head_dim must be positive and even");
     runtime_assert(src->shape[src->rank - 1] == head_dim, "rope last dimension mismatch");
     runtime_assert(dst->elem_count == src->elem_count, "rope size mismatch");
 
     const int half = head_dim / 2;
-    const float inv_half = host_recip_approx((float)half);
-    const float rope_base = host_exp_approx(-host_log_approx(theta) * inv_half);
+    runtime_assert(inv_freq_bits != NULL, "rope precomputed inv_freq must not be null");
+    runtime_assert(inv_freq_len >= half, "rope precomputed inv_freq length mismatch");
+
     int outer = 1;
     int seq_len = 1;
     if (src->rank == 2) {
@@ -851,20 +916,111 @@ static void host_rope(TinyTensor *dst, const TinyTensor *src, int head_dim, int 
         seq_len = src->shape[src->rank - 2];
     }
 
+    float *dst_data = tensor_f32(dst);
+    float *src_data = tensor_f32(src);
     for (int outer_idx = 0; outer_idx < outer; ++outer_idx) {
         for (int seq_idx = 0; seq_idx < seq_len; ++seq_idx) {
-            int logical_pos = position + (src->rank == 2 ? 0 : seq_idx);
-            int base = ((outer_idx * seq_len) + seq_idx) * head_dim;
-            float inv_freq = 1.0f;
+            const int logical_pos = position + seq_idx;
+            const int base = ((outer_idx * seq_len) + seq_idx) * head_dim;
             for (int i = 0; i < half; ++i) {
-                float angle = (float)logical_pos * inv_freq;
-                float c = host_cos_approx(angle);
-                float s = host_sin_approx(angle);
-                float first = tensor_get_float(src, base + i);
-                float second = tensor_get_float(src, base + half + i);
-                tensor_set_float(dst, base + i, first * c - second * s);
-                tensor_set_float(dst, base + half + i, second * c + first * s);
-                inv_freq *= rope_base;
+                const float inv_freq = host_float_from_bits(inv_freq_bits[i]);
+                const float angle = (float)logical_pos * inv_freq;
+                const float c = cosf(angle);
+                const float s = sinf(angle);
+                const float first = src_data[base + i];
+                const float second = src_data[base + half + i];
+                dst_data[base + i] = first * c - second * s;
+                dst_data[base + half + i] = second * c + first * s;
+            }
+        }
+    }
+}
+
+static void host_rope(TinyTensor *dst, const TinyTensor *src, int head_dim, int position, float theta)
+{
+    runtime_assert(dst->dtype == TINY_DTYPE_FLOAT32, "rope output must be float");
+    runtime_assert(src->rank >= 2, "rope expects rank >= 2");
+    runtime_assert(theta > 0.0f, "rope theta must be positive");
+    runtime_assert(head_dim > 0 && (head_dim % 2) == 0, "rope head_dim must be positive and even");
+    runtime_assert(src->shape[src->rank - 1] == head_dim, "rope last dimension mismatch");
+    runtime_assert(dst->elem_count == src->elem_count, "rope size mismatch");
+
+    const int half = head_dim / 2;
+    int outer = 1;
+    int seq_len = 1;
+    if (src->rank == 2) {
+        outer = src->shape[0];
+        seq_len = 1;
+    } else {
+        for (int axis = 0; axis < src->rank - 2; ++axis) {
+            outer *= src->shape[axis];
+        }
+        seq_len = src->shape[src->rank - 2];
+    }
+
+    float *dst_data = tensor_f32(dst);
+    float *src_data = tensor_f32(src);
+    if (host_rope_cache_prepare(head_dim, theta, position + seq_len - 1)) {
+        for (int outer_idx = 0; outer_idx < outer; ++outer_idx) {
+            for (int seq_idx = 0; seq_idx < seq_len; ++seq_idx) {
+                int logical_pos = position + seq_idx;
+                int base = ((outer_idx * seq_len) + seq_idx) * head_dim;
+                const float *cos_row = g_rope_cache_cos[logical_pos];
+                const float *sin_row = g_rope_cache_sin[logical_pos];
+                for (int i = 0; i < half; ++i) {
+                    float c = cos_row[i];
+                    float s = sin_row[i];
+                    float first = src_data[base + i];
+                    float second = src_data[base + half + i];
+                    dst_data[base + i] = first * c - second * s;
+                    dst_data[base + half + i] = second * c + first * s;
+                }
+            }
+        }
+        return;
+    }
+
+    {
+        const float rope_base = powf(theta, -1.0f / (float)half);
+        float inv_freqs[half];
+        float delta_cos[half];
+        float delta_sin[half];
+        float cur_cos[half];
+        float cur_sin[half];
+        float inv_freq = 1.0f;
+        for (int i = 0; i < half; ++i) {
+            inv_freqs[i] = inv_freq;
+            delta_cos[i] = cosf(inv_freq);
+            delta_sin[i] = sinf(inv_freq);
+            inv_freq *= rope_base;
+        }
+        for (int outer_idx = 0; outer_idx < outer; ++outer_idx) {
+            {
+                const int initial_pos = position;
+                for (int i = 0; i < half; ++i) {
+                    float angle = (float)initial_pos * inv_freqs[i];
+                    cur_cos[i] = cosf(angle);
+                    cur_sin[i] = sinf(angle);
+                }
+            }
+            for (int seq_idx = 0; seq_idx < seq_len; ++seq_idx) {
+                int base = ((outer_idx * seq_len) + seq_idx) * head_dim;
+                for (int i = 0; i < half; ++i) {
+                    float c = cur_cos[i];
+                    float s = cur_sin[i];
+                    float first = src_data[base + i];
+                    float second = src_data[base + half + i];
+                    dst_data[base + i] = first * c - second * s;
+                    dst_data[base + half + i] = second * c + first * s;
+                }
+                if (src->rank != 2 && seq_idx + 1 < seq_len) {
+                    for (int i = 0; i < half; ++i) {
+                        float c = cur_cos[i];
+                        float s = cur_sin[i];
+                        cur_cos[i] = (c * delta_cos[i]) - (s * delta_sin[i]);
+                        cur_sin[i] = (s * delta_cos[i]) + (c * delta_sin[i]);
+                    }
+                }
             }
         }
     }

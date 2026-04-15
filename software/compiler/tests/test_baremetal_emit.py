@@ -1335,6 +1335,8 @@ def test_host_op_rope_emulation_and_v2_emit():
     artifact = compile_plan(plan, {"y": expected.astype(np.float32)})
     source = emit_cv32e40p_program_v2(artifact, {}, program_name="unit_test_rope_v2")
     assert "TNPU_HOST_ROPE" in source
+    assert "_host_rope0_inv_freq_bits" in source
+    assert ".arr0 =" in source
 
 
 def test_host_op_silu_emulation_and_v2_emit():
