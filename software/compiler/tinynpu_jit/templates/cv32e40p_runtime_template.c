@@ -971,6 +971,91 @@ static void host_add(TinyTensor *dst, const TinyTensor *lhs, const TinyTensor *r
     }
 }
 
+static void host_causal_mask(TinyTensor *dst, const TinyTensor *src, int past_kv_len, float fill_value)
+{
+    runtime_assert(dst->elem_count == src->elem_count, "causal_mask size mismatch");
+    runtime_assert(src->rank >= 2, "causal_mask expects rank >= 2");
+    runtime_assert(past_kv_len >= 0, "causal_mask past_kv_len must be non-negative");
+
+    const int q_len = src->shape[src->rank - 2];
+    const int k_len = src->shape[src->rank - 1];
+    const int outer = src->elem_count / (q_len * k_len);
+    if (src->dtype == TINY_DTYPE_FLOAT32) {
+        runtime_assert(dst->dtype == TINY_DTYPE_FLOAT32, "float causal_mask output must be float");
+        for (int outer_idx = 0; outer_idx < outer; ++outer_idx) {
+            const int base = outer_idx * q_len * k_len;
+            for (int row = 0; row < q_len; ++row) {
+                const int max_col = past_kv_len + row;
+                for (int col = 0; col < k_len; ++col) {
+                    const int linear = base + row * k_len + col;
+                    if (col > max_col) {
+                        tensor_set_float(dst, linear, fill_value);
+                    } else {
+                        tensor_set_float(dst, linear, tensor_get_float(src, linear));
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    runtime_assert(dst->dtype != TINY_DTYPE_FLOAT32, "integer causal_mask output must be integer");
+    {
+        const int32_t fill_i32 = (int32_t)host_round_to_i32(fill_value);
+        for (int outer_idx = 0; outer_idx < outer; ++outer_idx) {
+            const int base = outer_idx * q_len * k_len;
+            for (int row = 0; row < q_len; ++row) {
+                const int max_col = past_kv_len + row;
+                for (int col = 0; col < k_len; ++col) {
+                    const int linear = base + row * k_len + col;
+                    if (col > max_col) {
+                        tensor_set_i32(dst, linear, fill_i32);
+                    } else {
+                        tensor_set_i32(dst, linear, tensor_get_i32(src, linear));
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void host_concat_lastdim2(TinyTensor *dst, const TinyTensor *lhs, const TinyTensor *rhs)
+{
+    runtime_assert(lhs->rank == rhs->rank, "concat_lastdim2 rank mismatch");
+    runtime_assert(dst->rank == lhs->rank, "concat_lastdim2 output rank mismatch");
+    for (int axis = 0; axis < lhs->rank - 1; ++axis) {
+        runtime_assert(lhs->shape[axis] == rhs->shape[axis], "concat_lastdim2 prefix shape mismatch");
+        runtime_assert(dst->shape[axis] == lhs->shape[axis], "concat_lastdim2 output prefix mismatch");
+    }
+    runtime_assert(dst->shape[lhs->rank - 1] == lhs->shape[lhs->rank - 1] + rhs->shape[rhs->rank - 1], "concat_lastdim2 last-dim mismatch");
+    runtime_assert(lhs->dtype == rhs->dtype, "concat_lastdim2 dtype mismatch");
+    runtime_assert(dst->dtype == lhs->dtype, "concat_lastdim2 output dtype mismatch");
+
+    const int lhs_last = lhs->shape[lhs->rank - 1];
+    const int rhs_last = rhs->shape[rhs->rank - 1];
+    const int outer = lhs->elem_count / lhs_last;
+    for (int outer_idx = 0; outer_idx < outer; ++outer_idx) {
+        const int lhs_base = outer_idx * lhs_last;
+        const int rhs_base = outer_idx * rhs_last;
+        const int dst_base = outer_idx * (lhs_last + rhs_last);
+        if (dst->dtype == TINY_DTYPE_FLOAT32) {
+            for (int i = 0; i < lhs_last; ++i) {
+                tensor_set_float(dst, dst_base + i, tensor_get_float(lhs, lhs_base + i));
+            }
+            for (int i = 0; i < rhs_last; ++i) {
+                tensor_set_float(dst, dst_base + lhs_last + i, tensor_get_float(rhs, rhs_base + i));
+            }
+        } else {
+            for (int i = 0; i < lhs_last; ++i) {
+                tensor_set_i32(dst, dst_base + i, tensor_get_i32(lhs, lhs_base + i));
+            }
+            for (int i = 0; i < rhs_last; ++i) {
+                tensor_set_i32(dst, dst_base + lhs_last + i, tensor_get_i32(rhs, rhs_base + i));
+            }
+        }
+    }
+}
+
 static float host_float_from_bits(int32_t bits)
 {
     union {

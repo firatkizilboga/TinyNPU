@@ -138,3 +138,67 @@ def test_mean_benchmark_counts_embedded_dequantization_work():
     assert counts.reads == source.size * 2
     assert counts.muls == source.size
     assert counts.adds == source.size * 3
+
+
+def test_causal_mask_execution_and_validation():
+    source = np.array(
+        [
+            [1, 2, 3, 4],
+            [5, 6, 7, 8],
+            [9, 10, 11, 12],
+            [13, 14, 15, 16],
+        ],
+        dtype=np.int16,
+    )
+    expected = np.array(
+        [
+            [1, np.iinfo(np.int16).min, np.iinfo(np.int16).min, np.iinfo(np.int16).min],
+            [5, 6, np.iinfo(np.int16).min, np.iinfo(np.int16).min],
+            [9, 10, 11, np.iinfo(np.int16).min],
+            [13, 14, 15, 16],
+        ],
+        dtype=np.int32,
+    )
+
+    step = HostOp("mask0", "causal_mask", inputs=["x"], outputs=["y"])
+    artifact = _artifact_for_host_op(step, input_dtype=DType.INT16, output_dtype=DType.INT16)
+    artifact.plan.tensors["x"] = TensorSpec("x", source.shape, DType.INT16, TensorKind.INPUT)
+    artifact.plan.tensors["y"] = TensorSpec("y", source.shape, DType.INT16, TensorKind.OUTPUT, is_final_output=True)
+
+    result = HostEmulationExecutor().run(artifact, {"x": source})
+    np.testing.assert_array_equal(result.tensors["y"], expected)
+
+    with pytest.raises(ValueError, match="past_kv_len >= 0"):
+        compile_plan(
+            ExecutionPlan(
+                tensors={
+                    "x": TensorSpec("x", source.shape, DType.INT16, TensorKind.INPUT),
+                    "y": TensorSpec("y", source.shape, DType.INT16, TensorKind.OUTPUT, is_final_output=True),
+                },
+                steps=[HostOp("mask_bad", "causal_mask", inputs=["x"], outputs=["y"], attrs={"past_kv_len": -1})],
+                inputs=["x"],
+                outputs=["y"],
+            ),
+            expected_tensors={},
+        )
+
+
+def test_concat_lastdim2_execution():
+    lhs = np.array([[1, 2], [3, 4]], dtype=np.int16)
+    rhs = np.array([[5, 6, 7], [8, 9, 10]], dtype=np.int16)
+    expected = np.array([[1, 2, 5, 6, 7], [3, 4, 8, 9, 10]], dtype=np.int32)
+
+    tensors = {
+        "lhs": TensorSpec("lhs", lhs.shape, DType.INT16, TensorKind.INPUT),
+        "rhs": TensorSpec("rhs", rhs.shape, DType.INT16, TensorKind.INPUT),
+        "y": TensorSpec("y", expected.shape, DType.INT16, TensorKind.OUTPUT, is_final_output=True),
+    }
+    step = HostOp("cat0", "concat_lastdim2", inputs=["lhs", "rhs"], outputs=["y"])
+    artifact = CompiledArtifact(
+        plan=ExecutionPlan(tensors=tensors, steps=[step], inputs=["lhs", "rhs"], outputs=["y"]),
+        expected_tensors={},
+        segment_artifacts={},
+    )
+
+    result = HostEmulationExecutor().run(artifact, {"lhs": lhs, "rhs": rhs})
+    np.testing.assert_array_equal(result.tensors["y"], expected)

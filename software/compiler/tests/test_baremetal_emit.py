@@ -3,6 +3,7 @@ import pytest
 
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), "scripts"))
 
 from tinynpu_jit import emit_cv32e40p_c, emit_cv32e40p_program_v2
 from tinynpu_jit.golden import GoldenModel
@@ -30,6 +31,7 @@ from tinynpu_jit import (
 )
 from tinynpu import TinyNPUProgram
 from tinynpu.isa import BReadMode, OutputLayout, PrecisionMode, WritebackMode, XformMode
+from run_cv32e40p_prefill_transformer_block_jit_demo import build_artifact as build_prefill_transformer_block_artifact
 
 
 def test_emit_cv32e40p_c_for_two_segment_relu_chain():
@@ -1542,7 +1544,96 @@ def test_host_op_mul_add_emulation_and_v2_emit():
     add_artifact = compile_plan(add_plan, {"z": add_expected.astype(np.float32)})
     add_source = emit_cv32e40p_program_v2(add_artifact, {}, program_name="unit_test_add_v2")
     assert "TNPU_HOST_ADD" in add_source
-    assert ".input1_idx =" in add_source
+
+
+def test_host_op_causal_mask_emulation_and_emitters():
+    x = np.array(
+        [
+            [1, 2, 3, 4],
+            [5, 6, 7, 8],
+            [9, 10, 11, 12],
+            [13, 14, 15, 16],
+        ],
+        dtype=np.int16,
+    )
+    expected = np.array(
+        [
+            [1, np.iinfo(np.int16).min, np.iinfo(np.int16).min, np.iinfo(np.int16).min],
+            [5, 6, np.iinfo(np.int16).min, np.iinfo(np.int16).min],
+            [9, 10, 11, np.iinfo(np.int16).min],
+            [13, 14, 15, 16],
+        ],
+        dtype=np.int32,
+    )
+
+    values = {"x": x, "y": np.zeros_like(x, dtype=np.int32)}
+    step = HostOp("mask0", "causal_mask", inputs=["x"], outputs=["y"], attrs={"fill_value": float(np.iinfo(np.int16).min)})
+    execute_host_op(step, values, golden=GoldenModel())
+    np.testing.assert_array_equal(values["y"], expected)
+
+    tensors = {
+        "x": TensorSpec("x", x.shape, DType.INT16, TensorKind.CONSTANT, data=x),
+        "y": TensorSpec("y", x.shape, DType.INT16, TensorKind.OUTPUT, is_final_output=True),
+    }
+    plan = ExecutionPlan(tensors=tensors, steps=[step], inputs=[], outputs=["y"])
+    plan.add_verification_step("y", "y")
+    artifact = compile_plan(plan, {"y": expected.astype(np.int16)})
+    source_v2 = emit_cv32e40p_program_v2(artifact, {}, program_name="unit_test_causal_mask_v2")
+    source_cpu = emit_cv32e40p_c(artifact, {}, program_name="unit_test_causal_mask_cpu", cpu_only_baseline=True)
+    assert "TNPU_HOST_CAUSAL_MASK" in source_v2
+    assert "host_causal_mask(" in source_cpu
+
+
+def test_host_op_concat_lastdim2_emulation_and_emitters():
+    lhs = np.array([[1, 2], [3, 4]], dtype=np.int16)
+    rhs = np.array([[5, 6, 7], [8, 9, 10]], dtype=np.int16)
+    expected = np.array([[1, 2, 5, 6, 7], [3, 4, 8, 9, 10]], dtype=np.int32)
+
+    values = {
+        "lhs": lhs,
+        "rhs": rhs,
+        "y": np.zeros(expected.shape, dtype=np.int32),
+    }
+    step = HostOp("cat0", "concat_lastdim2", inputs=["lhs", "rhs"], outputs=["y"])
+    execute_host_op(step, values, golden=GoldenModel())
+    np.testing.assert_array_equal(values["y"], expected)
+
+    tensors = {
+        "lhs": TensorSpec("lhs", lhs.shape, DType.INT16, TensorKind.CONSTANT, data=lhs),
+        "rhs": TensorSpec("rhs", rhs.shape, DType.INT16, TensorKind.CONSTANT, data=rhs),
+        "y": TensorSpec("y", expected.shape, DType.INT16, TensorKind.OUTPUT, is_final_output=True),
+    }
+    plan = ExecutionPlan(tensors=tensors, steps=[step], inputs=[], outputs=["y"])
+    plan.add_verification_step("y", "y")
+    artifact = compile_plan(plan, {"y": expected.astype(np.int16)})
+    source_v2 = emit_cv32e40p_program_v2(artifact, {}, program_name="unit_test_concat_lastdim2_v2")
+    source_cpu = emit_cv32e40p_c(artifact, {}, program_name="unit_test_concat_lastdim2_cpu", cpu_only_baseline=True)
+    assert "TNPU_HOST_CONCAT_LASTDIM2" in source_v2
+    assert "host_concat_lastdim2(" in source_cpu
+    assert ".input1_idx =" in source_v2
+
+
+def test_prefill_transformer_block_builds_and_emits_new_host_ops():
+    artifact, expected = build_prefill_transformer_block_artifact(
+        d_model=16,
+        d_head=8,
+        n_heads=2,
+        ffn_dim=8,
+        token_count=8,
+        seed=0,
+    )
+
+    assert "seg_qkv" in artifact.segment_artifacts
+    assert "seg_ffn_down" in artifact.segment_artifacts
+    assert artifact.plan.outputs == ["out"]
+    assert expected.shape == (8, 16)
+
+    source_v2 = emit_cv32e40p_program_v2(artifact, {}, program_name="unit_test_prefill_transformer_block_v2")
+    source_cpu = emit_cv32e40p_c(artifact, {}, program_name="unit_test_prefill_transformer_block_cpu", cpu_only_baseline=True)
+    assert "TNPU_HOST_CAUSAL_MASK" in source_v2
+    assert "TNPU_HOST_CONCAT_LASTDIM2" in source_v2
+    assert "host_causal_mask(" in source_cpu
+    assert "host_concat_lastdim2(" in source_cpu
 
 
 # ---------------------------------------------------------------------------
