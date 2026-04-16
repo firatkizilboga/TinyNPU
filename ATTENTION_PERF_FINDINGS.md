@@ -107,3 +107,69 @@ This means benchmark comparisons must use current `decode_attention_*_v2` artifa
 2. Reduce tiny decode segment fixed overheads.
 3. Move more of the Q-side boundary path off the host if worthwhile.
 4. Treat RoPE as secondary unless it blocks or simplifies a larger path.
+
+## Prefill Findings
+
+### First working sequence-wide prefill attention point
+
+Config:
+
+- `d_model=32`
+- `d_head=16`
+- `token_count=8`
+- `seed=0`
+
+Important implementation note:
+
+- The first prototype used a host `transpose_k` shortcut and that was a bad bottleneck.
+- The corrected prefill path now uses native K/V layout rather than host `transpose_k`.
+
+Working NPU artifact:
+
+- program: `cv32e40p_prefill_attention_d32_h16_t8_s0_v2`
+- preload:
+  - `preload.ub_image = 8,728`
+  - `preload.im_seg_cache = 569`
+  - `preload.im_seg_q = 89`
+  - `preload.im_seg_score = 89`
+  - `preload.im_seg_value = 121`
+- hot path:
+  - `segment.seg_cache.npu = 8,082`
+  - `segment.seg_q.npu = 7,166`
+  - `hostop.alias_q_a = 1,794`
+  - `segment.seg_score.npu = 8,513`
+  - `hostop.softmax_scores_f16 = 7,909`
+  - `segment.seg_value.npu = 11,859`
+
+Totals:
+
+- NPU hot total = `45,323`
+- NPU cold total = `54,919`
+
+CPU-only baseline:
+
+- program: `cv32e40p_prefill_attention_cpu_only_d32_h16_t8_s0`
+- `segment.seg_cache.cpu = 170,595`
+- `segment.seg_q.cpu = 83,454`
+- `hostop.alias_q_a = 390`
+- `segment.seg_score.cpu = 22,401`
+- `hostop.softmax_scores_f16 = 5,879`
+- `hostop.quantize_probs = 39,353`
+- `segment.seg_value.cpu = 114,794`
+- `hostop.dequant_out = 2,061`
+
+CPU total:
+
+- `438,927`
+
+Interpretation:
+
+- NPU hot speedup: `9.68x`
+- NPU cold speedup: `7.99x`
+- Prefill is a much better accelerator regime than tiny decode because the larger sequence-wide work amortizes fixed costs.
+
+### Prefill conclusion
+
+- Sequence-wide prefill attention is already transformer-like enough to be meaningful.
+- The first real prefill point strongly favors the NPU over CPU-only execution.
+- The main prefill lesson so far is that layout matters immediately: native K/V layout is acceptable, host `transpose_k` is not.
