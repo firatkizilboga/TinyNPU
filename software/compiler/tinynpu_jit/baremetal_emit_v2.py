@@ -41,6 +41,8 @@ _HOST_KIND_ENUM = {
     "mul": "TNPU_HOST_MUL",
     "add": "TNPU_HOST_ADD",
     "k_cache_scatter_write": "TNPU_HOST_K_CACHE_SCATTER_WRITE",
+    "causal_mask": "TNPU_HOST_CAUSAL_MASK",
+    "concat_lastdim2": "TNPU_HOST_CONCAT_LASTDIM2",
 }
 
 
@@ -577,6 +579,9 @@ def emit_cv32e40p_program_v2(
                     + ", ".join(str(v) for v in scatter_addrs)
                     + "};"
                 )
+            elif step.kind == "causal_mask":
+                attrs_i32[0] = int(step.attrs.get("past_kv_len", 0))
+                attrs_f32[0] = float(step.attrs.get("fill_value", -32768.0))
 
             host_entries.append(
                 "    {"

@@ -156,6 +156,16 @@ def _validate_binary_same_shape(step: HostOp) -> None:
     return
 
 
+def _validate_causal_mask(step: HostOp) -> None:
+    past_kv_len = int(step.attrs.get("past_kv_len", 0))
+    if past_kv_len < 0:
+        raise ValueError(f"Host op 'causal_mask' requires past_kv_len >= 0, got {past_kv_len}.")
+
+
+def _validate_concat_lastdim2(step: HostOp) -> None:
+    return
+
+
 def _softmax_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
     axis = int(step.attrs.get("axis", -1))
     values[step.outputs[0]] = golden.softmax(values[step.inputs[0]], axis=axis)
@@ -530,6 +540,55 @@ def _add_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, An
     )
 
 
+def _causal_mask_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
+    source = np.asarray(values[step.inputs[0]])
+    if source.ndim < 2:
+        raise ValueError(f"causal_mask expects rank >= 2, got rank {source.ndim}.")
+    out = np.array(source, copy=True)
+    q_len = source.shape[-2]
+    k_len = source.shape[-1]
+    past_kv_len = int(step.attrs.get("past_kv_len", 0))
+    if source.dtype.kind == "f":
+        fill_value = np.float32(step.attrs.get("fill_value", -1.0e9))
+    else:
+        fill_value = np.int32(step.attrs.get("fill_value", np.iinfo(np.int16).min))
+    for row in range(q_len):
+        max_col = past_kv_len + row
+        if max_col + 1 < k_len:
+            out[..., row, max_col + 1 :] = fill_value
+    values[step.outputs[0]] = out
+
+
+def _causal_mask_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
+    elems = int(np.asarray(values[step.outputs[0]]).size)
+    return "host_intrinsic", _counts(
+        reads=elems,
+        writes=elems,
+        branches=elems,
+    )
+
+
+def _concat_lastdim2_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
+    lhs = np.asarray(values[step.inputs[0]])
+    rhs = np.asarray(values[step.inputs[1]])
+    if lhs.ndim == 0 or rhs.ndim == 0:
+        raise ValueError("concat_lastdim2 expects rank >= 1 inputs.")
+    if lhs.shape[:-1] != rhs.shape[:-1]:
+        raise ValueError(f"concat_lastdim2 prefix-shape mismatch: {lhs.shape} vs {rhs.shape}.")
+    values[step.outputs[0]] = np.concatenate([lhs, rhs], axis=-1)
+
+
+def _concat_lastdim2_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
+    lhs_elems = int(np.asarray(values[step.inputs[0]]).size)
+    rhs_elems = int(np.asarray(values[step.inputs[1]]).size)
+    out_elems = int(np.asarray(values[step.outputs[0]]).size)
+    return "host_intrinsic", _counts(
+        reads=lhs_elems + rhs_elems,
+        writes=out_elems,
+        branches=out_elems,
+    )
+
+
 def _rope_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
     x = np.asarray(values[step.inputs[0]], dtype=np.float32)
     out = np.array(x, copy=True)
@@ -606,6 +665,14 @@ def benchmark_host_op(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str,
 for _spec in (
     HostOpSpec("add", _add_eval, _add_benchmark, input_arity=2, semantic_validator=_validate_binary_same_shape),
     HostOpSpec("alias", _alias_eval, _movement_benchmark),
+    HostOpSpec("causal_mask", _causal_mask_eval, _causal_mask_benchmark, semantic_validator=_validate_causal_mask),
+    HostOpSpec(
+        "concat_lastdim2",
+        _concat_lastdim2_eval,
+        _concat_lastdim2_benchmark,
+        input_arity=2,
+        semantic_validator=_validate_concat_lastdim2,
+    ),
     HostOpSpec(
         "dequantize",
         _dequantize_eval,

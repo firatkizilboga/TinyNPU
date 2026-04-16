@@ -38,6 +38,8 @@ typedef enum {
     TNPU_HOST_ADD = 17,
     TNPU_HOST_SOFTMAX_F16 = 18,
     TNPU_HOST_K_CACHE_SCATTER_WRITE = 19,
+    TNPU_HOST_CAUSAL_MASK = 20,
+    TNPU_HOST_CONCAT_LASTDIM2 = 21,
 } TnpuHostKind;
 
 typedef enum {

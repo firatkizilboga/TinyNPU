@@ -172,6 +172,15 @@ def _emit_host_step_attrs(
 
     if step.kind == "alias":
         lines.append(f"    host_alias({out_ref}, {in_ref});")
+    elif step.kind == "causal_mask":
+        past_kv_len = int(step.attrs.get("past_kv_len", 0))
+        fill_value = float(step.attrs.get("fill_value", -32768.0))
+        lines.append(
+            f"    host_causal_mask({out_ref}, {in_ref}, {past_kv_len}, {_format_scalar(fill_value, dtype=DType.FLOAT32)});"
+        )
+    elif step.kind == "concat_lastdim2":
+        rhs_ref = _emit_tensor_reference(step.inputs[1])
+        lines.append(f"    host_concat_lastdim2({out_ref}, {in_ref}, {rhs_ref});")
     elif step.kind == "relu":
         lines.append(f"    host_relu({out_ref}, {in_ref});")
     elif step.kind == "sigmoid":
