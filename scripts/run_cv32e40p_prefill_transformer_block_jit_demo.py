@@ -164,10 +164,10 @@ def build_plan(
             DType.INT16,
             TensorKind.INTERMEDIATE,
         )
-        tensors[f"probs_f16_h{head_idx}"] = TensorSpec(
-            f"probs_f16_h{head_idx}",
+        tensors[f"probs_h{head_idx}"] = TensorSpec(
+            f"probs_h{head_idx}",
             (token_count, token_count),
-            DType.INT16,
+            DType.FLOAT32,
             TensorKind.INTERMEDIATE,
         )
         tensors[f"probs_q_h{head_idx}"] = TensorSpec(
@@ -264,16 +264,16 @@ def build_plan(
                     attrs={"past_kv_len": 0, "fill_value": float(np.iinfo(np.int16).min)},
                 ),
                 HostOp(
-                    f"softmax_scores_f16_h{head_idx}",
-                    "softmax_f16",
+                    f"softmax_scores_h{head_idx}",
+                    "softmax",
                     inputs=[f"masked_scores_h{head_idx}"],
-                    outputs=[f"probs_f16_h{head_idx}"],
+                    outputs=[f"probs_h{head_idx}"],
                     attrs={"axis": -1},
                 ),
                 HostOp(
                     f"quantize_probs_h{head_idx}",
                     "quantize",
-                    inputs=[f"probs_f16_h{head_idx}"],
+                    inputs=[f"probs_h{head_idx}"],
                     outputs=[f"probs_q_h{head_idx}"],
                     attrs={"scale": attn_scale, "zero_point": 0, "dtype": DType.INT16},
                 ),
