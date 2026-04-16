@@ -29,6 +29,8 @@ from software.workload.jit_multitile_matmul import (  # noqa: E402
 CORE_DIR = REPO_ROOT / "external" / "cv32e40p" / "example_tb" / "core"
 GENERATED_DIR = REPO_ROOT / "generated"
 RUNTIME_DIR = REPO_ROOT / "software" / "compiler" / "tinynpu_jit"
+TNPU_RISCV_MARCH = os.environ.get("TINYNPU_RISCV_MARCH", "rv32imfc")
+TNPU_RISCV_MABI = os.environ.get("TINYNPU_RISCV_MABI", "ilp32f")
 CUSTOM_DIR = CORE_DIR / "custom"
 RUNS_DIR = REPO_ROOT / "runs"
 
@@ -81,6 +83,16 @@ int main(void)
 
 
 def _toolchain_prefix() -> Path:
+    prefix_override = os.environ.get("TINYNPU_RISCV_PREFIX")
+    if prefix_override:
+        prefix = Path(prefix_override)
+        gcc = prefix.parent / (prefix.name + "gcc")
+        if not gcc.exists():
+            raise FileNotFoundError(f"{gcc} not found for TINYNPU_RISCV_PREFIX")
+        return prefix
+    preferred = Path("/opt/riscv-ilp32f/bin/riscv32-unknown-elf-gcc")
+    if preferred.exists():
+        return preferred.parent / "riscv32-unknown-elf-"
     gcc = shutil.which("riscv32-unknown-elf-gcc")
     if gcc is None:
         raise FileNotFoundError("riscv32-unknown-elf-gcc not found in PATH")
@@ -128,8 +140,8 @@ def _compile_case(program_name: str, program_path: Path, runner_path: Path, pref
     hex_path = CUSTOM_DIR / f"{program_name}.hex"
     compile_cmd = [
         gcc,
-        "-march=rv32imfc",
-        "-mabi=ilp32",
+        f"-march={TNPU_RISCV_MARCH}",
+        f"-mabi={TNPU_RISCV_MABI}",
         "-o",
         str(elf_path),
         "-w",

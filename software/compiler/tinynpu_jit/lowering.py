@@ -80,7 +80,10 @@ class SegmentCompiler:
                 if op.writeback_mode == "normal":
                     if out_spec.metadata.get("storage_view_of") and out_spec.metadata.get("storage_role", "B") == "B":
                         if out_cache_kind == "K" and op.in_dtype == DType.INT16 and op.out_dtype == DType.INT16:
-                            op.writeback_mode = "k_cache_append_int16"
+                            if not op.rope_cs_name:
+                                # With rope_cs_name the XFORM needs contiguous C-layout output;
+                                # skip K_CACHE_APPEND and let the caller scatter separately.
+                                op.writeback_mode = "k_cache_append_int16"
                         elif out_cache_kind == "V" and op.in_dtype == DType.INT16 and op.out_dtype == DType.INT16:
                             op.writeback_mode = "v_cache_append_int16"
                         op.output_layout = "b"
@@ -130,6 +133,8 @@ class SegmentCompiler:
             referenced.add(op.out)
             if op.bias:
                 referenced.add(op.bias)
+            if op.rope_cs_name:
+                referenced.add(op.rope_cs_name)
         for name in list(referenced):
             spec = plan.tensors[name]
             base_name = spec.metadata.get("storage_view_of")
@@ -217,6 +222,8 @@ class SegmentCompiler:
                 b_word_offset=int(op.b_word_offset),
                 b_read_mode=b_read_mode,
             )
+            if op.rope_cs_name:
+                program.xform_rope_k16(op.out, op.rope_cs_name)
 
         # Pre-assign globally planned addresses before compile() runs so that
         # program.compile() respects the planner layout instead of bump-allocating.

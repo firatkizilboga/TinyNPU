@@ -17,6 +17,7 @@ if str(REPO_ROOT / "software" / "compiler") not in sys.path:
 from tinynpu_jit import (  # noqa: E402
     DType,
     ExecutionPlan,
+    HostOp,
     MatMulOp,
     NpuSegment,
     TensorKind,
@@ -29,7 +30,6 @@ from tinynpu_jit import (  # noqa: E402
 CORE_DIR = REPO_ROOT / "external" / "cv32e40p" / "example_tb" / "core"
 CUSTOM_DIR = CORE_DIR / "custom"
 GENERATED_DIR = REPO_ROOT / "generated"
-RUNTIME_DIR = REPO_ROOT / "software" / "compiler" / "tinynpu_jit"
 TNPU_RISCV_MARCH = os.environ.get("TINYNPU_RISCV_MARCH", "rv32imfc")
 TNPU_RISCV_MABI = os.environ.get("TINYNPU_RISCV_MABI", "ilp32f")
 
@@ -105,89 +105,56 @@ def _run(cmd: list[str], *, cwd: Path, env: dict[str, str] | None = None, captur
 
 
 def build_demo_artifact():
-    lhs0 = np.array(
+    x_f = np.array(
         [
-            [1, 2, -1, 0, 3, -2, 1, 4],
-            [0, -1, 2, 3, -2, 1, 0, 2],
-            [3, 1, 0, -1, 2, 2, -3, 1],
-            [2, 0, 1, 1, -1, 3, 2, -2],
-            [-1, 2, 3, 0, 1, -1, 2, 1],
-            [4, -2, 1, 2, 0, 1, -1, 3],
-            [1, 1, -2, 4, 2, 0, 3, -1],
-            [0, 3, 2, -1, 1, 2, 1, 0],
+            [1.0, -2.0, 3.0, -4.0, 0.5, -0.5, 2.5, -1.5],
+            [0.0, 1.0, -1.0, 2.0, 3.0, -3.0, 4.0, -4.0],
+            [2.0, 2.0, 2.0, 2.0, -2.0, -2.0, -2.0, -2.0],
+            [1.5, -1.5, 0.0, 0.0, 1.0, -1.0, 2.0, -2.0],
+            [3.0, 0.0, -3.0, 1.0, -1.0, 2.0, -2.0, 4.0],
+            [0.25, -0.25, 0.75, -0.75, 1.25, -1.25, 1.75, -1.75],
+            [4.0, 3.0, 2.0, 1.0, -1.0, -2.0, -3.0, -4.0],
+            [1.0, 0.0, 1.0, 0.0, -1.0, 0.0, -1.0, 0.0],
         ],
-        dtype=np.int16,
+        dtype=np.float32,
     )
-    rhs0 = np.array(
-        [
-            [1, 0, 1, 0, -1, 2, 0, 1],
-            [0, 1, 0, 1, 2, -1, 1, 0],
-            [1, -1, 1, 0, 0, 1, 2, 1],
-            [2, 0, -1, 1, 1, 0, -1, 2],
-            [0, 2, 1, -1, 1, 1, 0, 0],
-            [1, 1, 0, 2, -1, 0, 1, -1],
-            [0, -1, 2, 1, 0, 1, 1, 2],
-            [1, 0, 1, 1, 2, 0, -1, 1],
-        ],
-        dtype=np.int16,
-    )
-    lhs1 = np.array(
-        [
-            [2, 1, 0, -1, 1, 2, 0, 1],
-            [1, 0, 2, 1, -1, 0, 1, 2],
-            [0, 1, 1, 2, 0, -1, 2, 1],
-            [1, 2, -1, 0, 2, 1, 1, 0],
-            [2, -1, 1, 1, 0, 2, -1, 1],
-            [0, 2, 1, -1, 1, 0, 2, 1],
-            [1, 1, 0, 2, 1, -1, 0, 2],
-            [2, 0, 1, 1, -1, 1, 2, 0],
-        ],
-        dtype=np.int16,
-    )
-
-    mid = np.clip(lhs0.astype(np.int32) @ rhs0.astype(np.int32), -32768, 32767).astype(np.int16)
-    y = np.clip(lhs1.astype(np.int32) @ mid.astype(np.int32), -32768, 32767).astype(np.int16)
+    scale = 0.5
+    x_q = np.clip(np.rint(x_f / scale), -32768, 32767).astype(np.int16)
+    w = np.eye(8, dtype=np.int16)
+    y = x_q.copy()
 
     tensors = {
-        "lhs0": TensorSpec("lhs0", lhs0.shape, DType.INT16, TensorKind.INPUT),
-        "rhs0": TensorSpec("rhs0", rhs0.shape, DType.INT16, TensorKind.CONSTANT, data=rhs0),
-        "lhs1": TensorSpec("lhs1", lhs1.shape, DType.INT16, TensorKind.CONSTANT, data=lhs1),
-        "mid": TensorSpec("mid", mid.shape, DType.INT16, TensorKind.INTERMEDIATE),
+        "x_f": TensorSpec("x_f", x_f.shape, DType.FLOAT32, TensorKind.INPUT),
+        "x_q": TensorSpec("x_q", x_q.shape, DType.INT16, TensorKind.INTERMEDIATE),
+        "w": TensorSpec("w", w.shape, DType.INT16, TensorKind.CONSTANT, data=w),
         "y": TensorSpec("y", y.shape, DType.INT16, TensorKind.OUTPUT, is_final_output=True),
     }
-
     steps = [
-        NpuSegment(
-            "segment_000",
-            [
-                MatMulOp("op0", "lhs0", "rhs0", "mid"),
-                MatMulOp("op1", "lhs1", "mid", "y"),
-            ],
-            inputs=["lhs0", "rhs0", "lhs1"],
-            outputs=["y"],
-        )
+        HostOp("quant_x", "quantize", inputs=["x_f"], outputs=["x_q"], attrs={"scale": scale, "zero_point": 0}),
+        NpuSegment("seg_quant", [MatMulOp("op0", "x_q", "w", "y")], inputs=["x_q", "w"], outputs=["y"]),
     ]
-
-    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=["lhs0"], outputs=["y"])
+    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=["x_f"], outputs=["y"])
     plan.add_verification_step("y", "final_y")
     artifact = compile_plan(plan, {"y": y})
-
-    seg = artifact.plan.steps[0]
-    assert seg.ops[0].output_layout == "b"
-    assert artifact.segment_artifacts["segment_000"].symbol_table["mid"]["role"] == "B"
-    return artifact, {"lhs0": lhs0}, y
+    return artifact, {"x_f": x_f}
 
 
 def main() -> int:
-    program_name = "cv32e40p_b_layout_demo_v2"
+    program_name = "cv32e40p_quantize_stage_demo_v2"
     program_symbol = _sanitize(program_name)
     program_path = GENERATED_DIR / f"{program_name}_program.c"
     runner_path = GENERATED_DIR / f"{program_name}_runner.c"
 
-    artifact, inputs, expected = build_demo_artifact()
+    artifact, inputs = build_demo_artifact()
     GENERATED_DIR.mkdir(exist_ok=True)
     write_cv32e40p_program_v2(artifact, inputs, program_path, program_name=program_name)
     runner_path.write_text(_runner_source(program_symbol))
+
+    source_text = program_path.read_text()
+    if "TNPU_WRITE_QUANTIZE_F32_TO_INT16" not in source_text:
+        raise RuntimeError("quantize write transform was not emitted")
+    if "TNPU_HOST_QUANTIZE" in source_text:
+        raise RuntimeError("quantize host op was not absorbed")
 
     prefix = _toolchain_prefix()
     gcc = f"{prefix}gcc"
@@ -218,19 +185,16 @@ def main() -> int:
             "-T",
             "custom/link.ld",
             "-static",
-            "custom/crt0.S",
-            str(runner_path),
+            "-ffast-math",
+            "-fno-builtin-printf",
+            "-I.",
+            f"-I{include_dir}",
+            f"-I{REPO_ROOT / 'software' / 'compiler' / 'tinynpu_jit'}",
             str(program_path),
-            str(RUNTIME_DIR / "tinynpu_runtime_v2.c"),
-            "mem_stall/mem_stall.c",
-            "custom/syscalls.c",
-            "custom/vectors.S",
-            "-I",
-            str(include_dir),
-            "-I",
-            "mem_stall",
-            "-I",
-            str(RUNTIME_DIR),
+            str(runner_path),
+            str(CORE_DIR / "custom" / "crt0.S"),
+            str(CORE_DIR / "custom" / "syscalls.c"),
+            str(REPO_ROOT / "software" / "compiler" / "tinynpu_jit" / "tinynpu_runtime_v2.c"),
             "-L",
             str(lib_dir),
             "-lc",
@@ -238,25 +202,28 @@ def main() -> int:
             "-lgcc",
         ],
         cwd=CORE_DIR,
+        env=build_env,
     )
-    _run([objcopy, "-O", "verilog", str(elf_path), str(hex_path)], cwd=CORE_DIR)
+    _run([objcopy, "-O", "verilog", str(elf_path), str(hex_path)], cwd=CORE_DIR, env=build_env)
 
-    env = dict(os.environ)
-    env["VERILATOR_MAX_TICKS"] = "3000000000"
-    proc = _run(
+    sim_env = dict(build_env)
+    sim_env.setdefault("VERILATOR_MAX_TICKS", "3000000000")
+    sim = _run(
         [
             str(CORE_DIR / "obj_dir" / "cv32e40p_tb_vlt_npu"),
             "+verilator+noassert",
             f"+firmware={hex_path}",
-            "+maxcycles=250000",
+            "+maxcycles=2000000",
         ],
         cwd=CORE_DIR,
-        env=env,
+        env=sim_env,
         capture=True,
     )
-    print(f"program={program_name}")
-    print(f"expected_checksum={int(expected.astype(np.int64).sum())}")
-    print(proc.stdout)
+    print(sim.stdout, end="")
+    if sim.stderr:
+        print(sim.stderr, end="", file=sys.stderr)
+    if "EXIT SUCCESS" not in sim.stdout:
+        raise RuntimeError("simulation did not report EXIT SUCCESS")
     return 0
 
 

@@ -27,6 +27,8 @@ from run_cv32e40p_b_append_demo import (  # noqa: E402
     CUSTOM_DIR,
     GENERATED_DIR,
     RUNTIME_DIR,
+    TNPU_RISCV_MABI,
+    TNPU_RISCV_MARCH,
     _run,
     _runner_source,
     _sanitize,
@@ -168,8 +170,8 @@ def main() -> int:
     _run(
         [
             gcc,
-            "-march=rv32imfc",
-            "-mabi=ilp32",
+            f"-march={TNPU_RISCV_MARCH}",
+            f"-mabi={TNPU_RISCV_MABI}",
             "-o",
             str(elf_path),
             "-w",

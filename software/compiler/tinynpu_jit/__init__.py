@@ -34,6 +34,8 @@ from .ir import (
     make_native_int16_k_cache_specs,
     make_native_int16_v_cache_specs,
     make_native_int16_kv_cache_specs,
+    make_rope_cos_sin_table_q14,
+    make_rope_cs_tensor_spec,
 )
 from .markers import im2col_for_npu, mark_for_verify, npu_matmul, quantize_for_npu
 from .memory_planner import GlobalMemoryReport, SegmentMemoryPlan, plan_program_memory, plan_segment_memory
@@ -64,6 +66,8 @@ __all__ = [
     "make_native_int16_k_cache_specs",
     "make_native_int16_v_cache_specs",
     "make_native_int16_kv_cache_specs",
+    "make_rope_cos_sin_table_q14",
+    "make_rope_cs_tensor_spec",
     "NpuSegment",
     "PrimitiveCounts",
     "five_stage_in_order_model",

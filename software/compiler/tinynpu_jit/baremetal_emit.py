@@ -158,7 +158,12 @@ def _activation_code(kind: str) -> int:
     return mapping[kind]
 
 
-def _emit_host_step_attrs(step: HostOp) -> tuple[list[str], list[str]]:
+def _emit_host_step_attrs(
+    step: HostOp,
+    artifact: CompiledArtifact,
+    *,
+    cpu_only_baseline: bool = False,
+) -> tuple[list[str], list[str]]:
     decls: list[str] = []
     lines: list[str] = []
     out_ref = _emit_tensor_reference(step.outputs[0])
@@ -177,7 +182,13 @@ def _emit_host_step_attrs(step: HostOp) -> tuple[list[str], list[str]]:
         scale = float(step.attrs["scale"])
         inv_scale = 1.0 / scale
         zero_point = int(step.attrs.get("zero_point", 0))
-        lines.append(f"    host_quantize({out_ref}, {in_ref}, {_format_scalar(inv_scale, dtype=DType.FLOAT32)}, {zero_point});")
+        src_from_softmax_f16 = False
+        for producer in artifact.plan.steps:
+            if isinstance(producer, HostOp) and producer.outputs and producer.outputs[0] == step.inputs[0]:
+                src_from_softmax_f16 = producer.kind == "softmax_f16"
+                break
+        fn = "host_quantize_fp16bits" if src_from_softmax_f16 else "host_quantize"
+        lines.append(f"    {fn}({out_ref}, {in_ref}, {_format_scalar(inv_scale, dtype=DType.FLOAT32)}, {zero_point});")
     elif step.kind == "dequantize":
         scale = float(step.attrs["scale"])
         zero_point = int(step.attrs.get("zero_point", 0))
@@ -199,6 +210,9 @@ def _emit_host_step_attrs(step: HostOp) -> tuple[list[str], list[str]]:
     elif step.kind == "softmax":
         axis = int(step.attrs.get("axis", -1))
         lines.append(f"    host_softmax({out_ref}, {in_ref}, {axis});")
+    elif step.kind == "softmax_f16":
+        axis = int(step.attrs.get("axis", -1))
+        lines.append(f"    host_softmax_f16({out_ref}, {in_ref}, {axis});")
     elif step.kind == "mean":
         dims = step.attrs.get("dim")
         if dims is None:
@@ -266,11 +280,29 @@ def _emit_host_step_attrs(step: HostOp) -> tuple[list[str], list[str]]:
     elif step.kind == "silu":
         lines.append(f"    host_silu({out_ref}, {in_ref});")
     elif step.kind == "mul":
-        rhs_ref = _tensor_ref(step.inputs[1])
+        rhs_ref = _emit_tensor_reference(step.inputs[1])
         lines.append(f"    host_mul({out_ref}, {in_ref}, {rhs_ref});")
     elif step.kind == "add":
-        rhs_ref = _tensor_ref(step.inputs[1])
+        rhs_ref = _emit_tensor_reference(step.inputs[1])
         lines.append(f"    host_add({out_ref}, {in_ref}, {rhs_ref});")
+    elif step.kind == "k_cache_scatter_write":
+        out_spec = artifact.plan.tensors[step.outputs[0]]
+        token_index = int(step.attrs.get("token_index", out_spec.metadata["cache_token_index"]))
+        if cpu_only_baseline:
+            base_name = str(step.attrs.get("k_cache_base", out_spec.metadata["storage_view_of"]))
+            base_ref = _emit_tensor_reference(base_name)
+            lines.append(f"    host_commit_k_cache_slot({base_ref}, {in_ref}, {token_index});")
+        else:
+            scatter_addrs = tuple(int(v) for v in out_spec.metadata["cache_scatter_word_addrs"])
+            token_lane = token_index % 8
+            arr_name = f"{prefix}_scatter_addrs"
+            decls.append(
+                f"static const int {arr_name}[{len(scatter_addrs)}] = "
+                + "{"
+                + ", ".join(str(v) for v in scatter_addrs)
+                + "};"
+            )
+            lines.append(f"    host_k_cache_scatter_write({in_ref}, {arr_name}, {token_lane});")
     else:
         raise NotImplementedError(f"Bare-metal runtime emitter does not support host op '{step.kind}'.")
     return decls, lines
@@ -407,10 +439,50 @@ def emit_cv32e40p_c(
 
     body_lines: list[str] = []
 
+    def _cpu_only_materialize_lines(tensor_name: str | None) -> list[str]:
+        if tensor_name is None:
+            return []
+        spec = artifact.plan.tensors[tensor_name]
+        base_name = spec.metadata.get("storage_view_of")
+        cache_kind = spec.metadata.get("cache_kind")
+        if not cpu_only_baseline or base_name is None or cache_kind not in {"K", "V"}:
+            return []
+        token_index = int(spec.metadata.get("cache_token_index", -1))
+        if cache_kind == "K":
+            return [
+                f"    host_materialize_k_cache_view({_emit_tensor_reference(tensor_name)}, "
+                f"{_emit_tensor_reference(str(base_name))}, {token_index});"
+            ]
+        return [
+            f"    host_materialize_v_cache_view({_emit_tensor_reference(tensor_name)}, "
+            f"{_emit_tensor_reference(str(base_name))}, {token_index});"
+        ]
+
+    def _cpu_only_sync_output_lines(tensor_name: str) -> list[str]:
+        spec = artifact.plan.tensors[tensor_name]
+        base_name = spec.metadata.get("storage_view_of")
+        cache_kind = spec.metadata.get("cache_kind")
+        if not cpu_only_baseline or base_name is None or cache_kind not in {"K", "V"}:
+            return []
+        token_index = spec.metadata.get("cache_token_index")
+        if token_index is None:
+            return []
+        if cache_kind == "K":
+            return [
+                f"    host_commit_k_cache_slot({_emit_tensor_reference(str(base_name))}, "
+                f"{_emit_tensor_reference(tensor_name)}, {int(token_index)});"
+            ]
+        return [
+            f"    host_commit_v_cache_slot({_emit_tensor_reference(str(base_name))}, "
+            f"{_emit_tensor_reference(tensor_name)}, {int(token_index)});"
+        ]
+
     for step in artifact.plan.steps:
         if isinstance(step, HostOp):
-            attr_decls, lines = _emit_host_step_attrs(step)
+            attr_decls, lines = _emit_host_step_attrs(step, artifact, cpu_only_baseline=cpu_only_baseline)
             decls.extend(attr_decls)
+            for input_name in step.inputs:
+                body_lines.extend(_cpu_only_materialize_lines(input_name))
             if repeat_count > 1:
                 body_lines.append(f'    if (repeat_iter == 0) printf("HostOp {step.kind}: {step.name}\\n");')
                 body_lines.append("    cycle_t0 = read_mcycle32();")
@@ -448,11 +520,15 @@ def emit_cv32e40p_c(
                     body_lines.append(f'    printf("CpuSegment: {step.name}\\n");')
                 body_lines.append("    cycle_t0 = read_mcycle32();")
                 for op in step.ops:
+                    body_lines.extend(_cpu_only_materialize_lines(op.lhs))
+                    body_lines.extend(_cpu_only_materialize_lines(op.rhs))
+                    body_lines.extend(_cpu_only_materialize_lines(op.bias))
                     body_lines.append(
                         "    host_matmul("
                         f"{_segment_ref(op.out)}, {_segment_ref(op.lhs)}, {_segment_ref(op.rhs)}, {_segment_ref(op.bias)}, "
                         f"{int(op.multiplier)}, {int(op.shift)}, {_activation_code(op.activation)}, {int(op.h_gelu_x_scale_shift)});"
                     )
+                    body_lines.extend(_cpu_only_sync_output_lines(op.out))
                 body_lines.append("    cycle_t1 = read_mcycle32();")
                 if repeat_count > 1:
                     body_lines.append("    delta = cycle_t0 - cycle_t1;")

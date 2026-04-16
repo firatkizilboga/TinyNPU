@@ -5,6 +5,7 @@ class Opcode(IntEnum):
     HALT = 0x1
     MATMUL = 0x2
     MOVE = 0x3
+    XFORM = 0x4
 
 class PrecisionMode(IntEnum):
     INT4 = 0
@@ -33,6 +34,13 @@ class WritebackMode(IntEnum):
 class BReadMode(IntEnum):
     NORMAL = 0
     K_CACHE_INT16 = 1
+
+
+class XformMode(IntEnum):
+    NONE = 0
+    Q_F16_I16 = 1
+    DQ_I16_F16 = 2
+    ROPE_K16 = 3  # RoPE rotation: INT16 Q14, in-place over K in UB
 
 class Instruction:
     def encode(self, symbol_to_addr):
@@ -132,6 +140,59 @@ class Halt(Instruction):
         instr |= (Opcode.HALT & 0xF) << 252
         return instr
 
+
+class Xform(Instruction):
+    def __init__(self, src, dest, mode=XformMode.Q_F16_I16, multiplier=1, shift=0):
+        self.src = src
+        self.dest = dest
+        self.mode = mode
+        self.multiplier = multiplier
+        self.shift = shift
+        self.count = 0  # Words count, inferred by compiler
+
+    def encode(self, symbol_to_addr):
+        src_addr = symbol_to_addr[self.src]
+        dest_addr = symbol_to_addr[self.dest]
+        instr = 0
+        instr |= (Opcode.XFORM & 0xF) << 252
+        instr |= (self.mode & 0xF) << 248
+        instr |= (src_addr & 0xFFFF) << 232
+        instr |= (dest_addr & 0xFFFF) << 216
+        instr |= (self.count & 0xFFFF) << 200
+        instr |= (self.multiplier & 0xFFFF) << 184
+        instr |= (self.shift & 0xFF) << 176
+        return instr
+
+
+class XformRopeK16(Instruction):
+    """RoPE rotation XFORM for INT16 Q14 K vectors stored in UB.
+
+    Instruction field mapping (reuses the XFORM encoding):
+      [251:248] = XFORM_MODE_ROPE_K16 (3)
+      [247:232] = src_addr   (K base address in UB)
+      [231:216] = dest_addr  (output K address, may equal src for in-place)
+      [215:200] = half_count (= total_k_words // 2; number of lo/hi word pairs)
+      [199:184] = cs_addr    (base address of cos/sin table: cos[0..half-1] then sin[0..half-1])
+    """
+    def __init__(self, src, dest, cs_addr):
+        self.src = src        # symbol name of K tensor
+        self.dest = dest      # symbol name of output K (same as src for in-place)
+        self.cs_addr = cs_addr  # symbol name of cos/sin table tensor
+        self.half_count = 0   # filled in by program.compile()
+
+    def encode(self, symbol_to_addr):
+        src_addr = symbol_to_addr[self.src]
+        dest_addr = symbol_to_addr[self.dest]
+        cs_base = symbol_to_addr[self.cs_addr]
+        instr = 0
+        instr |= (Opcode.XFORM & 0xF) << 252
+        instr |= (XformMode.ROPE_K16 & 0xF) << 248
+        instr |= (src_addr & 0xFFFF) << 232
+        instr |= (dest_addr & 0xFFFF) << 216
+        instr |= (self.half_count & 0xFFFF) << 200
+        instr |= (cs_base & 0xFFFF) << 184
+        return instr
+
 # --- Legacy Functions for compatibility if needed ---
 def pack_matmul(
     opcode,
@@ -189,6 +250,18 @@ def pack_move(opcode, src, dest, count):
 def pack_simple(opcode):
     instr = 0
     instr |= (opcode & 0xF) << 252
+    return instr
+
+
+def pack_xform(opcode, mode, src, dest, count, multiplier=1, shift=0):
+    instr = 0
+    instr |= (opcode & 0xF) << 252
+    instr |= (mode & 0xF) << 248
+    instr |= (src & 0xFFFF) << 232
+    instr |= (dest & 0xFFFF) << 216
+    instr |= (count & 0xFFFF) << 200
+    instr |= (multiplier & 0xFFFF) << 184
+    instr |= (shift & 0xFF) << 176
     return instr
 
 # --- MMIO Helpers ---

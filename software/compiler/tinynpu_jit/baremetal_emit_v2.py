@@ -31,6 +31,7 @@ _HOST_KIND_ENUM = {
     "reshape": "TNPU_HOST_RESHAPE",
     "transpose": "TNPU_HOST_TRANSPOSE",
     "softmax": "TNPU_HOST_SOFTMAX",
+    "softmax_f16": "TNPU_HOST_SOFTMAX_F16",
     "mean": "TNPU_HOST_MEAN",
     "im2col": "TNPU_HOST_IM2COL",
     "layout_restore": "TNPU_HOST_LAYOUT_RESTORE",
@@ -39,6 +40,7 @@ _HOST_KIND_ENUM = {
     "silu": "TNPU_HOST_SILU",
     "mul": "TNPU_HOST_MUL",
     "add": "TNPU_HOST_ADD",
+    "k_cache_scatter_write": "TNPU_HOST_K_CACHE_SCATTER_WRITE",
 }
 
 
@@ -124,6 +126,20 @@ def _is_step_instance(step: Any, cls: type[Any]) -> bool:
     return step.__class__.__name__ == cls.__name__
 
 
+def _build_consumers(plan_steps: list[Any]) -> dict[str, list[Any]]:
+    consumers: dict[str, list[Any]] = {}
+    for step in plan_steps:
+        if _is_step_instance(step, HostOp):
+            for name in step.inputs:
+                consumers.setdefault(name, []).append(step)
+        elif _is_step_instance(step, NpuSegment):
+            for name in step.inputs:
+                consumers.setdefault(name, []).append(step)
+        elif _is_step_instance(step, VerifyTensor):
+            consumers.setdefault(step.tensor_name, []).append(step)
+    return consumers
+
+
 def emit_cv32e40p_program_v2(
     artifact: CompiledArtifact,
     inputs: dict[str, np.ndarray],
@@ -202,6 +218,13 @@ def emit_cv32e40p_program_v2(
     for step in artifact.plan.steps:
         if _is_step_instance(step, VerifyTensor) and step.tensor_name in artifact.expected_tensors:
             expected_tensor_names.add(step.tensor_name)
+
+    def resolve_tensor_addr(tensor_name: str) -> int:
+        for seg_artifact in artifact.segment_artifacts.values():
+            symbol = seg_artifact.symbol_table.get(tensor_name)
+            if symbol is not None:
+                return int(symbol["addr"])
+        raise KeyError(f"Unable to resolve planned address for tensor '{tensor_name}'.")
     for name in sorted(expected_tensor_names):
         expected_spec = artifact.plan.tensors[name].clone_without_data()
         expected_spec.data = np.array(artifact.expected_tensors[name], copy=True)
@@ -272,6 +295,48 @@ def emit_cv32e40p_program_v2(
             + "\n};"
         )
 
+    tensor_consumers = _build_consumers(artifact.plan.steps)
+    producer_by_output: dict[str, HostOp] = {}
+    for step in artifact.plan.steps:
+        if _is_step_instance(step, HostOp):
+            for output_name in step.outputs:
+                producer_by_output[output_name] = step
+
+    absorbed_quantize_outputs: set[str] = set()
+    for output_name, step in producer_by_output.items():
+        if step.kind != "quantize":
+            continue
+        uses = tensor_consumers.get(output_name, [])
+        non_verify_uses = [use for use in uses if not _is_step_instance(use, VerifyTensor)]
+        if not non_verify_uses:
+            continue
+        if not all(_is_step_instance(use, NpuSegment) for use in non_verify_uses):
+            continue
+        absorbed_quantize_outputs.add(output_name)
+
+    absorbed_dequantize_by_input: dict[str, HostOp] = {}
+    for step in artifact.plan.steps:
+        if not _is_step_instance(step, HostOp):
+            continue
+        if step.kind != "dequantize":
+            continue
+        source_name = step.inputs[0]
+        source_spec = artifact.plan.tensors[source_name]
+        output_spec = artifact.plan.tensors[step.outputs[0]]
+        uses = tensor_consumers.get(source_name, [])
+        non_verify_uses = [use for use in uses if not _is_step_instance(use, VerifyTensor)]
+        if len(non_verify_uses) != 1 or non_verify_uses[0] is not step:
+            continue
+        if source_name in expected_tensor_names:
+            continue
+        if source_spec.dtype != DType.INT16:
+            continue
+        if output_spec.dtype != DType.FLOAT32:
+            continue
+        absorbed_dequantize_by_input[source_name] = step
+
+    absorbed_dequantize_step_names: set[str] = set()
+
     segment_entries: list[str] = []
     segment_index: dict[str, int] = {}
     for step in artifact.plan.steps:
@@ -287,10 +352,41 @@ def emit_cv32e40p_program_v2(
             if tensor_name in produced_inside:
                 continue
             sym = segment.symbol_table[tensor_name]
+            write_tensor_name = tensor_name
+            transform = "TNPU_WRITE_TRANSFORM_NONE"
+            attrs_i32 = [0, 0]
+            attrs_f32 = [0.0]
+            if tensor_name in absorbed_quantize_outputs:
+                producer = producer_by_output[tensor_name]
+                source_name = producer.inputs[0]
+                source_spec = artifact.plan.tensors[source_name]
+                if (
+                    source_spec.dtype == DType.FLOAT32
+                    and int(sym["precision"]) == 2
+                    and str(sym["role"]) == "A"
+                ):
+                    write_tensor_name = source_name
+                    transform = "TNPU_WRITE_QUANTIZE_F32_TO_INT16"
+                    attrs_i32[0] = int(producer.attrs.get("zero_point", 0))
+                    attrs_f32[0] = 1.0 / float(producer.attrs["scale"])
+                elif (
+                    source_spec.dtype == DType.INT16
+                    and int(sym["precision"]) == 2
+                    and str(sym["role"]) == "A"
+                    and int(producer.attrs.get("zero_point", 0)) == 0
+                ):
+                    source_producer = producer_by_output.get(source_name)
+                    if source_producer is not None and source_producer.kind == "softmax_f16":
+                        write_tensor_name = source_name
+                        transform = "TNPU_WRITE_XFORM_Q_F16_I16"
+                        attrs_f32[0] = 1.0 / float(producer.attrs["scale"])
             writes.append(
                 "    {"
-                f".tensor_idx = {tensor_index[tensor_name]}, .addr = 0x{int(sym['addr']):04x}u, "
+                f".tensor_idx = {tensor_index[write_tensor_name]}, .addr = 0x{int(sym['addr']):04x}u, "
                 f".word_count = {int(sym['word_count'])}u, .precision = {int(sym['precision'])}, "
+                f".transform = {transform}, "
+                f".attrs_i32 = {{{attrs_i32[0]}, {attrs_i32[1]}}}, "
+                f".attrs_f32 = {{{_format_scalar(attrs_f32[0], dtype=DType.FLOAT32)}}}, "
                 f'.role = "{sym["role"]}"'
                 "}"
             )
@@ -306,16 +402,31 @@ def emit_cv32e40p_program_v2(
                 "    {"
                 f".tensor_idx = {tensor_index[symbol_name]}, .addr = 0x{int(sym['addr']):04x}u, "
                 f".word_count = {int(sym['word_count'])}u, .precision = {int(sym['precision'])}, "
+                ".transform = TNPU_WRITE_TRANSFORM_NONE, .attrs_i32 = {0, 0}, .attrs_f32 = {0.0f}, "
                 f'.role = "{sym["role"]}"'
                 "}"
             )
         reads: list[str] = []
         for output_name in step.outputs:
             sym = segment.symbol_table[output_name]
+            read_tensor_name = output_name
+            read_transform = "TNPU_READ_TRANSFORM_NONE"
+            read_attrs_i32 = [0, 0]
+            read_attrs_f32 = [0.0]
+            dequant_step = absorbed_dequantize_by_input.get(output_name)
+            if dequant_step is not None:
+                read_tensor_name = dequant_step.outputs[0]
+                read_transform = "TNPU_READ_DEQUANTIZE_INT16_TO_FLOAT32"
+                read_attrs_i32[0] = int(dequant_step.attrs.get("zero_point", 0))
+                read_attrs_f32[0] = float(dequant_step.attrs["scale"])
+                absorbed_dequantize_step_names.add(dequant_step.name)
             reads.append(
                 "    {"
-                f".tensor_idx = {tensor_index[output_name]}, .addr = 0x{int(sym['addr']):04x}u, "
-                f".precision = {int(sym['precision'])}, .role = \"{sym['role']}\""
+                f".tensor_idx = {tensor_index[read_tensor_name]}, .addr = 0x{int(sym['addr']):04x}u, "
+                f".precision = {int(sym['precision'])}, .transform = {read_transform}, "
+                f".attrs_i32 = {{{read_attrs_i32[0]}, {read_attrs_i32[1]}}}, "
+                f".attrs_f32 = {{{_format_scalar(read_attrs_f32[0], dtype=DType.FLOAT32)}}}, "
+                f".role = \"{sym['role']}\""
                 "}"
             )
         writes_name = f"{symbol}_seg_{_sanitize(step.name)}_writes"
@@ -360,6 +471,10 @@ def emit_cv32e40p_program_v2(
 
     for step in artifact.plan.steps:
         if _is_step_instance(step, HostOp):
+            if step.kind == "quantize" and step.outputs and step.outputs[0] in absorbed_quantize_outputs:
+                continue
+            if step.kind == "dequantize" and step.name in absorbed_dequantize_step_names:
+                continue
             if step.kind not in _HOST_KIND_ENUM:
                 raise NotImplementedError(f"Bare-metal runtime v2 emitter does not support host op '{step.kind}'.")
             attrs_i32 = [0] * 8
@@ -384,7 +499,7 @@ def emit_cv32e40p_program_v2(
                         + ", ".join(str(v) for v in axes)
                         + "};"
                     )
-            elif step.kind == "softmax":
+            elif step.kind in {"softmax", "softmax_f16"}:
                 attrs_i32[0] = int(step.attrs.get("axis", -1))
             elif step.kind == "mean":
                 dims = step.attrs.get("dim")
@@ -447,6 +562,21 @@ def emit_cv32e40p_program_v2(
                         + ", ".join(str(int(v)) for v in inv_freq_bits.tolist())
                         + "};"
                     )
+            elif step.kind == "k_cache_scatter_write":
+                out_spec = artifact.plan.tensors[step.outputs[0]]
+                base_name = str(out_spec.metadata.get("storage_view_of", step.outputs[0]))
+                base_addr = resolve_tensor_addr(base_name)
+                scatter_addrs = tuple(base_addr + int(offset) for offset in out_spec.metadata["cache_scatter_word_addrs"])
+                token_lane = int(out_spec.metadata["cache_token_index"]) % 8
+                attrs_i32[0] = token_lane
+                arr0_name = f"{symbol}_host_{_sanitize(step.name)}_scatter_addrs"
+                arr0_len = len(scatter_addrs)
+                decls.append(
+                    f"static const int {arr0_name}[{arr0_len}] = "
+                    + "{"
+                    + ", ".join(str(v) for v in scatter_addrs)
+                    + "};"
+                )
 
             host_entries.append(
                 "    {"
@@ -471,6 +601,8 @@ def emit_cv32e40p_program_v2(
             continue
 
         if _is_step_instance(step, VerifyTensor):
+            if step.tensor_name in absorbed_quantize_outputs:
+                continue
             if step.tensor_name not in expected_tensor_names:
                 continue
             verify_entries.append(

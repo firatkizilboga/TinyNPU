@@ -162,8 +162,28 @@ def _softmax_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenMod
 
 
 def _softmax_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
-    source_elements = int(np.array(values[step.inputs[0]], copy=False).size)
-    elems = int(np.array(values[step.outputs[0]], copy=False).size)
+    source_elements = int(np.asarray(values[step.inputs[0]]).size)
+    elems = int(np.asarray(values[step.outputs[0]]).size)
+    return "host_intrinsic", _counts(
+        reads=source_elements * 2,
+        adds=elems * 3,
+        divs=elems,
+        nonlinear=elems,
+        writes=elems,
+        branches=elems * 2,
+    )
+
+
+def _softmax_f16_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
+    axis = int(step.attrs.get("axis", -1))
+    probs = np.asarray(golden.softmax(values[step.inputs[0]], axis=axis), dtype=np.float32)
+    probs_f16_bits = probs.astype(np.float16).view(np.uint16).astype(np.int16)
+    values[step.outputs[0]] = probs_f16_bits
+
+
+def _softmax_f16_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
+    source_elements = int(np.asarray(values[step.inputs[0]]).size)
+    elems = int(np.asarray(values[step.outputs[0]]).size)
     return "host_intrinsic", _counts(
         reads=source_elements * 2,
         adds=elems * 3,
@@ -184,8 +204,8 @@ def _quantize_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenMo
 
 
 def _quantize_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
-    source_elements = int(np.array(values[step.inputs[0]], copy=False).size)
-    elems = int(np.array(values[step.outputs[0]], copy=False).size)
+    source_elements = int(np.asarray(values[step.inputs[0]]).size)
+    elems = int(np.asarray(values[step.outputs[0]]).size)
     return "host_intrinsic", _counts(
         reads=source_elements,
         divs=elems,
@@ -205,8 +225,8 @@ def _dequantize_eval(step: HostOp, values: dict[str, np.ndarray], golden: Golden
 
 
 def _dequantize_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
-    source_elements = int(np.array(values[step.inputs[0]], copy=False).size)
-    elems = int(np.array(values[step.outputs[0]], copy=False).size)
+    source_elements = int(np.asarray(values[step.inputs[0]]).size)
+    elems = int(np.asarray(values[step.outputs[0]]).size)
     adds = elems * 2 if int(step.attrs.get("zero_point", 0)) != 0 else elems
     return "host_intrinsic", _counts(
         reads=source_elements,
@@ -223,8 +243,8 @@ def _sigmoid_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenMod
 
 
 def _sigmoid_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
-    source_elements = int(np.array(values[step.inputs[0]], copy=False).size)
-    elems = int(np.array(values[step.outputs[0]], copy=False).size)
+    source_elements = int(np.asarray(values[step.inputs[0]]).size)
+    elems = int(np.asarray(values[step.outputs[0]]).size)
     return "host_intrinsic", _counts(
         reads=source_elements,
         adds=elems * 2,
@@ -242,8 +262,8 @@ def _gelu_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel)
 
 
 def _gelu_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
-    source_elements = int(np.array(values[step.inputs[0]], copy=False).size)
-    elems = int(np.array(values[step.outputs[0]], copy=False).size)
+    source_elements = int(np.asarray(values[step.inputs[0]]).size)
+    elems = int(np.asarray(values[step.outputs[0]]).size)
     return "host_intrinsic", _counts(
         reads=source_elements,
         adds=elems * 3,
@@ -254,14 +274,35 @@ def _gelu_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, A
     )
 
 
+def _k_cache_scatter_write_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
+    """Python-side simulation of the scatter-write into the K-cache.
+
+    On hardware this writes each INT16 key element to its per-token lane in the UB via
+    shared SRAM.  In the Python evaluator we replicate the logical result: write the
+    [1, d_head] key into the slot tensor AND update the corresponding column of the base
+    k_cache [d_head, token_count] matrix so that downstream ops see the correct values.
+    """
+    key = np.asarray(values[step.inputs[0]], dtype=np.int16)  # [1, d_head]
+    token_index = int(step.attrs["token_index"])
+    k_cache_base = str(step.attrs["k_cache_base"])
+    values[step.outputs[0]] = key
+    if k_cache_base in values:
+        values[k_cache_base][:, token_index] = key.flatten()
+
+
+def _k_cache_scatter_write_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
+    d_head = int(np.asarray(values[step.inputs[0]]).size)
+    return "host_intrinsic", _counts(reads=d_head, writes=d_head)
+
+
 def _silu_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
-    source = np.array(values[step.inputs[0]], dtype=np.float32, copy=False)
+    source = np.asarray(values[step.inputs[0]], dtype=np.float32)
     values[step.outputs[0]] = (source / (np.float32(1.0) + np.exp(-source))).astype(np.float32)
 
 
 def _silu_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
-    source_elements = int(np.array(values[step.inputs[0]], copy=False).size)
-    elems = int(np.array(values[step.outputs[0]], copy=False).size)
+    source_elements = int(np.asarray(values[step.inputs[0]]).size)
+    elems = int(np.asarray(values[step.outputs[0]]).size)
     return "host_intrinsic", _counts(
         reads=source_elements,
         adds=elems * 2,
@@ -278,8 +319,8 @@ def _relu_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel)
 
 
 def _relu_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
-    source_elements = int(np.array(values[step.inputs[0]], copy=False).size)
-    elems = int(np.array(values[step.outputs[0]], copy=False).size)
+    source_elements = int(np.asarray(values[step.inputs[0]]).size)
+    elems = int(np.asarray(values[step.outputs[0]]).size)
     return "host_intrinsic", _counts(
         reads=source_elements,
         clamps=elems,
@@ -289,7 +330,7 @@ def _relu_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, A
 
 
 def _mean_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
-    source = np.array(values[step.inputs[0]], copy=False)
+    source = np.asarray(values[step.inputs[0]])
     dims = step.attrs.get("dim")
     axis = None if dims is None else tuple(int(dim) for dim in dims)
     keepdim = bool(step.attrs.get("keepdim", False))
@@ -305,8 +346,8 @@ def _mean_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel)
 
 
 def _mean_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
-    source_elements = int(np.array(values[step.inputs[0]], copy=False).size)
-    out_elems = int(np.array(values[step.outputs[0]], copy=False).size)
+    source_elements = int(np.asarray(values[step.inputs[0]]).size)
+    out_elems = int(np.asarray(values[step.outputs[0]]).size)
     counts = _counts(
         reads=source_elements,
         adds=source_elements,
@@ -328,7 +369,7 @@ def _alias_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel
 
 
 def _movement_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
-    elems = int(np.array(values[step.outputs[0]], copy=False).size)
+    elems = int(np.asarray(values[step.outputs[0]]).size)
     return "cpu_replaced", _counts(
         reads=elems,
         writes=elems,
@@ -338,7 +379,7 @@ def _movement_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[st
 
 
 def _im2col_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
-    image = np.array(values[step.inputs[0]], copy=False)
+    image = np.asarray(values[step.inputs[0]])
     layout = step.attrs.get("input_layout", "hwc")
     if layout == "matrix_hwc":
         matrix_h = int(step.attrs["matrix_h"])
@@ -367,7 +408,7 @@ def _im2col_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenMode
 
 
 def _im2col_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
-    elems = int(np.array(values[step.outputs[0]], copy=False).size)
+    elems = int(np.asarray(values[step.outputs[0]]).size)
     return "cpu_replaced", _counts(
         reads=elems,
         writes=elems,
@@ -385,7 +426,7 @@ def _transpose_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenM
 
 
 def _layout_restore_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
-    source = np.array(values[step.inputs[0]], copy=False)
+    source = np.asarray(values[step.inputs[0]])
     hwc = source.reshape(
         int(step.attrs["out_h"]),
         int(step.attrs["out_w"]),
@@ -414,8 +455,8 @@ def _requantize_eval(step: HostOp, values: dict[str, np.ndarray], golden: Golden
 
 
 def _requantize_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
-    source_elements = int(np.array(values[step.inputs[0]], copy=False).size)
-    elems = int(np.array(values[step.outputs[0]], copy=False).size)
+    source_elements = int(np.asarray(values[step.inputs[0]]).size)
+    elems = int(np.asarray(values[step.outputs[0]]).size)
     return "host_intrinsic", _counts(
         reads=source_elements,
         muls=elems,
@@ -427,8 +468,8 @@ def _requantize_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[
 
 
 def _rmsnorm_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
-    x = np.array(values[step.inputs[0]], dtype=np.float32, copy=False)
-    weight = np.array(values[step.inputs[1]], dtype=np.float32, copy=False).reshape(-1)
+    x = np.asarray(values[step.inputs[0]], dtype=np.float32)
+    weight = np.asarray(values[step.inputs[1]], dtype=np.float32).reshape(-1)
     hidden = x.shape[-1]
     if weight.size != hidden:
         raise ValueError(f"rmsnorm weight size mismatch: hidden={hidden}, weight={weight.size}.")
@@ -439,7 +480,7 @@ def _rmsnorm_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenMod
 
 
 def _rmsnorm_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
-    x = np.array(values[step.inputs[0]], copy=False)
+    x = np.asarray(values[step.inputs[0]])
     elems = int(x.size)
     rows = int(elems // x.shape[-1])
     return "host_intrinsic", _counts(
@@ -454,15 +495,15 @@ def _rmsnorm_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str
 
 
 def _mul_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
-    lhs = np.array(values[step.inputs[0]], dtype=np.float32, copy=False)
-    rhs = np.array(values[step.inputs[1]], dtype=np.float32, copy=False)
+    lhs = np.asarray(values[step.inputs[0]], dtype=np.float32)
+    rhs = np.asarray(values[step.inputs[1]], dtype=np.float32)
     if lhs.shape != rhs.shape:
         raise ValueError(f"mul requires same-shape inputs, got {lhs.shape} and {rhs.shape}.")
     values[step.outputs[0]] = (lhs * rhs).astype(np.float32)
 
 
 def _mul_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
-    elems = int(np.array(values[step.outputs[0]], copy=False).size)
+    elems = int(np.asarray(values[step.outputs[0]]).size)
     return "host_intrinsic", _counts(
         reads=elems * 2,
         muls=elems,
@@ -472,15 +513,15 @@ def _mul_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, An
 
 
 def _add_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
-    lhs = np.array(values[step.inputs[0]], dtype=np.float32, copy=False)
-    rhs = np.array(values[step.inputs[1]], dtype=np.float32, copy=False)
+    lhs = np.asarray(values[step.inputs[0]], dtype=np.float32)
+    rhs = np.asarray(values[step.inputs[1]], dtype=np.float32)
     if lhs.shape != rhs.shape:
         raise ValueError(f"add requires same-shape inputs, got {lhs.shape} and {rhs.shape}.")
     values[step.outputs[0]] = (lhs + rhs).astype(np.float32)
 
 
 def _add_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
-    elems = int(np.array(values[step.outputs[0]], copy=False).size)
+    elems = int(np.asarray(values[step.outputs[0]]).size)
     return "host_intrinsic", _counts(
         reads=elems * 2,
         adds=elems,
@@ -490,7 +531,7 @@ def _add_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, An
 
 
 def _rope_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
-    x = np.array(values[step.inputs[0]], dtype=np.float32, copy=False)
+    x = np.asarray(values[step.inputs[0]], dtype=np.float32)
     out = np.array(x, copy=True)
     head_dim = int(step.attrs["head_dim"])
     position = int(step.attrs.get("position", 0))
@@ -520,7 +561,7 @@ def _rope_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel)
 
 
 def _rope_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
-    x = np.array(values[step.inputs[0]], copy=False)
+    x = np.asarray(values[step.inputs[0]])
     elems = int(x.size)
     return "host_intrinsic", _counts(
         reads=elems,
@@ -583,6 +624,13 @@ for _spec in (
     ),
     HostOpSpec("gelu", _gelu_eval, _gelu_benchmark),
     HostOpSpec(
+        "k_cache_scatter_write",
+        _k_cache_scatter_write_eval,
+        _k_cache_scatter_write_benchmark,
+        required_attrs=("token_index", "k_cache_base"),
+        quant_boundary_policy="host_to_npu",
+    ),
+    HostOpSpec(
         "layout_restore",
         _layout_restore_eval,
         _movement_benchmark,
@@ -622,6 +670,7 @@ for _spec in (
     HostOpSpec("sigmoid", _sigmoid_eval, _sigmoid_benchmark),
     HostOpSpec("silu", _silu_eval, _silu_benchmark),
     HostOpSpec("softmax", _softmax_eval, _softmax_benchmark),
+    HostOpSpec("softmax_f16", _softmax_f16_eval, _softmax_f16_benchmark),
     HostOpSpec("transpose", _transpose_eval, _movement_benchmark, semantic_validator=_validate_transpose),
 ):
     register_host_op(_spec)
