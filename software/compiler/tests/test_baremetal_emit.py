@@ -18,6 +18,7 @@ from tinynpu_jit import (
     NpuSegment,
     TensorKind,
     TensorSpec,
+    VerificationMode,
     b_slot_word_stride,
     compile_plan,
     make_b_cache_specs,
@@ -1634,6 +1635,8 @@ def test_prefill_transformer_block_builds_and_emits_new_host_ops():
     assert "TNPU_HOST_CONCAT_LASTDIM2" in source_v2
     assert "host_causal_mask(" in source_cpu
     assert "host_concat_lastdim2(" in source_cpu
+    result = run_host_emulation(artifact, {}, verification=VerificationMode.FINAL)
+    assert "prefill_transformer_block_out" in result.verified
 
 
 # ---------------------------------------------------------------------------
