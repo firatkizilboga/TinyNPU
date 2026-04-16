@@ -24,9 +24,12 @@ from tinynpu_jit import (
     make_native_int16_k_cache_specs,
     make_native_int16_kv_cache_specs,
     make_native_int16_v_cache_specs,
+    make_rope_cos_sin_table_q14,
+    make_rope_cs_tensor_spec,
+    run_host_emulation,
 )
 from tinynpu import TinyNPUProgram
-from tinynpu.isa import BReadMode, OutputLayout, PrecisionMode, WritebackMode
+from tinynpu.isa import BReadMode, OutputLayout, PrecisionMode, WritebackMode, XformMode
 
 
 def test_emit_cv32e40p_c_for_two_segment_relu_chain():
@@ -218,10 +221,119 @@ def test_emit_cv32e40p_program_v2_structured_program():
     assert '#include "tinynpu_runtime_v2.h"' in source
     assert "const TnpuProgram unit_test_program_v2" in source
     assert "TNPU_OP_PRELOAD_UB" in source
+
+
+def test_emit_cv32e40p_program_v2_absorbs_quantize_into_segment_write():
+    x_f = np.array(
+        [
+            [1.0, -2.0, 3.0, -4.0, 0.5, -0.5, 2.5, -1.5],
+            [0.0, 1.0, -1.0, 2.0, 3.0, -3.0, 4.0, -4.0],
+            [2.0, 2.0, 2.0, 2.0, -2.0, -2.0, -2.0, -2.0],
+            [1.5, -1.5, 0.0, 0.0, 1.0, -1.0, 2.0, -2.0],
+            [3.0, 0.0, -3.0, 1.0, -1.0, 2.0, -2.0, 4.0],
+            [0.25, -0.25, 0.75, -0.75, 1.25, -1.25, 1.75, -1.75],
+            [4.0, 3.0, 2.0, 1.0, -1.0, -2.0, -3.0, -4.0],
+            [1.0, 0.0, 1.0, 0.0, -1.0, 0.0, -1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    scale = 0.5
+    x_q = np.clip(np.rint(x_f / scale), -32768, 32767).astype(np.int16)
+    w = np.eye(8, dtype=np.int16)
+    y = x_q.copy()
+
+    tensors = {
+        "x_f": TensorSpec("x_f", x_f.shape, DType.FLOAT32, TensorKind.INPUT),
+        "x_q": TensorSpec("x_q", x_q.shape, DType.INT16, TensorKind.INTERMEDIATE),
+        "w": TensorSpec("w", w.shape, DType.INT16, TensorKind.CONSTANT, data=w),
+        "y": TensorSpec("y", y.shape, DType.INT16, TensorKind.OUTPUT, is_final_output=True),
+    }
+    steps = [
+        HostOp("quant_x", "quantize", inputs=["x_f"], outputs=["x_q"], attrs={"scale": scale, "zero_point": 0}),
+        NpuSegment("seg0", [MatMulOp("op0", "x_q", "w", "y")], inputs=["x_q", "w"], outputs=["y"]),
+    ]
+    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=["x_f"], outputs=["y"])
+    plan.add_verification_step("y", "final_y")
+    artifact = compile_plan(plan, {"y": y})
+
+    source = emit_cv32e40p_program_v2(artifact, {"x_f": x_f}, program_name="unit_test_v2_quant_absorb")
+
+    assert "TNPU_WRITE_QUANTIZE_F32_TO_INT16" in source
+    assert ".transform = TNPU_WRITE_QUANTIZE_F32_TO_INT16" in source
+    assert "TNPU_HOST_QUANTIZE" not in source
     assert "TNPU_OP_SEGMENT" in source
-    assert "TNPU_OP_HOST" in source
     assert "TNPU_OP_VERIFY" in source
-    assert "TNPU_HOST_RELU" in source
+
+
+def test_emit_cv32e40p_program_v2_absorbs_f16_quantize_into_xform_write():
+    scores = np.array([[1, 0, -1, 2, -2, 3, -3, 4]], dtype=np.int16)
+    probs_f16_bits = np.zeros_like(scores, dtype=np.int16)
+    attn_q = np.zeros_like(scores, dtype=np.int16)
+    w = np.eye(8, dtype=np.int16)
+    y = np.zeros_like(scores, dtype=np.int16)
+
+    tensors = {
+        "scores": TensorSpec("scores", scores.shape, DType.INT16, TensorKind.INPUT),
+        "probs_f16": TensorSpec("probs_f16", probs_f16_bits.shape, DType.INT16, TensorKind.INTERMEDIATE),
+        "attn_q": TensorSpec("attn_q", attn_q.shape, DType.INT16, TensorKind.INTERMEDIATE),
+        "w": TensorSpec("w", w.shape, DType.INT16, TensorKind.CONSTANT, data=w),
+        "y": TensorSpec("y", y.shape, DType.INT16, TensorKind.OUTPUT, is_final_output=True),
+    }
+    steps = [
+        HostOp("softmax_scores_f16", "softmax_f16", inputs=["scores"], outputs=["probs_f16"], attrs={"axis": -1}),
+        HostOp("quantize_probs", "quantize", inputs=["probs_f16"], outputs=["attn_q"], attrs={"scale": 0.5, "zero_point": 0}),
+        NpuSegment("seg0", [MatMulOp("op0", "attn_q", "w", "y")], inputs=["attn_q", "w"], outputs=["y"]),
+    ]
+    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=["scores"], outputs=["y"])
+    plan.add_verification_step("y", "final_y")
+    artifact = compile_plan(plan, {"y": y})
+
+    source = emit_cv32e40p_program_v2(artifact, {"scores": scores}, program_name="unit_test_v2_f16_quant_absorb")
+
+    assert "TNPU_WRITE_XFORM_Q_F16_I16" in source
+    assert ".transform = TNPU_WRITE_XFORM_Q_F16_I16" in source
+    assert "TNPU_HOST_SOFTMAX_F16" in source
+    assert "TNPU_HOST_QUANTIZE" not in source
+
+
+def test_emit_cv32e40p_program_v2_absorbs_dequantize_into_segment_read():
+    x_q = np.array(
+        [
+            [8, -4, 2, 0, 1, -1, 3, -3],
+            [0, 2, -2, 4, -4, 6, -6, 8],
+            [1, 1, 1, 1, -1, -1, -1, -1],
+            [3, -3, 0, 0, 2, -2, 5, -5],
+            [7, 0, -7, 2, -2, 4, -4, 6],
+            [1, -1, 2, -2, 3, -3, 4, -4],
+            [8, 6, 4, 2, -2, -4, -6, -8],
+            [2, 0, 2, 0, -2, 0, -2, 0],
+        ],
+        dtype=np.int16,
+    )
+    w = np.eye(8, dtype=np.int16)
+    y_q = x_q.copy()
+    scale = 0.25
+    y_f = (y_q.astype(np.float32) * scale).astype(np.float32)
+
+    tensors = {
+        "x_q": TensorSpec("x_q", x_q.shape, DType.INT16, TensorKind.INPUT),
+        "w": TensorSpec("w", w.shape, DType.INT16, TensorKind.CONSTANT, data=w),
+        "y_q": TensorSpec("y_q", y_q.shape, DType.INT16, TensorKind.INTERMEDIATE),
+        "y_f": TensorSpec("y_f", y_f.shape, DType.FLOAT32, TensorKind.OUTPUT, is_final_output=True),
+    }
+    steps = [
+        NpuSegment("seg0", [MatMulOp("op0", "x_q", "w", "y_q")], inputs=["x_q", "w"], outputs=["y_q"]),
+        HostOp("dequant_y", "dequantize", inputs=["y_q"], outputs=["y_f"], attrs={"scale": scale, "zero_point": 0}),
+    ]
+    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=["x_q"], outputs=["y_f"])
+    plan.add_verification_step("y_f", "final_y")
+    artifact = compile_plan(plan, {"y_f": y_f})
+
+    source = emit_cv32e40p_program_v2(artifact, {"x_q": x_q}, program_name="unit_test_v2_dequant_absorb")
+
+    assert "TNPU_READ_DEQUANTIZE_INT16_TO_FLOAT32" in source
+    assert ".transform = TNPU_READ_DEQUANTIZE_INT16_TO_FLOAT32" in source
+    assert "TNPU_HOST_DEQUANTIZE" not in source
 
 
 def test_compile_plan_marks_rhs_chaining_output_as_b_layout():
@@ -373,6 +485,43 @@ def test_tinynpu_program_encodes_k_cache_append_mode_in_matmul_instruction():
     inst = int(binary["im"][0])
     assert ((inst >> 248) & 0xF) == int(WritebackMode.K_CACHE_APPEND_INT16)
     assert ((inst >> 184) & 0xFFFF) == 17
+
+
+def test_tinynpu_program_encodes_xform_q_f16_i16_instruction():
+    program = TinyNPUProgram()
+    src = np.zeros((8, 8), dtype=np.int16)
+    dst = np.zeros((8, 8), dtype=np.int16)
+    program.declare_data("src_f16", src, precision=PrecisionMode.INT16, role="A")
+    program.declare_data("dst_i16", dst, precision=PrecisionMode.INT16, role="A")
+    program.xform_q_f16_i16("src_f16", "dst_i16", multiplier=123, shift=7)
+    program.halt()
+    binary = program.compile()
+
+    inst = int(binary["im"][0])
+    assert ((inst >> 252) & 0xF) == 0x4
+    assert ((inst >> 248) & 0xF) == int(XformMode.Q_F16_I16)
+    assert ((inst >> 200) & 0xFFFF) == 8
+    assert ((inst >> 184) & 0xFFFF) == 123
+    assert ((inst >> 176) & 0xFF) == 7
+
+
+def test_tinynpu_program_encodes_xform_q_f16_i16_inplace_instruction():
+    program = TinyNPUProgram()
+    src = np.zeros((8, 8), dtype=np.int16)
+    program.declare_data("src_f16", src, precision=PrecisionMode.INT16, role="A")
+    program.xform_q_f16_i16("src_f16", multiplier=16, shift=1)
+    program.halt()
+    binary = program.compile()
+
+    inst = int(binary["im"][0])
+    src_addr = (inst >> 232) & 0xFFFF
+    dst_addr = (inst >> 216) & 0xFFFF
+    assert ((inst >> 252) & 0xF) == 0x4
+    assert ((inst >> 248) & 0xF) == int(XformMode.Q_F16_I16)
+    assert src_addr == dst_addr
+    assert ((inst >> 200) & 0xFFFF) == 8
+    assert ((inst >> 184) & 0xFFFF) == 16
+    assert ((inst >> 176) & 0xFF) == 1
 
 
 def test_compile_plan_preserves_output_word_offset_in_segment_binary():
@@ -1394,3 +1543,130 @@ def test_host_op_mul_add_emulation_and_v2_emit():
     add_source = emit_cv32e40p_program_v2(add_artifact, {}, program_name="unit_test_add_v2")
     assert "TNPU_HOST_ADD" in add_source
     assert ".input1_idx =" in add_source
+
+
+# ---------------------------------------------------------------------------
+# XFORM ROPE_K16
+# ---------------------------------------------------------------------------
+
+def _rope_rotate_half_q14(k_q14: np.ndarray, cs_q14: np.ndarray) -> np.ndarray:
+    """Reference Python impl of rotate-half RoPE in INT16 Q14 arithmetic."""
+    k = k_q14.astype(np.int32).reshape(-1)
+    cs = cs_q14.astype(np.int32).reshape(-1)
+    d = len(k)
+    half = d // 2
+    k_lo = k[:half]
+    k_hi = k[half:]
+    cos_q = cs[:half]
+    sin_q = cs[half:]
+    lo_rot = np.clip((k_lo * cos_q - k_hi * sin_q + (1 << 13)) >> 14, -32768, 32767)
+    hi_rot = np.clip((k_hi * cos_q + k_lo * sin_q + (1 << 13)) >> 14, -32768, 32767)
+    return np.concatenate([lo_rot, hi_rot]).astype(np.int16)
+
+
+def test_make_rope_cos_sin_table_q14_shape_and_dtype():
+    """make_rope_cos_sin_table_q14 returns an int16 array of length d_head."""
+    for d_head in (8, 16, 64):
+        table = make_rope_cos_sin_table_q14(d_head, position=3)
+        assert table.shape == (d_head,), f"bad shape for d_head={d_head}"
+        assert table.dtype == np.int16
+
+
+def test_rope_cos_sin_table_values():
+    """cos and sin halves should be cos(pos*freq) and sin(pos*freq) in Q14."""
+    d_head = 16
+    position = 5
+    theta = 10000.0
+    table = make_rope_cos_sin_table_q14(d_head, position=position, theta=theta)
+    half = d_head // 2
+    Q14 = 16384.0
+    for i in range(half):
+        freq = 1.0 / (theta ** (2.0 * i / d_head))
+        angle = position * freq
+        expected_cos = int(round(np.cos(angle) * Q14))
+        expected_sin = int(round(np.sin(angle) * Q14))
+        assert int(table[i]) == expected_cos, f"cos mismatch at i={i}"
+        assert int(table[half + i]) == expected_sin, f"sin mismatch at i={i}"
+
+
+def test_npu_program_xform_rope_k16_isa_encoding():
+    """TinyNPUProgram.xform_rope_k16 produces a XFORM ROPE_K16 instruction."""
+    from tinynpu.isa import XformMode, Opcode
+
+    d_head = 16
+    k_data = np.ones((1, d_head), dtype=np.int16) * 100
+    cs_data = make_rope_cos_sin_table_q14(d_head, position=3).reshape(1, d_head)
+
+    prog = TinyNPUProgram()
+    prog.declare_data("k", k_data, role="C")
+    prog.declare_data("cs", cs_data, role="C")
+    prog.xform_rope_k16("k", "cs")
+    prog.halt()
+    binary = prog.compile()
+
+    # The XFORM ROPE_K16 instruction should be the first instruction.
+    instr = binary["im"][0]
+    opcode = (instr >> 252) & 0xF
+    mode = (instr >> 248) & 0xF
+    assert opcode == int(Opcode.XFORM), f"expected XFORM opcode, got {opcode}"
+    assert mode == int(XformMode.ROPE_K16), f"expected ROPE_K16 mode, got {mode}"
+
+    # half_count should be d_head / 16 = 1 for d_head=16
+    half_count = (instr >> 200) & 0xFFFF
+    assert half_count == d_head // 16, f"half_count={half_count}, expected {d_head // 16}"
+
+
+def test_npu_segment_with_rope_cs_python_simulation():
+    """End-to-end test: matmul producing K, then XFORM ROPE_K16, using host emulation."""
+    d_head = 16
+    d_model = 8  # small for test speed
+    rng = np.random.default_rng(42)
+
+    x = rng.integers(-4, 5, size=(1, d_model), dtype=np.int16)
+    w_k = rng.integers(-4, 5, size=(d_model, d_head), dtype=np.int16)
+    position = 3
+    theta = 10000.0
+
+    # Expected: K = x @ w_k, then ROPE
+    k_ref = np.clip(x.astype(np.int32) @ w_k.astype(np.int32), -32768, 32767).astype(np.int16)
+    cs_ref = make_rope_cos_sin_table_q14(d_head, position, theta)
+    k_rope_ref = _rope_rotate_half_q14(k_ref, cs_ref)
+
+    cs_tensor_spec = make_rope_cs_tensor_spec("k_rope_cs", d_head, position, theta)
+
+    tensors = {
+        "x": TensorSpec("x", x.shape, DType.INT16, TensorKind.CONSTANT, data=x),
+        "w_k": TensorSpec("w_k", w_k.shape, DType.INT16, TensorKind.CONSTANT, data=w_k),
+        "k_out": TensorSpec("k_out", (1, d_head), DType.INT16, TensorKind.OUTPUT, is_final_output=True),
+        "k_rope_cs": cs_tensor_spec,
+    }
+
+    seg = NpuSegment(
+        "seg_k",
+        [MatMulOp("op_k", "x", "w_k", "k_out", in_dtype=DType.INT16, out_dtype=DType.INT16,
+                  rope_cs_name="k_rope_cs")],
+        inputs=["x", "w_k"],
+        outputs=["k_out"],
+    )
+    plan = ExecutionPlan(tensors=tensors, steps=[seg], inputs=["x"], outputs=["k_out"])
+    plan.add_verification_step("k_out", "k_out")
+    artifact = compile_plan(plan, {"k_out": k_rope_ref})
+
+    seg_artifact = artifact.segment_artifacts["seg_k"]
+    k_addr = int(seg_artifact.symbol_table["k_out"]["addr"])
+    cs_addr = int(seg_artifact.symbol_table["k_rope_cs"]["addr"])
+    w_addr = int(seg_artifact.symbol_table["w_k"]["addr"])
+
+    assert cs_addr != w_addr, "RoPE cos/sin table must not alias the weight tensor in UB"
+    assert cs_addr != k_addr, "RoPE cos/sin table must not alias the K output tensor in UB"
+
+    result = run_host_emulation(artifact, {"x": x})
+    k_sim = np.asarray(result.tensors["k_out"]).astype(np.int16).reshape(-1)
+
+    # Allow ±1 rounding tolerance due to Q14 integer arithmetic
+    diff = np.abs(k_sim.astype(np.int32) - k_rope_ref.astype(np.int32))
+    assert diff.max() <= 1, (
+        f"ROPE result mismatch: max diff={diff.max()}\n"
+        f"  sim:      {k_sim}\n"
+        f"  expected: {k_rope_ref}"
+    )

@@ -28,84 +28,47 @@ if str(REPO_ROOT / "software" / "compiler") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "software" / "compiler"))
 
 from tinynpu import TinyNPUProgram  # noqa: E402
-from tinynpu.isa import OutputLayout, PrecisionMode, WritebackMode  # noqa: E402
+from tinynpu.isa import PrecisionMode  # noqa: E402
 
 
 def build_program() -> tuple[TinyNPUProgram, np.ndarray]:
-    lhs0 = np.array([[1, 2, -1, 0, 3, -2, 1, 4]], dtype=np.int16)
-    rhs0 = np.array(
+    src_f32 = np.array(
         [
-            [1, 0, 1, 0, -1, 2, 0, 1, 2, -1, 0, 1, 1, 0, -1, 2],
-            [0, 1, 0, 1, 2, -1, 1, 0, 1, 0, 2, -1, 0, 1, 2, 1],
-            [1, -1, 1, 0, 0, 1, 2, 1, -1, 1, 0, 2, 1, 2, 0, -1],
-            [2, 0, -1, 1, 1, 0, -1, 2, 0, 1, -1, 1, 2, 0, 1, 1],
-            [0, 2, 1, -1, 1, 1, 0, 0, 2, 1, 1, 0, -1, 1, 0, 2],
-            [1, 1, 0, 2, -1, 0, 1, -1, 1, 0, 1, 2, 0, -1, 1, 0],
-            [0, -1, 2, 1, 0, 1, 1, 2, -1, 2, 1, 0, 1, 1, 2, 0],
-            [1, 0, 1, 1, 2, 0, -1, 1, 0, 1, 1, -1, 1, 2, 0, 1],
+            [1.0, -2.0, 3.5, -4.25, 0.5, -0.5, 2.5, -1.5],
+            [0.0, 1.0, -1.0, 2.0, 3.0, -3.0, 4.0, -4.0],
+            [2.0, 2.0, 2.0, 2.0, -2.0, -2.0, -2.0, -2.0],
+            [1.5, -1.5, 0.0, 0.0, 1.0, -1.0, 2.0, -2.0],
+            [3.0, 0.0, -3.0, 1.0, -1.0, 2.0, -2.0, 4.0],
+            [0.25, -0.25, 0.75, -0.75, 1.25, -1.25, 1.75, -1.75],
+            [4.0, 3.0, 2.0, 1.0, -1.0, -2.0, -3.0, -4.0],
+            [1.0, 0.0, 1.0, 0.0, -1.0, 0.0, -1.0, 0.0],
         ],
-        dtype=np.int16,
-    )
-    lhs1 = np.array([[2, 1, 0, -1, 1, 2, 0, 1]], dtype=np.int16)
-    rhs1 = np.array(
-        [
-            [0, 1, 1, 0, 2, 1, 0, -1, 1, 0, 2, 1, -1, 0, 1, 2],
-            [1, 0, 2, 1, -1, 0, 1, 2, 0, 2, 1, -1, 1, 1, 0, 1],
-            [2, 1, 0, -1, 1, 2, 1, 0, 1, -1, 1, 2, 0, 1, 2, 1],
-            [1, -1, 1, 2, 0, 1, 2, 1, -1, 1, 2, 0, 1, 2, 1, 0],
-            [0, 2, 1, 0, 1, -1, 1, 2, 2, 1, 0, 1, -1, 1, 2, 0],
-            [1, 1, -1, 1, 2, 0, 0, 1, 1, -1, 1, 0, 2, 1, 0, 1],
-            [2, 0, 1, 1, 0, 2, -1, 1, 0, 1, 1, 2, 1, 0, 2, -1],
-            [1, 2, 0, 1, -1, 1, 2, 0, 2, 0, 1, -1, 1, 2, 0, 1],
-        ],
-        dtype=np.int16,
+        dtype=np.float32,
     )
 
-    token0 = np.clip(lhs0.astype(np.int32) @ rhs0.astype(np.int32), -32768, 32767).astype(np.int16)
-    token1 = np.clip(lhs1.astype(np.int32) @ rhs1.astype(np.int32), -32768, 32767).astype(np.int16)
-    expected_cache = np.zeros((16, 16), dtype=np.int16)
-    expected_cache[:, 1] = token0[0]
-    expected_cache[:, 9] = token1[0]
+    multiplier = 16
+    shift = 0
+    src_f16 = src_f32.astype(np.float16)
+    expected_i16 = np.clip(np.rint(src_f16.astype(np.float32) * float(multiplier)), -32768, 32767).astype(np.int16)
+    src_f16_bits = src_f16.view(np.uint16).view(np.int16)
 
     program = TinyNPUProgram()
-    program.declare_data("lhs0", lhs0, precision=PrecisionMode.INT16, role="A")
-    program.declare_data("rhs0", rhs0, precision=PrecisionMode.INT16, role="B")
-    program.declare_data("lhs1", lhs1, precision=PrecisionMode.INT16, role="A")
-    program.declare_data("rhs1", rhs1, precision=PrecisionMode.INT16, role="B")
-    program.declare_data("k_cache", np.zeros((16, 16), dtype=np.int16), precision=PrecisionMode.INT16, role="B")
-
-    program.matmul(
-        "lhs0",
-        "rhs0",
-        "k_cache",
-        in_precision=PrecisionMode.INT16,
-        out_precision=PrecisionMode.INT16,
-        output_layout=OutputLayout.B,
-        writeback_mode=WritebackMode.K_CACHE_APPEND_INT16,
-        output_word_offset=1,
-    )
-    program.matmul(
-        "lhs1",
-        "rhs1",
-        "k_cache",
-        in_precision=PrecisionMode.INT16,
-        out_precision=PrecisionMode.INT16,
-        output_layout=OutputLayout.B,
-        writeback_mode=WritebackMode.K_CACHE_APPEND_INT16,
-        output_word_offset=17,
-    )
+    # Source stores raw FP16 bit patterns in 16-bit lanes.
+    program.declare_data("src_f16_bits", src_f16_bits, precision=PrecisionMode.INT16, role="A")
+    program.declare_data("dst_i16", np.zeros((8, 8), dtype=np.int16), precision=PrecisionMode.INT16, role="A")
+    program.xform_q_f16_i16("src_f16_bits", "dst_i16", multiplier=multiplier, shift=shift)
     program.halt()
-    return program, expected_cache
+    return program, expected_i16
 
 
-def _emit_program_source(program_name: str, program: TinyNPUProgram, expected_cache: np.ndarray) -> str:
+def _emit_program_source(program_name: str, program: TinyNPUProgram, expected: np.ndarray) -> str:
     symbol = _sanitize(program_name)
     binary = program.compile()
-    cache = program.symbols["k_cache"]
+    dst = program.symbols["dst_i16"]
 
     decls: list[str] = []
-    decls.append(_emit_i32_array(f"{symbol}_cache_data", np.zeros(expected_cache.shape, dtype=np.int32), section_data=False))
-    decls.append(_emit_i32_array(f"{symbol}_cache_expected_data", expected_cache.astype(np.int32), section_data=True))
+    decls.append(_emit_i32_array(f"{symbol}_dst_data", np.zeros(expected.shape, dtype=np.int32), section_data=False))
+    decls.append(_emit_i32_array(f"{symbol}_dst_expected_data", expected.astype(np.int32), section_data=True))
     decls.append(f"static const uint16_t {symbol}_output_indices[1] = {{0}};")
     decls.append(_emit_u32x4_image(f"{symbol}_ub_image", [int(word) for word in binary["ub"]]))
 
@@ -131,7 +94,7 @@ def _emit_program_source(program_name: str, program: TinyNPUProgram, expected_ca
     decls.append(
         "static const TnpuTensorRead "
         f"{symbol}_seg_reads[1] = {{\n"
-        f'    {{.tensor_idx = 0, .addr = 0x{cache.addr:04x}u, .precision = 2, .role = "K"}}\n'
+        f'    {{.tensor_idx = 0, .addr = 0x{dst.addr:04x}u, .precision = 2, .role = "A"}}\n'
         "};"
     )
     decls.append(
@@ -142,14 +105,14 @@ def _emit_program_source(program_name: str, program: TinyNPUProgram, expected_ca
     )
     decls.append(
         f"static const TnpuTensorDesc {symbol}_tensors[2] = {{\n"
-        f'    {{.name = "k_cache", .data = {symbol}_cache_data, .dtype = TNPU_DTYPE_INT16, .rank = 2, .shape = {{16, 16, 1, 1}}, .elem_count = 256}},\n'
-        f'    {{.name = "k_cache_expected", .data = {symbol}_cache_expected_data, .dtype = TNPU_DTYPE_INT16, .rank = 2, .shape = {{16, 16, 1, 1}}, .elem_count = 256}}\n'
+        f'    {{.name = "dst_i16", .data = {symbol}_dst_data, .dtype = TNPU_DTYPE_INT16, .rank = 2, .shape = {{8, 8, 1, 1}}, .elem_count = 64}},\n'
+        f'    {{.name = "dst_i16_expected", .data = {symbol}_dst_expected_data, .dtype = TNPU_DTYPE_INT16, .rank = 2, .shape = {{8, 8, 1, 1}}, .elem_count = 64}}\n'
         "};"
     )
     decls.append(
         "static const TnpuVerifyOp "
         f"{symbol}_verify_ops[1] = {{\n"
-        '    {.label = "k_cache_append", .actual_tensor_idx = 0, .expected_tensor_idx = 1, .is_final_output = 1}\n'
+        '    {.label = "xform_q_f16_i16", .actual_tensor_idx = 0, .expected_tensor_idx = 1, .is_final_output = 1}\n'
         "};"
     )
     decls.append(
@@ -186,24 +149,23 @@ def _emit_program_source(program_name: str, program: TinyNPUProgram, expected_ca
     )
 
     return (
+        '#include "tinynpu_runtime_v2.h"\n'
         "#include <stddef.h>\n"
-        "#include <stdint.h>\n"
-        '#include "tinynpu_runtime_v2.h"\n\n'
+        "#include <stdint.h>\n\n"
         + "\n\n".join(decls)
         + "\n"
     )
 
 
 def main() -> int:
-    program_name = "cv32e40p_k_cache_append_demo_v2"
+    program_name = "cv32e40p_xform_q_f16_i16_demo_v2"
     program_symbol = _sanitize(program_name)
     program_path = GENERATED_DIR / f"{program_name}_program.c"
     runner_path = GENERATED_DIR / f"{program_name}_runner.c"
 
-    program, expected_cache = build_program()
-    source = _emit_program_source(program_name, program, expected_cache)
+    program, expected = build_program()
     GENERATED_DIR.mkdir(exist_ok=True)
-    program_path.write_text(source)
+    program_path.write_text(_emit_program_source(program_name, program, expected))
     runner_path.write_text(_runner_source(program_symbol))
 
     prefix = _toolchain_prefix()
@@ -218,6 +180,7 @@ def main() -> int:
     build_env = dict(os.environ)
     build_env["CCACHE_DISABLE"] = "1"
     build_env["TMPDIR"] = "/tmp"
+
     _run(["make", "verilator-build-npu"], cwd=CORE_DIR, env=build_env)
     _run(
         [
@@ -235,19 +198,16 @@ def main() -> int:
             "-T",
             "custom/link.ld",
             "-static",
-            "custom/crt0.S",
-            str(runner_path),
+            "-ffast-math",
+            "-fno-builtin-printf",
+            "-I.",
+            f"-I{include_dir}",
+            f"-I{RUNTIME_DIR}",
             str(program_path),
+            str(runner_path),
+            str(CORE_DIR / "custom" / "crt0.S"),
+            str(CORE_DIR / "custom" / "syscalls.c"),
             str(RUNTIME_DIR / "tinynpu_runtime_v2.c"),
-            "mem_stall/mem_stall.c",
-            "custom/syscalls.c",
-            "custom/vectors.S",
-            "-I",
-            str(include_dir),
-            "-I",
-            "mem_stall",
-            "-I",
-            str(RUNTIME_DIR),
             "-L",
             str(lib_dir),
             "-lc",
@@ -255,25 +215,28 @@ def main() -> int:
             "-lgcc",
         ],
         cwd=CORE_DIR,
+        env=build_env,
     )
-    _run([objcopy, "-O", "verilog", str(elf_path), str(hex_path)], cwd=CORE_DIR)
+    _run([objcopy, "-O", "verilog", str(elf_path), str(hex_path)], cwd=CORE_DIR, env=build_env)
 
-    env = dict(os.environ)
-    env["VERILATOR_MAX_TICKS"] = "3000000000"
-    proc = _run(
+    sim_env = dict(build_env)
+    sim_env.setdefault("VERILATOR_MAX_TICKS", "3000000000")
+    sim = _run(
         [
             str(CORE_DIR / "obj_dir" / "cv32e40p_tb_vlt_npu"),
             "+verilator+noassert",
             f"+firmware={hex_path}",
-            "+maxcycles=250000",
+            "+maxcycles=2000000",
         ],
         cwd=CORE_DIR,
-        env=env,
+        env=sim_env,
         capture=True,
     )
-    print(f"program={program_name}")
-    print(f"expected_checksum={int(expected_cache.astype(np.int64).sum())}")
-    print(proc.stdout)
+    print(sim.stdout, end="")
+    if sim.stderr:
+        print(sim.stderr, file=sys.stderr, end="")
+    if "EXIT SUCCESS" not in sim.stdout:
+        raise RuntimeError("simulation did not report EXIT SUCCESS")
     return 0
 
 

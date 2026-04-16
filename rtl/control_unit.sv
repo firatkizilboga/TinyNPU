@@ -67,6 +67,7 @@ module control_unit #(
     CTRL_FETCH,
     CTRL_DECODE,
     CTRL_EXEC_MOVE,
+    CTRL_EXEC_XFORM,
     CTRL_EXEC_MATMUL,
     CTRL_MM_CLEAR,
     CTRL_MM_FEED,
@@ -79,7 +80,7 @@ module control_unit #(
 
   ctrl_state_t state, next_state;
   logic [`ADDR_WIDTH-1:0] pc, pc_next;
-  localparam int CTRL_STATE_COUNT = 15;
+  localparam int CTRL_STATE_COUNT = 16;
   localparam int PERF_COUNTER_WIDTH = 64;
   localparam int PERF_COUNTERS_FLAT_WIDTH = CTRL_STATE_COUNT * PERF_COUNTER_WIDTH;
 
@@ -97,6 +98,21 @@ module control_unit #(
   logic [`ADDR_WIDTH-1:0] move_dest, move_dest_next;
   logic [`ADDR_WIDTH-1:0] move_count, move_count_next;
   logic move_phase, move_phase_next;
+
+  // --- Internal Registers for XFORM ---
+  logic [`ADDR_WIDTH-1:0] xform_src, xform_src_next;
+  logic [`ADDR_WIDTH-1:0] xform_dest, xform_dest_next;
+  logic [`ADDR_WIDTH-1:0] xform_count, xform_count_next;
+  logic xform_phase, xform_phase_next;
+  xform_mode_t xform_mode, xform_mode_next;
+  logic [15:0] xform_multiplier, xform_multiplier_next;
+  logic [7:0] xform_shift, xform_shift_next;
+
+  // --- ROPE Buffer Registers (used by XFORM_MODE_ROPE_K16) ---
+  logic [`BUFFER_WIDTH-1:0] rope_k_lo_buf;    // K[0..half-1] latched from UB
+  logic [`BUFFER_WIDTH-1:0] rope_k_hi_buf;    // K[half..d-1] latched from UB
+  logic [`BUFFER_WIDTH-1:0] rope_cos_buf;     // cos table word latched from UB
+  logic [`BUFFER_WIDTH-1:0] rope_k_hi_rot_buf; // rotated K_hi latched for phase-5 write
 
   // --- Internal Registers for MATMUL ---
   logic [`ADDR_WIDTH-1:0] mm_a_base, mm_b_base, mm_c_base, mm_bias_base;
@@ -143,12 +159,17 @@ module control_unit #(
       ub_rdata_reg <= '0;
       {latched_cmd, latched_addr, latched_mmvr, latched_arg} <= '0;
       {move_src, move_dest, move_count, move_phase} <= '0;
+      {xform_src, xform_dest, xform_count, xform_phase} <= '0;
+      xform_mode <= XFORM_MODE_NONE;
+      xform_multiplier <= '0;
+      xform_shift <= '0;
       {mm_a_base, mm_b_base, mm_c_base, mm_bias_base, mm_output_word_offset, mm_b_word_offset, mm_m_total, mm_k_total, mm_n_total} <= '0;
       {mm_shift, mm_multiplier, mm_activation, mm_h_gelu_x_scale_shift, mm_in_precision, mm_out_precision, mm_write_offset} <= '0;
       mm_output_layout <= OUT_LAYOUT_C;
       mm_writeback_mode <= WB_MODE_NORMAL;
       mm_b_read_mode <= B_READ_MODE_NORMAL;
       {m_idx, n_idx, k_idx, cycle_cnt} <= '0;
+      {rope_k_lo_buf, rope_k_hi_buf, rope_cos_buf, rope_k_hi_rot_buf} <= '0;
       perf_total_cycles <= '0;
       for (int perf_i = 0; perf_i < CTRL_STATE_COUNT; perf_i++) begin
         perf_state_cycles[perf_i] <= '0;
@@ -179,6 +200,28 @@ module control_unit #(
       move_dest  <= move_dest_next;
       move_count <= move_count_next;
       move_phase <= move_phase_next;
+
+      // XFORM Update
+      xform_src <= xform_src_next;
+      xform_dest <= xform_dest_next;
+      xform_count <= xform_count_next;
+      xform_phase <= xform_phase_next;
+      xform_mode <= xform_mode_next;
+      xform_multiplier <= xform_multiplier_next;
+      xform_shift <= xform_shift_next;
+
+      // ROPE_K16: latch UB reads into rotation buffers each phase
+      // cycle_cnt here is the CURRENT phase (already updated to next value via cycle_next)
+      // ub_rdata_reg captured this cycle holds data fetched in the previous phase's address.
+      if (state == CTRL_EXEC_XFORM && xform_mode == XFORM_MODE_ROPE_K16) begin
+        case (cycle_cnt)
+          3'd1: rope_k_lo_buf <= ub_rdata_reg; // phase 0 addressed K_lo; latch now
+          3'd2: rope_k_hi_buf <= ub_rdata_reg; // phase 1 addressed K_hi
+          3'd3: rope_cos_buf  <= ub_rdata_reg; // phase 2 addressed cos
+          3'd4: rope_k_hi_rot_buf <= rope_k_hi_rot_w; // sin in ub_rdata_reg; latch K_hi_rot
+          default: ;
+        endcase
+      end
 
       // MATMUL Latch from Instruction Memory
       if (state == CTRL_DECODE && im_rdata[255:252] == ISA_OP_MATMUL) begin
@@ -236,6 +279,135 @@ module control_unit #(
     logic        wb_valid_cycle;
     logic [$clog2(`ARRAY_SIZE)-1:0] cache_lane_idx;
     logic [`ADDR_WIDTH-1:0] mm_c_effective_base;
+    logic [`BUFFER_WIDTH-1:0] xform_word_q_f16_i16;
+
+    function automatic logic signed [63:0] round_shift_right_signed(
+        input logic signed [63:0] value,
+        input int unsigned shift
+    );
+        logic signed [63:0] abs_value;
+        logic signed [63:0] rounded;
+        begin
+            if (shift == 0) begin
+                round_shift_right_signed = value;
+            end else if (shift >= 63) begin
+                round_shift_right_signed = '0;
+            end else if (value >= 0) begin
+                round_shift_right_signed = (value + (64'sd1 <<< (shift - 1))) >>> shift;
+            end else begin
+                abs_value = -value;
+                rounded = (abs_value + (64'sd1 <<< (shift - 1))) >>> shift;
+                round_shift_right_signed = -rounded;
+            end
+        end
+    endfunction
+
+    function automatic logic signed [15:0] clip_i16(
+        input logic signed [63:0] value
+    );
+        begin
+            if (value > 64'sd32767) begin
+                clip_i16 = 16'sh7fff;
+            end else if (value < -64'sd32768) begin
+                clip_i16 = 16'sh8000;
+            end else begin
+                clip_i16 = value[15:0];
+            end
+        end
+    endfunction
+
+    function automatic logic signed [15:0] quantize_lane_q_f16_i16(
+        input logic [15:0] fp16,
+        input logic [15:0] multiplier,
+        input logic [7:0] shift
+    );
+        logic sign;
+        logic [4:0] exp_bits;
+        logic [9:0] frac_bits;
+        logic signed [63:0] mant;
+        logic signed [63:0] scaled;
+        logic signed [63:0] qvalue;
+        int exp2;
+        int left_shift;
+        int right_shift;
+        begin
+            sign = fp16[15];
+            exp_bits = fp16[14:10];
+            frac_bits = fp16[9:0];
+            qvalue = 64'sd0;
+            if (multiplier == 16'd0) begin
+                quantize_lane_q_f16_i16 = 16'sd0;
+            end else if (exp_bits == 5'h1f) begin
+                quantize_lane_q_f16_i16 = sign ? -16'sd32768 : 16'sd32767;
+            end else if (exp_bits == 5'd0 && frac_bits == 10'd0) begin
+                quantize_lane_q_f16_i16 = 16'sd0;
+            end else begin
+                if (exp_bits == 5'd0) begin
+                    // subnormal: frac * 2^-24
+                    mant = $signed({2'b00, frac_bits});
+                    exp2 = -24;
+                end else begin
+                    // normal: (1024 + frac) * 2^(exp-25)
+                    mant = $signed({2'b01, frac_bits});
+                    exp2 = $signed({1'b0, exp_bits}) - 25;
+                end
+
+                scaled = mant * $signed({1'b0, multiplier});
+                if (exp2 >= $signed({1'b0, shift})) begin
+                    left_shift = exp2 - $signed({1'b0, shift});
+                    if (left_shift >= 47) begin
+                        qvalue = 64'sh7fffffffffffffff;
+                    end else begin
+                        qvalue = scaled <<< left_shift;
+                    end
+                end else begin
+                    right_shift = $signed({1'b0, shift}) - exp2;
+                    qvalue = round_shift_right_signed(scaled, right_shift);
+                end
+
+                if (sign) begin
+                    qvalue = -qvalue;
+                end
+                quantize_lane_q_f16_i16 = clip_i16(qvalue);
+            end
+        end
+    endfunction
+
+    always_comb begin
+        xform_word_q_f16_i16 = ub_rdata_reg;
+        for (int lane = 0; lane < `ARRAY_SIZE; lane++) begin
+            xform_word_q_f16_i16[lane*16 +: 16] =
+                quantize_lane_q_f16_i16(
+                    ub_rdata_reg[lane*16 +: 16],
+                    xform_multiplier,
+                    xform_shift
+                );
+        end
+    end
+
+    // --- RoPE INT16 Q14 rotation combinational ---
+    // Valid during CTRL_EXEC_XFORM phase 4 (ub_rdata_reg = sin word).
+    // rope_k_lo_rot_w[j] = clip_i16((K_lo[j]*cos[j] - K_hi[j]*sin[j]) >> 14)
+    // rope_k_hi_rot_w[j] = clip_i16((K_hi[j]*cos[j] + K_lo[j]*sin[j]) >> 14)
+    logic [`BUFFER_WIDTH-1:0] rope_k_lo_rot_w;
+    logic [`BUFFER_WIDTH-1:0] rope_k_hi_rot_w;
+
+    always_comb begin
+        rope_k_lo_rot_w = '0;
+        rope_k_hi_rot_w = '0;
+        for (int rj = 0; rj < `ARRAY_SIZE; rj++) begin
+            automatic logic signed [15:0] klo_v, khi_v, cos_v, sin_v;
+            automatic logic signed [31:0] lo_prod, hi_prod;
+            klo_v   = $signed(rope_k_lo_buf[rj*16 +: 16]);
+            khi_v   = $signed(rope_k_hi_buf[rj*16 +: 16]);
+            cos_v   = $signed(rope_cos_buf[rj*16 +: 16]);
+            sin_v   = $signed(ub_rdata_reg[rj*16 +: 16]); // sin valid in phase 4
+            lo_prod = klo_v * cos_v - khi_v * sin_v;
+            hi_prod = khi_v * cos_v + klo_v * sin_v;
+            rope_k_lo_rot_w[rj*16 +: 16] = clip_i16($signed(lo_prod) >>> 14);
+            rope_k_hi_rot_w[rj*16 +: 16] = clip_i16($signed(hi_prod) >>> 14);
+        end
+    end
 
     always_comb begin
         unique case (mm_out_precision)
@@ -326,6 +498,13 @@ module control_unit #(
     move_dest_next = move_dest;
     move_count_next = move_count;
     move_phase_next = move_phase;
+    xform_src_next = xform_src;
+    xform_dest_next = xform_dest;
+    xform_count_next = xform_count;
+    xform_phase_next = xform_phase;
+    xform_mode_next = xform_mode;
+    xform_multiplier_next = xform_multiplier;
+    xform_shift_next = xform_shift;
     m_next = m_idx;
     n_next = n_idx;
     k_next = k_idx;
@@ -417,6 +596,18 @@ module control_unit #(
             move_phase_next = 1'b0;
             next_state = CTRL_EXEC_MOVE;
           end
+          ISA_OP_XFORM: begin
+            xform_mode_next = xform_mode_t'(im_rdata[251:248]);
+            xform_src_next = im_rdata[247:232];
+            xform_dest_next = im_rdata[231:216];
+            xform_count_next = im_rdata[215:200];
+            xform_multiplier_next = im_rdata[199:184];
+            xform_shift_next = im_rdata[183:176];
+            xform_phase_next = 1'b0;
+            k_next = '0;      // pair index for ROPE_K16
+            cycle_next = '0;  // phase index for ROPE_K16
+            next_state = CTRL_EXEC_XFORM;
+          end
           ISA_OP_MATMUL: begin
             ppu_bias_clear = 1'b1;
             next_state = CTRL_EXEC_MATMUL;
@@ -443,6 +634,74 @@ module control_unit #(
           move_dest_next = move_dest + 1;
           move_count_next = move_count - 1;
           move_phase_next = 1'b0;
+        end
+      end
+
+      CTRL_EXEC_XFORM: begin
+        status_out = `STATUS_BUSY;
+        ub_req = 1'b1;
+
+        if (xform_mode == XFORM_MODE_ROPE_K16) begin
+          // 6-phase per K-pair: k_idx = pair index (0..half_count-1)
+          // xform_count = half_count, xform_multiplier = cs_base (cos/sin table addr)
+          // Both K and cos/sin use stride-8 (one valid word per ARRAY_SIZE-word tile).
+          // K stored as OUT_LAYOUT_C for m=1: valid word at src + n_tile*8 + 0.
+          // cos/sin stored as C-layout [1, d_head] with data[0, 0:half]=cos, data[0, half:d]=sin:
+          //   cos[k] at cs + k*8, sin[k] at cs + (k + half_count)*8
+          if (k_idx >= xform_count) begin
+            pc_next = pc + `INST_CHUNKS;
+            next_state = CTRL_FETCH;
+          end else begin
+            case (cycle_cnt)
+              3'd0: begin // read K_lo tile (stride-8)
+                ub_addr = xform_src + (k_idx << 3);
+                cycle_next = 3'd1;
+              end
+              3'd1: begin // K_lo in ub_rdata_reg; read K_hi tile
+                ub_addr = xform_src + ((k_idx + xform_count) << 3);
+                cycle_next = 3'd2;
+              end
+              3'd2: begin // K_hi in ub_rdata_reg; read cos word (stride-8)
+                ub_addr = xform_multiplier + (k_idx << 3);
+                cycle_next = 3'd3;
+              end
+              3'd3: begin // cos in ub_rdata_reg; read sin word (stride-8)
+                ub_addr = xform_multiplier + ((k_idx + xform_count) << 3);
+                cycle_next = 3'd4;
+              end
+              3'd4: begin // sin is now in ub_rdata_reg; write rotated K_lo (stride-8)
+                ub_addr = xform_dest + (k_idx << 3);
+                ub_wr_en = 1'b1;
+                ub_wdata = rope_k_lo_rot_w;
+                cycle_next = 3'd5;
+              end
+              3'd5: begin // write rotated K_hi (stride-8, pre-latched)
+                ub_addr = xform_dest + ((k_idx + xform_count) << 3);
+                ub_wr_en = 1'b1;
+                ub_wdata = rope_k_hi_rot_buf;
+                k_next = k_idx + 1;
+                cycle_next = 3'd0;
+              end
+              default: cycle_next = 3'd0;
+            endcase
+          end
+        end else if (xform_count == 0) begin
+          pc_next = pc + `INST_CHUNKS;
+          next_state = CTRL_FETCH;
+        end else if (xform_phase == 1'b0) begin
+          ub_addr = xform_src;
+          xform_phase_next = 1'b1;
+        end else begin
+          ub_addr = xform_dest;
+          ub_wr_en = 1'b1;
+          unique case (xform_mode)
+            XFORM_MODE_Q_F16_I16: ub_wdata = xform_word_q_f16_i16;
+            default: ub_wdata = ub_rdata_reg;
+          endcase
+          xform_src_next = xform_src + 1;
+          xform_dest_next = xform_dest + 1;
+          xform_count_next = xform_count - 1;
+          xform_phase_next = 1'b0;
         end
       end
 

@@ -2,7 +2,7 @@ import numpy as np
 import os
 import re
 import json
-from .isa import Opcode, HostCmd, PrecisionMode, MatMul, Move, Halt, OutputLayout, WritebackMode, BReadMode, generate_host_messages
+from .isa import Opcode, HostCmd, PrecisionMode, MatMul, Move, Halt, Xform, XformRopeK16, XformMode, OutputLayout, WritebackMode, BReadMode, generate_host_messages
 from .packer import Packer
 from .memory import MemoryManager
 
@@ -248,6 +248,43 @@ class TinyNPUProgram:
         if dest_name not in self.symbols: self.symbols[dest_name] = Symbol(dest_name, src.shape, src.precision, role=src.storage_role)
         self.instructions.append(Move(src_name, dest_name))
 
+    def xform_q_f16_i16(self, src_name, dest_name=None, multiplier=1, shift=0):
+        if src_name not in self.symbols:
+            raise ValueError(f"Source symbol '{src_name}' not found.")
+        src = self.symbols[src_name]
+        if dest_name is None:
+            dest_name = src_name
+        if dest_name not in self.symbols:
+            self.symbols[dest_name] = Symbol(dest_name, src.shape, PrecisionMode.INT16, role=src.storage_role)
+        self.instructions.append(
+            Xform(
+                src_name,
+                dest_name,
+                mode=XformMode.Q_F16_I16,
+                multiplier=multiplier,
+                shift=shift,
+            )
+        )
+
+    def xform_rope_k16(self, k_name, cs_name, dest_name=None):
+        """Apply RoPE in-place on a K tensor stored as INT16 Q14.
+
+        k_name:   symbol for the K vector (shape [1, d_head], role C or B).
+        cs_name:  symbol for the cos/sin table (shape [1, d_head], role C or B).
+                  Layout: first half = cos[0..half-1], second half = sin[0..half-1].
+        dest_name: output symbol (defaults to k_name for in-place rotation).
+        """
+        if k_name not in self.symbols:
+            raise ValueError(f"Symbol '{k_name}' not found.")
+        if cs_name not in self.symbols:
+            raise ValueError(f"Cos/sin symbol '{cs_name}' not found.")
+        src = self.symbols[k_name]
+        if dest_name is None:
+            dest_name = k_name
+        if dest_name not in self.symbols:
+            self.symbols[dest_name] = Symbol(dest_name, src.shape, PrecisionMode.INT16, role=src.storage_role)
+        self.instructions.append(XformRopeK16(k_name, dest_name, cs_name))
+
     def halt(self): self.instructions.append(Halt())
 
     def compile(self):
@@ -291,7 +328,29 @@ class TinyNPUProgram:
             else:
                 raise ValueError(f"Unsupported view role '{sym.storage_role}' for symbol '{name}'.")
         for instr in self.instructions:
-            if isinstance(instr, Move): instr.count = self.symbols[instr.src].word_count
+            if isinstance(instr, Move):
+                instr.count = self.symbols[instr.src].word_count
+            if isinstance(instr, XformRopeK16):
+                src_sym = self.symbols[instr.src]
+                # K is stored as C-layout for m=1: n_tiles = ceil(shape[1] / ARRAY_SIZE)
+                # Valid tile words are at src + n_tile * ARRAY_SIZE (stride-8).
+                # half_count = n_tiles // 2 (must be even).
+                n_tiles = (src_sym.shape[1] + self.array_size - 1) // self.array_size
+                if n_tiles % 2 != 0:
+                    raise ValueError(
+                        f"XFORM ROPE_K16 requires an even number of K column tiles (got {n_tiles}) "
+                        f"for '{instr.src}' — d_head must be a multiple of {2 * self.array_size}."
+                    )
+                instr.half_count = n_tiles // 2
+            elif isinstance(instr, Xform):
+                src_words = self.symbols[instr.src].word_count
+                dst_words = self.symbols[instr.dest].word_count
+                if src_words != dst_words:
+                    raise ValueError(
+                        f"XFORM source/dest word counts must match (got {src_words} vs {dst_words}) "
+                        f"for {instr.src}->{instr.dest}."
+                    )
+                instr.count = src_words
         symbol_to_addr = {name: sym.addr for name, sym in self.symbols.items()}
         # Build UB image indexed by address so pre-assigned (non-sequential) addresses work.
         total_ub_words = max((sym.addr + sym.word_count for sym in self.symbols.values() if not sym.is_view), default=0)

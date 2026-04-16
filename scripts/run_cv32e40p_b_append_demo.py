@@ -22,6 +22,8 @@ CORE_DIR = REPO_ROOT / "external" / "cv32e40p" / "example_tb" / "core"
 CUSTOM_DIR = CORE_DIR / "custom"
 GENERATED_DIR = REPO_ROOT / "generated"
 RUNTIME_DIR = REPO_ROOT / "software" / "compiler" / "tinynpu_jit"
+TNPU_RISCV_MARCH = os.environ.get("TINYNPU_RISCV_MARCH", "rv32imfc")
+TNPU_RISCV_MABI = os.environ.get("TINYNPU_RISCV_MABI", "ilp32f")
 
 
 def _sanitize(name: str) -> str:
@@ -79,6 +81,16 @@ def _emit_i32_array(name: str, values: np.ndarray, *, section_data: bool) -> str
 
 
 def _toolchain_prefix() -> Path:
+    prefix_override = os.environ.get("TINYNPU_RISCV_PREFIX")
+    if prefix_override:
+        prefix = Path(prefix_override)
+        gcc = prefix.parent / (prefix.name + "gcc")
+        if not gcc.exists():
+            raise FileNotFoundError(f"{gcc} not found for TINYNPU_RISCV_PREFIX")
+        return prefix
+    preferred = Path("/opt/riscv-ilp32f/bin/riscv32-unknown-elf-gcc")
+    if preferred.exists():
+        return preferred.parent / "riscv32-unknown-elf-"
     gcc = shutil.which("riscv32-unknown-elf-gcc")
     if gcc is None:
         raise FileNotFoundError("riscv32-unknown-elf-gcc not found in PATH")
@@ -311,8 +323,8 @@ def main() -> int:
     _run(
         [
             gcc,
-            "-march=rv32imfc",
-            "-mabi=ilp32",
+            f"-march={TNPU_RISCV_MARCH}",
+            f"-mabi={TNPU_RISCV_MABI}",
             "-o",
             str(elf_path),
             "-w",

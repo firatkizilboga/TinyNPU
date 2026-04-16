@@ -73,6 +73,7 @@ class MatMulOp:
     output_word_offset: int = 0
     b_word_offset: int = 0
     b_read_mode: str = "normal"
+    rope_cs_name: str | None = None  # if set, emit XFORM ROPE_K16 after this matmul
 
 
 @dataclass
@@ -437,3 +438,46 @@ def describe_int16_v_cache_append(d_head: int, token_capacity: int, token_index:
         block_word_count=block_word_count,
         scatter_word_addrs=scatter,
     )
+
+
+def make_rope_cos_sin_table_q14(
+    d_head: int,
+    position: int,
+    theta: float = 10000.0,
+) -> np.ndarray:
+    """Compute a "rotate-half" RoPE cos/sin table as INT16 Q14.
+
+    Returns a flat int16 array of length d_head:
+      [cos(pos * freq_0), ..., cos(pos * freq_{half-1}),
+       sin(pos * freq_0), ..., sin(pos * freq_{half-1})]
+    where freq_i = 1 / theta^(2*i / d_head), half = d_head // 2.
+
+    Scaled by 2^14 = 16384 and rounded to the nearest INT16.
+    """
+    if d_head % 2 != 0:
+        raise ValueError(f"d_head must be even, got {d_head}.")
+    half = d_head // 2
+    inv_freq = 1.0 / (theta ** (np.arange(0, d_head, 2, dtype=np.float64) / d_head))
+    angle = position * inv_freq  # shape [half]
+    cos_vals = np.cos(angle)
+    sin_vals = np.sin(angle)
+    Q14 = 16384.0
+    table = np.concatenate([cos_vals, sin_vals]) * Q14
+    table = np.clip(np.round(table), -32768, 32767).astype(np.int16)
+    return table
+
+
+def make_rope_cs_tensor_spec(
+    name: str,
+    d_head: int,
+    position: int,
+    theta: float = 10000.0,
+    kind: "TensorKind" = TensorKind.CONSTANT,
+) -> "TensorSpec":
+    """Create a TensorSpec for the RoPE cos/sin table preloaded into UB.
+
+    Shape [1, d_head], DType.INT16, layout mirrors a K output tensor so
+    that XFORM ROPE_K16 can address both K and cos/sin with stride-8.
+    """
+    data = make_rope_cos_sin_table_q14(d_head, position, theta).reshape(1, d_head)
+    return TensorSpec(name, (1, d_head), DType.INT16, kind, data=data)

@@ -36,6 +36,8 @@ typedef enum {
     TNPU_HOST_SILU = 15,
     TNPU_HOST_MUL = 16,
     TNPU_HOST_ADD = 17,
+    TNPU_HOST_SOFTMAX_F16 = 18,
+    TNPU_HOST_K_CACHE_SCATTER_WRITE = 19,
 } TnpuHostKind;
 
 typedef enum {
@@ -67,13 +69,30 @@ typedef struct {
     uint16_t addr;
     uint16_t word_count;
     uint8_t precision;
+    uint8_t transform;
+    int32_t attrs_i32[2];
+    float attrs_f32[1];
     const char *role;
 } TnpuTensorWrite;
+
+typedef enum {
+    TNPU_WRITE_TRANSFORM_NONE = 0,
+    TNPU_WRITE_QUANTIZE_F32_TO_INT16 = 1,
+    TNPU_WRITE_XFORM_Q_F16_I16 = 2,
+} TnpuTensorWriteTransform;
+
+typedef enum {
+    TNPU_READ_TRANSFORM_NONE = 0,
+    TNPU_READ_DEQUANTIZE_INT16_TO_FLOAT32 = 1,
+} TnpuTensorReadTransform;
 
 typedef struct {
     uint16_t tensor_idx;
     uint16_t addr;
     uint8_t precision;
+    uint8_t transform;
+    int32_t attrs_i32[2];
+    float attrs_f32[1];
     const char *role;
 } TnpuTensorRead;
 

@@ -78,6 +78,10 @@ def infer_roles(segment: NpuSegment) -> dict[str, str]:
         uses[op.rhs].add("rhs")
         if op.bias:
             uses[op.bias].add("bias")
+        if op.rope_cs_name:
+            # RoPE cos/sin tables are staged as regular UB tensors and read
+            # through the C-layout addressing pattern used by XFORM_ROPE_K16.
+            uses[op.rope_cs_name].add("rope_cs")
         uses[op.out].add("out")
 
     roles: dict[str, str] = {}
@@ -101,6 +105,8 @@ def _collect_referenced_tensor_names(segment: NpuSegment) -> set[str]:
         names.update([op.lhs, op.rhs, op.out])
         if op.bias:
             names.add(op.bias)
+        if op.rope_cs_name:
+            names.add(op.rope_cs_name)
     return names
 
 
@@ -172,6 +178,8 @@ def compute_liveness(segment: NpuSegment) -> dict[str, TensorLiveness]:
     for i, op in enumerate(ops):
         for name in [op.lhs, op.rhs] + ([op.bias] if op.bias else []):
             last_use[name] = i
+        if op.rope_cs_name:
+            last_use[op.rope_cs_name] = i
 
     for name in all_names:
         if name in segment.outputs:

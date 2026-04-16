@@ -60,6 +60,328 @@ static inline int tnpu_precision_to_packed_count(int precision)
     return 0;
 }
 
+#define TNPU_XFORM_SCRATCH_IM_ADDR 0x87F8u
+#define TNPU_ISA_OP_XFORM 0x4u
+#define TNPU_ISA_OP_HALT 0x2u
+#define TNPU_XFORM_MODE_Q_F16_I16 0x1u
+
+static inline uint16_t tnpu_float32_to_fp16_bits(float value)
+{
+    union {
+        float f;
+        uint32_t u;
+    } v = {value};
+    const uint32_t sign = (v.u >> 16) & 0x8000u;
+    const uint32_t exp = (v.u >> 23) & 0xFFu;
+    uint32_t mant = v.u & 0x7FFFFFu;
+    int32_t half_exp;
+
+    if (exp == 0xFFu) {
+        if (mant == 0u) {
+            return (uint16_t)(sign | 0x7C00u);
+        }
+        mant >>= 13;
+        if (mant == 0u) {
+            mant = 1u;
+        }
+        return (uint16_t)(sign | 0x7C00u | mant);
+    }
+
+    half_exp = (int32_t)exp - 127 + 15;
+    if (half_exp >= 0x1F) {
+        return (uint16_t)(sign | 0x7C00u);
+    }
+    if (half_exp <= 0) {
+        uint32_t shift;
+        uint32_t rounded;
+        if (half_exp < -10) {
+            return (uint16_t)sign;
+        }
+        mant |= 0x800000u;
+        shift = (uint32_t)(14 - half_exp);
+        rounded = mant + ((1u << (shift - 1)) - 1u) + ((mant >> shift) & 1u);
+        return (uint16_t)(sign | (rounded >> shift));
+    }
+
+    {
+        uint32_t half_mant = mant >> 13;
+        const uint32_t round_bits = mant & 0x1FFFu;
+        if (round_bits > 0x1000u || (round_bits == 0x1000u && (half_mant & 1u))) {
+            half_mant += 1u;
+            if (half_mant == 0x400u) {
+                half_mant = 0u;
+                half_exp += 1;
+                if (half_exp >= 0x1F) {
+                    return (uint16_t)(sign | 0x7C00u);
+                }
+            }
+        }
+        return (uint16_t)(sign | ((uint32_t)half_exp << 10) | half_mant);
+    }
+}
+
+static void tnpu_write_tensor_a_f16bits_from_float(
+    const TinyTensor *tensor,
+    uint16_t base_addr,
+    int word_count)
+{
+    const int rows = tensor->rank == 1 ? 1 : tensor->shape[0];
+    const int cols = tensor->rank == 1 ? tensor->shape[0] : tensor->shape[1];
+    const int m_tiles = (rows + TNPU_ARRAY_SIZE - 1) / TNPU_ARRAY_SIZE;
+    const int k_tiles = (cols + TNPU_ARRAY_SIZE - 1) / TNPU_ARRAY_SIZE;
+    uint16_t addr = base_addr;
+    uint16_t lanes[TNPU_ARRAY_SIZE];
+    uint32_t chunks[TNPU_MMVR_WORDS_32];
+
+    runtime_assert(word_count == m_tiles * k_tiles * TNPU_ARRAY_SIZE, "role A fp16 write word count mismatch");
+    for (int mt = 0; mt < m_tiles; ++mt) {
+        for (int kt = 0; kt < k_tiles; ++kt) {
+            for (int lane_selector = 0; lane_selector < TNPU_ARRAY_SIZE; ++lane_selector) {
+                for (int lane = 0; lane < TNPU_ARRAY_SIZE; ++lane) {
+                    const int row = mt * TNPU_ARRAY_SIZE + lane;
+                    const int col = kt * TNPU_ARRAY_SIZE + lane_selector;
+                    uint16_t value = 0u;
+                    if (row < rows && col < cols) {
+                        value = tnpu_float32_to_fp16_bits(tensor_get_float(tensor, row * cols + col));
+                    }
+                    lanes[lane] = value;
+                }
+                tnpu_lanes_to_chunks_u16(lanes, chunks);
+                npu_write_mem_word(addr++, chunks);
+            }
+        }
+    }
+}
+
+static inline void tnpu_pack_field_u32(uint32_t words[8], uint16_t lsb, uint8_t width, uint32_t value)
+{
+    uint16_t bit = lsb;
+    uint8_t remaining = width;
+    uint32_t v = value;
+    while (remaining > 0) {
+        const uint16_t idx = bit >> 5;
+        const uint8_t off = (uint8_t)(bit & 31u);
+        const uint8_t take = (uint8_t)((remaining < (uint8_t)(32u - off)) ? remaining : (uint8_t)(32u - off));
+        const uint32_t mask = (take == 32u) ? 0xFFFFFFFFu : ((1u << take) - 1u);
+        words[idx] |= (v & mask) << off;
+        v >>= take;
+        bit = (uint16_t)(bit + take);
+        remaining = (uint8_t)(remaining - take);
+    }
+}
+
+static void tnpu_pack_xform_q_f16_i16_words(
+    uint32_t words[8],
+    uint16_t src,
+    uint16_t dst,
+    uint16_t count,
+    uint16_t multiplier,
+    uint8_t shift)
+{
+    memset(words, 0, sizeof(uint32_t) * 8u);
+    tnpu_pack_field_u32(words, 252, 4, TNPU_ISA_OP_XFORM);
+    tnpu_pack_field_u32(words, 248, 4, TNPU_XFORM_MODE_Q_F16_I16);
+    tnpu_pack_field_u32(words, 232, 16, src);
+    tnpu_pack_field_u32(words, 216, 16, dst);
+    tnpu_pack_field_u32(words, 200, 16, count);
+    tnpu_pack_field_u32(words, 184, 16, multiplier);
+    tnpu_pack_field_u32(words, 176, 8, shift);
+}
+
+static void tnpu_pack_halt_words(uint32_t words[8])
+{
+    memset(words, 0, sizeof(uint32_t) * 8u);
+    tnpu_pack_field_u32(words, 252, 4, TNPU_ISA_OP_HALT);
+}
+
+static void tnpu_run_xform_q_f16_i16(
+    uint16_t src_addr,
+    uint16_t dst_addr,
+    uint16_t count,
+    uint16_t multiplier,
+    uint8_t shift)
+{
+    uint32_t xform_words[8];
+    uint32_t halt_words[8];
+
+    tnpu_pack_xform_q_f16_i16_words(xform_words, src_addr, dst_addr, count, multiplier, shift);
+    tnpu_pack_halt_words(halt_words);
+    npu_write_mem_word(TNPU_XFORM_SCRATCH_IM_ADDR + 0u, &xform_words[0]);
+    npu_write_mem_word(TNPU_XFORM_SCRATCH_IM_ADDR + 1u, &xform_words[4]);
+    npu_write_mem_word(TNPU_XFORM_SCRATCH_IM_ADDR + 2u, &halt_words[0]);
+    npu_write_mem_word(TNPU_XFORM_SCRATCH_IM_ADDR + 3u, &halt_words[4]);
+    runtime_assert(npu_run((uint32_t)TNPU_XFORM_SCRATCH_IM_ADDR) == 0, "xform execution failed");
+}
+
+static void tnpu_choose_xform_scale_params(float inv_scale, uint16_t *multiplier, uint8_t *shift)
+{
+    float best_err = 3.402823466e+38f;
+    uint16_t best_mult = 1u;
+    uint8_t best_shift = 0u;
+    if (inv_scale >= 1.0f) {
+        const uint32_t rounded = (uint32_t)(inv_scale + 0.5f);
+        if ((float)rounded == inv_scale && rounded <= 65535u) {
+            *multiplier = (uint16_t)rounded;
+            *shift = 0u;
+            return;
+        }
+    }
+    for (uint8_t s = 0; s <= 15u; ++s) {
+        const float scaled = inv_scale * (float)(1u << s);
+        uint32_t m;
+        float approx;
+        float err;
+        if (scaled > 65535.0f) {
+            break;
+        }
+        m = (uint32_t)(scaled + 0.5f);
+        if (m == 0u) {
+            m = 1u;
+        }
+        approx = (float)m / (float)(1u << s);
+        err = (approx >= inv_scale) ? (approx - inv_scale) : (inv_scale - approx);
+        if (err < best_err || (err == best_err && s > best_shift)) {
+            best_err = err;
+            best_mult = (uint16_t)m;
+            best_shift = s;
+        }
+    }
+    if (best_err >= 3.402823466e+38f) {
+        best_mult = 65535u;
+        best_shift = 0u;
+    }
+    *multiplier = best_mult;
+    *shift = best_shift;
+}
+
+static inline int64_t tnpu_round_shift_right_signed(int64_t value, int shift)
+{
+    int64_t abs_v;
+    int64_t rounded;
+    if (shift <= 0) {
+        return value;
+    }
+    if (shift >= 63) {
+        return value < 0 ? -1 : 0;
+    }
+    if (value >= 0) {
+        return (value + ((int64_t)1 << (shift - 1))) >> shift;
+    }
+    abs_v = -value;
+    rounded = (abs_v + ((int64_t)1 << (shift - 1))) >> shift;
+    return -rounded;
+}
+
+static inline int16_t tnpu_clip_i16(int64_t value)
+{
+    if (value > 32767) {
+        return 32767;
+    }
+    if (value < -32768) {
+        return -32768;
+    }
+    return (int16_t)value;
+}
+
+static int16_t tnpu_quantize_fp16_lane_to_i16(uint16_t fp16, uint16_t multiplier, uint8_t shift)
+{
+    int sign = (fp16 >> 15) & 1;
+    int exp_bits = (fp16 >> 10) & 0x1F;
+    int frac_bits = fp16 & 0x3FF;
+    int64_t mant;
+    int64_t scaled;
+    int64_t qvalue;
+    int exp2;
+
+    if (multiplier == 0u) {
+        return 0;
+    }
+    if (exp_bits == 0x1F) {
+        return sign ? -32768 : 32767;
+    }
+    if (exp_bits == 0 && frac_bits == 0) {
+        return 0;
+    }
+
+    if (exp_bits == 0) {
+        mant = (int64_t)frac_bits;
+        exp2 = -24;
+    } else {
+        mant = (int64_t)(1024 + frac_bits);
+        exp2 = exp_bits - 25;
+    }
+
+    scaled = mant * (int64_t)multiplier;
+    if (exp2 >= (int)shift) {
+        int left_shift = exp2 - (int)shift;
+        if (left_shift >= 47) {
+            qvalue = 0x7FFFFFFFFFFFFFFFLL;
+        } else {
+            qvalue = scaled << left_shift;
+        }
+    } else {
+        int right_shift = (int)shift - exp2;
+        qvalue = tnpu_round_shift_right_signed(scaled, right_shift);
+    }
+    if (sign) {
+        qvalue = -qvalue;
+    }
+    return tnpu_clip_i16(qvalue);
+}
+
+static void tnpu_write_tensor_a_qf16_to_i16_fast(
+    const TinyTensor *tensor,
+    uint16_t base_addr,
+    uint16_t word_count,
+    uint16_t multiplier,
+    uint8_t shift)
+{
+    const int rows = tensor->rank == 1 ? 1 : tensor->shape[0];
+    const int cols = tensor->rank == 1 ? tensor->shape[0] : tensor->shape[1];
+    const int m_tiles = (rows + TNPU_ARRAY_SIZE - 1) / TNPU_ARRAY_SIZE;
+    const int k_tiles = (cols + TNPU_ARRAY_SIZE - 1) / TNPU_ARRAY_SIZE;
+    const int32_t *src = tensor_i32(tensor);
+    uint16_t addr = base_addr;
+    uint16_t lanes[TNPU_ARRAY_SIZE];
+    uint32_t chunks[TNPU_MMVR_WORDS_32];
+
+    runtime_assert(word_count == (uint16_t)(m_tiles * k_tiles * TNPU_ARRAY_SIZE), "qf16->i16 role A word count mismatch");
+
+    for (int mt = 0; mt < m_tiles; ++mt) {
+        for (int kt = 0; kt < k_tiles; ++kt) {
+            for (int lane_selector = 0; lane_selector < TNPU_ARRAY_SIZE; ++lane_selector) {
+                for (int lane = 0; lane < TNPU_ARRAY_SIZE; ++lane) {
+                    const int row = mt * TNPU_ARRAY_SIZE + lane;
+                    const int col = kt * TNPU_ARRAY_SIZE + lane_selector;
+                    int16_t value = 0;
+                    if (row < rows && col < cols) {
+                        uint16_t fp16_bits = (uint16_t)src[row * cols + col];
+                        value = tnpu_quantize_fp16_lane_to_i16(fp16_bits, multiplier, shift);
+                    }
+                    lanes[lane] = (uint16_t)value;
+                }
+                tnpu_lanes_to_chunks_u16(lanes, chunks);
+                npu_write_mem_word(addr++, chunks);
+            }
+        }
+    }
+}
+
+static void tnpu_write_tensor_a_quantized_via_xform(
+    const TinyTensor *tensor,
+    uint16_t base_addr,
+    int word_count,
+    float inv_scale)
+{
+    uint16_t multiplier;
+    uint8_t shift;
+    runtime_assert(inv_scale > 0.0f, "xform quantized write expects positive inv_scale");
+    runtime_assert(word_count <= 0xFFFF, "xform quantized write expects <= 65535 words");
+    tnpu_write_tensor_a_f16bits_from_float(tensor, base_addr, word_count);
+    tnpu_choose_xform_scale_params(inv_scale, &multiplier, &shift);
+    tnpu_run_xform_q_f16_i16(base_addr, base_addr, (uint16_t)word_count, multiplier, shift);
+}
+
 static void tnpu_write_tensor_a_fast(
     const TinyTensor *tensor,
     uint16_t base_addr,
@@ -133,6 +455,46 @@ static void tnpu_read_tensor_c_int16_fast(
                         continue;
                     }
                     out[row_idx * cols + col_idx] = (int16_t)packed_lane;
+                }
+            }
+        }
+    }
+}
+
+static void tnpu_read_tensor_c_int16_dequantize_float_fast(
+    TinyTensor *dst,
+    uint16_t addr,
+    float scale,
+    int zero_point)
+{
+    const int rows = dst->rank == 1 ? 1 : dst->shape[0];
+    const int cols = dst->rank == 1 ? dst->shape[0] : dst->shape[1];
+    const int m_tiles = (rows + TNPU_ARRAY_SIZE - 1) / TNPU_ARRAY_SIZE;
+    const int n_tiles = (cols + TNPU_ARRAY_SIZE - 1) / TNPU_ARRAY_SIZE;
+    float *out = tensor_f32(dst);
+    uint32_t chunks[TNPU_MMVR_WORDS_32];
+
+    runtime_assert(dst->dtype == TINY_DTYPE_FLOAT32, "dequantize read expects float32 destination");
+    runtime_assert(scale > 0.0f, "dequantize read expects positive scale");
+
+    for (int mt = 0; mt < m_tiles; ++mt) {
+        for (int nt = 0; nt < n_tiles; ++nt) {
+            const uint16_t tile_addr =
+                (uint16_t)(addr + (mt * n_tiles * TNPU_ARRAY_SIZE) + (nt * TNPU_ARRAY_SIZE));
+            for (int row_in_tile = 0; row_in_tile < TNPU_ARRAY_SIZE; ++row_in_tile) {
+                runtime_assert(
+                    npu_read_mem_word((uint16_t)(tile_addr + row_in_tile), chunks, 2) == 0,
+                    "readback failed");
+                for (int lane = 0; lane < TNPU_ARRAY_SIZE; ++lane) {
+                    const int row_idx = mt * TNPU_ARRAY_SIZE + row_in_tile;
+                    const int col_idx = nt * TNPU_ARRAY_SIZE + lane;
+                    const uint16_t packed_lane = (lane & 1)
+                        ? (uint16_t)(chunks[lane / 2] >> 16)
+                        : (uint16_t)(chunks[lane / 2] & 0xFFFFu);
+                    if (row_idx >= rows || col_idx >= cols) {
+                        continue;
+                    }
+                    out[row_idx * cols + col_idx] = ((float)((int32_t)(int16_t)packed_lane - zero_point)) * scale;
                 }
             }
         }
@@ -247,6 +609,9 @@ static int tnpu_execute_host_op(TinyTensor *runtime_tensors, const TnpuHostOp *o
         case TNPU_HOST_SOFTMAX:
             host_softmax(out, in, op->attrs_i32[0]);
             return 0;
+        case TNPU_HOST_SOFTMAX_F16:
+            host_softmax_f16(out, in, op->attrs_i32[0]);
+            return 0;
         case TNPU_HOST_MEAN:
             host_mean(
                 out,
@@ -320,6 +685,9 @@ static int tnpu_execute_host_op(TinyTensor *runtime_tensors, const TnpuHostOp *o
             }
             host_add(out, in, in1);
             return 0;
+        case TNPU_HOST_K_CACHE_SCATTER_WRITE:
+            host_k_cache_scatter_write(in, (const int *)op->arr0, op->attrs_i32[0]);
+            return 0;
         default:
             printf("runtime v2: unsupported host op kind=%u (%s)\n", (unsigned)op->kind, op->name ? op->name : "?");
             return 1;
@@ -343,7 +711,34 @@ static int tnpu_execute_segment(TinyTensor *runtime_tensors, const TnpuSegment *
         const TnpuTensorWrite *write = &segment->writes[i];
         TinyTensor *tensor = &runtime_tensors[write->tensor_idx];
         char role = tnpu_role_code(write->role, 'A');
-        if (role == 'A' && (int)write->precision == 2) {
+        if (write->transform == TNPU_WRITE_QUANTIZE_F32_TO_INT16) {
+            if (role != 'A' || (int)write->precision != 2) {
+                printf("runtime v2: quantized write only supports role A INT16\n");
+                return 1;
+            }
+            /* Keep TNPU_WRITE_QUANTIZE_F32_TO_INT16 numerically exact.
+             * The XFORM fast path is available via TNPU_WRITE_XFORM_Q_F16_I16.
+             */
+            write_tensor_to_npu_quantized_a_int16_from_float(
+                tensor,
+                write->addr,
+                (int)write->word_count,
+                write->attrs_f32[0],
+                write->attrs_i32[0]);
+        } else if (write->transform == TNPU_WRITE_XFORM_Q_F16_I16) {
+            uint16_t multiplier;
+            uint8_t shift;
+            if (role != 'A' || (int)write->precision != 2) {
+                printf("runtime v2: xform write only supports role A INT16\n");
+                return 1;
+            }
+            if (write->attrs_i32[0] != 0) {
+                printf("runtime v2: xform write currently requires zero_point=0\n");
+                return 1;
+            }
+            tnpu_choose_xform_scale_params(write->attrs_f32[0], &multiplier, &shift);
+            tnpu_write_tensor_a_qf16_to_i16_fast(tensor, write->addr, write->word_count, multiplier, shift);
+        } else if (role == 'A' && (int)write->precision == 2) {
             tnpu_write_tensor_a_fast(tensor, write->addr, (int)write->precision, write->word_count);
         } else {
             write_tensor_to_npu(
@@ -375,7 +770,13 @@ static int tnpu_execute_segment(TinyTensor *runtime_tensors, const TnpuSegment *
         const TnpuTensorRead *read = &segment->reads[i];
         TinyTensor *tensor = &runtime_tensors[read->tensor_idx];
         char role = tnpu_role_code(read->role, 'C');
-        if (role == 'C' && (int)read->precision == 2) {
+        if (read->transform == TNPU_READ_DEQUANTIZE_INT16_TO_FLOAT32) {
+            if (role != 'C' || (int)read->precision != 2) {
+                printf("runtime v2: dequantize read only supports role C INT16 source\n");
+                return 1;
+            }
+            tnpu_read_tensor_c_int16_dequantize_float_fast(tensor, read->addr, read->attrs_f32[0], read->attrs_i32[0]);
+        } else if (role == 'C' && (int)read->precision == 2) {
             tnpu_read_tensor_c_int16_fast(tensor, read->addr);
         } else {
             read_tensor_from_npu(
