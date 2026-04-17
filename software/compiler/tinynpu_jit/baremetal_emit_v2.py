@@ -29,6 +29,7 @@ _HOST_KIND_ENUM = {
     "dequantize": "TNPU_HOST_DEQUANTIZE",
     "requantize": "TNPU_HOST_REQUANTIZE",
     "reshape": "TNPU_HOST_RESHAPE",
+    "slice_row": "TNPU_HOST_SLICE_ROW",
     "transpose": "TNPU_HOST_TRANSPOSE",
     "softmax": "TNPU_HOST_SOFTMAX",
     "softmax_f16": "TNPU_HOST_SOFTMAX_F16",
@@ -491,6 +492,8 @@ def emit_cv32e40p_program_v2(
             elif step.kind == "quantize":
                 attrs_f32[0] = 1.0 / float(step.attrs["scale"])
                 attrs_i32[0] = int(step.attrs.get("zero_point", 0))
+            elif step.kind == "slice_row":
+                attrs_i32[0] = int(step.attrs.get("row_index", 0))
             elif step.kind == "transpose":
                 axes = tuple(int(axis) for axis in step.attrs.get("axes", []))
                 if axes:

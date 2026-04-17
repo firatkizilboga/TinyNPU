@@ -8,7 +8,7 @@ from .artifact import CompiledArtifact, ExecutionResult
 from .benchmark import BenchmarkReport, CostModel, estimate_host_op_counts, estimate_npu_segment_cpu_counts
 from .golden import GoldenModel
 from .host_ops import execute_host_op
-from .ir import HostOp, NpuSegment, TensorKind, VerificationMode, VerifyTensor
+from .ir import DType, HostOp, NpuSegment, TensorKind, VerificationMode, VerifyTensor
 
 
 class HostEmulationExecutor:
@@ -39,7 +39,7 @@ class HostEmulationExecutor:
         benchmark_report = BenchmarkReport(cost_model=cost_model or CostModel()) if benchmark else None
         for step in artifact.plan.steps:
             if isinstance(step, NpuSegment):
-                self._run_npu_segment(step, values)
+                self._run_npu_segment(step, values, artifact.plan.tensors)
                 if benchmark_report is not None:
                     benchmark_report.add_entry(
                         step=step.name,
@@ -134,7 +134,7 @@ class HostEmulationExecutor:
             return step.is_final_output
         return True
 
-    def _run_npu_segment(self, step: NpuSegment, values: dict[str, np.ndarray]) -> None:
+    def _run_npu_segment(self, step: NpuSegment, values: dict[str, np.ndarray], tensors: dict[str, object]) -> None:
         for op in step.ops:
             bias = values.get(op.bias) if op.bias else None
             values[op.out] = self.golden.matmul(
@@ -162,6 +162,21 @@ class HostEmulationExecutor:
                 k_hi_rot = np.clip((k_hi * cos_q14 + k_lo * sin_q14 + (1 << 13)) >> 14, -32768, 32767)
                 rotated = np.concatenate([k_lo_rot, k_hi_rot]).astype(np.int16)
                 values[op.out] = rotated.reshape(values[op.out].shape)
+            out_spec = tensors.get(op.out)
+            if out_spec is not None:
+                base_name = out_spec.metadata.get("storage_view_of")
+                cache_kind = out_spec.metadata.get("cache_kind")
+                token_index = out_spec.metadata.get("cache_token_index")
+                if base_name and cache_kind in {"K", "V"} and token_index is not None:
+                    base_spec = tensors[str(base_name)]
+                    if str(base_name) not in values:
+                        dtype = np.float32 if base_spec.dtype == DType.FLOAT32 else np.int16
+                        values[str(base_name)] = np.zeros(base_spec.shape, dtype=dtype)
+                    slot = np.asarray(values[op.out]).reshape(-1)
+                    if cache_kind == "K":
+                        values[str(base_name)][:, int(token_index)] = slot
+                    else:
+                        values[str(base_name)][int(token_index), :] = slot
 
     def _run_host_op(self, step: HostOp, values: dict[str, np.ndarray]) -> None:
         execute_host_op(step, values, golden=self.golden)

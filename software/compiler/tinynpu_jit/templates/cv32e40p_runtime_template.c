@@ -325,6 +325,25 @@ static void host_relu(TinyTensor *dst, const TinyTensor *src)
     }
 }
 
+static void host_slice_row(TinyTensor *dst, const TinyTensor *src, int row_index)
+{
+    runtime_assert(src->rank >= 2, "slice_row expects rank >= 2");
+    runtime_assert(row_index >= 0 && row_index < src->shape[0], "slice_row row_index out of range");
+    const int row_width = src->elem_count / src->shape[0];
+    runtime_assert(dst->elem_count == row_width, "slice_row output size mismatch");
+    if (src->dtype == TINY_DTYPE_FLOAT32) {
+        runtime_assert(dst->dtype == TINY_DTYPE_FLOAT32, "slice_row dtype mismatch");
+        for (int i = 0; i < row_width; ++i) {
+            tensor_set_float(dst, i, tensor_get_float(src, row_index * row_width + i));
+        }
+        return;
+    }
+    runtime_assert(dst->dtype != TINY_DTYPE_FLOAT32, "slice_row dtype mismatch");
+    for (int i = 0; i < row_width; ++i) {
+        tensor_set_i32(dst, i, tensor_get_i32(src, row_index * row_width + i));
+    }
+}
+
 static float host_exp_approx(float x);
 static float host_recip_approx(float x);
 static float host_log_approx(float x);

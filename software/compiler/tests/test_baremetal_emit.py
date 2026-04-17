@@ -1490,6 +1490,28 @@ def test_host_op_layernorm_emulation_and_v2_emit():
     assert "host_layernorm(" in source_cpu
 
 
+def test_host_op_slice_row_emulation_and_emit():
+    x = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.int16)
+    expected = np.array([[4, 5, 6]], dtype=np.int32)
+
+    values = {"x": x, "y": np.zeros((1, 3), dtype=np.int32)}
+    step = HostOp("slice1", "slice_row", inputs=["x"], outputs=["y"], attrs={"row_index": 1})
+    execute_host_op(step, values, golden=GoldenModel())
+    np.testing.assert_array_equal(values["y"], expected)
+
+    tensors = {
+        "x": TensorSpec("x", x.shape, DType.INT16, TensorKind.CONSTANT, data=x),
+        "y": TensorSpec("y", (1, 3), DType.INT16, TensorKind.OUTPUT, is_final_output=True),
+    }
+    plan = ExecutionPlan(tensors=tensors, steps=[step], inputs=[], outputs=["y"])
+    plan.add_verification_step("y", "y")
+    artifact = compile_plan(plan, {"y": expected.astype(np.int16)})
+    source_v2 = emit_cv32e40p_program_v2(artifact, {}, program_name="unit_test_slice_row_v2")
+    source_cpu = emit_cv32e40p_c(artifact, {}, program_name="unit_test_slice_row_cpu", cpu_only_baseline=True)
+    assert "TNPU_HOST_SLICE_ROW" in source_v2
+    assert "host_slice_row(" in source_cpu
+
+
 def test_host_op_rope_emulation_and_v2_emit():
     x = np.array([[1.0, 2.0, 3.0, 4.0]], dtype=np.float32)
     head_dim = 4
@@ -1655,7 +1677,8 @@ def test_prefill_transformer_block_builds_and_emits_new_host_ops():
         seed=0,
     )
 
-    assert "seg_qkv" in artifact.segment_artifacts
+    assert "seg_q" in artifact.segment_artifacts
+    assert "seg_kv_cache" in artifact.segment_artifacts
     assert "seg_ffn_proj" in artifact.segment_artifacts
     assert artifact.plan.outputs == ["out"]
     assert expected.shape == (8, 16)
