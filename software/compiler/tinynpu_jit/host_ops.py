@@ -143,6 +143,12 @@ def _validate_rmsnorm(step: HostOp) -> None:
         raise ValueError(f"Host op 'rmsnorm' requires eps > 0, got {eps}.")
 
 
+def _validate_layernorm(step: HostOp) -> None:
+    eps = float(step.attrs.get("eps", 1.0e-6))
+    if eps <= 0.0:
+        raise ValueError(f"Host op 'layernorm' requires eps > 0, got {eps}.")
+
+
 def _validate_rope(step: HostOp) -> None:
     head_dim = int(step.attrs["head_dim"])
     theta = float(step.attrs.get("theta", 10000.0))
@@ -504,6 +510,37 @@ def _rmsnorm_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str
     )
 
 
+def _layernorm_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
+    x = np.asarray(values[step.inputs[0]], dtype=np.float32)
+    weight_bias = np.asarray(values[step.inputs[1]], dtype=np.float32).reshape(-1)
+    hidden = x.shape[-1]
+    if weight_bias.size != hidden * 2:
+        raise ValueError(f"layernorm weight/bias size mismatch: hidden={hidden}, weight_bias={weight_bias.size}.")
+    weight = weight_bias[:hidden]
+    bias = weight_bias[hidden:]
+    eps = np.float32(step.attrs.get("eps", 1.0e-6))
+    mean = np.mean(x, axis=-1, keepdims=True, dtype=np.float32)
+    centered = x - mean
+    var = np.mean(np.square(centered, dtype=np.float32), axis=-1, keepdims=True, dtype=np.float32)
+    y = centered / np.sqrt(var + eps).astype(np.float32)
+    values[step.outputs[0]] = (y * weight.reshape((1,) * (x.ndim - 1) + (hidden,)) + bias.reshape((1,) * (x.ndim - 1) + (hidden,))).astype(np.float32)
+
+
+def _layernorm_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
+    x = np.asarray(values[step.inputs[0]])
+    elems = int(x.size)
+    rows = int(elems // x.shape[-1])
+    return "host_intrinsic", _counts(
+        reads=elems * 3,
+        muls=elems * 3,
+        adds=elems * 3 + rows,
+        divs=elems,
+        nonlinear=rows,
+        writes=elems,
+        branches=elems,
+    )
+
+
 def _mul_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
     lhs = np.asarray(values[step.inputs[0]], dtype=np.float32)
     rhs = np.asarray(values[step.inputs[1]], dtype=np.float32)
@@ -706,6 +743,14 @@ for _spec in (
         semantic_validator=_validate_layout_restore,
     ),
     HostOpSpec("mean", _mean_eval, _mean_benchmark, semantic_validator=_validate_mean),
+    HostOpSpec(
+        "layernorm",
+        _layernorm_eval,
+        _layernorm_benchmark,
+        input_arity=2,
+        required_attrs=("eps",),
+        semantic_validator=_validate_layernorm,
+    ),
     HostOpSpec("mul", _mul_eval, _mul_benchmark, input_arity=2, semantic_validator=_validate_binary_same_shape),
     HostOpSpec(
         "quantize",

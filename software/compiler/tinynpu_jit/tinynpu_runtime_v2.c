@@ -655,6 +655,13 @@ static int tnpu_execute_host_op(TinyTensor *runtime_tensors, const TnpuHostOp *o
             }
             host_rmsnorm(out, in, in1, op->attrs_f32[0]);
             return 0;
+        case TNPU_HOST_LAYERNORM:
+            if (in1 == NULL) {
+                printf("runtime v2: layernorm missing weight/bias input\n");
+                return 1;
+            }
+            host_layernorm(out, in, in1, op->attrs_f32[0]);
+            return 0;
         case TNPU_HOST_ROPE:
             if (op->arr0 != NULL && op->arr0_len > 0u) {
                 host_rope_precomputed(

@@ -202,3 +202,40 @@ def test_concat_lastdim2_execution():
 
     result = HostEmulationExecutor().run(artifact, {"lhs": lhs, "rhs": rhs})
     np.testing.assert_array_equal(result.tensors["y"], expected)
+
+
+def test_layernorm_execution_and_validation():
+    source = np.array([[1.0, -2.0, 3.0, -4.0]], dtype=np.float32)
+    weight = np.array([1.5, 0.5, 2.0, 1.0], dtype=np.float32)
+    bias = np.array([0.1, -0.2, 0.3, -0.4], dtype=np.float32)
+    weight_bias = np.stack([weight, bias], axis=0).astype(np.float32)
+    mean = np.mean(source, axis=-1, keepdims=True)
+    centered = source - mean
+    var = np.mean(np.square(centered), axis=-1, keepdims=True)
+    expected = ((centered / np.sqrt(var + 1.0e-6)) * weight.reshape(1, -1) + bias.reshape(1, -1)).astype(np.float32)
+
+    tensors = {
+        "x": TensorSpec("x", source.shape, DType.FLOAT32, TensorKind.INPUT),
+        "wb": TensorSpec("wb", weight_bias.shape, DType.FLOAT32, TensorKind.INPUT),
+        "y": TensorSpec("y", source.shape, DType.FLOAT32, TensorKind.OUTPUT, is_final_output=True),
+    }
+    step = HostOp("ln0", "layernorm", inputs=["x", "wb"], outputs=["y"], attrs={"eps": 1.0e-6})
+    artifact = CompiledArtifact(
+        plan=ExecutionPlan(tensors=tensors, steps=[step], inputs=["x", "wb"], outputs=["y"]),
+        expected_tensors={},
+        segment_artifacts={},
+    )
+
+    result = HostEmulationExecutor().run(artifact, {"x": source, "wb": weight_bias})
+    np.testing.assert_allclose(result.tensors["y"], expected, rtol=1e-5, atol=1e-5)
+
+    with pytest.raises(ValueError, match="eps > 0"):
+        compile_plan(
+            ExecutionPlan(
+                tensors=tensors,
+                steps=[HostOp("ln_bad", "layernorm", inputs=["x", "wb"], outputs=["y"], attrs={"eps": 0.0})],
+                inputs=["x", "wb"],
+                outputs=["y"],
+            ),
+            expected_tensors={},
+        )

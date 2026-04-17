@@ -36,6 +36,7 @@ _HOST_KIND_ENUM = {
     "im2col": "TNPU_HOST_IM2COL",
     "layout_restore": "TNPU_HOST_LAYOUT_RESTORE",
     "rmsnorm": "TNPU_HOST_RMSNORM",
+    "layernorm": "TNPU_HOST_LAYERNORM",
     "rope": "TNPU_HOST_ROPE",
     "silu": "TNPU_HOST_SILU",
     "mul": "TNPU_HOST_MUL",
@@ -544,7 +545,7 @@ def emit_cv32e40p_program_v2(
                 attrs_i32[2] = int(step.attrs["out_h"])
                 attrs_i32[3] = int(step.attrs["out_w"])
                 attrs_i32[4] = int(step.attrs["out_channels"])
-            elif step.kind == "rmsnorm":
+            elif step.kind in {"rmsnorm", "layernorm"}:
                 attrs_f32[0] = float(step.attrs.get("eps", 1.0e-6))
             elif step.kind == "rope":
                 head_dim = int(step.attrs.get("head_dim", 0))
