@@ -279,6 +279,12 @@ def _emit_host_step_attrs(
         lines.append(
             f"    host_rmsnorm({out_ref}, {in_ref}, {weight_ref}, {_format_scalar(eps, dtype=DType.FLOAT32)});"
         )
+    elif step.kind == "layernorm":
+        weight_ref = _emit_tensor_reference(step.inputs[1])
+        eps = float(step.attrs.get("eps", 1.0e-6))
+        lines.append(
+            f"    host_layernorm({out_ref}, {in_ref}, {weight_ref}, {_format_scalar(eps, dtype=DType.FLOAT32)});"
+        )
     elif step.kind == "rope":
         head_dim = int(step.attrs["head_dim"])
         position = int(step.attrs.get("position", 0))

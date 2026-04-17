@@ -951,6 +951,42 @@ static void host_rmsnorm(TinyTensor *dst, const TinyTensor *src, const TinyTenso
     }
 }
 
+static void host_layernorm(TinyTensor *dst, const TinyTensor *src, const TinyTensor *weight_bias, float eps)
+{
+    runtime_assert(eps > 0.0f, "layernorm eps must be positive");
+    runtime_assert(dst->dtype == TINY_DTYPE_FLOAT32, "layernorm output must be float");
+    runtime_assert(src->rank >= 1, "layernorm expects rank >= 1");
+    runtime_assert(dst->elem_count == src->elem_count, "layernorm size mismatch");
+
+    const int hidden = src->shape[src->rank - 1];
+    runtime_assert(weight_bias->elem_count == hidden * 2, "layernorm weight/bias size mismatch");
+    const int outer = src->elem_count / hidden;
+
+    for (int outer_idx = 0; outer_idx < outer; ++outer_idx) {
+        float mean = 0.0f;
+        float var = 0.0f;
+        const int base = outer_idx * hidden;
+        for (int i = 0; i < hidden; ++i) {
+            mean += tensor_get_float(src, base + i);
+        }
+        mean *= host_recip_approx((float)hidden);
+        for (int i = 0; i < hidden; ++i) {
+            float centered = tensor_get_float(src, base + i) - mean;
+            var += centered * centered;
+        }
+        var *= host_recip_approx((float)hidden);
+        {
+            float inv_std = host_rsqrt_approx(var + eps);
+            for (int i = 0; i < hidden; ++i) {
+                float centered = tensor_get_float(src, base + i) - mean;
+                float scale = tensor_get_float(weight_bias, i);
+                float bias = tensor_get_float(weight_bias, hidden + i);
+                tensor_set_float(dst, base + i, centered * inv_std * scale + bias);
+            }
+        }
+    }
+}
+
 static void host_mul(TinyTensor *dst, const TinyTensor *lhs, const TinyTensor *rhs)
 {
     runtime_assert(dst->dtype == TINY_DTYPE_FLOAT32, "mul expects float output");

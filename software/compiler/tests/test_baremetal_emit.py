@@ -1459,6 +1459,37 @@ def test_host_op_rmsnorm_emulation_and_v2_emit():
     assert ".input1_idx =" in source
 
 
+def test_host_op_layernorm_emulation_and_v2_emit():
+    x = np.array([[1.0, -2.0, 3.0, -4.0]], dtype=np.float32)
+    weight = np.array([1.5, 0.5, 2.0, 1.0], dtype=np.float32)
+    bias = np.array([0.1, -0.2, 0.3, -0.4], dtype=np.float32)
+    weight_bias = np.stack([weight, bias], axis=0).astype(np.float32)
+    eps = 1.0e-6
+    mean = np.mean(x, axis=-1, keepdims=True)
+    centered = x - mean
+    var = np.mean(np.square(centered), axis=-1, keepdims=True)
+    expected = ((centered / np.sqrt(var + eps)) * weight.reshape(1, -1) + bias.reshape(1, -1)).astype(np.float32)
+
+    values = {"x": x, "wb": weight_bias, "y": np.zeros_like(x)}
+    step = HostOp("ln0", "layernorm", inputs=["x", "wb"], outputs=["y"], attrs={"eps": eps})
+    execute_host_op(step, values, golden=GoldenModel())
+    np.testing.assert_allclose(values["y"], expected, rtol=1e-5, atol=1e-5)
+
+    tensors = {
+        "x": TensorSpec("x", x.shape, DType.FLOAT32, TensorKind.CONSTANT, data=x),
+        "wb": TensorSpec("wb", weight_bias.shape, DType.FLOAT32, TensorKind.CONSTANT, data=weight_bias),
+        "y": TensorSpec("y", x.shape, DType.FLOAT32, TensorKind.OUTPUT, is_final_output=True),
+    }
+    plan = ExecutionPlan(tensors=tensors, steps=[step], inputs=[], outputs=["y"])
+    plan.add_verification_step("y", "y")
+    artifact = compile_plan(plan, {"y": expected.astype(np.float32)})
+    source_v2 = emit_cv32e40p_program_v2(artifact, {}, program_name="unit_test_layernorm_v2")
+    source_cpu = emit_cv32e40p_c(artifact, {}, program_name="unit_test_layernorm_cpu", cpu_only_baseline=True)
+    assert "TNPU_HOST_LAYERNORM" in source_v2
+    assert ".input1_idx =" in source_v2
+    assert "host_layernorm(" in source_cpu
+
+
 def test_host_op_rope_emulation_and_v2_emit():
     x = np.array([[1.0, 2.0, 3.0, 4.0]], dtype=np.float32)
     head_dim = 4
@@ -1625,7 +1656,7 @@ def test_prefill_transformer_block_builds_and_emits_new_host_ops():
     )
 
     assert "seg_qkv" in artifact.segment_artifacts
-    assert "seg_ffn_down" in artifact.segment_artifacts
+    assert "seg_ffn_proj" in artifact.segment_artifacts
     assert artifact.plan.outputs == ["out"]
     assert expected.shape == (8, 16)
 
@@ -1633,8 +1664,10 @@ def test_prefill_transformer_block_builds_and_emits_new_host_ops():
     source_cpu = emit_cv32e40p_c(artifact, {}, program_name="unit_test_prefill_transformer_block_cpu", cpu_only_baseline=True)
     assert "TNPU_HOST_CAUSAL_MASK" in source_v2
     assert "TNPU_HOST_CONCAT_LASTDIM2" in source_v2
+    assert "TNPU_HOST_LAYERNORM" in source_v2
     assert "host_causal_mask(" in source_cpu
     assert "host_concat_lastdim2(" in source_cpu
+    assert "host_layernorm(" in source_cpu
     result = run_host_emulation(artifact, {}, verification=VerificationMode.FINAL)
     assert "prefill_transformer_block_out" in result.verified
 
