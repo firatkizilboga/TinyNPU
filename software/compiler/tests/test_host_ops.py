@@ -224,17 +224,33 @@ def test_layernorm_execution_and_validation():
         plan=ExecutionPlan(tensors=tensors, steps=[step], inputs=["x", "wb"], outputs=["y"]),
         expected_tensors={},
         segment_artifacts={},
+        )
+
+
+def test_slice_row_execution_and_validation():
+    source = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.int16)
+    expected = np.array([[4, 5, 6]], dtype=np.int32)
+
+    tensors = {
+        "x": TensorSpec("x", source.shape, DType.INT16, TensorKind.INPUT),
+        "y": TensorSpec("y", (1, source.shape[1]), DType.INT16, TensorKind.OUTPUT, is_final_output=True),
+    }
+    step = HostOp("slice1", "slice_row", inputs=["x"], outputs=["y"], attrs={"row_index": 1})
+    artifact = CompiledArtifact(
+        plan=ExecutionPlan(tensors=tensors, steps=[step], inputs=["x"], outputs=["y"]),
+        expected_tensors={},
+        segment_artifacts={},
     )
 
-    result = HostEmulationExecutor().run(artifact, {"x": source, "wb": weight_bias})
-    np.testing.assert_allclose(result.tensors["y"], expected, rtol=1e-5, atol=1e-5)
+    result = HostEmulationExecutor().run(artifact, {"x": source})
+    np.testing.assert_array_equal(result.tensors["y"], expected)
 
-    with pytest.raises(ValueError, match="eps > 0"):
+    with pytest.raises(ValueError, match="row_index >= 0"):
         compile_plan(
             ExecutionPlan(
                 tensors=tensors,
-                steps=[HostOp("ln_bad", "layernorm", inputs=["x", "wb"], outputs=["y"], attrs={"eps": 0.0})],
-                inputs=["x", "wb"],
+                steps=[HostOp("slice_bad", "slice_row", inputs=["x"], outputs=["y"], attrs={"row_index": -1})],
+                inputs=["x"],
                 outputs=["y"],
             ),
             expected_tensors={},

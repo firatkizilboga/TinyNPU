@@ -181,6 +181,9 @@ def _emit_host_step_attrs(
     elif step.kind == "concat_lastdim2":
         rhs_ref = _emit_tensor_reference(step.inputs[1])
         lines.append(f"    host_concat_lastdim2({out_ref}, {in_ref}, {rhs_ref});")
+    elif step.kind == "slice_row":
+        row_index = int(step.attrs.get("row_index", 0))
+        lines.append(f"    host_slice_row({out_ref}, {in_ref}, {row_index});")
     elif step.kind == "relu":
         lines.append(f"    host_relu({out_ref}, {in_ref});")
     elif step.kind == "sigmoid":

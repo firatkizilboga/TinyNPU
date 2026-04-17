@@ -603,6 +603,9 @@ static int tnpu_execute_host_op(TinyTensor *runtime_tensors, const TnpuHostOp *o
         case TNPU_HOST_RESHAPE:
             host_reshape(out, in);
             return 0;
+        case TNPU_HOST_SLICE_ROW:
+            host_slice_row(out, in, op->attrs_i32[0]);
+            return 0;
         case TNPU_HOST_TRANSPOSE:
             host_transpose(out, in, op->arr0, (int)op->arr0_len);
             return 0;

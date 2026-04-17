@@ -172,6 +172,12 @@ def _validate_concat_lastdim2(step: HostOp) -> None:
     return
 
 
+def _validate_slice_row(step: HostOp) -> None:
+    row_index = int(step.attrs.get("row_index", 0))
+    if row_index < 0:
+        raise ValueError(f"Host op 'slice_row' requires row_index >= 0, got {row_index}.")
+
+
 def _softmax_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
     axis = int(step.attrs.get("axis", -1))
     values[step.outputs[0]] = golden.softmax(values[step.inputs[0]], axis=axis)
@@ -626,6 +632,25 @@ def _concat_lastdim2_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> t
     )
 
 
+def _slice_row_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
+    source = np.asarray(values[step.inputs[0]])
+    if source.ndim < 2:
+        raise ValueError(f"slice_row expects rank >= 2 input, got rank {source.ndim}.")
+    row_index = int(step.attrs.get("row_index", 0))
+    if row_index >= source.shape[0]:
+        raise ValueError(f"slice_row row_index {row_index} out of range for shape {source.shape}.")
+    values[step.outputs[0]] = np.asarray(source[row_index : row_index + 1, ...], copy=True)
+
+
+def _slice_row_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
+    out_elems = int(np.asarray(values[step.outputs[0]]).size)
+    return "host_intrinsic", _counts(
+        reads=out_elems,
+        writes=out_elems,
+        branches=1,
+    )
+
+
 def _rope_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
     x = np.asarray(values[step.inputs[0]], dtype=np.float32)
     out = np.array(x, copy=True)
@@ -710,6 +735,7 @@ for _spec in (
         input_arity=2,
         semantic_validator=_validate_concat_lastdim2,
     ),
+    HostOpSpec("slice_row", _slice_row_eval, _slice_row_benchmark, semantic_validator=_validate_slice_row),
     HostOpSpec(
         "dequantize",
         _dequantize_eval,

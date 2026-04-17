@@ -24,6 +24,7 @@ from tinynpu_jit import (  # noqa: E402
     TensorSpec,
     compile_plan,
     emit_cv32e40p_program_v2,
+    make_native_int16_kv_cache_specs,
 )
 from tinynpu_jit.golden import GoldenModel  # noqa: E402
 
@@ -145,9 +146,21 @@ def build_plan(
         "out": TensorSpec("out", (token_count, d_model), DType.FLOAT32, TensorKind.OUTPUT, is_final_output=True),
     }
 
-    qkv_ops: list[MatMulOp] = []
+    q_ops: list[MatMulOp] = []
+    kv_cache_ops: list[MatMulOp] = []
     concat_steps: list[HostOp] = []
     prev_concat_name: str | None = None
+    token_indices = list(range(token_count))
+    token_names = [f"t{idx}" for idx in token_indices]
+
+    for token_idx, token_name in zip(token_indices, token_names):
+        tensors[f"x_norm1_q_{token_name}"] = TensorSpec(
+            f"x_norm1_q_{token_name}",
+            (1, d_model),
+            DType.INT16,
+            TensorKind.INTERMEDIATE,
+            metadata={"storage_role": "A"},
+        )
 
     for head_idx in range(n_heads):
         w_q = _rand_i16(rng, (d_model, d_head))
@@ -164,10 +177,17 @@ def build_plan(
             TensorKind.INTERMEDIATE,
             metadata={"storage_role": "A"},
         )
-        tensors[f"k_seq_h{head_idx}"] = TensorSpec(f"k_seq_h{head_idx}", (token_count, d_head), DType.INT16, TensorKind.INTERMEDIATE)
-        tensors[f"k_t_h{head_idx}"] = TensorSpec(f"k_t_h{head_idx}", (d_head, token_count), DType.INT16, TensorKind.INTERMEDIATE)
-        tensors[f"v_seq_h{head_idx}"] = TensorSpec(f"v_seq_h{head_idx}", (token_count, d_head), DType.INT16, TensorKind.INTERMEDIATE)
-        tensors[f"v_b_h{head_idx}"] = TensorSpec(f"v_b_h{head_idx}", (token_count, d_head), DType.INT16, TensorKind.INTERMEDIATE)
+        tensors.update(
+            make_native_int16_kv_cache_specs(
+                k_base_name=f"k_cache_h{head_idx}",
+                v_base_name=f"v_cache_h{head_idx}",
+                d_head=d_head,
+                token_capacity=token_count,
+                token_names=token_names,
+                token_indices=token_indices,
+                kind=TensorKind.INTERMEDIATE,
+            )
+        )
         tensors[f"scores_h{head_idx}"] = TensorSpec(f"scores_h{head_idx}", (token_count, token_count), DType.INT16, TensorKind.INTERMEDIATE)
         tensors[f"masked_scores_h{head_idx}"] = TensorSpec(
             f"masked_scores_h{head_idx}",
@@ -190,13 +210,28 @@ def build_plan(
         )
         tensors[f"attn_h{head_idx}"] = TensorSpec(f"attn_h{head_idx}", (token_count, d_head), DType.INT16, TensorKind.INTERMEDIATE)
 
-        qkv_ops.extend(
-            [
-                MatMulOp(f"op_q_h{head_idx}", "x_norm1_q", f"w_q_h{head_idx}", f"q_int_h{head_idx}", in_dtype=DType.INT16, out_dtype=DType.INT16),
-                MatMulOp(f"op_k_h{head_idx}", "x_norm1_q", f"w_k_h{head_idx}", f"k_seq_h{head_idx}", in_dtype=DType.INT16, out_dtype=DType.INT16),
-                MatMulOp(f"op_v_h{head_idx}", "x_norm1_q", f"w_v_h{head_idx}", f"v_seq_h{head_idx}", in_dtype=DType.INT16, out_dtype=DType.INT16),
-            ]
-        )
+        q_ops.append(MatMulOp(f"op_q_h{head_idx}", "x_norm1_q", f"w_q_h{head_idx}", f"q_int_h{head_idx}", in_dtype=DType.INT16, out_dtype=DType.INT16))
+        for token_name in token_names:
+            kv_cache_ops.extend(
+                [
+                    MatMulOp(
+                        f"op_k_h{head_idx}_{token_name}",
+                        f"x_norm1_q_{token_name}",
+                        f"w_k_h{head_idx}",
+                        f"k_cache_h{head_idx}_{token_name}",
+                        in_dtype=DType.INT16,
+                        out_dtype=DType.INT16,
+                    ),
+                    MatMulOp(
+                        f"op_v_h{head_idx}_{token_name}",
+                        f"x_norm1_q_{token_name}",
+                        f"w_v_h{head_idx}",
+                        f"v_cache_h{head_idx}_{token_name}",
+                        in_dtype=DType.INT16,
+                        out_dtype=DType.INT16,
+                    ),
+                ]
+            )
 
         if prev_concat_name is None:
             prev_concat_name = f"attn_h{head_idx}"
@@ -241,30 +276,43 @@ def build_plan(
             outputs=["x_norm1_q"],
             attrs={"scale": act_scale, "zero_point": 0, "dtype": DType.INT16},
         ),
-        NpuSegment(
-            "seg_qkv",
-            qkv_ops,
-            inputs=["x_norm1_q"],
-            outputs=[name for name in tensors if name.startswith(("q_int_h", "k_seq_h", "v_seq_h"))],
-        ),
     ]
+
+    for token_idx, token_name in zip(token_indices, token_names):
+        steps.append(
+            HostOp(
+                f"slice_x_norm1_q_{token_name}",
+                "slice_row",
+                inputs=["x_norm1_q"],
+                outputs=[f"x_norm1_q_{token_name}"],
+                attrs={"row_index": token_idx},
+            )
+        )
+
+    steps.extend(
+        [
+        NpuSegment(
+            "seg_q",
+            q_ops,
+            inputs=["x_norm1_q"],
+            outputs=[name for name in tensors if name.startswith("q_int_h")],
+        ),
+        NpuSegment(
+            "seg_kv_cache",
+            kv_cache_ops,
+            inputs=[f"x_norm1_q_{name}" for name in token_names],
+            outputs=[],
+        ),
+    ])
 
     for head_idx in range(n_heads):
         steps.extend(
             [
                 HostOp(f"alias_q_a_h{head_idx}", "alias", inputs=[f"q_int_h{head_idx}"], outputs=[f"q_a_h{head_idx}"]),
-                HostOp(
-                    f"transpose_k_h{head_idx}",
-                    "transpose",
-                    inputs=[f"k_seq_h{head_idx}"],
-                    outputs=[f"k_t_h{head_idx}"],
-                    attrs={"axes": (1, 0)},
-                ),
-                HostOp(f"alias_v_b_h{head_idx}", "alias", inputs=[f"v_seq_h{head_idx}"], outputs=[f"v_b_h{head_idx}"]),
                 NpuSegment(
                     f"seg_score_h{head_idx}",
-                    [MatMulOp(f"op_qk_h{head_idx}", f"q_a_h{head_idx}", f"k_t_h{head_idx}", f"scores_h{head_idx}", in_dtype=DType.INT16, out_dtype=DType.INT16)],
-                    inputs=[f"q_a_h{head_idx}", f"k_t_h{head_idx}"],
+                    [MatMulOp(f"op_qk_h{head_idx}", f"q_a_h{head_idx}", f"k_cache_h{head_idx}", f"scores_h{head_idx}", in_dtype=DType.INT16, out_dtype=DType.INT16)],
+                    inputs=[f"q_a_h{head_idx}"],
                     outputs=[f"scores_h{head_idx}"],
                 ),
                 HostOp(
@@ -290,8 +338,8 @@ def build_plan(
                 ),
                 NpuSegment(
                     f"seg_av_h{head_idx}",
-                    [MatMulOp(f"op_av_h{head_idx}", f"probs_q_h{head_idx}", f"v_b_h{head_idx}", f"attn_h{head_idx}", shift=8, in_dtype=DType.INT16, out_dtype=DType.INT16)],
-                    inputs=[f"probs_q_h{head_idx}", f"v_b_h{head_idx}"],
+                    [MatMulOp(f"op_av_h{head_idx}", f"probs_q_h{head_idx}", f"v_cache_h{head_idx}", f"attn_h{head_idx}", shift=8, in_dtype=DType.INT16, out_dtype=DType.INT16)],
+                    inputs=[f"probs_q_h{head_idx}"],
                     outputs=[f"attn_h{head_idx}"],
                 ),
             ]
@@ -479,6 +527,8 @@ def main() -> int:
             str(include_dir),
             "-I",
             "mem_stall",
+            "-I",
+            str(RUNTIME_DIR),
             "-L",
             str(lib_dir),
             "-lc",
