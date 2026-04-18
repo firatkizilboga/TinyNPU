@@ -1820,3 +1820,55 @@ def test_npu_segment_with_rope_cs_python_simulation():
         f"  sim:      {k_sim}\n"
         f"  expected: {k_rope_ref}"
     )
+
+
+def test_compile_plan_rewrites_host_rope_chain_to_xform():
+    d_model = 8
+    d_head = 16
+    position = 3
+    theta = 10000.0
+    rng = np.random.default_rng(7)
+
+    x = rng.integers(-4, 5, size=(1, d_model), dtype=np.int16)
+    w_q = rng.integers(-4, 5, size=(d_model, d_head), dtype=np.int16)
+
+    q_ref = np.clip(x.astype(np.int32) @ w_q.astype(np.int32), -32768, 32767).astype(np.int16)
+    cs_ref = make_rope_cos_sin_table_q14(d_head, position, theta)
+    q_rope_ref = _rope_rotate_half_q14(q_ref, cs_ref)
+
+    tensors = {
+        "x": TensorSpec("x", x.shape, DType.INT16, TensorKind.INPUT),
+        "w_q": TensorSpec("w_q", w_q.shape, DType.INT16, TensorKind.CONSTANT, data=w_q),
+        "q_int": TensorSpec("q_int", (1, d_head), DType.INT16, TensorKind.INTERMEDIATE),
+        "q_f": TensorSpec("q_f", (1, d_head), DType.FLOAT32, TensorKind.INTERMEDIATE),
+        "q_rope_f": TensorSpec("q_rope_f", (1, d_head), DType.FLOAT32, TensorKind.INTERMEDIATE),
+        "q_rope_q": TensorSpec("q_rope_q", (1, d_head), DType.INT16, TensorKind.OUTPUT, is_final_output=True),
+    }
+    steps = [
+        NpuSegment("seg_q", [MatMulOp("op_q", "x", "w_q", "q_int")], inputs=["x", "w_q"], outputs=["q_int"]),
+        HostOp("dequant_q", "dequantize", inputs=["q_int"], outputs=["q_f"], attrs={"scale": 1.0 / 32.0, "zero_point": 0}),
+        HostOp("rope_q", "rope", inputs=["q_f"], outputs=["q_rope_f"], attrs={"head_dim": d_head, "position": position, "theta": theta}),
+        HostOp(
+            "quant_q_rope",
+            "quantize",
+            inputs=["q_rope_f"],
+            outputs=["q_rope_q"],
+            attrs={"scale": 1.0 / 32.0, "zero_point": 0, "dtype": DType.INT16},
+        ),
+    ]
+    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=["x"], outputs=["q_rope_q"])
+    plan.add_verification_step("q_rope_q", "q_rope_q")
+
+    artifact = compile_plan(plan, {"q_rope_q": q_rope_ref})
+
+    seg = artifact.segment_artifacts["seg_q"]
+    assert artifact.plan.steps[0].ops[0].out == "q_rope_q"
+    assert artifact.plan.steps[0].ops[0].rope_cs_name == "q_rope_q__rope_cs"
+    assert "q_rope_q__rope_cs" in artifact.plan.tensors
+    assert all(not (isinstance(step, HostOp) and step.name in {"dequant_q", "rope_q", "quant_q_rope"}) for step in artifact.plan.steps)
+    assert "q_rope_q__rope_cs" in seg.symbol_table
+
+    result = run_host_emulation(artifact, {"x": x}, verification=VerificationMode.OFF)
+    assert "q_rope_q" in result.tensors
+    diff = np.abs(np.asarray(result.tensors["q_rope_q"]).astype(np.int32).reshape(-1) - q_rope_ref.astype(np.int32).reshape(-1))
+    assert diff.max() <= 1

@@ -1327,7 +1327,6 @@ static void host_k_cache_scatter_matrix(TinyTensor *dst, const TinyTensor *src, 
     }
 #else
     (void)base_addr;
-    runtime_assert(0, "k_cache_scatter_matrix requires TINYNPU_USE_SHARED_SRAM=1");
 #endif
 }
 
@@ -1368,7 +1367,6 @@ static void host_v_cache_scatter_matrix(TinyTensor *dst, const TinyTensor *src, 
     }
 #else
     (void)base_addr;
-    runtime_assert(0, "v_cache_scatter_matrix requires TINYNPU_USE_SHARED_SRAM=1");
 #endif
 }
 
@@ -1538,6 +1536,38 @@ static void host_rope(TinyTensor *dst, const TinyTensor *src, int head_dim, int 
                     }
                 }
             }
+        }
+    }
+}
+
+static void host_rope_k16_q14(TinyTensor *dst, const TinyTensor *src, const TinyTensor *cs)
+{
+    runtime_assert(dst->dtype == TINY_DTYPE_INT16, "rope_k16_q14 output must be INT16");
+    runtime_assert(src->dtype == TINY_DTYPE_INT16, "rope_k16_q14 input must be INT16");
+    runtime_assert(cs->dtype == TINY_DTYPE_INT16, "rope_k16_q14 cos/sin must be INT16");
+    runtime_assert(src->rank >= 2, "rope_k16_q14 expects rank >= 2");
+    runtime_assert(cs->rank >= 2, "rope_k16_q14 expects rank >= 2 cos/sin tensor");
+    runtime_assert(dst->elem_count == src->elem_count, "rope_k16_q14 size mismatch");
+    runtime_assert(src->shape[src->rank - 1] == cs->shape[cs->rank - 1], "rope_k16_q14 last dimension mismatch");
+    runtime_assert((src->shape[src->rank - 1] % 2) == 0, "rope_k16_q14 head_dim must be even");
+
+    const int head_dim = src->shape[src->rank - 1];
+    const int half = head_dim / 2;
+    const int rows = src->elem_count / head_dim;
+
+    for (int row = 0; row < rows; ++row) {
+        const int base = row * head_dim;
+        for (int i = 0; i < half; ++i) {
+            const int32_t first = tensor_get_i32(src, base + i);
+            const int32_t second = tensor_get_i32(src, base + half + i);
+            const int32_t c = tensor_get_i32(cs, i);
+            const int32_t s = tensor_get_i32(cs, half + i);
+            const int32_t lo = (first * c - second * s) >> 14;
+            const int32_t hi = (second * c + first * s) >> 14;
+            const int32_t lo_clip = lo < -32768 ? -32768 : (lo > 32767 ? 32767 : lo);
+            const int32_t hi_clip = hi < -32768 ? -32768 : (hi > 32767 ? 32767 : hi);
+            tensor_set_i32(dst, base + i, lo_clip);
+            tensor_set_i32(dst, base + half + i, hi_clip);
         }
     }
 }
