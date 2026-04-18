@@ -22,6 +22,7 @@ from tinynpu_jit import (  # noqa: E402
     compile_plan,
     emit_cv32e40p_program_v2,
     make_native_int16_kv_cache_specs,
+    make_rope_cos_sin_table_q14,
     make_rope_cs_tensor_spec,
 )
 from tinynpu_jit.golden import GoldenModel  # noqa: E402
@@ -91,6 +92,23 @@ def _rope_ref(x: np.ndarray, *, position: int, head_dim: int, theta: float) -> n
     out[..., :half] = first * cos - second * sin
     out[..., half:head_dim] = second * cos + first * sin
     return out.astype(np.float32)
+
+
+def _rope_q14_int16_ref(x_q: np.ndarray, *, position: int, head_dim: int, theta: float) -> np.ndarray:
+    x_i16 = np.asarray(x_q, dtype=np.int16)
+    if x_i16.shape[-1] != head_dim:
+        raise ValueError(f"rope_q14_int16_ref expects last dimension {head_dim}, got {x_i16.shape[-1]}")
+    if head_dim % 2 != 0:
+        raise ValueError(f"rope_q14_int16_ref expects even head_dim, got {head_dim}")
+    half = head_dim // 2
+    cs = make_rope_cos_sin_table_q14(head_dim, position, theta).astype(np.int32)
+    cos = cs[:half].reshape(1, half)
+    sin = cs[half:].reshape(1, half)
+    first = x_i16[..., :half].astype(np.int32)
+    second = x_i16[..., half:head_dim].astype(np.int32)
+    lo = np.clip((first * cos - second * sin) >> 14, -32768, 32767).astype(np.int16)
+    hi = np.clip((second * cos + first * sin) >> 14, -32768, 32767).astype(np.int16)
+    return np.concatenate([lo, hi], axis=-1).astype(np.int16)
 
 
 def build_artifact(
@@ -235,8 +253,11 @@ def build_artifact(
             v_val = golden.matmul(x_t, w_v_by_head[kv_head], out_dtype=DType.INT16)
             v_cache_by_head[kv_head][cache_slot, :] = v_val[0]
             k_val_f = golden.dequantize(k_val, scale=proj_scale, zero_point=0)
-            k_rope_f = _rope_ref(k_val_f, position=token_pos, head_dim=d_head, theta=rope_theta)
-            k_rope_q = golden.quantize(k_rope_f, scale=proj_scale, zero_point=0, out_dtype=DType.INT16)
+            if use_hw_rope_k:
+                k_rope_q = _rope_q14_int16_ref(k_val, position=token_pos, head_dim=d_head, theta=rope_theta)
+            else:
+                k_rope_f = _rope_ref(k_val_f, position=token_pos, head_dim=d_head, theta=rope_theta)
+                k_rope_q = golden.quantize(k_rope_f, scale=proj_scale, zero_point=0, out_dtype=DType.INT16)
             k_cache_by_head[kv_head][:, cache_slot] = k_rope_q[0]
             k_rope_q_by_head[kv_head] = k_rope_q
             if step_idx == 0 and kv_head == 0:
