@@ -25,7 +25,7 @@
 // ----------------------------------------------------------------------------
 // Buffer Parameters
 // ----------------------------------------------------------------------------
-`define BUFFER_DEPTH 8192         // Number of vectors in unified buffer
+`define BUFFER_DEPTH 32768        // Number of vectors in unified buffer
 `define BUFFER_WIDTH (`DATA_WIDTH * `ARRAY_SIZE)  // 1024 vectors × N elements
 
 // ----------------------------------------------------------------------------
@@ -113,7 +113,7 @@ typedef enum logic [1:0] {
 `define REG_MMVR    'h10
 
 // Memory Map
-`define IM_BASE_ADDR 16'h8000 // Instructions start here
+`define IM_BASE_ADDR 16'h9000 // Instructions start here
 `define IM_SIZE      1024     // Depth of Instruction Memory (256-bit words)
 `define INST_WIDTH   256      // Fixed Instruction Width (4 * 64-bit)
 `define INST_CHUNKS  (`INST_WIDTH / `BUFFER_WIDTH < 1 ? 1 : `INST_WIDTH / `BUFFER_WIDTH)

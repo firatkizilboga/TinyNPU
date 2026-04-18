@@ -43,6 +43,9 @@ _HOST_KIND_ENUM = {
     "mul": "TNPU_HOST_MUL",
     "add": "TNPU_HOST_ADD",
     "k_cache_scatter_write": "TNPU_HOST_K_CACHE_SCATTER_WRITE",
+    "v_cache_scatter_write": "TNPU_HOST_V_CACHE_SCATTER_WRITE",
+    "k_cache_scatter_matrix": "TNPU_HOST_K_CACHE_SCATTER_MATRIX",
+    "v_cache_scatter_matrix": "TNPU_HOST_V_CACHE_SCATTER_MATRIX",
     "causal_mask": "TNPU_HOST_CAUSAL_MASK",
     "concat_lastdim2": "TNPU_HOST_CONCAT_LASTDIM2",
 }
@@ -380,7 +383,11 @@ def emit_cv32e40p_program_v2(
                     and int(producer.attrs.get("zero_point", 0)) == 0
                 ):
                     source_producer = producer_by_output.get(source_name)
-                    if source_producer is not None and source_producer.kind == "softmax_f16":
+                    if (
+                        str(producer.attrs.get("input_encoding", "")) == "fp16_bits"
+                        or (source_producer is not None and source_producer.kind == "softmax_f16")
+                        or (source_producer is not None and str(source_producer.attrs.get("output_encoding", "")) == "fp16_bits")
+                    ):
                         write_tensor_name = source_name
                         transform = "TNPU_WRITE_XFORM_Q_F16_I16"
                         attrs_f32[0] = 1.0 / float(producer.attrs["scale"])
@@ -492,6 +499,7 @@ def emit_cv32e40p_program_v2(
             elif step.kind == "quantize":
                 attrs_f32[0] = 1.0 / float(step.attrs["scale"])
                 attrs_i32[0] = int(step.attrs.get("zero_point", 0))
+                attrs_i32[1] = 1 if str(step.attrs.get("input_encoding", "")) == "fp16_bits" else 0
             elif step.kind == "slice_row":
                 attrs_i32[0] = int(step.attrs.get("row_index", 0))
             elif step.kind == "transpose":
@@ -583,6 +591,21 @@ def emit_cv32e40p_program_v2(
                     + ", ".join(str(v) for v in scatter_addrs)
                     + "};"
                 )
+            elif step.kind == "v_cache_scatter_write":
+                out_spec = artifact.plan.tensors[step.outputs[0]]
+                base_name = str(out_spec.metadata.get("storage_view_of", step.outputs[0]))
+                base_addr = resolve_tensor_addr(base_name)
+                scatter_addrs = tuple(base_addr + int(offset) for offset in out_spec.metadata["cache_scatter_word_addrs"])
+                arr0_name = f"{symbol}_host_{_sanitize(step.name)}_scatter_addrs"
+                arr0_len = len(scatter_addrs)
+                decls.append(
+                    f"static const int {arr0_name}[{arr0_len}] = "
+                    + "{"
+                    + ", ".join(str(v) for v in scatter_addrs)
+                    + "};"
+                )
+            elif step.kind in {"k_cache_scatter_matrix", "v_cache_scatter_matrix"}:
+                attrs_i32[0] = resolve_tensor_addr(step.outputs[0])
             elif step.kind == "causal_mask":
                 attrs_i32[0] = int(step.attrs.get("past_kv_len", 0))
                 attrs_f32[0] = float(step.attrs.get("fill_value", -32768.0))
@@ -618,7 +641,8 @@ def emit_cv32e40p_program_v2(
                 "    {"
                 f'.label = "{step.label}", .actual_tensor_idx = {tensor_index[step.tensor_name]}, '
                 f'.expected_tensor_idx = {tensor_index[step.tensor_name + "_expected"]}, '
-                f".is_final_output = {1 if step.is_final_output else 0}"
+                f".is_final_output = {1 if step.is_final_output else 0}, "
+                f".float_atol = {_format_scalar(step.float_atol, dtype=DType.FLOAT32)}"
                 "}"
             )
             verify_index[step.tensor_name] = len(verify_entries) - 1

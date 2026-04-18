@@ -42,6 +42,9 @@ typedef enum {
     TNPU_HOST_CAUSAL_MASK = 21,
     TNPU_HOST_CONCAT_LASTDIM2 = 22,
     TNPU_HOST_LAYERNORM = 23,
+    TNPU_HOST_V_CACHE_SCATTER_WRITE = 24,
+    TNPU_HOST_K_CACHE_SCATTER_MATRIX = 25,
+    TNPU_HOST_V_CACHE_SCATTER_MATRIX = 26,
 } TnpuHostKind;
 
 typedef enum {
@@ -133,6 +136,7 @@ typedef struct {
     uint16_t actual_tensor_idx;
     uint16_t expected_tensor_idx;
     uint8_t is_final_output;
+    float float_atol;
 } TnpuVerifyOp;
 
 typedef struct {

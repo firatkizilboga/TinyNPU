@@ -203,6 +203,78 @@ def _softmax_f16_eval(step: HostOp, values: dict[str, np.ndarray], golden: Golde
     values[step.outputs[0]] = probs_f16_bits
 
 
+def _fp16_bits_to_float32_array(value: np.ndarray) -> np.ndarray:
+    bits = np.asarray(value, dtype=np.int16).view(np.uint16)
+    return bits.view(np.float16).astype(np.float32)
+
+
+def _host_exp_approx_scalar(x: float) -> float:
+    exp_neg_int = (
+        1.0,
+        0.36787945,
+        0.13533528,
+        0.049787067,
+        0.01831564,
+        0.006737947,
+        0.0024787523,
+        0.00091188197,
+        0.00033546263,
+        0.00012340980,
+        0.00004539993,
+        0.0000167017,
+        0.0000061442124,
+        0.0000022603294,
+        0.00000083152872,
+        0.00000030590232,
+        0.00000011253518,
+    )
+    if x == 0.0:
+        return 1.0
+    if x > 0.0:
+        return _host_recip_approx_scalar(_host_exp_approx_scalar(-x))
+    if x <= -16.0:
+        return 0.0
+    k = int(-x)
+    r = x + float(k)
+    poly = 1.0 + r * (1.0 + r * (0.5 + r * (0.16666667 + r * (0.04166667 + r * 0.0083333333))))
+    return exp_neg_int[k] * max(poly, 0.0)
+
+
+def _host_recip_approx_scalar(x: float) -> float:
+    if x == 0.0:
+        return math.inf if math.copysign(1.0, x) > 0 else -math.inf
+    ax = abs(x)
+    if ax < 0.5:
+        y = 1.0 / x
+        return y * (2.0 - x * y)
+    y = 48.0 / (17.0 * x + 31.0 * math.copysign(1.0, x))
+    y = y * (2.0 - x * y)
+    y = y * (2.0 - x * y)
+    return y
+
+
+def _host_erf_approx_scalar(x: float) -> float:
+    p = 0.3275911
+    a1 = 0.25482959
+    a2 = -0.28449672
+    a3 = 1.4214138
+    a4 = -1.4531521
+    a5 = 1.0614054
+    sign = 1.0
+    if x < 0.0:
+        sign = -1.0
+        x = -x
+    t = _host_recip_approx_scalar(1.0 + p * x)
+    poly = (((((a5 * t) + a4) * t + a3) * t + a2) * t + a1) * t
+    return sign * (1.0 - poly * _host_exp_approx_scalar(-(x * x)))
+
+
+def _gelu_runtime_approx(source: np.ndarray) -> np.ndarray:
+    source_f32 = np.asarray(source, dtype=np.float32)
+    erf = np.vectorize(lambda v: _host_erf_approx_scalar(float(v) * 0.70710678), otypes=[np.float32])(source_f32)
+    return (np.float32(0.5) * source_f32 * (np.float32(1.0) + erf)).astype(np.float32)
+
+
 def _softmax_f16_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
     source_elements = int(np.asarray(values[step.inputs[0]]).size)
     elems = int(np.asarray(values[step.outputs[0]]).size)
@@ -217,8 +289,11 @@ def _softmax_f16_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple
 
 
 def _quantize_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
+    source = values[step.inputs[0]]
+    if str(step.attrs.get("input_encoding", "")) == "fp16_bits":
+        source = _fp16_bits_to_float32_array(np.asarray(source))
     values[step.outputs[0]] = golden.quantize(
-        values[step.inputs[0]],
+        source,
         scale=float(step.attrs["scale"]),
         zero_point=int(step.attrs.get("zero_point", 0)),
         out_dtype=_dtype_attr(step.attrs.get("dtype", DType.INT8)),
@@ -279,8 +354,11 @@ def _sigmoid_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str
 
 def _gelu_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
     source = np.array(values[step.inputs[0]], dtype=np.float32)
-    erf = np.vectorize(math.erf, otypes=[np.float32])(source / np.float32(np.sqrt(2.0)))
-    values[step.outputs[0]] = np.float32(0.5) * source * (np.float32(1.0) + erf)
+    out = _gelu_runtime_approx(source)
+    if str(step.attrs.get("output_encoding", "")) == "fp16_bits":
+        values[step.outputs[0]] = out.astype(np.float16).view(np.uint16).astype(np.int16)
+    else:
+        values[step.outputs[0]] = out
 
 
 def _gelu_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
@@ -315,6 +393,44 @@ def _k_cache_scatter_write_eval(step: HostOp, values: dict[str, np.ndarray], gol
 def _k_cache_scatter_write_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
     d_head = int(np.asarray(values[step.inputs[0]]).size)
     return "host_intrinsic", _counts(reads=d_head, writes=d_head)
+
+
+def _v_cache_scatter_write_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
+    value = np.asarray(values[step.inputs[0]], dtype=np.int16)
+    token_index = int(step.attrs["token_index"])
+    v_cache_base = str(step.attrs["v_cache_base"])
+    values[step.outputs[0]] = value
+    if v_cache_base in values:
+        values[v_cache_base][token_index, :] = value.reshape(-1)
+
+
+def _v_cache_scatter_write_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
+    d_head = int(np.asarray(values[step.inputs[0]]).size)
+    return "host_intrinsic", _counts(reads=d_head, writes=d_head)
+
+
+def _k_cache_scatter_matrix_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
+    source = np.asarray(values[step.inputs[0]], dtype=np.int16)
+    if source.ndim != 2:
+        raise ValueError(f"k_cache_scatter_matrix expects rank-2 source, got {source.shape}.")
+    values[step.outputs[0]] = np.asarray(source.T, dtype=np.int16, copy=True)
+
+
+def _k_cache_scatter_matrix_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
+    elems = int(np.asarray(values[step.inputs[0]]).size)
+    return "host_intrinsic", _counts(reads=elems, writes=elems)
+
+
+def _v_cache_scatter_matrix_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
+    source = np.asarray(values[step.inputs[0]], dtype=np.int16)
+    if source.ndim != 2:
+        raise ValueError(f"v_cache_scatter_matrix expects rank-2 source, got {source.shape}.")
+    values[step.outputs[0]] = np.asarray(source, dtype=np.int16, copy=True)
+
+
+def _v_cache_scatter_matrix_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
+    elems = int(np.asarray(values[step.inputs[0]]).size)
+    return "host_intrinsic", _counts(reads=elems, writes=elems)
 
 
 def _silu_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
@@ -529,7 +645,11 @@ def _layernorm_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenM
     centered = x - mean
     var = np.mean(np.square(centered, dtype=np.float32), axis=-1, keepdims=True, dtype=np.float32)
     y = centered / np.sqrt(var + eps).astype(np.float32)
-    values[step.outputs[0]] = (y * weight.reshape((1,) * (x.ndim - 1) + (hidden,)) + bias.reshape((1,) * (x.ndim - 1) + (hidden,))).astype(np.float32)
+    out = (y * weight.reshape((1,) * (x.ndim - 1) + (hidden,)) + bias.reshape((1,) * (x.ndim - 1) + (hidden,))).astype(np.float32)
+    if str(step.attrs.get("output_encoding", "")) == "fp16_bits":
+        values[step.outputs[0]] = out.astype(np.float16).view(np.uint16).astype(np.int16)
+    else:
+        values[step.outputs[0]] = out
 
 
 def _layernorm_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
@@ -758,6 +878,25 @@ for _spec in (
         _k_cache_scatter_write_eval,
         _k_cache_scatter_write_benchmark,
         required_attrs=("token_index", "k_cache_base"),
+        quant_boundary_policy="host_to_npu",
+    ),
+    HostOpSpec(
+        "v_cache_scatter_write",
+        _v_cache_scatter_write_eval,
+        _v_cache_scatter_write_benchmark,
+        required_attrs=("token_index", "v_cache_base"),
+        quant_boundary_policy="host_to_npu",
+    ),
+    HostOpSpec(
+        "k_cache_scatter_matrix",
+        _k_cache_scatter_matrix_eval,
+        _k_cache_scatter_matrix_benchmark,
+        quant_boundary_policy="host_to_npu",
+    ),
+    HostOpSpec(
+        "v_cache_scatter_matrix",
+        _v_cache_scatter_matrix_eval,
+        _v_cache_scatter_matrix_benchmark,
         quant_boundary_policy="host_to_npu",
     ),
     HostOpSpec(

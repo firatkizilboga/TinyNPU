@@ -7,7 +7,7 @@
 #define NPU_BASE 0x30000000u
 #define TB_TIMER_CTRL_BASE 0x15000000u
 #define TB_TIMER_COUNT_REG 0x15001000u
-#define TINY_IM_BASE_ADDR 0x8000u
+#define TINY_IM_BASE_ADDR 0x9000u
 #define NPU_SHARED_UB_BASE 0x31000000u
 #define NPU_SHARED_IM_BASE 0x32000000u
 #define TINY_ARRAY_SIZE __TINY_ARRAY_SIZE__
@@ -587,14 +587,21 @@ static float host_erf_approx(float x)
     }
 }
 
+static uint16_t host_float32_to_fp16_bits(float value);
+static void host_quantize_fp16bits(TinyTensor *dst, const TinyTensor *src, float inv_scale, int zero_point);
+
 static void host_gelu(TinyTensor *dst, const TinyTensor *src)
 {
-    runtime_assert(dst->dtype == TINY_DTYPE_FLOAT32, "gelu expects float output");
     runtime_assert(dst->elem_count == src->elem_count, "gelu size mismatch");
     for (int i = 0; i < src->elem_count; ++i) {
         float value = tensor_get_float(src, i);
         float erf_term = host_erf_approx(value * 0.70710678f);
-        tensor_set_float(dst, i, 0.5f * value * (1.0f + erf_term));
+        float out = 0.5f * value * (1.0f + erf_term);
+        if (dst->dtype == TINY_DTYPE_FLOAT32) {
+            tensor_set_float(dst, i, out);
+        } else {
+            tensor_set_i32(dst, i, (int16_t)host_float32_to_fp16_bits(out));
+        }
     }
 }
 
@@ -608,6 +615,11 @@ static void host_quantize(TinyTensor *dst, const TinyTensor *src, float inv_scal
         int64_t quantized = host_round_to_i64(source * inv_scale) + (int64_t)zero_point;
         tensor_set_i32(dst, i, clip_for_dtype(quantized, dst->dtype));
     }
+}
+
+static void host_quantize_fp16bits_attr(TinyTensor *dst, const TinyTensor *src, float inv_scale, int zero_point)
+{
+    host_quantize_fp16bits(dst, src, inv_scale, zero_point);
 }
 
 static void host_quantize_fp16bits(TinyTensor *dst, const TinyTensor *src, float inv_scale, int zero_point)
@@ -973,7 +985,6 @@ static void host_rmsnorm(TinyTensor *dst, const TinyTensor *src, const TinyTenso
 static void host_layernorm(TinyTensor *dst, const TinyTensor *src, const TinyTensor *weight_bias, float eps)
 {
     runtime_assert(eps > 0.0f, "layernorm eps must be positive");
-    runtime_assert(dst->dtype == TINY_DTYPE_FLOAT32, "layernorm output must be float");
     runtime_assert(src->rank >= 1, "layernorm expects rank >= 1");
     runtime_assert(dst->elem_count == src->elem_count, "layernorm size mismatch");
 
@@ -1000,7 +1011,12 @@ static void host_layernorm(TinyTensor *dst, const TinyTensor *src, const TinyTen
                 float centered = tensor_get_float(src, base + i) - mean;
                 float scale = tensor_get_float(weight_bias, i);
                 float bias = tensor_get_float(weight_bias, hidden + i);
-                tensor_set_float(dst, base + i, centered * inv_std * scale + bias);
+                float out = centered * inv_std * scale + bias;
+                if (dst->dtype == TINY_DTYPE_FLOAT32) {
+                    tensor_set_float(dst, base + i, out);
+                } else {
+                    tensor_set_i32(dst, base + i, (int16_t)host_float32_to_fp16_bits(out));
+                }
             }
         }
     }
@@ -1249,6 +1265,110 @@ static void host_k_cache_scatter_write(
     (void)scatter_addrs;
     (void)token_lane;
     runtime_assert(0, "k_cache_scatter_write requires TINYNPU_USE_SHARED_SRAM=1");
+#endif
+}
+
+static void host_v_cache_scatter_write(
+    const TinyTensor *src,
+    const int *scatter_addrs,
+    int scatter_count)
+{
+    runtime_assert(src->dtype == TINY_DTYPE_INT16, "v_cache_scatter_write: input must be INT16");
+    runtime_assert(scatter_count > 0, "v_cache_scatter_write: scatter_count must be positive");
+#if TINYNPU_USE_SHARED_SRAM
+    volatile int16_t *ub = (volatile int16_t *)((uintptr_t)NPU_SHARED_UB_BASE);
+    for (int tile = 0; tile < scatter_count; ++tile) {
+        const int base = tile * 8;
+        for (int lane = 0; lane < 8; ++lane) {
+            const int elem = base + lane;
+            if (elem < src->elem_count) {
+                ub[scatter_addrs[tile] * 8 + lane] = (int16_t)tensor_get_i32(src, elem);
+            }
+        }
+    }
+#else
+    (void)scatter_addrs;
+    (void)scatter_count;
+    runtime_assert(0, "v_cache_scatter_write requires TINYNPU_USE_SHARED_SRAM=1");
+#endif
+}
+
+static void host_k_cache_scatter_matrix(TinyTensor *dst, const TinyTensor *src, int base_addr)
+{
+    runtime_assert(dst->dtype == TINY_DTYPE_INT16, "k_cache_scatter_matrix: output must be INT16");
+    runtime_assert(src->dtype == TINY_DTYPE_INT16, "k_cache_scatter_matrix: input must be INT16");
+    runtime_assert(src->rank >= 2, "k_cache_scatter_matrix expects rank >= 2 input");
+    runtime_assert(dst->rank >= 2, "k_cache_scatter_matrix expects rank >= 2 output");
+    const int token_count = src->shape[0];
+    const int d_head = src->shape[1];
+    runtime_assert(dst->shape[0] == d_head, "k_cache_scatter_matrix output row mismatch");
+    runtime_assert(dst->shape[1] >= token_count, "k_cache_scatter_matrix output token capacity too small");
+    for (int token = 0; token < token_count; ++token) {
+        for (int row = 0; row < d_head; ++row) {
+            tensor_set_i32(dst, row * dst->shape[1] + token, tensor_get_i32(src, token * d_head + row));
+        }
+    }
+#if TINYNPU_USE_SHARED_SRAM
+    {
+        volatile int16_t *ub = (volatile int16_t *)((uintptr_t)NPU_SHARED_UB_BASE);
+        const int k_tiles = (d_head + 7) / 8;
+        const int block_words = k_tiles * 8;
+        for (int token = 0; token < token_count; ++token) {
+            const int token_block = token / 8;
+            const int token_lane = token % 8;
+            const int block_base = base_addr + token_block * block_words;
+            for (int row = 0; row < d_head; ++row) {
+                const int k_tile = row / 8;
+                const int row_in_tile = row % 8;
+                const int word_addr = block_base + k_tile * 8 + row_in_tile;
+                ub[word_addr * 8 + token_lane] = (int16_t)tensor_get_i32(src, token * d_head + row);
+            }
+        }
+    }
+#else
+    (void)base_addr;
+    runtime_assert(0, "k_cache_scatter_matrix requires TINYNPU_USE_SHARED_SRAM=1");
+#endif
+}
+
+static void host_v_cache_scatter_matrix(TinyTensor *dst, const TinyTensor *src, int base_addr)
+{
+    runtime_assert(dst->dtype == TINY_DTYPE_INT16, "v_cache_scatter_matrix: output must be INT16");
+    runtime_assert(src->dtype == TINY_DTYPE_INT16, "v_cache_scatter_matrix: input must be INT16");
+    runtime_assert(src->rank >= 2, "v_cache_scatter_matrix expects rank >= 2 input");
+    runtime_assert(dst->rank >= 2, "v_cache_scatter_matrix expects rank >= 2 output");
+    const int token_count = src->shape[0];
+    const int d_head = src->shape[1];
+    runtime_assert(dst->shape[0] >= token_count, "v_cache_scatter_matrix output token capacity too small");
+    runtime_assert(dst->shape[1] == d_head, "v_cache_scatter_matrix output column mismatch");
+    for (int token = 0; token < token_count; ++token) {
+        for (int col = 0; col < d_head; ++col) {
+            tensor_set_i32(dst, token * d_head + col, tensor_get_i32(src, token * d_head + col));
+        }
+    }
+#if TINYNPU_USE_SHARED_SRAM
+    {
+        volatile int16_t *ub = (volatile int16_t *)((uintptr_t)NPU_SHARED_UB_BASE);
+        const int n_tiles = (d_head + 7) / 8;
+        const int block_words = n_tiles * 8;
+        for (int token = 0; token < token_count; ++token) {
+            const int token_block = token / 8;
+            const int row_in_block = token % 8;
+            const int block_base = base_addr + token_block * block_words;
+            for (int n_tile = 0; n_tile < n_tiles; ++n_tile) {
+                const int word_addr = block_base + n_tile * 8 + row_in_block;
+                for (int lane = 0; lane < 8; ++lane) {
+                    const int col = n_tile * 8 + lane;
+                    if (col < d_head) {
+                        ub[word_addr * 8 + lane] = (int16_t)tensor_get_i32(src, token * d_head + col);
+                    }
+                }
+            }
+        }
+    }
+#else
+    (void)base_addr;
+    runtime_assert(0, "v_cache_scatter_matrix requires TINYNPU_USE_SHARED_SRAM=1");
 #endif
 }
 

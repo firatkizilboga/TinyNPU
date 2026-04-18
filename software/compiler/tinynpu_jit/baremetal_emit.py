@@ -194,12 +194,16 @@ def _emit_host_step_attrs(
         scale = float(step.attrs["scale"])
         inv_scale = 1.0 / scale
         zero_point = int(step.attrs.get("zero_point", 0))
-        src_from_softmax_f16 = False
+        src_from_fp16bits = str(step.attrs.get("input_encoding", "")) == "fp16_bits"
         for producer in artifact.plan.steps:
             if isinstance(producer, HostOp) and producer.outputs and producer.outputs[0] == step.inputs[0]:
-                src_from_softmax_f16 = producer.kind == "softmax_f16"
+                src_from_fp16bits = (
+                    src_from_fp16bits
+                    or producer.kind == "softmax_f16"
+                    or str(producer.attrs.get("output_encoding", "")) == "fp16_bits"
+                )
                 break
-        fn = "host_quantize_fp16bits" if src_from_softmax_f16 else "host_quantize"
+        fn = "host_quantize_fp16bits" if src_from_fp16bits else "host_quantize"
         lines.append(f"    {fn}({out_ref}, {in_ref}, {_format_scalar(inv_scale, dtype=DType.FLOAT32)}, {zero_point});")
     elif step.kind == "dequantize":
         scale = float(step.attrs["scale"])
@@ -321,6 +325,23 @@ def _emit_host_step_attrs(
                 + "};"
             )
             lines.append(f"    host_k_cache_scatter_write({in_ref}, {arr_name}, {token_lane});")
+    elif step.kind == "v_cache_scatter_write":
+        out_spec = artifact.plan.tensors[step.outputs[0]]
+        token_index = int(step.attrs.get("token_index", out_spec.metadata["cache_token_index"]))
+        if cpu_only_baseline:
+            base_name = str(step.attrs.get("v_cache_base", out_spec.metadata["storage_view_of"]))
+            base_ref = _emit_tensor_reference(base_name)
+            lines.append(f"    host_commit_v_cache_slot({base_ref}, {in_ref}, {token_index});")
+        else:
+            scatter_addrs = tuple(int(v) for v in out_spec.metadata["cache_scatter_word_addrs"])
+            arr_name = f"{prefix}_scatter_addrs"
+            decls.append(
+                f"static const int {arr_name}[{len(scatter_addrs)}] = "
+                + "{"
+                + ", ".join(str(v) for v in scatter_addrs)
+                + "};"
+            )
+            lines.append(f"    host_v_cache_scatter_write({in_ref}, {arr_name}, {len(scatter_addrs)});")
     else:
         raise NotImplementedError(f"Bare-metal runtime emitter does not support host op '{step.kind}'.")
     return decls, lines
