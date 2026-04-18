@@ -1,17 +1,196 @@
 from __future__ import annotations
 
+from collections import defaultdict
+
 import numpy as np
 
 from tinynpu import TinyNPUProgram
 
 from .artifact import CompiledArtifact, SegmentArtifact
-from .ir import DType, ExecutionPlan, HostOp, NpuSegment, TensorKind, VerifyTensor, to_precision_mode
+from .ir import (
+    DType,
+    ExecutionPlan,
+    HostOp,
+    MatMulOp,
+    NpuSegment,
+    TensorKind,
+    VerifyTensor,
+    make_rope_cs_tensor_spec,
+    to_precision_mode,
+)
 from .memory_planner import (
     MemoryPlanEntry,
     SegmentMemoryPlan,
     infer_roles,
     plan_program_memory,
 )
+
+
+def _tensor_use_counts(plan: ExecutionPlan) -> dict[str, int]:
+    counts: dict[str, int] = defaultdict(int)
+    for step in plan.steps:
+        if isinstance(step, HostOp):
+            for name in step.inputs:
+                counts[name] += 1
+        elif isinstance(step, NpuSegment):
+            for op in step.ops:
+                counts[op.lhs] += 1
+                counts[op.rhs] += 1
+                if op.bias:
+                    counts[op.bias] += 1
+        elif isinstance(step, VerifyTensor):
+            counts[step.tensor_name] += 1
+    return counts
+
+
+def _replace_segment_output(segment: NpuSegment, old_name: str, new_name: str) -> None:
+    segment.outputs = [new_name if name == old_name else name for name in segment.outputs]
+
+
+def _can_lower_rope_pattern(
+    plan: ExecutionPlan,
+    producer_op: MatMulOp,
+    source_name: str,
+    dequant: HostOp,
+    rope: HostOp,
+    quant: HostOp,
+    use_counts: dict[str, int],
+) -> bool:
+    if producer_op.rope_cs_name is not None:
+        return False
+    if producer_op.in_dtype != DType.INT16 or producer_op.out_dtype != DType.INT16:
+        return False
+    if plan.tensors[source_name].dtype != DType.INT16:
+        return False
+    if len(dequant.inputs) != 1 or len(dequant.outputs) != 1:
+        return False
+    if len(rope.inputs) != 1 or len(rope.outputs) != 1:
+        return False
+    if len(quant.inputs) != 1 or len(quant.outputs) != 1:
+        return False
+    if dequant.outputs[0] != rope.inputs[0]:
+        return False
+    if rope.outputs[0] != quant.inputs[0]:
+        return False
+    if use_counts.get(source_name, 0) != 1:
+        return False
+    if use_counts.get(dequant.outputs[0], 0) != 1:
+        return False
+    if use_counts.get(rope.outputs[0], 0) != 1:
+        return False
+    source_spec = plan.tensors[source_name]
+    target_spec = plan.tensors[quant.outputs[0]]
+    if source_spec.shape != target_spec.shape or target_spec.dtype != DType.INT16:
+        return False
+
+    deq_scale = float(dequant.attrs.get("scale", 1.0))
+    quant_scale = float(quant.attrs.get("scale", 1.0))
+    deq_zero = int(dequant.attrs.get("zero_point", 0))
+    quant_zero = int(quant.attrs.get("zero_point", 0))
+    quant_dtype = quant.attrs.get("dtype", DType.INT16)
+    if quant_dtype != DType.INT16:
+        return False
+    if deq_zero != quant_zero:
+        return False
+    if abs(deq_scale - quant_scale) > 1.0e-12:
+        return False
+
+    head_dim = int(rope.attrs.get("head_dim", 0))
+    position = rope.attrs.get("position")
+    theta = rope.attrs.get("theta")
+    if head_dim <= 0 or head_dim % 16 != 0:
+        return False
+    if position is None or theta is None:
+        return False
+    if source_spec.shape[-1] != head_dim:
+        return False
+    return True
+
+
+def rewrite_host_rope_patterns(plan: ExecutionPlan) -> None:
+    producer_by_tensor: dict[str, tuple[NpuSegment, MatMulOp]] = {}
+    for step in plan.steps:
+        if isinstance(step, NpuSegment):
+            for op in step.ops:
+                producer_by_tensor[op.out] = (step, op)
+
+    use_counts = _tensor_use_counts(plan)
+    new_steps: list[HostOp | NpuSegment | VerifyTensor] = []
+    index = 0
+    while index < len(plan.steps):
+        step = plan.steps[index]
+        if (
+            index + 2 < len(plan.steps)
+            and isinstance(step, HostOp)
+            and step.kind == "dequantize"
+            and isinstance(plan.steps[index + 1], HostOp)
+            and plan.steps[index + 1].kind == "rope"
+            and isinstance(plan.steps[index + 2], HostOp)
+            and plan.steps[index + 2].kind == "quantize"
+        ):
+            dequant = step
+            rope = plan.steps[index + 1]
+            quant = plan.steps[index + 2]
+            source_name = dequant.inputs[0]
+            producer = producer_by_tensor.get(source_name)
+            if producer is not None:
+                segment, producer_op = producer
+                if _can_lower_rope_pattern(plan, producer_op, source_name, dequant, rope, quant, use_counts):
+                    target_name = quant.outputs[0]
+                    rope_cs_name = f"{target_name}__rope_cs"
+                    if rope_cs_name not in plan.tensors:
+                        plan.tensors[rope_cs_name] = make_rope_cs_tensor_spec(
+                            rope_cs_name,
+                            int(rope.attrs["head_dim"]),
+                            int(rope.attrs["position"]),
+                            float(rope.attrs["theta"]),
+                            kind=TensorKind.CONSTANT,
+                        )
+                    producer_op.out = target_name
+                    producer_op.rope_cs_name = rope_cs_name
+                    _replace_segment_output(segment, source_name, target_name)
+                    producer_by_tensor.pop(source_name, None)
+                    producer_by_tensor[target_name] = (segment, producer_op)
+                    index += 3
+                    continue
+        new_steps.append(step)
+        index += 1
+    plan.steps = new_steps
+
+
+def prune_unused_tensors(plan: ExecutionPlan) -> None:
+    referenced: set[str] = set(plan.inputs + plan.outputs)
+    for step in plan.steps:
+        if isinstance(step, HostOp):
+            referenced.update(step.inputs)
+            referenced.update(step.outputs)
+        elif isinstance(step, NpuSegment):
+            referenced.update(step.inputs)
+            referenced.update(step.outputs)
+            for op in step.ops:
+                referenced.add(op.lhs)
+                referenced.add(op.rhs)
+                referenced.add(op.out)
+                if op.bias:
+                    referenced.add(op.bias)
+                if op.rope_cs_name:
+                    referenced.add(op.rope_cs_name)
+        elif isinstance(step, VerifyTensor):
+            referenced.add(step.tensor_name)
+
+    changed = True
+    while changed:
+        changed = False
+        for name in list(referenced):
+            spec = plan.tensors.get(name)
+            if spec is None:
+                continue
+            base_name = spec.metadata.get("storage_view_of")
+            if base_name and str(base_name) not in referenced:
+                referenced.add(str(base_name))
+                changed = True
+
+    plan.tensors = {name: spec for name, spec in plan.tensors.items() if name in referenced}
 
 
 class SegmentCompiler:
@@ -21,6 +200,8 @@ class SegmentCompiler:
     def compile(self, plan: ExecutionPlan, expected_tensors: dict[str, np.ndarray]) -> CompiledArtifact:
         _tmp = TinyNPUProgram(defines_path=self.defines_path)
         array_size = int(_tmp.hw.params.get("ARRAY_SIZE", 8))
+        rewrite_host_rope_patterns(plan)
+        prune_unused_tensors(plan)
         self._fuse_layout_restore_im2col(plan)
         self._annotate_output_layouts(plan)
         # Read UB capacity from hardware config

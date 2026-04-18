@@ -158,6 +158,16 @@ def _activation_code(kind: str) -> int:
     return mapping[kind]
 
 
+def _lookup_tensor_addr(artifact: CompiledArtifact, tensor_name: str) -> int:
+    if artifact.memory_report is None:
+        return 0
+    for segment in artifact.memory_report.segments:
+        for entry in segment.entries:
+            if entry.name == tensor_name:
+                return int(entry.address)
+    return 0
+
+
 def _emit_host_step_attrs(
     step: HostOp,
     artifact: CompiledArtifact,
@@ -342,6 +352,12 @@ def _emit_host_step_attrs(
                 + "};"
             )
             lines.append(f"    host_v_cache_scatter_write({in_ref}, {arr_name}, {len(scatter_addrs)});")
+    elif step.kind == "k_cache_scatter_matrix":
+        base_addr = 0 if cpu_only_baseline else _lookup_tensor_addr(artifact, step.outputs[0])
+        lines.append(f"    host_k_cache_scatter_matrix({out_ref}, {in_ref}, {base_addr});")
+    elif step.kind == "v_cache_scatter_matrix":
+        base_addr = 0 if cpu_only_baseline else _lookup_tensor_addr(artifact, step.outputs[0])
+        lines.append(f"    host_v_cache_scatter_matrix({out_ref}, {in_ref}, {base_addr});")
     else:
         raise NotImplementedError(f"Bare-metal runtime emitter does not support host op '{step.kind}'.")
     return decls, lines
@@ -567,6 +583,10 @@ def emit_cv32e40p_c(
                         f"{_segment_ref(op.out)}, {_segment_ref(op.lhs)}, {_segment_ref(op.rhs)}, {_segment_ref(op.bias)}, "
                         f"{int(op.multiplier)}, {int(op.shift)}, {_activation_code(op.activation)}, {int(op.h_gelu_x_scale_shift)});"
                     )
+                    if op.rope_cs_name:
+                        body_lines.append(
+                            f"    host_rope_k16_q14({_segment_ref(op.out)}, {_segment_ref(op.out)}, {_segment_ref(op.rope_cs_name)});"
+                        )
                     body_lines.extend(_cpu_only_sync_output_lines(op.out))
                 body_lines.append("    cycle_t1 = read_mcycle32();")
                 if repeat_count > 1:

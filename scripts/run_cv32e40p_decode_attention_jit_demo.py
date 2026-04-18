@@ -23,7 +23,6 @@ from tinynpu_jit import (  # noqa: E402
     emit_cv32e40p_program_v2,
     make_native_int16_kv_cache_specs,
     make_rope_cos_sin_table_q14,
-    make_rope_cs_tensor_spec,
 )
 from tinynpu_jit.golden import GoldenModel  # noqa: E402
 
@@ -154,7 +153,7 @@ def build_artifact(
 
     rng = np.random.default_rng(seed)
     golden = GoldenModel()
-    use_hw_rope_k = (d_head % 16) == 0
+    use_hw_rope = (d_head % 16) == 0
 
     tensors: dict[str, TensorSpec] = {}
     q_to_kv_head = [q_head * n_kv_heads // n_heads for q_head in range(n_heads)]
@@ -245,6 +244,7 @@ def build_artifact(
         k_rope_q_by_head: dict[int, np.ndarray] = {}
         for kv_head in range(n_kv_heads):
             k_proj_name = f"k_proj_s{step_idx}_h{kv_head}"
+            k_proj_f_name = f"k_proj_f_s{step_idx}_h{kv_head}"
             k_rope_f_name = f"k_rope_f_s{step_idx}_h{kv_head}"
             k_rope_q_name = f"k_rope_q_s{step_idx}_h{kv_head}"
             v_slot_name = f"v_cache_h{kv_head}_{step_name}"
@@ -253,7 +253,7 @@ def build_artifact(
             v_val = golden.matmul(x_t, w_v_by_head[kv_head], out_dtype=DType.INT16)
             v_cache_by_head[kv_head][cache_slot, :] = v_val[0]
             k_val_f = golden.dequantize(k_val, scale=proj_scale, zero_point=0)
-            if use_hw_rope_k:
+            if use_hw_rope:
                 k_rope_q = _rope_q14_int16_ref(k_val, position=token_pos, head_dim=d_head, theta=rope_theta)
             else:
                 k_rope_f = _rope_ref(k_val_f, position=token_pos, head_dim=d_head, theta=rope_theta)
@@ -265,31 +265,11 @@ def build_artifact(
                 k_rope_verify_expected = k_rope_q.copy()
 
             tensors[k_rope_q_name] = TensorSpec(k_rope_q_name, k_val.shape, DType.INT16, TensorKind.INTERMEDIATE)
-            k_slot_name = f"k_cache_h{kv_head}_{step_name}"
-            if use_hw_rope_k:
-                rope_cs_name = f"k_rope_cs_s{step_idx}_h{kv_head}"
-                tensors[rope_cs_name] = make_rope_cs_tensor_spec(
-                    rope_cs_name,
-                    d_head,
-                    token_pos,
-                    rope_theta,
-                    kind=TensorKind.CONSTANT,
-                )
-                seg_proj_ops.append(
-                    MatMulOp(
-                        f"op_k_proj_h{kv_head}_s{step_idx}",
-                        x_name,
-                        f"w_k_h{kv_head}",
-                        k_rope_q_name,
-                        rope_cs_name=rope_cs_name,
-                    )
-                )
-                seg_proj_outputs.append(k_rope_q_name)
-            else:
-                tensors[k_proj_name] = TensorSpec(k_proj_name, k_val.shape, DType.INT16, TensorKind.INTERMEDIATE)
-                tensors[k_rope_f_name] = TensorSpec(k_rope_f_name, k_val.shape, DType.FLOAT32, TensorKind.INTERMEDIATE)
-                seg_proj_ops.append(MatMulOp(f"op_k_proj_h{kv_head}_s{step_idx}", x_name, f"w_k_h{kv_head}", k_proj_name))
-                seg_proj_outputs.append(k_proj_name)
+            tensors[k_proj_name] = TensorSpec(k_proj_name, k_val.shape, DType.INT16, TensorKind.INTERMEDIATE)
+            tensors[k_proj_f_name] = TensorSpec(k_proj_f_name, k_val.shape, DType.FLOAT32, TensorKind.INTERMEDIATE)
+            tensors[k_rope_f_name] = TensorSpec(k_rope_f_name, k_val.shape, DType.FLOAT32, TensorKind.INTERMEDIATE)
+            seg_proj_ops.append(MatMulOp(f"op_k_proj_h{kv_head}_s{step_idx}", x_name, f"w_k_h{kv_head}", k_proj_name))
+            seg_proj_outputs.append(k_proj_name)
             seg_proj_ops.append(MatMulOp(f"op_v_proj_h{kv_head}_s{step_idx}", x_name, f"w_v_h{kv_head}", v_slot_name))
 
         for q_head in range(n_heads):
@@ -298,9 +278,12 @@ def build_artifact(
             q_rope_f_name = f"q_rope_f_s{step_idx}_h{q_head}"
             q_rope_q_name = f"q_rope_q_s{step_idx}_h{q_head}"
             q_val = golden.matmul(x_t, w_q_by_head[q_head], out_dtype=DType.INT16)
-            q_val_f = golden.dequantize(q_val, scale=proj_scale, zero_point=0)
-            q_rope_f = _rope_ref(q_val_f, position=token_pos, head_dim=d_head, theta=rope_theta)
-            q_rope_q = golden.quantize(q_rope_f, scale=proj_scale, zero_point=0, out_dtype=DType.INT16)
+            if use_hw_rope:
+                q_rope_q = _rope_q14_int16_ref(q_val, position=token_pos, head_dim=d_head, theta=rope_theta)
+            else:
+                q_val_f = golden.dequantize(q_val, scale=proj_scale, zero_point=0)
+                q_rope_f = _rope_ref(q_val_f, position=token_pos, head_dim=d_head, theta=rope_theta)
+                q_rope_q = golden.quantize(q_rope_f, scale=proj_scale, zero_point=0, out_dtype=DType.INT16)
             q_rope_q_by_head[q_head] = q_rope_q
             tensors[q_proj_name] = TensorSpec(q_proj_name, q_val.shape, DType.INT16, TensorKind.INTERMEDIATE)
             tensors[q_proj_f_name] = TensorSpec(q_proj_f_name, q_val.shape, DType.FLOAT32, TensorKind.INTERMEDIATE)
@@ -317,35 +300,34 @@ def build_artifact(
 
         steps.append(NpuSegment(f"seg_proj_s{step_idx}", seg_proj_ops, inputs=[], outputs=seg_proj_outputs))
 
-        if not use_hw_rope_k:
-            for kv_head in range(n_kv_heads):
-                steps.append(
-                    HostOp(
-                        f"dequant_k_proj_s{step_idx}_h{kv_head}",
-                        "dequantize",
-                        inputs=[f"k_proj_s{step_idx}_h{kv_head}"],
-                        outputs=[f"k_proj_f_s{step_idx}_h{kv_head}"],
-                        attrs={"scale": proj_scale, "zero_point": 0},
-                    )
+        for kv_head in range(n_kv_heads):
+            steps.append(
+                HostOp(
+                    f"dequant_k_proj_s{step_idx}_h{kv_head}",
+                    "dequantize",
+                    inputs=[f"k_proj_s{step_idx}_h{kv_head}"],
+                    outputs=[f"k_proj_f_s{step_idx}_h{kv_head}"],
+                    attrs={"scale": proj_scale, "zero_point": 0},
                 )
-                steps.append(
-                    HostOp(
-                        f"rope_k_proj_s{step_idx}_h{kv_head}",
-                        "rope",
-                        inputs=[f"k_proj_f_s{step_idx}_h{kv_head}"],
-                        outputs=[f"k_rope_f_s{step_idx}_h{kv_head}"],
-                        attrs={"head_dim": d_head, "position": token_pos, "theta": rope_theta},
-                    )
+            )
+            steps.append(
+                HostOp(
+                    f"rope_k_proj_s{step_idx}_h{kv_head}",
+                    "rope",
+                    inputs=[f"k_proj_f_s{step_idx}_h{kv_head}"],
+                    outputs=[f"k_rope_f_s{step_idx}_h{kv_head}"],
+                    attrs={"head_dim": d_head, "position": token_pos, "theta": rope_theta},
                 )
-                steps.append(
-                    HostOp(
-                        f"quant_k_rope_s{step_idx}_h{kv_head}",
-                        "quantize",
-                        inputs=[f"k_rope_f_s{step_idx}_h{kv_head}"],
-                        outputs=[f"k_rope_q_s{step_idx}_h{kv_head}"],
-                        attrs={"scale": proj_scale, "zero_point": 0, "dtype": DType.INT16},
-                    )
+            )
+            steps.append(
+                HostOp(
+                    f"quant_k_rope_s{step_idx}_h{kv_head}",
+                    "quantize",
+                    inputs=[f"k_rope_f_s{step_idx}_h{kv_head}"],
+                    outputs=[f"k_rope_q_s{step_idx}_h{kv_head}"],
+                    attrs={"scale": proj_scale, "zero_point": 0, "dtype": DType.INT16},
                 )
+            )
         for kv_head in range(n_kv_heads):
             steps.append(
                 HostOp(
