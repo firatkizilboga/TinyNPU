@@ -64,6 +64,124 @@ def _layernorm_ref(x: np.ndarray, weight_bias: np.ndarray, eps: float) -> np.nda
     return (norm * weight.reshape(shape) + bias.reshape(shape)).astype(np.float32)
 
 
+def _fp16_roundtrip(x: np.ndarray) -> np.ndarray:
+    return np.asarray(x, dtype=np.float32).astype(np.float16).astype(np.float32)
+
+
+def _fp16_bits_carrier(x: np.ndarray) -> np.ndarray:
+    return np.asarray(x, dtype=np.float32).astype(np.float16).view(np.uint16).astype(np.int16)
+
+
+def _host_recip_approx_scalar(x: float) -> float:
+    if x <= 0.0:
+        raise ValueError("reciprocal input must be positive")
+    exp2 = 0
+    while x > 1.0:
+        x *= 0.5
+        exp2 += 1
+    while x < 0.5:
+        x *= 2.0
+        exp2 -= 1
+    y = 2.8235295 - 1.8823529 * x
+    y = y * (2.0 - x * y)
+    y = y * (2.0 - x * y)
+    while exp2 > 0:
+        y *= 0.5
+        exp2 -= 1
+    while exp2 < 0:
+        y *= 2.0
+        exp2 += 1
+    return y
+
+
+def _host_rsqrt_approx_scalar(x: float) -> float:
+    if x <= 0.0:
+        raise ValueError("rsqrt input must be positive")
+    scale = 1.0
+    while x > 2.0:
+        x *= 0.25
+        scale *= 0.5
+    while x < 0.5:
+        x *= 4.0
+        scale *= 2.0
+    y = 1.25 - 0.25 * x
+    for _ in range(4):
+        y = y * (1.5 - 0.5 * x * y * y)
+    return y * scale
+
+
+def _host_exp_approx_scalar(x: float) -> float:
+    exp_neg_int = (
+        1.0,
+        0.36787945,
+        0.13533528,
+        0.049787067,
+        0.018315639,
+        0.0067379470,
+        0.0024787522,
+        0.00091188195,
+        0.00033546263,
+        0.00012340980,
+        0.000045399930,
+        0.000016701700,
+        0.0000061442124,
+        0.0000022603294,
+        0.00000083152872,
+        0.00000030590232,
+        0.00000011253518,
+    )
+    if x == 0.0:
+        return 1.0
+    if x > 0.0:
+        return _host_recip_approx_scalar(_host_exp_approx_scalar(-x))
+    if x <= -16.0:
+        return 0.0
+    k = int(-x)
+    r = x + float(k)
+    poly = 1.0 + r * (1.0 + r * (0.5 + r * (0.16666667 + r * (0.04166667 + r * 0.0083333333))))
+    return exp_neg_int[k] * max(poly, 0.0)
+
+
+def _host_erf_approx_scalar(x: float) -> float:
+    p = 0.3275911
+    a1 = 0.25482959
+    a2 = -0.28449672
+    a3 = 1.4214138
+    a4 = -1.4531521
+    a5 = 1.0614054
+    sign = 1.0
+    if x < 0.0:
+        sign = -1.0
+        x = -x
+    t = _host_recip_approx_scalar(1.0 + p * x)
+    poly = (((((a5 * t) + a4) * t + a3) * t + a2) * t + a1) * t
+    return sign * (1.0 - poly * _host_exp_approx_scalar(-(x * x)))
+
+
+def _gelu_runtime_approx(x: np.ndarray) -> np.ndarray:
+    source = np.asarray(x, dtype=np.float32)
+    erf_term = np.vectorize(lambda v: _host_erf_approx_scalar(float(v) * 0.70710678), otypes=[np.float32])(source)
+    return (0.5 * source * (1.0 + erf_term)).astype(np.float32)
+
+
+def _layernorm_runtime_approx(x: np.ndarray, weight_bias: np.ndarray, eps: float) -> np.ndarray:
+    hidden = x.shape[-1]
+    flat = np.asarray(weight_bias, dtype=np.float32).reshape(-1)
+    weight = flat[:hidden]
+    bias = flat[hidden:]
+    out = np.zeros_like(x, dtype=np.float32)
+    x2 = np.asarray(x, dtype=np.float32).reshape(-1, hidden)
+    out2 = out.reshape(-1, hidden)
+    for row_idx in range(x2.shape[0]):
+        row = x2[row_idx]
+        mean = float(np.sum(row, dtype=np.float32)) * _host_recip_approx_scalar(float(hidden))
+        centered = row - np.float32(mean)
+        var = float(np.sum(centered * centered, dtype=np.float32)) * _host_recip_approx_scalar(float(hidden))
+        inv_std = _host_rsqrt_approx_scalar(var + float(eps))
+        out2[row_idx] = (centered * np.float32(inv_std) * weight + bias).astype(np.float32)
+    return out
+
+
 def build_plan(
     *,
     d_model: int = 32,
@@ -74,6 +192,11 @@ def build_plan(
     seed: int = 0,
     act_scale: float = 1.0 / 32.0,
     attn_scale: float = 1.0 / 256.0,
+    verify_tensors: tuple[str, ...] = ("out",),
+    ffn_fc_activation: str = "h_gelu",
+    ffn_fc_zero_bias: bool = False,
+    ffn_fc_weight_mode: str = "normal",
+    ffn_fc_input_name: str = "x_norm2_q",
 ):
     if d_model <= 0 or d_model % 8 != 0:
         raise ValueError("d_model must be a positive multiple of 8")
@@ -99,8 +222,14 @@ def build_plan(
     ln1_wb = np.stack([ln1_gamma, ln1_beta], axis=0).astype(np.float32)
     ln2_wb = np.stack([ln2_gamma, ln2_beta], axis=0).astype(np.float32)
     w_o = _rand_i16(rng, (attn_dim, d_model))
-    w_fc = _rand_i16(rng, (d_model, ffn_dim))
+    if ffn_fc_weight_mode == "identity":
+        if d_model != ffn_dim:
+            raise ValueError("ffn_fc_weight_mode=identity requires d_model == ffn_dim")
+        w_fc = np.eye(d_model, dtype=np.int16)
+    else:
+        w_fc = _rand_i16(rng, (d_model, ffn_dim))
     w_proj = _rand_i16(rng, (ffn_dim, d_model))
+    ffn_zero_bias = np.zeros((1, ffn_dim), dtype=np.int16) if ffn_fc_zero_bias else None
 
     tensors: dict[str, TensorSpec] = {
         "x": TensorSpec("x", x.shape, DType.INT16, TensorKind.CONSTANT, data=x),
@@ -112,7 +241,7 @@ def build_plan(
         "w_fc": TensorSpec("w_fc", w_fc.shape, DType.INT16, TensorKind.CONSTANT, data=w_fc),
         "w_proj": TensorSpec("w_proj", w_proj.shape, DType.INT16, TensorKind.CONSTANT, data=w_proj),
         "x_pos": TensorSpec("x_pos", (token_count, d_model), DType.FLOAT32, TensorKind.INTERMEDIATE),
-        "x_norm1": TensorSpec("x_norm1", (token_count, d_model), DType.FLOAT32, TensorKind.INTERMEDIATE),
+        "x_norm1": TensorSpec("x_norm1", (token_count, d_model), DType.INT16, TensorKind.INTERMEDIATE),
         "x_norm1_q": TensorSpec(
             "x_norm1_q",
             (token_count, d_model),
@@ -123,7 +252,7 @@ def build_plan(
         "o_int": TensorSpec("o_int", (token_count, d_model), DType.INT16, TensorKind.INTERMEDIATE),
         "o_f": TensorSpec("o_f", (token_count, d_model), DType.FLOAT32, TensorKind.INTERMEDIATE),
         "resid1": TensorSpec("resid1", (token_count, d_model), DType.FLOAT32, TensorKind.INTERMEDIATE),
-        "x_norm2": TensorSpec("x_norm2", (token_count, d_model), DType.FLOAT32, TensorKind.INTERMEDIATE),
+        "x_norm2": TensorSpec("x_norm2", (token_count, d_model), DType.INT16, TensorKind.INTERMEDIATE),
         "x_norm2_q": TensorSpec(
             "x_norm2_q",
             (token_count, d_model),
@@ -132,10 +261,8 @@ def build_plan(
             metadata={"storage_role": "A"},
         ),
         "ffn_fc_int": TensorSpec("ffn_fc_int", (token_count, ffn_dim), DType.INT16, TensorKind.INTERMEDIATE),
-        "ffn_fc_f": TensorSpec("ffn_fc_f", (token_count, ffn_dim), DType.FLOAT32, TensorKind.INTERMEDIATE),
-        "ffn_gelu": TensorSpec("ffn_gelu", (token_count, ffn_dim), DType.FLOAT32, TensorKind.INTERMEDIATE),
-        "ffn_gelu_q": TensorSpec(
-            "ffn_gelu_q",
+        "ffn_fc_a": TensorSpec(
+            "ffn_fc_a",
             (token_count, ffn_dim),
             DType.INT16,
             TensorKind.INTERMEDIATE,
@@ -143,8 +270,23 @@ def build_plan(
         ),
         "ffn_out_int": TensorSpec("ffn_out_int", (token_count, d_model), DType.INT16, TensorKind.INTERMEDIATE),
         "ffn_out_f": TensorSpec("ffn_out_f", (token_count, d_model), DType.FLOAT32, TensorKind.INTERMEDIATE),
-        "out": TensorSpec("out", (token_count, d_model), DType.FLOAT32, TensorKind.OUTPUT, is_final_output=True),
+        "out": TensorSpec(
+            "out",
+            (token_count, d_model),
+            DType.FLOAT32,
+            TensorKind.OUTPUT,
+            is_final_output=True,
+            metadata={"verify_atol": 0.5},
+        ),
     }
+    if ffn_zero_bias is not None:
+        tensors["a_ffn_zero_bias"] = TensorSpec(
+            "a_ffn_zero_bias",
+            ffn_zero_bias.shape,
+            DType.INT16,
+            TensorKind.CONSTANT,
+            data=ffn_zero_bias,
+        )
 
     q_ops: list[MatMulOp] = []
     kv_cache_ops: list[MatMulOp] = []
@@ -152,15 +294,6 @@ def build_plan(
     prev_concat_name: str | None = None
     token_indices = list(range(token_count))
     token_names = [f"t{idx}" for idx in token_indices]
-
-    for token_idx, token_name in zip(token_indices, token_names):
-        tensors[f"x_norm1_q_{token_name}"] = TensorSpec(
-            f"x_norm1_q_{token_name}",
-            (1, d_model),
-            DType.INT16,
-            TensorKind.INTERMEDIATE,
-            metadata={"storage_role": "A"},
-        )
 
     for head_idx in range(n_heads):
         w_q = _rand_i16(rng, (d_model, d_head))
@@ -170,6 +303,8 @@ def build_plan(
         tensors[f"w_k_h{head_idx}"] = TensorSpec(f"w_k_h{head_idx}", w_k.shape, DType.INT16, TensorKind.CONSTANT, data=w_k)
         tensors[f"w_v_h{head_idx}"] = TensorSpec(f"w_v_h{head_idx}", w_v.shape, DType.INT16, TensorKind.CONSTANT, data=w_v)
         tensors[f"q_int_h{head_idx}"] = TensorSpec(f"q_int_h{head_idx}", (token_count, d_head), DType.INT16, TensorKind.INTERMEDIATE)
+        tensors[f"k_seq_h{head_idx}"] = TensorSpec(f"k_seq_h{head_idx}", (token_count, d_head), DType.INT16, TensorKind.INTERMEDIATE)
+        tensors[f"v_seq_h{head_idx}"] = TensorSpec(f"v_seq_h{head_idx}", (token_count, d_head), DType.INT16, TensorKind.INTERMEDIATE)
         tensors[f"q_a_h{head_idx}"] = TensorSpec(
             f"q_a_h{head_idx}",
             (token_count, d_head),
@@ -198,7 +333,7 @@ def build_plan(
         tensors[f"probs_h{head_idx}"] = TensorSpec(
             f"probs_h{head_idx}",
             (token_count, token_count),
-            DType.FLOAT32,
+            DType.INT16,
             TensorKind.INTERMEDIATE,
         )
         tensors[f"probs_q_h{head_idx}"] = TensorSpec(
@@ -211,28 +346,26 @@ def build_plan(
         tensors[f"attn_h{head_idx}"] = TensorSpec(f"attn_h{head_idx}", (token_count, d_head), DType.INT16, TensorKind.INTERMEDIATE)
 
         q_ops.append(MatMulOp(f"op_q_h{head_idx}", "x_norm1_q", f"w_q_h{head_idx}", f"q_int_h{head_idx}", in_dtype=DType.INT16, out_dtype=DType.INT16))
-        for token_name in token_names:
-            kv_cache_ops.extend(
-                [
-                    MatMulOp(
-                        f"op_k_h{head_idx}_{token_name}",
-                        f"x_norm1_q_{token_name}",
-                        f"w_k_h{head_idx}",
-                        f"k_cache_h{head_idx}_{token_name}",
-                        in_dtype=DType.INT16,
-                        out_dtype=DType.INT16,
-                    ),
-                    MatMulOp(
-                        f"op_v_h{head_idx}_{token_name}",
-                        f"x_norm1_q_{token_name}",
-                        f"w_v_h{head_idx}",
-                        f"v_cache_h{head_idx}_{token_name}",
-                        in_dtype=DType.INT16,
-                        out_dtype=DType.INT16,
-                    ),
-                ]
-            )
-
+        kv_cache_ops.extend(
+            [
+                MatMulOp(
+                    f"op_k_h{head_idx}",
+                    "x_norm1_q",
+                    f"w_k_h{head_idx}",
+                    f"k_seq_h{head_idx}",
+                    in_dtype=DType.INT16,
+                    out_dtype=DType.INT16,
+                ),
+                MatMulOp(
+                    f"op_v_h{head_idx}",
+                    "x_norm1_q",
+                    f"w_v_h{head_idx}",
+                    f"v_seq_h{head_idx}",
+                    in_dtype=DType.INT16,
+                    out_dtype=DType.INT16,
+                ),
+            ]
+        )
         if prev_concat_name is None:
             prev_concat_name = f"attn_h{head_idx}"
         else:
@@ -268,26 +401,21 @@ def build_plan(
 
     steps: list[object] = [
         HostOp("add_pos", "add", inputs=["x_f", "pos_emb"], outputs=["x_pos"]),
-        HostOp("layernorm1", "layernorm", inputs=["x_pos", "ln1_wb"], outputs=["x_norm1"], attrs={"eps": 1.0e-5}),
+        HostOp(
+            "layernorm1",
+            "layernorm",
+            inputs=["x_pos", "ln1_wb"],
+            outputs=["x_norm1"],
+            attrs={"eps": 1.0e-5, "output_encoding": "fp16_bits"},
+        ),
         HostOp(
             "quant_x_norm1",
             "quantize",
             inputs=["x_norm1"],
             outputs=["x_norm1_q"],
-            attrs={"scale": act_scale, "zero_point": 0, "dtype": DType.INT16},
+            attrs={"scale": act_scale, "zero_point": 0, "dtype": DType.INT16, "input_encoding": "fp16_bits"},
         ),
     ]
-
-    for token_idx, token_name in zip(token_indices, token_names):
-        steps.append(
-            HostOp(
-                f"slice_x_norm1_q_{token_name}",
-                "slice_row",
-                inputs=["x_norm1_q"],
-                outputs=[f"x_norm1_q_{token_name}"],
-                attrs={"row_index": token_idx},
-            )
-        )
 
     steps.extend(
         [
@@ -300,10 +428,22 @@ def build_plan(
         NpuSegment(
             "seg_kv_cache",
             kv_cache_ops,
-            inputs=[f"x_norm1_q_{name}" for name in token_names],
-            outputs=[],
+            inputs=["x_norm1_q"],
+            outputs=[name for name in tensors if name.startswith("k_seq_h") or name.startswith("v_seq_h")],
         ),
     ])
+
+    for head_idx in range(n_heads):
+        steps.extend(
+            [
+                HostOp(
+                    f"k_cache_scatter_matrix_h{head_idx}",
+                    "k_cache_scatter_matrix",
+                    inputs=[f"k_seq_h{head_idx}"],
+                    outputs=[f"k_cache_h{head_idx}"],
+                ),
+            ]
+        )
 
     for head_idx in range(n_heads):
         steps.extend(
@@ -324,7 +464,7 @@ def build_plan(
                 ),
                 HostOp(
                     f"softmax_scores_h{head_idx}",
-                    "softmax",
+                    "softmax_f16",
                     inputs=[f"masked_scores_h{head_idx}"],
                     outputs=[f"probs_h{head_idx}"],
                     attrs={"axis": -1},
@@ -334,7 +474,13 @@ def build_plan(
                     "quantize",
                     inputs=[f"probs_h{head_idx}"],
                     outputs=[f"probs_q_h{head_idx}"],
-                    attrs={"scale": attn_scale, "zero_point": 0, "dtype": DType.INT16},
+                    attrs={"scale": attn_scale, "zero_point": 0, "dtype": DType.INT16, "input_encoding": "fp16_bits"},
+                ),
+                HostOp(
+                    f"v_cache_scatter_matrix_h{head_idx}",
+                    "v_cache_scatter_matrix",
+                    inputs=[f"v_seq_h{head_idx}"],
+                    outputs=[f"v_cache_h{head_idx}"],
                 ),
                 NpuSegment(
                     f"seg_av_h{head_idx}",
@@ -357,33 +503,40 @@ def build_plan(
             ),
             HostOp("dequant_o", "dequantize", inputs=["o_int"], outputs=["o_f"], attrs={"scale": act_scale, "zero_point": 0}),
             HostOp("residual1", "add", inputs=["x_pos", "o_f"], outputs=["resid1"]),
-            HostOp("layernorm2", "layernorm", inputs=["resid1", "ln2_wb"], outputs=["x_norm2"], attrs={"eps": 1.0e-5}),
+            HostOp(
+                "layernorm2",
+                "layernorm",
+                inputs=["resid1", "ln2_wb"],
+                outputs=["x_norm2"],
+                attrs={"eps": 1.0e-5, "output_encoding": "fp16_bits"},
+            ),
             HostOp(
                 "quant_x_norm2",
                 "quantize",
                 inputs=["x_norm2"],
                 outputs=["x_norm2_q"],
-                attrs={"scale": act_scale, "zero_point": 0, "dtype": DType.INT16},
+                attrs={"scale": act_scale, "zero_point": 0, "dtype": DType.INT16, "input_encoding": "fp16_bits"},
             ),
             NpuSegment(
                 "seg_ffn_fc",
-                [MatMulOp("op_ffn_fc", "x_norm2_q", "w_fc", "ffn_fc_int", in_dtype=DType.INT16, out_dtype=DType.INT16)],
-                inputs=["x_norm2_q"],
+                [MatMulOp(
+                    "op_ffn_fc",
+                    ffn_fc_input_name,
+                    "w_fc",
+                    "ffn_fc_int",
+                    bias="a_ffn_zero_bias" if ffn_fc_zero_bias else None,
+                    activation=ffn_fc_activation,
+                    in_dtype=DType.INT16,
+                    out_dtype=DType.INT16,
+                )],
+                inputs=[ffn_fc_input_name],
                 outputs=["ffn_fc_int"],
             ),
-            HostOp("dequant_ffn_fc", "dequantize", inputs=["ffn_fc_int"], outputs=["ffn_fc_f"], attrs={"scale": act_scale, "zero_point": 0}),
-            HostOp("gelu_ffn", "gelu", inputs=["ffn_fc_f"], outputs=["ffn_gelu"]),
-            HostOp(
-                "quant_ffn_gelu",
-                "quantize",
-                inputs=["ffn_gelu"],
-                outputs=["ffn_gelu_q"],
-                attrs={"scale": act_scale, "zero_point": 0, "dtype": DType.INT16},
-            ),
+            HostOp("alias_ffn_fc_a", "alias", inputs=["ffn_fc_int"], outputs=["ffn_fc_a"]),
             NpuSegment(
                 "seg_ffn_proj",
-                [MatMulOp("op_ffn_proj", "ffn_gelu_q", "w_proj", "ffn_out_int", in_dtype=DType.INT16, out_dtype=DType.INT16)],
-                inputs=["ffn_gelu_q"],
+                [MatMulOp("op_ffn_proj", "ffn_fc_a", "w_proj", "ffn_out_int", in_dtype=DType.INT16, out_dtype=DType.INT16)],
+                inputs=["ffn_fc_a"],
                 outputs=["ffn_out_int"],
             ),
             HostOp("dequant_ffn_out", "dequantize", inputs=["ffn_out_int"], outputs=["ffn_out_f"], attrs={"scale": act_scale, "zero_point": 0}),
@@ -392,17 +545,40 @@ def build_plan(
     )
 
     plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=[], outputs=["out"])
-    plan.add_verification_step("out", "prefill_transformer_block_out")
+    verify_labels = {
+        "out": "prefill_transformer_block_out",
+        "ffn_fc_int": "ffn_fc_int",
+        "ffn_out_f": "ffn_out_f",
+        "o_int": "o_int",
+        "o_f": "o_f",
+        "resid1": "resid1",
+        "x_norm1": "x_norm1",
+        "x_norm2": "x_norm2",
+        "x_norm1_q": "x_norm1_q",
+        "x_norm2_q": "x_norm2_q",
+        "attn_cat": "attn_cat",
+        "attn_h0": "attn_h0",
+        "scores_h0": "scores_h0",
+        "probs_h0": "probs_h0",
+        "v_cache_h0": "v_cache_h0",
+        "v_seq_h0": "v_seq_h0",
+    }
+    for tensor_name in verify_tensors:
+        plan.add_verification_step(tensor_name, verify_labels.get(tensor_name, tensor_name))
     return plan
 
 
 def build_artifact(**kwargs):
+    verify_tensors = tuple(kwargs.get("verify_tensors", ("out",)))
     plan = build_plan(**kwargs)
     golden = GoldenModel()
     tensors = plan.tensors
     act_scale = float(kwargs.get("act_scale", 1.0 / 32.0))
     attn_scale = float(kwargs.get("attn_scale", 1.0 / 256.0))
     n_heads = int(kwargs["n_heads"])
+    ffn_fc_activation = str(kwargs.get("ffn_fc_activation", "h_gelu"))
+    ffn_fc_zero_bias = bool(kwargs.get("ffn_fc_zero_bias", False))
+    ffn_fc_input_name = str(kwargs.get("ffn_fc_input_name", "x_norm2_q"))
 
     x_f = np.array(tensors["x_f"].data, dtype=np.float32, copy=True)
     pos_emb = np.array(tensors["pos_emb"].data, dtype=np.float32, copy=True)
@@ -413,10 +589,13 @@ def build_artifact(**kwargs):
     w_proj = np.array(tensors["w_proj"].data, dtype=np.int16, copy=True)
 
     x_pos = (x_f + pos_emb).astype(np.float32)
-    x_norm1 = _layernorm_ref(x_pos, ln1_wb, 1.0e-5)
+    x_norm1 = _fp16_roundtrip(_layernorm_runtime_approx(x_pos, ln1_wb, 1.0e-5))
     x_norm1_q = golden.quantize(x_norm1, scale=act_scale, zero_point=0, out_dtype=DType.INT16)
 
     attn_heads: list[np.ndarray] = []
+    expected_scores: dict[str, np.ndarray] = {}
+    expected_probs: dict[str, np.ndarray] = {}
+    expected_v_seq: dict[str, np.ndarray] = {}
     for head_idx in range(n_heads):
         w_q = np.array(tensors[f"w_q_h{head_idx}"].data, dtype=np.int16, copy=True)
         w_k = np.array(tensors[f"w_k_h{head_idx}"].data, dtype=np.int16, copy=True)
@@ -424,12 +603,15 @@ def build_artifact(**kwargs):
         q_int = golden.matmul(x_norm1_q, w_q, out_dtype=DType.INT16)
         k_seq = golden.matmul(x_norm1_q, w_k, out_dtype=DType.INT16)
         v_seq = golden.matmul(x_norm1_q, w_v, out_dtype=DType.INT16)
+        expected_v_seq[f"v_seq_h{head_idx}"] = np.array(v_seq, copy=True)
         scores = golden.matmul(q_int, np.array(k_seq.T, dtype=np.int16, copy=True), out_dtype=DType.INT16)
+        expected_scores[f"scores_h{head_idx}"] = np.array(scores, copy=True)
         masked_scores = np.array(scores, copy=True)
         for row in range(masked_scores.shape[0]):
             if row + 1 < masked_scores.shape[1]:
                 masked_scores[row, row + 1 :] = np.iinfo(np.int16).min
-        probs = golden.softmax(masked_scores, axis=-1).astype(np.float32)
+        probs = _fp16_roundtrip(golden.softmax(masked_scores, axis=-1).astype(np.float32))
+        expected_probs[f"probs_h{head_idx}"] = _fp16_bits_carrier(probs)
         probs_q = golden.quantize(probs, scale=attn_scale, zero_point=0, out_dtype=DType.INT16)
         attn_h = golden.matmul(probs_q, v_seq, shift=8, out_dtype=DType.INT16)
         attn_heads.append(np.array(attn_h, copy=True))
@@ -442,18 +624,45 @@ def build_artifact(**kwargs):
     o_f = golden.dequantize(o_int, scale=act_scale, zero_point=0)
     resid1 = (x_pos + o_f).astype(np.float32)
 
-    x_norm2 = _layernorm_ref(resid1, ln2_wb, 1.0e-5)
+    x_norm2 = _fp16_roundtrip(_layernorm_runtime_approx(resid1, ln2_wb, 1.0e-5))
     x_norm2_q = golden.quantize(x_norm2, scale=act_scale, zero_point=0, out_dtype=DType.INT16)
-    ffn_fc_int = golden.matmul(x_norm2_q, w_fc, out_dtype=DType.INT16)
-    ffn_fc_f = golden.dequantize(ffn_fc_int, scale=act_scale, zero_point=0)
-    erf_term = np.vectorize(lambda v: math.erf(float(v) * 0.70710678), otypes=[np.float32])(ffn_fc_f).astype(np.float32)
-    ffn_gelu = (0.5 * ffn_fc_f * (1.0 + erf_term)).astype(np.float32)
-    ffn_gelu_q = golden.quantize(ffn_gelu, scale=act_scale, zero_point=0, out_dtype=DType.INT16)
-    ffn_out_int = golden.matmul(ffn_gelu_q, w_proj, out_dtype=DType.INT16)
+    ffn_zero_bias = np.array(tensors["a_ffn_zero_bias"].data, dtype=np.int16, copy=True) if ffn_fc_zero_bias else None
+    ffn_fc_input = x_norm2_q if ffn_fc_input_name == "x_norm2_q" else x_norm1_q
+    ffn_fc_int = golden.matmul(
+        ffn_fc_input,
+        w_fc,
+        bias=ffn_zero_bias,
+        activation=ffn_fc_activation,
+        out_dtype=DType.INT16,
+    )
+    ffn_out_int = golden.matmul(ffn_fc_int, w_proj, out_dtype=DType.INT16)
     ffn_out_f = golden.dequantize(ffn_out_int, scale=act_scale, zero_point=0)
     out = (resid1 + ffn_out_f).astype(np.float32)
 
-    artifact = compile_plan(plan, {"out": np.array(out, copy=True)})
+    expected_tensors = {
+        "out": np.array(out, copy=True),
+        "ffn_fc_int": np.array(ffn_fc_int, copy=True),
+        "ffn_out_f": np.array(ffn_out_f, copy=True),
+        "o_int": np.array(o_int, copy=True),
+        "o_f": np.array(o_f, copy=True),
+        "resid1": np.array(resid1, copy=True),
+        "x_norm1": np.array(x_norm1, copy=True),
+        "x_norm2": np.array(x_norm2, copy=True),
+        "x_norm1_q": np.array(x_norm1_q, copy=True),
+        "x_norm2_q": np.array(x_norm2_q, copy=True),
+        "attn_cat": np.array(attn_cat, copy=True),
+    }
+    if attn_heads:
+        expected_tensors["attn_h0"] = np.array(attn_heads[0], copy=True)
+    expected_tensors.update(expected_scores)
+    expected_tensors.update(expected_probs)
+    expected_tensors.update(expected_v_seq)
+    if "v_seq_h0" in expected_v_seq:
+        expected_tensors["v_cache_h0"] = np.array(expected_v_seq["v_seq_h0"], copy=True)
+    artifact = compile_plan(
+        plan,
+        {name: expected_tensors[name] for name in verify_tensors if name in expected_tensors},
+    )
     return artifact, out
 
 
@@ -465,8 +674,16 @@ def main() -> int:
     parser.add_argument("--ffn-dim", type=int, default=64)
     parser.add_argument("--token-count", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--verify-tensor", action="append", default=None)
+    parser.add_argument("--ffn-fc-activation", type=str, default="h_gelu")
+    parser.add_argument("--ffn-fc-zero-bias", action="store_true")
+    parser.add_argument("--ffn-fc-weight-mode", type=str, default="normal")
+    parser.add_argument("--ffn-fc-input-name", type=str, default="x_norm2_q")
+    parser.add_argument("--maxcycles", type=int, default=3000000)
+    parser.add_argument("--verilator-max-ticks", type=int, default=30000000000)
     args = parser.parse_args()
 
+    verify_tensors = tuple(args.verify_tensor) if args.verify_tensor else ("out",)
     artifact, expected = build_artifact(
         d_model=args.d_model,
         d_head=args.d_head,
@@ -474,6 +691,11 @@ def main() -> int:
         ffn_dim=args.ffn_dim,
         token_count=args.token_count,
         seed=args.seed,
+        verify_tensors=verify_tensors,
+        ffn_fc_activation=args.ffn_fc_activation,
+        ffn_fc_zero_bias=args.ffn_fc_zero_bias,
+        ffn_fc_weight_mode=args.ffn_fc_weight_mode,
+        ffn_fc_input_name=args.ffn_fc_input_name,
     )
 
     program_name = (
@@ -485,7 +707,7 @@ def main() -> int:
     program_path = GENERATED_DIR / f"{program_name}_program.c"
     runner_path = GENERATED_DIR / f"{runner_name}.c"
 
-    source = emit_cv32e40p_program_v2(artifact, {"out": expected}, program_name=program_name)
+    source = emit_cv32e40p_program_v2(artifact, artifact.expected_tensors, program_name=program_name)
     program_path.write_text(source)
     runner_path.write_text(_runner_source(program_name))
 
@@ -541,13 +763,13 @@ def main() -> int:
     _run([objcopy, "-O", "verilog", str(elf_path), str(hex_path)], cwd=CORE_DIR, env=build_env)
 
     env = dict(os.environ)
-    env["VERILATOR_MAX_TICKS"] = "30000000000"
+    env["VERILATOR_MAX_TICKS"] = str(args.verilator_max_ticks)
     proc = _run(
         [
             str(CORE_DIR / "obj_dir" / "cv32e40p_tb_vlt_npu"),
             "+verilator+noassert",
             f"+firmware={hex_path}",
-            "+maxcycles=3000000",
+            f"+maxcycles={args.maxcycles}",
         ],
         cwd=CORE_DIR,
         env=env,
@@ -558,6 +780,11 @@ def main() -> int:
         f"d_model={args.d_model} d_head={args.d_head} n_heads={args.n_heads} "
         f"ffn_dim={args.ffn_dim} token_count={args.token_count} seed={args.seed}"
     )
+    print(f"ffn_fc_activation={args.ffn_fc_activation}")
+    print(f"ffn_fc_zero_bias={args.ffn_fc_zero_bias}")
+    print(f"ffn_fc_weight_mode={args.ffn_fc_weight_mode}")
+    print(f"ffn_fc_input_name={args.ffn_fc_input_name}")
+    print(f"verify_tensors={verify_tensors}")
     print(f"expected_checksum={float(np.array(expected, dtype=np.float32).sum()):.6f}")
     print(proc.stdout)
     return 0

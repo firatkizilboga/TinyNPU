@@ -98,6 +98,7 @@ class VerifyTensor:
     tensor_name: str
     label: str
     is_final_output: bool = False
+    float_atol: float = 1.0e-3
 
 
 PlanStep = NpuSegment | HostOp | VerifyTensor
@@ -118,6 +119,7 @@ class ExecutionPlan:
                 tensor_name=tensor_name,
                 label=label or tensor.verify_label or tensor_name,
                 is_final_output=tensor.is_final_output,
+                float_atol=float(tensor.metadata.get("verify_atol", 1.0e-3)),
             )
         )
 

@@ -592,7 +592,11 @@ static int tnpu_execute_host_op(TinyTensor *runtime_tensors, const TnpuHostOp *o
             host_gelu(out, in);
             return 0;
         case TNPU_HOST_QUANTIZE:
-            host_quantize(out, in, op->attrs_f32[0], op->attrs_i32[0]);
+            if (op->attrs_i32[1] != 0) {
+                host_quantize_fp16bits(out, in, op->attrs_f32[0], op->attrs_i32[0]);
+            } else {
+                host_quantize(out, in, op->attrs_f32[0], op->attrs_i32[0]);
+            }
             return 0;
         case TNPU_HOST_DEQUANTIZE:
             host_dequantize(out, in, op->attrs_f32[0], op->attrs_i32[0]);
@@ -697,6 +701,15 @@ static int tnpu_execute_host_op(TinyTensor *runtime_tensors, const TnpuHostOp *o
             return 0;
         case TNPU_HOST_K_CACHE_SCATTER_WRITE:
             host_k_cache_scatter_write(in, (const int *)op->arr0, op->attrs_i32[0]);
+            return 0;
+        case TNPU_HOST_V_CACHE_SCATTER_WRITE:
+            host_v_cache_scatter_write(in, (const int *)op->arr0, (int)op->arr0_len);
+            return 0;
+        case TNPU_HOST_K_CACHE_SCATTER_MATRIX:
+            host_k_cache_scatter_matrix(out, in, op->attrs_i32[0]);
+            return 0;
+        case TNPU_HOST_V_CACHE_SCATTER_MATRIX:
+            host_v_cache_scatter_matrix(out, in, op->attrs_i32[0]);
             return 0;
         case TNPU_HOST_CAUSAL_MASK:
             host_causal_mask(out, in, op->attrs_i32[0], op->attrs_f32[0]);
@@ -821,7 +834,23 @@ static int tnpu_execute_verify(TinyTensor *runtime_tensors, const TnpuVerifyOp *
 {
     const TinyTensor *actual = &runtime_tensors[verify->actual_tensor_idx];
     const TinyTensor *expected = &runtime_tensors[verify->expected_tensor_idx];
-    if (!tensor_matches_expected(actual, expected)) {
+    const float float_atol = verify->float_atol > 0.0f ? verify->float_atol : 1.0e-3f;
+    int matches = 1;
+    if (actual->dtype == TINY_DTYPE_FLOAT32 && expected->dtype == TINY_DTYPE_FLOAT32) {
+        if (actual->elem_count != expected->elem_count) {
+            matches = 0;
+        } else {
+            for (int i = 0; i < actual->elem_count; ++i) {
+                if (fabsf(tensor_get_float(actual, i) - tensor_get_float(expected, i)) > float_atol) {
+                    matches = 0;
+                    break;
+                }
+            }
+        }
+    } else {
+        matches = tensor_matches_expected(actual, expected);
+    }
+    if (!matches) {
         printf(
             "verification failed: %s (%s)\n",
             verify->label ? verify->label : actual->name,
@@ -832,6 +861,11 @@ static int tnpu_execute_verify(TinyTensor *runtime_tensors, const TnpuVerifyOp *
             actual->elem_count,
             expected->dtype,
             expected->elem_count);
+        if (actual->dtype == TINY_DTYPE_FLOAT32 && expected->dtype == TINY_DTYPE_FLOAT32) {
+            printf("float_atol=");
+            print_float_scalar(float_atol);
+            printf("\n");
+        }
         print_tensor(actual);
         print_tensor(expected);
         return 1;

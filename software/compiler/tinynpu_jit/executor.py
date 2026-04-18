@@ -28,6 +28,13 @@ class HostEmulationExecutor:
         for name, spec in artifact.plan.tensors.items():
             if spec.kind == TensorKind.CONSTANT and spec.data is not None:
                 values[name] = np.array(spec.data, copy=True)
+            elif (
+                spec.kind != TensorKind.CONSTANT
+                and spec.metadata.get("cache_kind") in {"K", "V"}
+                and not spec.metadata.get("storage_view_of")
+            ):
+                dtype = np.float32 if spec.dtype == DType.FLOAT32 else np.int16
+                values[name] = np.zeros(spec.shape, dtype=dtype)
 
         for name in artifact.plan.inputs:
             if name not in inputs:
