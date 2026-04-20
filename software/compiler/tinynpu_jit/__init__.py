@@ -2,6 +2,7 @@ from .api import compile_module, compile_plan, run_host_emulation
 from .artifact import CompiledArtifact, ExecutionResult, SegmentArtifact
 from .baremetal_emit import emit_cv32e40p_c, write_cv32e40p_c
 from .baremetal_emit_v2 import emit_cv32e40p_program_v2, write_cv32e40p_program_v2
+from .builder import IRBuilder
 from .benchmark import (
     BenchmarkEntry,
     BenchmarkReport,
@@ -44,6 +45,7 @@ from .simulator import SimulatorExecutor, run_sim
 
 __all__ = [
     "CompiledArtifact",
+    "IRBuilder",
     "BenchmarkEntry",
     "b_slot_word_stride",
     "BenchmarkReport",

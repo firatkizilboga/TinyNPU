@@ -19,6 +19,7 @@ from tinynpu_jit import (
     TensorKind,
     TensorSpec,
     VerificationMode,
+    VerifyTensor,
     b_slot_word_stride,
     compile_plan,
     make_b_cache_specs,
@@ -32,6 +33,17 @@ from tinynpu_jit import (
 )
 from tinynpu import TinyNPUProgram
 from tinynpu.isa import BReadMode, OutputLayout, PrecisionMode, WritebackMode, XformMode
+from run_cv32e40p_decode_attention_jit_demo import (
+    build_artifact_legacy as build_decode_attention_artifact_legacy,
+    build_artifact_via_builder as build_decode_attention_artifact_via_builder,
+)
+from tinynpu_jit.blocks.gpt2_block import (
+    QGPT2Block,
+    QGPT2BlockConfig,
+    build_decode_artifact as build_gpt2_decode_artifact,
+    build_prefill_artifact as build_gpt2_prefill_artifact,
+    build_shared_state as build_gpt2_shared_state,
+)
 from run_cv32e40p_prefill_transformer_block_jit_demo import build_artifact as build_prefill_transformer_block_artifact
 
 
@@ -1074,6 +1086,148 @@ def test_compile_plan_supports_decode_attention_bridge():
     inst_av = int(seg_value.binary["im"][0])
     assert ((inst_av >> 52) & 0xF) == int(BReadMode.NORMAL)
     assert ((inst_av >> 112) & 0xFF) == 8
+
+
+def test_decode_attention_builder_matches_legacy_artifact():
+    params = {
+        "d_model": 16,
+        "n_heads": 1,
+        "n_kv_heads": 1,
+        "d_head": 16,
+        "token_capacity": 32,
+        "token_indices": [1, 9, 17, 25],
+        "seed": 0,
+    }
+    legacy_artifact, legacy_expected, legacy_d_model = build_decode_attention_artifact_legacy(**params)
+    builder_artifact, builder_expected, builder_d_model = build_decode_attention_artifact_via_builder(**params)
+
+    assert legacy_d_model == builder_d_model
+    np.testing.assert_array_equal(legacy_expected, builder_expected)
+    assert legacy_artifact.plan.inputs == builder_artifact.plan.inputs
+    assert legacy_artifact.plan.outputs == builder_artifact.plan.outputs
+    assert legacy_artifact.expected_tensors.keys() == builder_artifact.expected_tensors.keys()
+    for name in legacy_artifact.expected_tensors:
+        np.testing.assert_array_equal(legacy_artifact.expected_tensors[name], builder_artifact.expected_tensors[name])
+
+    def _step_signature(step):
+        if isinstance(step, HostOp):
+            return ("host", step.name, step.kind, tuple(step.inputs), tuple(step.outputs), dict(step.attrs))
+        if isinstance(step, NpuSegment):
+            return (
+                "seg",
+                step.name,
+                tuple(step.inputs),
+                tuple(step.outputs),
+                tuple(
+                    (
+                        op.name,
+                        op.lhs,
+                        op.rhs,
+                        op.out,
+                        op.bias,
+                        op.multiplier,
+                        op.shift,
+                        op.activation,
+                        op.in_dtype,
+                        op.out_dtype,
+                        op.output_layout,
+                        op.writeback_mode,
+                        op.output_word_offset,
+                        op.b_word_offset,
+                        op.b_read_mode,
+                        op.rope_cs_name,
+                    )
+                    for op in step.ops
+                ),
+            )
+        if isinstance(step, VerifyTensor):
+            return ("verify", step.tensor_name, step.label, step.is_final_output, step.float_atol)
+        raise TypeError(step)
+
+    assert [_step_signature(step) for step in legacy_artifact.plan.steps] == [
+        _step_signature(step) for step in builder_artifact.plan.steps
+    ]
+    assert legacy_artifact.static_ub_image == builder_artifact.static_ub_image
+    assert set(legacy_artifact.segment_artifacts) == set(builder_artifact.segment_artifacts)
+    for seg_name in legacy_artifact.segment_artifacts:
+        legacy_seg = legacy_artifact.segment_artifacts[seg_name]
+        builder_seg = builder_artifact.segment_artifacts[seg_name]
+        assert legacy_seg.binary["im"] == builder_seg.binary["im"]
+        assert legacy_seg.binary["ub"] == builder_seg.binary["ub"]
+        assert legacy_seg.symbol_table == builder_seg.symbol_table
+
+
+def test_gpt2_block_module_builds_prefill_and_decode():
+    prefill_artifact, _, prefill_ref = build_gpt2_prefill_artifact(
+        d_model=32,
+        d_head=8,
+        n_heads=4,
+        ffn_dim=128,
+        prompt_len=8,
+        seed=0,
+    )
+    decode_artifact, _, _, decode_ref = build_gpt2_decode_artifact(
+        d_model=32,
+        d_head=8,
+        n_heads=4,
+        ffn_dim=128,
+        prompt_len=8,
+        seed=0,
+    )
+
+    assert sorted(prefill_artifact.segment_artifacts.keys()) == [
+        "seg_ffn_fc",
+        "seg_ffn_proj",
+        "seg_kv_cache",
+        "seg_o_proj",
+        "seg_q",
+        "seg_score",
+        "seg_value",
+    ]
+    assert sorted(decode_artifact.segment_artifacts.keys()) == [
+        "seg_ffn_fc",
+        "seg_ffn_proj",
+        "seg_o_proj",
+        "seg_qkv",
+        "seg_score",
+        "seg_value",
+    ]
+    assert prefill_artifact.plan.outputs == ["out"]
+    assert decode_artifact.plan.outputs == ["out"]
+    assert prefill_ref["out"].shape == (8, 32)
+    assert decode_ref["out"].shape == (1, 32)
+
+
+def test_qgpt2_block_matches_hf_style_fused_shapes():
+    state = build_gpt2_shared_state(
+        d_model=32,
+        d_head=8,
+        n_heads=4,
+        ffn_dim=128,
+        prompt_len=8,
+        seed=0,
+    )
+    block = state["block"]
+
+    assert isinstance(block, QGPT2Block)
+    assert block.config == QGPT2BlockConfig(d_model=32, d_head=8, n_heads=4, ffn_dim=128)
+    assert block.attn_c_attn_w.shape == (32, 96)
+    assert block.attn_c_attn_b.shape == (1, 96)
+    assert block.attn_c_proj_w.shape == (32, 32)
+    assert block.attn_c_proj_b.shape == (1, 32)
+    assert block.mlp_c_fc_w.shape == (32, 128)
+    assert block.mlp_c_fc_b.shape == (1, 128)
+    assert block.mlp_c_proj_w.shape == (128, 32)
+    assert block.mlp_c_proj_b.shape == (1, 32)
+
+    w_q, w_k, w_v = block.split_c_attn_weights()
+    b_q, b_k, b_v = block.split_c_attn_biases_fp32()
+    assert [w.shape for w in w_q] == [(32, 8)] * 4
+    assert [w.shape for w in w_k] == [(32, 8)] * 4
+    assert [w.shape for w in w_v] == [(32, 8)] * 4
+    assert [b.shape for b in b_q] == [(1, 8)] * 4
+    assert [b.shape for b in b_k] == [(1, 8)] * 4
+    assert [b.shape for b in b_v] == [(1, 8)] * 4
 
 
 def test_describe_int16_k_cache_append_requires_lane_partial_writes():
