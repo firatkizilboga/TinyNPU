@@ -55,9 +55,11 @@ def _build_case(*, mode: str, d_model: int, d_head: int, n_heads: int, ffn_dim: 
     block = state["block"]
     prefill_ref = reference_prefill_float(state, d_head=d_head, n_heads=n_heads)
     if mode == "prefill":
-        expected = np.asarray(prefill_ref["out"], dtype=np.float32)
+        ref = prefill_ref
+        expected = np.asarray(ref["out"], dtype=np.float32)
     else:
-        expected = np.asarray(reference_decode_float(state, prefill_ref, d_head=d_head, n_heads=n_heads)["out"], dtype=np.float32)
+        ref = reference_decode_float(state, prefill_ref, d_head=d_head, n_heads=n_heads)
+        expected = np.asarray(ref["out"], dtype=np.float32)
 
     tensors: dict[str, np.ndarray] = {
         "x_in": np.asarray(state["x_prompt_in"] if mode == "prefill" else state["x_decode_in"], dtype=np.float32),
@@ -71,8 +73,23 @@ def _build_case(*, mode: str, d_model: int, d_head: int, n_heads: int, ffn_dim: 
         "mlp_c_fc_b": np.asarray(block.mlp_c_fc_b, dtype=np.float32),
         "mlp_c_proj_w": np.asarray(block.mlp_c_proj_w, dtype=np.float32),
         "mlp_c_proj_b": np.asarray(block.mlp_c_proj_b, dtype=np.float32),
+        "x_norm1_expected": np.asarray(ref["x_norm1"], dtype=np.float32),
+        "q_expected": np.concatenate([np.asarray(head, dtype=np.float32) for head in ref["q_heads"]], axis=-1).astype(np.float32),
+        "scores_expected": np.concatenate([np.asarray(head, dtype=np.float32) for head in ref["scores_heads"]], axis=0).astype(np.float32),
+        "probs_expected": np.concatenate([np.asarray(head, dtype=np.float32) for head in ref["probs_heads"]], axis=0).astype(np.float32),
+        "o_expected": np.asarray(ref["o_f"], dtype=np.float32),
+        "x_norm2_expected": np.asarray(ref["x_norm2"], dtype=np.float32),
+        "ffn_fc_expected": np.asarray(ref["ffn_fc"], dtype=np.float32),
+        "ffn_gelu_expected": np.asarray(ref["ffn_gelu"], dtype=np.float32),
+        "ffn_out_expected": np.asarray(ref["ffn_out_f"], dtype=np.float32),
         "out_expected": expected,
     }
+    if mode == "prefill":
+        tensors["k_expected"] = np.concatenate([np.asarray(head, dtype=np.float32) for head in ref["k_heads"]], axis=-1).astype(np.float32)
+        tensors["v_expected"] = np.concatenate([np.asarray(head, dtype=np.float32) for head in ref["v_heads"]], axis=-1).astype(np.float32)
+    else:
+        tensors["k_expected"] = np.concatenate([np.asarray(head, dtype=np.float32) for head in ref["k_cur_heads"]], axis=-1).astype(np.float32)
+        tensors["v_expected"] = np.concatenate([np.asarray(head, dtype=np.float32) for head in ref["v_cur_heads"]], axis=-1).astype(np.float32)
     if mode == "decode":
         cache_len = prompt_len + 1
         for head_idx in range(n_heads):
@@ -308,6 +325,12 @@ static float max_abs_diff(const float *a, const float *b, int elems)
     return maxv;
 }}
 
+static void print_stage_diff(const char *label, const float *actual, const float *expected, int elems)
+{{
+    float diff = max_abs_diff(actual, expected, elems);
+    printf("%s.max_abs_diff=%f\\n", label, (double)diff);
+}}
+
 {chr(10).join(decls)}
 
 int main(void)
@@ -332,6 +355,7 @@ int main(void)
     layernorm_f32(x_in, ln1_wb, x_norm1_buf, seq_len, d_model, 1.0e-5f);
     cycle_t1 = read_mcycle32();
     print_cycle_delta32("cpu_native.layernorm1", cycle_t0, cycle_t1);
+    print_stage_diff("cpu_native.layernorm1", x_norm1_buf, x_norm1_expected, seq_len * d_model);
 
     cycle_t0 = read_mcycle32();
     matmul_f32(x_norm1_buf, attn_c_attn_w, qkv_buf, seq_len, d_model, 3 * attn_dim);
@@ -339,6 +363,9 @@ int main(void)
     split_qkv_heads(qkv_buf, q_buf, k_buf, v_buf, seq_len, n_heads, d_head);
     cycle_t1 = read_mcycle32();
     print_cycle_delta32("cpu_native.c_attn", cycle_t0, cycle_t1);
+    print_stage_diff("cpu_native.q", q_buf, q_expected, seq_len * attn_dim);
+    print_stage_diff("cpu_native.k", k_buf, k_expected, seq_len * attn_dim);
+    print_stage_diff("cpu_native.v", v_buf, v_expected, seq_len * attn_dim);
 
     cycle_t0 = read_mcycle32();
     for (int head = 0; head < n_heads; ++head) {{
@@ -398,12 +425,15 @@ int main(void)
     }
     cycle_t1 = read_mcycle32();
     print_cycle_delta32("cpu_native.attention", cycle_t0, cycle_t1);
+    print_stage_diff("cpu_native.scores", scores_buf, scores_expected, seq_len * cache_len);
+    print_stage_diff("cpu_native.probs", probs_buf, probs_expected, seq_len * cache_len);
 
     cycle_t0 = read_mcycle32();
     matmul_f32(attn_cat_buf, attn_c_proj_w, o_buf, seq_len, attn_dim, d_model);
     add_bias_f32(o_buf, attn_c_proj_b, seq_len, d_model);
     cycle_t1 = read_mcycle32();
     print_cycle_delta32("cpu_native.c_proj", cycle_t0, cycle_t1);
+    print_stage_diff("cpu_native.o", o_buf, o_expected, seq_len * d_model);
 
     cycle_t0 = read_mcycle32();
     for (int i = 0; i < seq_len * d_model; ++i) {{
@@ -416,6 +446,7 @@ int main(void)
     layernorm_f32(resid1_buf, ln2_wb, x_norm2_buf, seq_len, d_model, 1.0e-5f);
     cycle_t1 = read_mcycle32();
     print_cycle_delta32("cpu_native.layernorm2", cycle_t0, cycle_t1);
+    print_stage_diff("cpu_native.layernorm2", x_norm2_buf, x_norm2_expected, seq_len * d_model);
 
     cycle_t0 = read_mcycle32();
     matmul_f32(x_norm2_buf, mlp_c_fc_w, ffn_fc_buf, seq_len, d_model, ffn_dim);
@@ -425,6 +456,9 @@ int main(void)
     add_bias_f32(ffn_out_buf, mlp_c_proj_b, seq_len, d_model);
     cycle_t1 = read_mcycle32();
     print_cycle_delta32("cpu_native.mlp", cycle_t0, cycle_t1);
+    print_stage_diff("cpu_native.ffn_fc", ffn_fc_buf, ffn_fc_expected, seq_len * ffn_dim);
+    print_stage_diff("cpu_native.ffn_gelu", ffn_gelu_buf, ffn_gelu_expected, seq_len * ffn_dim);
+    print_stage_diff("cpu_native.ffn_out", ffn_out_buf, ffn_out_expected, seq_len * d_model);
 
     cycle_t0 = read_mcycle32();
     for (int i = 0; i < seq_len * d_model; ++i) {{
