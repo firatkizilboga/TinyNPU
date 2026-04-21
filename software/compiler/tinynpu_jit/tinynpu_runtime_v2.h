@@ -177,6 +177,8 @@ int tinynpu_run(
     void *scratch,
     uint32_t scratch_words);
 
+void tinynpu_set_force_mmio(int enabled);
+
 int tinynpu_run_repeat(
     const TnpuProgram *program,
     const TnpuTensor *const *inputs,

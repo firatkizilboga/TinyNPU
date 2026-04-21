@@ -9,6 +9,10 @@ import numpy as np
 from tinynpu.isa import PrecisionMode
 from tinynpu.packer import Packer
 
+# TODO(refactor): this file currently mixes tensor metadata with a very thin
+# low-level op set (`MatMulOp` + stringly-typed `HostOp`). The next migration
+# step should introduce a typed high-level op layer plus an IRBuilder that lowers
+# back into the existing `MatMulOp`/`NpuSegment` path. See MIGRATION_TODO.md.
 
 class DType(str, Enum):
     INT4 = "int4"
@@ -57,6 +61,10 @@ class TensorSpec:
 
 @dataclass
 class MatMulOp:
+    # TODO(refactor): keep this as the low-level NPU op, but stop treating it as
+    # the compiler's only real semantic op. High-level concepts like Linear,
+    # Attention, RoPE, LayerNorm, and KV append should lower into this instead
+    # of being encoded indirectly through emitter/runtime conventions.
     name: str
     lhs: str
     rhs: str
@@ -86,6 +94,8 @@ class NpuSegment:
 
 @dataclass
 class HostOp:
+    # TODO(refactor): HostOp should become a genuine escape hatch. Most current
+    # uses really want typed IR nodes with explicit attrs and lowering rules.
     name: str
     kind: str
     inputs: list[str]

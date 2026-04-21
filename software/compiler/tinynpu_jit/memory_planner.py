@@ -532,10 +532,14 @@ def plan_program_memory(
         if not roles_seen:
             continue
         if len(roles_seen) != 1:
-            raise ValueError(
-                f"Cross-segment tensor '{name}' is used with multiple hardware roles: {sorted(roles_seen)}"
-            )
-        role = next(iter(roles_seen))
+            if roles_seen == {"A", "C"}:
+                role = "C"
+            else:
+                raise ValueError(
+                    f"Cross-segment tensor '{name}' is used with multiple hardware roles: {sorted(roles_seen)}"
+                )
+        else:
+            role = next(iter(roles_seen))
         wc = _compute_word_count(spec, role, packer, array_size)
         persistent_entries[name] = MemoryPlanEntry(name=name, address=persistent_addr, word_count=wc)
         persistent_addr += wc

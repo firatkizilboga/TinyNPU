@@ -44,7 +44,7 @@ enum {
 
 static int g_tinynpu_force_mmio_transfers = 0;
 
-static void tinynpu_set_force_mmio(int enabled)
+void tinynpu_set_force_mmio(int enabled)
 {
     g_tinynpu_force_mmio_transfers = enabled ? 1 : 0;
 }
@@ -2038,6 +2038,16 @@ static void npu_shared_write_image(
     }
 }
 
+static void print_preload_progress(const char *label, int completed, int total)
+{
+    if (total < 512) {
+        return;
+    }
+    if (completed == 1 || completed == total || (completed % 256) == 0) {
+        printf("%s %d/%d\n", label, completed, total);
+    }
+}
+
 static void npu_shared_read_word(uint16_t addr, uint32_t chunks[TINY_BUFFER_WORDS_32])
 {
     const uintptr_t base = npu_shared_base_for_addr(addr);
@@ -2507,12 +2517,23 @@ static void load_ub_image(uint16_t base_addr, const uint32_t image[][TINY_BUFFER
 {
 #if TINYNPU_USE_SHARED_SRAM
     if (!g_tinynpu_force_mmio_transfers) {
-        npu_shared_write_image(base_addr, image, word_count);
+        const uintptr_t base = npu_shared_base_for_addr(base_addr);
+        const uint32_t rel_word = npu_shared_rel_word_for_addr(base_addr);
+        volatile uint32_t *dst =
+            (volatile uint32_t *)(base + (uintptr_t)(rel_word * (uint32_t)TINY_MMVR_BYTES));
+        for (int i = 0; i < word_count; ++i) {
+            for (int part = 0; part < TINY_BUFFER_WORDS_32; ++part) {
+                dst[part] = image[i][part];
+            }
+            dst += TINY_BUFFER_WORDS_32;
+            print_preload_progress("preload.ub_image.progress", i + 1, word_count);
+        }
         return;
     }
 #endif
     for (int i = 0; i < word_count; ++i) {
         npu_write_mem_word((uint16_t)(base_addr + i), image[i]);
+        print_preload_progress("preload.ub_image.progress", i + 1, word_count);
     }
 }
 
@@ -2520,12 +2541,23 @@ static void load_im_image(uint16_t base_addr, const uint32_t image[][TINY_BUFFER
 {
 #if TINYNPU_USE_SHARED_SRAM
     if (!g_tinynpu_force_mmio_transfers) {
-        npu_shared_write_image(base_addr, image, word_count);
+        const uintptr_t base = npu_shared_base_for_addr(base_addr);
+        const uint32_t rel_word = npu_shared_rel_word_for_addr(base_addr);
+        volatile uint32_t *dst =
+            (volatile uint32_t *)(base + (uintptr_t)(rel_word * (uint32_t)TINY_MMVR_BYTES));
+        for (int i = 0; i < word_count; ++i) {
+            for (int part = 0; part < TINY_BUFFER_WORDS_32; ++part) {
+                dst[part] = image[i][part];
+            }
+            dst += TINY_BUFFER_WORDS_32;
+            print_preload_progress("preload.im_image.progress", i + 1, word_count);
+        }
         return;
     }
 #endif
     for (int i = 0; i < word_count; ++i) {
         npu_write_mem_word((uint16_t)(base_addr + i), image[i]);
+        print_preload_progress("preload.im_image.progress", i + 1, word_count);
     }
 }
 

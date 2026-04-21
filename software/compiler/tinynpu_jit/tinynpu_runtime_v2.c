@@ -1112,8 +1112,6 @@ int tinynpu_run(
         return EXIT_FAILURE;
     }
 
-    tinynpu_set_force_mmio(0);
-
     printf("TinyNPU runtime v2 program: %s\n", program->name ? program->name : "program_v2");
     tb_timer_reset_counter();
 
@@ -1161,8 +1159,6 @@ int tinynpu_run_repeat(
     if (runtime_tensors == NULL) {
         return EXIT_FAILURE;
     }
-
-    tinynpu_set_force_mmio(0);
 
     printf("TinyNPU runtime v2 program: %s\n", program->name ? program->name : "program_v2");
     tb_timer_reset_counter();

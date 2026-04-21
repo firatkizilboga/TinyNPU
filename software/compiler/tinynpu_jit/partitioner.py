@@ -11,6 +11,13 @@ from .host_ops import execute_host_op
 from .ir import DType, ExecutionPlan, HostOp, MatMulOp, NpuSegment, TensorKind, TensorSpec, VerifyTensor, normalize_shape
 from .quantization import synthesize_rescale
 
+# TODO(refactor): partition_fx_graph() is still a monolithic frontend that mixes
+# FX matching, golden execution, expected tensor capture, and IR construction in
+# one function. The migration target is:
+#   1. typed IR builder for hand-authored block emission
+#   2. registry-based FX handlers per op family
+#   3. separate golden/shadow-execution pass
+# See MIGRATION_TODO.md.
 
 @dataclass
 class PartitionState:

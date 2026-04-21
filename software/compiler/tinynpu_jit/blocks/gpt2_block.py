@@ -6,10 +6,7 @@ import numpy as np
 
 from tinynpu_jit import (
     DType,
-    ExecutionPlan,
-    HostOp,
-    MatMulOp,
-    NpuSegment,
+    IRBuilder,
     TensorKind,
     TensorSpec,
     compile_plan,
@@ -617,6 +614,315 @@ def _common_io_tensors(
     }
 
 
+def _add_tensor_specs(builder: IRBuilder, specs: dict[str, TensorSpec]) -> None:
+    for spec in specs.values():
+        builder.add_tensor(spec)
+
+
+def _add_head_projection_tensors(
+    builder: IRBuilder,
+    *,
+    block: QGPT2Block,
+    d_model: int,
+    d_head: int,
+    n_heads: int,
+    act_scale: float,
+) -> None:
+    w_q, w_k, w_v = block.split_c_attn_weights()
+    b_q_f, b_k_f, b_v_f = block.split_c_attn_biases_fp32()
+    for head_idx in range(n_heads):
+        builder.add_tensor(
+            TensorSpec(
+                f"w_q_h{head_idx}",
+                (d_model, d_head),
+                DType.INT16,
+                TensorKind.CONSTANT,
+                data=np.array(w_q[head_idx], dtype=np.int16, copy=True),
+            )
+        )
+        builder.add_tensor(
+            TensorSpec(
+                f"w_k_h{head_idx}",
+                (d_model, d_head),
+                DType.INT16,
+                TensorKind.CONSTANT,
+                data=np.array(w_k[head_idx], dtype=np.int16, copy=True),
+            )
+        )
+        builder.add_tensor(
+            TensorSpec(
+                f"w_v_h{head_idx}",
+                (d_model, d_head),
+                DType.INT16,
+                TensorKind.CONSTANT,
+                data=np.array(w_v[head_idx], dtype=np.int16, copy=True),
+            )
+        )
+        builder.add_tensor(
+            TensorSpec(
+                f"b_q_h{head_idx}",
+                (1, d_head),
+                DType.INT32,
+                TensorKind.CONSTANT,
+                data=_quantize_bias_fp32(np.array(b_q_f[head_idx], dtype=np.float32, copy=True), out_scale=act_scale),
+            )
+        )
+        builder.add_tensor(
+            TensorSpec(
+                f"b_k_h{head_idx}",
+                (1, d_head),
+                DType.INT32,
+                TensorKind.CONSTANT,
+                data=_quantize_bias_fp32(np.array(b_k_f[head_idx], dtype=np.float32, copy=True), out_scale=act_scale),
+            )
+        )
+        builder.add_tensor(
+            TensorSpec(
+                f"b_v_h{head_idx}",
+                (1, d_head),
+                DType.INT32,
+                TensorKind.CONSTANT,
+                data=_quantize_bias_fp32(np.array(b_v_f[head_idx], dtype=np.float32, copy=True), out_scale=act_scale),
+            )
+        )
+
+
+def _add_prefill_head_runtime_tensors(
+    builder: IRBuilder,
+    *,
+    d_head: int,
+    n_heads: int,
+    prompt_len: int,
+    act_scale: float,
+) -> None:
+    score_scale = _score_scale(d_head, (prompt_len, prompt_len), act_scale=act_scale)
+    token_names = [f"t{i}" for i in range(prompt_len)]
+    for head_idx in range(n_heads):
+        _add_tensor_specs(
+            builder,
+            make_native_int16_kv_cache_specs(
+                k_base_name=f"prefill_k_cache_h{head_idx}",
+                v_base_name=f"prefill_v_cache_h{head_idx}",
+                d_head=d_head,
+                token_capacity=prompt_len,
+                token_names=token_names,
+                token_indices=list(range(prompt_len)),
+                kind=TensorKind.INTERMEDIATE,
+            ),
+        )
+        builder.add_tensor(TensorSpec(f"q_int_h{head_idx}", (prompt_len, d_head), DType.INT16, TensorKind.INTERMEDIATE))
+        builder.add_tensor(TensorSpec(f"k_seq_h{head_idx}", (prompt_len, d_head), DType.INT16, TensorKind.INTERMEDIATE))
+        builder.add_tensor(TensorSpec(f"v_seq_h{head_idx}", (prompt_len, d_head), DType.INT16, TensorKind.INTERMEDIATE))
+        builder.add_tensor(
+            TensorSpec(
+                f"q_a_h{head_idx}",
+                (prompt_len, d_head),
+                DType.INT16,
+                TensorKind.INTERMEDIATE,
+                metadata={"storage_role": "A"},
+            )
+        )
+        builder.add_tensor(TensorSpec(f"scores_h{head_idx}", (prompt_len, prompt_len), DType.INT16, TensorKind.INTERMEDIATE))
+        builder.add_tensor(
+            TensorSpec(
+                f"score_scale_h{head_idx}",
+                (prompt_len, prompt_len),
+                DType.FLOAT32,
+                TensorKind.CONSTANT,
+                data=score_scale,
+            )
+        )
+        builder.add_tensor(TensorSpec(f"scores_scaled_h{head_idx}", (prompt_len, prompt_len), DType.FLOAT32, TensorKind.INTERMEDIATE))
+        builder.add_tensor(TensorSpec(f"masked_scores_h{head_idx}", (prompt_len, prompt_len), DType.FLOAT32, TensorKind.INTERMEDIATE))
+        builder.add_tensor(TensorSpec(f"probs_h{head_idx}", (prompt_len, prompt_len), DType.INT16, TensorKind.INTERMEDIATE))
+        builder.add_tensor(
+            TensorSpec(
+                f"probs_q_h{head_idx}",
+                (prompt_len, prompt_len),
+                DType.INT16,
+                TensorKind.INTERMEDIATE,
+                metadata={"storage_role": "A"},
+            )
+        )
+        builder.add_tensor(TensorSpec(f"attn_h{head_idx}", (prompt_len, d_head), DType.INT16, TensorKind.INTERMEDIATE))
+
+
+def _add_decode_head_runtime_tensors(
+    builder: IRBuilder,
+    *,
+    prefill_ref: dict[str, object],
+    d_head: int,
+    n_heads: int,
+    prompt_len: int,
+    cache_len: int,
+    act_scale: float,
+    decode_token_name: str,
+    cache_token_names: list[str],
+) -> None:
+    score_scale = _score_scale(d_head, (1, cache_len), act_scale=act_scale)
+    for head_idx in range(n_heads):
+        head_cache_specs = make_native_int16_kv_cache_specs(
+            k_base_name=f"k_cache_h{head_idx}",
+            v_base_name=f"v_cache_h{head_idx}",
+            d_head=d_head,
+            token_capacity=cache_len,
+            token_names=cache_token_names,
+            token_indices=list(range(cache_len)),
+            kind=TensorKind.INTERMEDIATE,
+        )
+        _add_tensor_specs(builder, head_cache_specs)
+        k_base = np.zeros((d_head, cache_len), dtype=np.int16)
+        v_base = np.zeros((cache_len, d_head), dtype=np.int16)
+        k_prefill = np.array(prefill_ref["k_heads"][head_idx], dtype=np.int16, copy=True)
+        v_prefill = np.array(prefill_ref["v_heads"][head_idx], dtype=np.int16, copy=True)
+        k_base[:, :prompt_len] = k_prefill.T
+        v_base[:prompt_len, :] = v_prefill
+        builder.tensors[f"k_cache_h{head_idx}"].data = k_base
+        builder.tensors[f"v_cache_h{head_idx}"].data = v_base
+        builder.add_tensor(TensorSpec(f"q_int_h{head_idx}", (1, d_head), DType.INT16, TensorKind.INTERMEDIATE))
+        builder.add_tensor(TensorSpec(f"k_cur_h{head_idx}", (1, d_head), DType.INT16, TensorKind.INTERMEDIATE))
+        builder.add_tensor(TensorSpec(f"v_cur_h{head_idx}", (1, d_head), DType.INT16, TensorKind.INTERMEDIATE))
+        builder.add_tensor(
+            TensorSpec(
+                f"q_a_h{head_idx}",
+                (1, d_head),
+                DType.INT16,
+                TensorKind.INTERMEDIATE,
+                metadata={"storage_role": "A"},
+            )
+        )
+        builder.add_tensor(TensorSpec(f"scores_h{head_idx}", (1, cache_len), DType.INT16, TensorKind.INTERMEDIATE))
+        builder.add_tensor(
+            TensorSpec(
+                f"score_scale_h{head_idx}",
+                (1, cache_len),
+                DType.FLOAT32,
+                TensorKind.CONSTANT,
+                data=score_scale,
+            )
+        )
+        builder.add_tensor(TensorSpec(f"scores_scaled_h{head_idx}", (1, cache_len), DType.FLOAT32, TensorKind.INTERMEDIATE))
+        builder.add_tensor(TensorSpec(f"probs_h{head_idx}", (1, cache_len), DType.INT16, TensorKind.INTERMEDIATE))
+        builder.add_tensor(
+            TensorSpec(
+                f"probs_q_h{head_idx}",
+                (1, cache_len),
+                DType.INT16,
+                TensorKind.INTERMEDIATE,
+                metadata={"storage_role": "A"},
+            )
+        )
+        builder.add_tensor(TensorSpec(f"attn_h{head_idx}", (1, d_head), DType.INT16, TensorKind.INTERMEDIATE))
+
+
+def _add_attention_concat_tensors(builder: IRBuilder, *, seq_len: int, d_head: int, n_heads: int) -> None:
+    for head_idx in range(1, n_heads):
+        builder.add_tensor(
+            TensorSpec(
+                f"attn_cat_{head_idx}",
+                (seq_len, (head_idx + 1) * d_head),
+                DType.INT16,
+                TensorKind.INTERMEDIATE,
+            )
+        )
+
+
+def _append_attention_post_score_steps(
+    builder: IRBuilder,
+    *,
+    n_heads: int,
+    attn_scale: float,
+    include_causal_mask: bool,
+    past_kv_len: int = 0,
+) -> None:
+    for head_idx in range(n_heads):
+        builder.host(
+            f"scale_scores_h{head_idx}",
+            "mul",
+            inputs=[f"scores_h{head_idx}", f"score_scale_h{head_idx}"],
+            outputs=[f"scores_scaled_h{head_idx}"],
+        )
+        if include_causal_mask:
+            builder.host(
+                f"causal_mask_h{head_idx}",
+                "causal_mask",
+                inputs=[f"scores_scaled_h{head_idx}"],
+                outputs=[f"masked_scores_h{head_idx}"],
+                attrs={"past_kv_len": past_kv_len, "fill_value": -1.0e10},
+            )
+            softmax_in = f"masked_scores_h{head_idx}"
+        else:
+            softmax_in = f"scores_scaled_h{head_idx}"
+        builder.host(
+            f"softmax_h{head_idx}",
+            "softmax_f16",
+            inputs=[softmax_in],
+            outputs=[f"probs_h{head_idx}"],
+            attrs={"axis": -1},
+        )
+        builder.host(
+            f"quant_probs_h{head_idx}",
+            "quantize",
+            inputs=[f"probs_h{head_idx}"],
+            outputs=[f"probs_q_h{head_idx}"],
+            attrs={"scale": attn_scale, "zero_point": 0, "dtype": DType.INT16, "input_encoding": "fp16_bits"},
+        )
+
+
+def _append_concat_alias_steps(builder: IRBuilder, *, n_heads: int, seq_len: int) -> None:
+    prev_attn_name = "attn_h0"
+    for head_idx in range(1, n_heads):
+        cat_name = f"attn_cat_{head_idx}"
+        builder.host(
+            f"concat_attn_{head_idx}",
+            "concat_lastdim2",
+            inputs=[prev_attn_name, f"attn_h{head_idx}"],
+            outputs=[cat_name],
+        )
+        prev_attn_name = cat_name
+    builder.host("alias_attn_cat", "alias", inputs=[prev_attn_name], outputs=["attn_cat"])
+    builder.host("alias_attn_cat_a", "alias", inputs=["attn_cat"], outputs=["attn_cat_a"])
+
+
+def _append_transformer_tail(builder: IRBuilder, *, act_scale: float) -> None:
+    builder.segment(
+        "seg_o_proj",
+        ops=[builder.matmul("op_o_proj", "attn_cat_a", "w_o", "o_int", bias="b_o", in_dtype=DType.INT16, out_dtype=DType.INT16)],
+        inputs=["attn_cat_a"],
+        outputs=["o_int"],
+    )
+    builder.host("dequant_o", "dequantize", inputs=["o_int"], outputs=["o_f"], attrs={"scale": act_scale, "zero_point": 0})
+    builder.host("residual1", "add", inputs=["x_in", "o_f"], outputs=["resid1"])
+    builder.host(
+        "layernorm2",
+        "layernorm",
+        inputs=["resid1", "ln2_wb"],
+        outputs=["x_norm2"],
+        attrs={"eps": 1.0e-5, "output_encoding": "fp16_bits"},
+    )
+    builder.host(
+        "quant_x_norm2",
+        "quantize",
+        inputs=["x_norm2"],
+        outputs=["x_norm2_q"],
+        attrs={"scale": act_scale, "zero_point": 0, "dtype": DType.INT16, "input_encoding": "fp16_bits"},
+    )
+    builder.segment(
+        "seg_ffn_fc",
+        ops=[builder.matmul("op_ffn_fc", "x_norm2_q", "w_fc", "ffn_fc_int", bias="b_fc", activation="h_gelu", in_dtype=DType.INT16, out_dtype=DType.INT16)],
+        inputs=["x_norm2_q"],
+        outputs=["ffn_fc_int"],
+    )
+    builder.segment(
+        "seg_ffn_proj",
+        ops=[builder.matmul("op_ffn_proj", "ffn_fc_int", "w_proj", "ffn_out_int", bias="b_proj", in_dtype=DType.INT16, out_dtype=DType.INT16)],
+        inputs=["ffn_fc_int"],
+        outputs=["ffn_out_int"],
+    )
+    builder.host("dequant_ffn_out", "dequantize", inputs=["ffn_out_int"], outputs=["ffn_out_f"], attrs={"scale": act_scale, "zero_point": 0})
+    builder.host("residual2", "add", inputs=["resid1", "ffn_out_f"], outputs=["out"])
+
+
 def build_prefill_artifact(
     *,
     d_model: int = 32,
@@ -657,113 +963,73 @@ def build_prefill_artifact(
     block = state["block"]
 
     attn_dim = n_heads * d_head
-    tensors = _common_io_tensors(
-        block=block,
-        x_in=np.array(state["x_prompt_in"], dtype=np.float32, copy=True),
-        d_model=d_model,
-        ffn_dim=ffn_dim,
-        attn_dim=attn_dim,
-        seq_len=prompt_len,
-        act_scale=act_scale,
+    b = IRBuilder()
+    _add_tensor_specs(
+        b,
+        _common_io_tensors(
+            block=block,
+            x_in=np.array(state["x_prompt_in"], dtype=np.float32, copy=True),
+            d_model=d_model,
+            ffn_dim=ffn_dim,
+            attn_dim=attn_dim,
+            seq_len=prompt_len,
+            act_scale=act_scale,
+        ),
     )
+    _add_head_projection_tensors(b, block=block, d_model=d_model, d_head=d_head, n_heads=n_heads, act_scale=act_scale)
+    _add_prefill_head_runtime_tensors(b, d_head=d_head, n_heads=n_heads, prompt_len=prompt_len, act_scale=act_scale)
+    _add_attention_concat_tensors(b, seq_len=prompt_len, d_head=d_head, n_heads=n_heads)
 
-    q_ops: list[MatMulOp] = []
-    kv_ops: list[MatMulOp] = []
-    score_ops: list[MatMulOp] = []
-    value_ops: list[MatMulOp] = []
-    concat_steps: list[HostOp] = []
-    prev_attn_name: str | None = None
-    score_scale = _score_scale(d_head, (prompt_len, prompt_len), act_scale=act_scale)
-    token_names = [f"t{i}" for i in range(prompt_len)]
-    w_q, w_k, w_v = block.split_c_attn_weights()
-    b_q_f, b_k_f, b_v_f = block.split_c_attn_biases_fp32()
-
-    for head_idx in range(n_heads):
-        tensors[f"w_q_h{head_idx}"] = TensorSpec(f"w_q_h{head_idx}", (d_model, d_head), DType.INT16, TensorKind.CONSTANT, data=np.array(w_q[head_idx], dtype=np.int16, copy=True))
-        tensors[f"w_k_h{head_idx}"] = TensorSpec(f"w_k_h{head_idx}", (d_model, d_head), DType.INT16, TensorKind.CONSTANT, data=np.array(w_k[head_idx], dtype=np.int16, copy=True))
-        tensors[f"w_v_h{head_idx}"] = TensorSpec(f"w_v_h{head_idx}", (d_model, d_head), DType.INT16, TensorKind.CONSTANT, data=np.array(w_v[head_idx], dtype=np.int16, copy=True))
-        tensors[f"b_q_h{head_idx}"] = TensorSpec(f"b_q_h{head_idx}", (1, d_head), DType.INT32, TensorKind.CONSTANT, data=_quantize_bias_fp32(np.array(b_q_f[head_idx], dtype=np.float32, copy=True), out_scale=act_scale))
-        tensors[f"b_k_h{head_idx}"] = TensorSpec(f"b_k_h{head_idx}", (1, d_head), DType.INT32, TensorKind.CONSTANT, data=_quantize_bias_fp32(np.array(b_k_f[head_idx], dtype=np.float32, copy=True), out_scale=act_scale))
-        tensors[f"b_v_h{head_idx}"] = TensorSpec(f"b_v_h{head_idx}", (1, d_head), DType.INT32, TensorKind.CONSTANT, data=_quantize_bias_fp32(np.array(b_v_f[head_idx], dtype=np.float32, copy=True), out_scale=act_scale))
-        tensors.update(
-            make_native_int16_kv_cache_specs(
-                k_base_name=f"prefill_k_cache_h{head_idx}",
-                v_base_name=f"prefill_v_cache_h{head_idx}",
-                d_head=d_head,
-                token_capacity=prompt_len,
-                token_names=token_names,
-                token_indices=list(range(prompt_len)),
-                kind=TensorKind.INTERMEDIATE,
-            )
-        )
-        tensors[f"q_int_h{head_idx}"] = TensorSpec(f"q_int_h{head_idx}", (prompt_len, d_head), DType.INT16, TensorKind.INTERMEDIATE)
-        tensors[f"k_seq_h{head_idx}"] = TensorSpec(f"k_seq_h{head_idx}", (prompt_len, d_head), DType.INT16, TensorKind.INTERMEDIATE)
-        tensors[f"v_seq_h{head_idx}"] = TensorSpec(f"v_seq_h{head_idx}", (prompt_len, d_head), DType.INT16, TensorKind.INTERMEDIATE)
-        tensors[f"q_a_h{head_idx}"] = TensorSpec(f"q_a_h{head_idx}", (prompt_len, d_head), DType.INT16, TensorKind.INTERMEDIATE, metadata={"storage_role": "A"})
-        tensors[f"scores_h{head_idx}"] = TensorSpec(f"scores_h{head_idx}", (prompt_len, prompt_len), DType.INT16, TensorKind.INTERMEDIATE)
-        tensors[f"score_scale_h{head_idx}"] = TensorSpec(f"score_scale_h{head_idx}", (prompt_len, prompt_len), DType.FLOAT32, TensorKind.CONSTANT, data=score_scale)
-        tensors[f"scores_scaled_h{head_idx}"] = TensorSpec(f"scores_scaled_h{head_idx}", (prompt_len, prompt_len), DType.FLOAT32, TensorKind.INTERMEDIATE)
-        tensors[f"masked_scores_h{head_idx}"] = TensorSpec(f"masked_scores_h{head_idx}", (prompt_len, prompt_len), DType.FLOAT32, TensorKind.INTERMEDIATE)
-        tensors[f"probs_h{head_idx}"] = TensorSpec(f"probs_h{head_idx}", (prompt_len, prompt_len), DType.INT16, TensorKind.INTERMEDIATE)
-        tensors[f"probs_q_h{head_idx}"] = TensorSpec(f"probs_q_h{head_idx}", (prompt_len, prompt_len), DType.INT16, TensorKind.INTERMEDIATE, metadata={"storage_role": "A"})
-        tensors[f"attn_h{head_idx}"] = TensorSpec(f"attn_h{head_idx}", (prompt_len, d_head), DType.INT16, TensorKind.INTERMEDIATE)
-
-        q_ops.append(MatMulOp(f"op_q_h{head_idx}", "x_norm1_q", f"w_q_h{head_idx}", f"q_int_h{head_idx}", bias=f"b_q_h{head_idx}", in_dtype=DType.INT16, out_dtype=DType.INT16))
-        kv_ops.append(MatMulOp(f"op_k_h{head_idx}", "x_norm1_q", f"w_k_h{head_idx}", f"k_seq_h{head_idx}", bias=f"b_k_h{head_idx}", in_dtype=DType.INT16, out_dtype=DType.INT16))
-        kv_ops.append(MatMulOp(f"op_v_h{head_idx}", "x_norm1_q", f"w_v_h{head_idx}", f"v_seq_h{head_idx}", bias=f"b_v_h{head_idx}", in_dtype=DType.INT16, out_dtype=DType.INT16))
-        score_ops.append(MatMulOp(f"op_qk_h{head_idx}", f"q_a_h{head_idx}", f"prefill_k_cache_h{head_idx}", f"scores_h{head_idx}", in_dtype=DType.INT16, out_dtype=DType.INT16))
-        value_ops.append(MatMulOp(f"op_av_h{head_idx}", f"probs_q_h{head_idx}", f"prefill_v_cache_h{head_idx}", f"attn_h{head_idx}", shift=8, in_dtype=DType.INT16, out_dtype=DType.INT16))
-
-        if prev_attn_name is None:
-            prev_attn_name = f"attn_h{head_idx}"
-        else:
-            cat_name = f"attn_cat_{head_idx}"
-            tensors[cat_name] = TensorSpec(cat_name, (prompt_len, (head_idx + 1) * d_head), DType.INT16, TensorKind.INTERMEDIATE)
-            concat_steps.append(HostOp(f"concat_attn_{head_idx}", "concat_lastdim2", inputs=[prev_attn_name, f"attn_h{head_idx}"], outputs=[cat_name]))
-            prev_attn_name = cat_name
-
-    steps: list[HostOp | NpuSegment] = [
-        HostOp("layernorm1", "layernorm", inputs=["x_in", "ln1_wb"], outputs=["x_norm1"], attrs={"eps": 1.0e-5, "output_encoding": "fp16_bits"}),
-        HostOp("quant_x_norm1", "quantize", inputs=["x_norm1"], outputs=["x_norm1_q"], attrs={"scale": act_scale, "zero_point": 0, "dtype": DType.INT16, "input_encoding": "fp16_bits"}),
-        NpuSegment("seg_q", q_ops, inputs=["x_norm1_q"], outputs=[f"q_int_h{i}" for i in range(n_heads)]),
-        NpuSegment("seg_kv_cache", kv_ops, inputs=["x_norm1_q"], outputs=[name for name in tensors if name.startswith(("k_seq_h", "v_seq_h"))]),
-    ]
-    for head_idx in range(n_heads):
-        steps.append(HostOp(f"k_cache_scatter_matrix_h{head_idx}", "k_cache_scatter_matrix", inputs=[f"k_seq_h{head_idx}"], outputs=[f"prefill_k_cache_h{head_idx}"]))
-        steps.append(HostOp(f"v_cache_scatter_matrix_h{head_idx}", "v_cache_scatter_matrix", inputs=[f"v_seq_h{head_idx}"], outputs=[f"prefill_v_cache_h{head_idx}"]))
-        steps.append(HostOp(f"alias_q_a_h{head_idx}", "alias", inputs=[f"q_int_h{head_idx}"], outputs=[f"q_a_h{head_idx}"]))
-    steps.append(NpuSegment("seg_score", score_ops, inputs=[f"q_a_h{i}" for i in range(n_heads)], outputs=[f"scores_h{i}" for i in range(n_heads)]))
-    for head_idx in range(n_heads):
-        steps.extend(
-            [
-                HostOp(f"scale_scores_h{head_idx}", "mul", inputs=[f"scores_h{head_idx}", f"score_scale_h{head_idx}"], outputs=[f"scores_scaled_h{head_idx}"]),
-                HostOp(f"causal_mask_h{head_idx}", "causal_mask", inputs=[f"scores_scaled_h{head_idx}"], outputs=[f"masked_scores_h{head_idx}"], attrs={"past_kv_len": 0, "fill_value": -1.0e10}),
-                HostOp(f"softmax_h{head_idx}", "softmax_f16", inputs=[f"masked_scores_h{head_idx}"], outputs=[f"probs_h{head_idx}"], attrs={"axis": -1}),
-                HostOp(f"quant_probs_h{head_idx}", "quantize", inputs=[f"probs_h{head_idx}"], outputs=[f"probs_q_h{head_idx}"], attrs={"scale": attn_scale, "zero_point": 0, "dtype": DType.INT16, "input_encoding": "fp16_bits"}),
-            ]
-        )
-    steps.append(NpuSegment("seg_value", value_ops, inputs=[f"probs_q_h{i}" for i in range(n_heads)], outputs=[f"attn_h{i}" for i in range(n_heads)]))
-    steps.extend(concat_steps)
-    if n_heads == 1:
-        steps.append(HostOp("alias_attn_cat", "alias", inputs=[prev_attn_name or "attn_h0"], outputs=["attn_cat"]))
-    elif prev_attn_name != "attn_cat":
-        steps.append(HostOp("alias_attn_cat", "alias", inputs=[prev_attn_name or "attn_h0"], outputs=["attn_cat"]))
-    steps.extend(
-        [
-            HostOp("alias_attn_cat_a", "alias", inputs=["attn_cat"], outputs=["attn_cat_a"]),
-            NpuSegment("seg_o_proj", [MatMulOp("op_o_proj", "attn_cat_a", "w_o", "o_int", bias="b_o", in_dtype=DType.INT16, out_dtype=DType.INT16)], inputs=["attn_cat_a"], outputs=["o_int"]),
-            HostOp("dequant_o", "dequantize", inputs=["o_int"], outputs=["o_f"], attrs={"scale": act_scale, "zero_point": 0}),
-            HostOp("residual1", "add", inputs=["x_in", "o_f"], outputs=["resid1"]),
-            HostOp("layernorm2", "layernorm", inputs=["resid1", "ln2_wb"], outputs=["x_norm2"], attrs={"eps": 1.0e-5, "output_encoding": "fp16_bits"}),
-            HostOp("quant_x_norm2", "quantize", inputs=["x_norm2"], outputs=["x_norm2_q"], attrs={"scale": act_scale, "zero_point": 0, "dtype": DType.INT16, "input_encoding": "fp16_bits"}),
-            NpuSegment("seg_ffn_fc", [MatMulOp("op_ffn_fc", "x_norm2_q", "w_fc", "ffn_fc_int", bias="b_fc", activation="h_gelu", in_dtype=DType.INT16, out_dtype=DType.INT16)], inputs=["x_norm2_q"], outputs=["ffn_fc_int"]),
-            NpuSegment("seg_ffn_proj", [MatMulOp("op_ffn_proj", "ffn_fc_int", "w_proj", "ffn_out_int", bias="b_proj", in_dtype=DType.INT16, out_dtype=DType.INT16)], inputs=["ffn_fc_int"], outputs=["ffn_out_int"]),
-            HostOp("dequant_ffn_out", "dequantize", inputs=["ffn_out_int"], outputs=["ffn_out_f"], attrs={"scale": act_scale, "zero_point": 0}),
-            HostOp("residual2", "add", inputs=["resid1", "ffn_out_f"], outputs=["out"]),
-        ]
+    b.host("layernorm1", "layernorm", inputs=["x_in", "ln1_wb"], outputs=["x_norm1"], attrs={"eps": 1.0e-5, "output_encoding": "fp16_bits"})
+    b.host(
+        "quant_x_norm1",
+        "quantize",
+        inputs=["x_norm1"],
+        outputs=["x_norm1_q"],
+        attrs={"scale": act_scale, "zero_point": 0, "dtype": DType.INT16, "input_encoding": "fp16_bits"},
     )
+    b.segment(
+        "seg_q",
+        ops=[
+            b.matmul(f"op_q_h{head_idx}", "x_norm1_q", f"w_q_h{head_idx}", f"q_int_h{head_idx}", bias=f"b_q_h{head_idx}", in_dtype=DType.INT16, out_dtype=DType.INT16)
+            for head_idx in range(n_heads)
+        ],
+        inputs=["x_norm1_q"],
+        outputs=[f"q_int_h{i}" for i in range(n_heads)],
+    )
+    kv_outputs = [f"{kind}_seq_h{head_idx}" for head_idx in range(n_heads) for kind in ("k", "v")]
+    kv_ops = []
+    for head_idx in range(n_heads):
+        kv_ops.append(b.matmul(f"op_k_h{head_idx}", "x_norm1_q", f"w_k_h{head_idx}", f"k_seq_h{head_idx}", bias=f"b_k_h{head_idx}", in_dtype=DType.INT16, out_dtype=DType.INT16))
+        kv_ops.append(b.matmul(f"op_v_h{head_idx}", "x_norm1_q", f"w_v_h{head_idx}", f"v_seq_h{head_idx}", bias=f"b_v_h{head_idx}", in_dtype=DType.INT16, out_dtype=DType.INT16))
+    b.segment("seg_kv_cache", ops=kv_ops, inputs=["x_norm1_q"], outputs=kv_outputs)
+    for head_idx in range(n_heads):
+        b.host(f"k_cache_scatter_matrix_h{head_idx}", "k_cache_scatter_matrix", inputs=[f"k_seq_h{head_idx}"], outputs=[f"prefill_k_cache_h{head_idx}"])
+        b.host(f"v_cache_scatter_matrix_h{head_idx}", "v_cache_scatter_matrix", inputs=[f"v_seq_h{head_idx}"], outputs=[f"prefill_v_cache_h{head_idx}"])
+        b.host(f"alias_q_a_h{head_idx}", "alias", inputs=[f"q_int_h{head_idx}"], outputs=[f"q_a_h{head_idx}"])
+    b.segment(
+        "seg_score",
+        ops=[
+            b.matmul(f"op_qk_h{head_idx}", f"q_a_h{head_idx}", f"prefill_k_cache_h{head_idx}", f"scores_h{head_idx}", in_dtype=DType.INT16, out_dtype=DType.INT16)
+            for head_idx in range(n_heads)
+        ],
+        inputs=[f"q_a_h{i}" for i in range(n_heads)],
+        outputs=[f"scores_h{i}" for i in range(n_heads)],
+    )
+    _append_attention_post_score_steps(b, n_heads=n_heads, attn_scale=attn_scale, include_causal_mask=True, past_kv_len=0)
+    b.segment(
+        "seg_value",
+        ops=[
+            b.matmul(f"op_av_h{head_idx}", f"probs_q_h{head_idx}", f"prefill_v_cache_h{head_idx}", f"attn_h{head_idx}", shift=8, in_dtype=DType.INT16, out_dtype=DType.INT16)
+            for head_idx in range(n_heads)
+        ],
+        inputs=[f"probs_q_h{i}" for i in range(n_heads)],
+        outputs=[f"attn_h{i}" for i in range(n_heads)],
+    )
+    _append_concat_alias_steps(b, n_heads=n_heads, seq_len=prompt_len)
+    _append_transformer_tail(b, act_scale=act_scale)
 
-    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=[], outputs=["out"])
+    plan = b.finalize(inputs=[], outputs=["out"])
     plan.add_verification_step("out", "gpt2_prefill_out")
     artifact = compile_plan(plan, {"gpt2_prefill_out": np.array(ref["out"], dtype=np.float32, copy=True)})
     return artifact, state, ref
@@ -809,126 +1075,95 @@ def build_decode_artifact(
     attn_dim = n_heads * d_head
     decode_token_name = "td"
     cache_token_names = [f"t{i}" for i in range(prompt_len)] + [decode_token_name]
-
-    tensors = _common_io_tensors(
-        block=block,
-        x_in=np.array(state["x_decode_in"], dtype=np.float32, copy=True),
-        d_model=d_model,
-        ffn_dim=ffn_dim,
-        attn_dim=attn_dim,
-        seq_len=1,
-        act_scale=act_scale,
+    b = IRBuilder()
+    _add_tensor_specs(
+        b,
+        _common_io_tensors(
+            block=block,
+            x_in=np.array(state["x_decode_in"], dtype=np.float32, copy=True),
+            d_model=d_model,
+            ffn_dim=ffn_dim,
+            attn_dim=attn_dim,
+            seq_len=1,
+            act_scale=act_scale,
+        ),
     )
+    _add_head_projection_tensors(b, block=block, d_model=d_model, d_head=d_head, n_heads=n_heads, act_scale=act_scale)
+    _add_decode_head_runtime_tensors(
+        b,
+        prefill_ref=prefill_ref,
+        d_head=d_head,
+        n_heads=n_heads,
+        prompt_len=prompt_len,
+        cache_len=cache_len,
+        act_scale=act_scale,
+        decode_token_name=decode_token_name,
+        cache_token_names=cache_token_names,
+    )
+    _add_attention_concat_tensors(b, seq_len=1, d_head=d_head, n_heads=n_heads)
 
-    qkv_ops: list[MatMulOp] = []
-    score_ops: list[MatMulOp] = []
-    value_ops: list[MatMulOp] = []
-    concat_steps: list[HostOp] = []
-    prev_attn_name: str | None = None
-    score_scale = _score_scale(d_head, (1, cache_len), act_scale=act_scale)
-    w_q, w_k, w_v = block.split_c_attn_weights()
-    b_q_f, b_k_f, b_v_f = block.split_c_attn_biases_fp32()
-
+    b.host("layernorm1", "layernorm", inputs=["x_in", "ln1_wb"], outputs=["x_norm1"], attrs={"eps": 1.0e-5, "output_encoding": "fp16_bits"})
+    b.host(
+        "quant_x_norm1",
+        "quantize",
+        inputs=["x_norm1"],
+        outputs=["x_norm1_q"],
+        attrs={"scale": act_scale, "zero_point": 0, "dtype": DType.INT16, "input_encoding": "fp16_bits"},
+    )
+    qkv_ops = []
     for head_idx in range(n_heads):
-        tensors[f"w_q_h{head_idx}"] = TensorSpec(f"w_q_h{head_idx}", (d_model, d_head), DType.INT16, TensorKind.CONSTANT, data=np.array(w_q[head_idx], dtype=np.int16, copy=True))
-        tensors[f"w_k_h{head_idx}"] = TensorSpec(f"w_k_h{head_idx}", (d_model, d_head), DType.INT16, TensorKind.CONSTANT, data=np.array(w_k[head_idx], dtype=np.int16, copy=True))
-        tensors[f"w_v_h{head_idx}"] = TensorSpec(f"w_v_h{head_idx}", (d_model, d_head), DType.INT16, TensorKind.CONSTANT, data=np.array(w_v[head_idx], dtype=np.int16, copy=True))
-        tensors[f"b_q_h{head_idx}"] = TensorSpec(f"b_q_h{head_idx}", (1, d_head), DType.INT32, TensorKind.CONSTANT, data=_quantize_bias_fp32(np.array(b_q_f[head_idx], dtype=np.float32, copy=True), out_scale=act_scale))
-        tensors[f"b_k_h{head_idx}"] = TensorSpec(f"b_k_h{head_idx}", (1, d_head), DType.INT32, TensorKind.CONSTANT, data=_quantize_bias_fp32(np.array(b_k_f[head_idx], dtype=np.float32, copy=True), out_scale=act_scale))
-        tensors[f"b_v_h{head_idx}"] = TensorSpec(f"b_v_h{head_idx}", (1, d_head), DType.INT32, TensorKind.CONSTANT, data=_quantize_bias_fp32(np.array(b_v_f[head_idx], dtype=np.float32, copy=True), out_scale=act_scale))
-
-        head_cache_specs = make_native_int16_kv_cache_specs(
-            k_base_name=f"k_cache_h{head_idx}",
-            v_base_name=f"v_cache_h{head_idx}",
-            d_head=d_head,
-            token_capacity=cache_len,
-            token_names=cache_token_names,
-            token_indices=list(range(cache_len)),
-            kind=TensorKind.INTERMEDIATE,
-        )
-        tensors.update(head_cache_specs)
-        k_base = np.zeros((d_head, cache_len), dtype=np.int16)
-        v_base = np.zeros((cache_len, d_head), dtype=np.int16)
-        k_prefill = np.array(prefill_ref["k_heads"][head_idx], dtype=np.int16, copy=True)
-        v_prefill = np.array(prefill_ref["v_heads"][head_idx], dtype=np.int16, copy=True)
-        k_base[:, :prompt_len] = k_prefill.T
-        v_base[:prompt_len, :] = v_prefill
-        tensors[f"k_cache_h{head_idx}"].data = k_base
-        tensors[f"v_cache_h{head_idx}"].data = v_base
-
-        tensors[f"q_int_h{head_idx}"] = TensorSpec(f"q_int_h{head_idx}", (1, d_head), DType.INT16, TensorKind.INTERMEDIATE)
-        tensors[f"k_cur_h{head_idx}"] = TensorSpec(f"k_cur_h{head_idx}", (1, d_head), DType.INT16, TensorKind.INTERMEDIATE)
-        tensors[f"v_cur_h{head_idx}"] = TensorSpec(f"v_cur_h{head_idx}", (1, d_head), DType.INT16, TensorKind.INTERMEDIATE)
-        tensors[f"q_a_h{head_idx}"] = TensorSpec(f"q_a_h{head_idx}", (1, d_head), DType.INT16, TensorKind.INTERMEDIATE, metadata={"storage_role": "A"})
-        tensors[f"scores_h{head_idx}"] = TensorSpec(f"scores_h{head_idx}", (1, cache_len), DType.INT16, TensorKind.INTERMEDIATE)
-        tensors[f"score_scale_h{head_idx}"] = TensorSpec(f"score_scale_h{head_idx}", (1, cache_len), DType.FLOAT32, TensorKind.CONSTANT, data=score_scale)
-        tensors[f"scores_scaled_h{head_idx}"] = TensorSpec(f"scores_scaled_h{head_idx}", (1, cache_len), DType.FLOAT32, TensorKind.INTERMEDIATE)
-        tensors[f"probs_h{head_idx}"] = TensorSpec(f"probs_h{head_idx}", (1, cache_len), DType.INT16, TensorKind.INTERMEDIATE)
-        tensors[f"probs_q_h{head_idx}"] = TensorSpec(f"probs_q_h{head_idx}", (1, cache_len), DType.INT16, TensorKind.INTERMEDIATE, metadata={"storage_role": "A"})
-        tensors[f"attn_h{head_idx}"] = TensorSpec(f"attn_h{head_idx}", (1, d_head), DType.INT16, TensorKind.INTERMEDIATE)
-
         qkv_ops.extend(
             [
-                MatMulOp(f"op_q_h{head_idx}", "x_norm1_q", f"w_q_h{head_idx}", f"q_int_h{head_idx}", bias=f"b_q_h{head_idx}", in_dtype=DType.INT16, out_dtype=DType.INT16),
-                MatMulOp(f"op_k_h{head_idx}", "x_norm1_q", f"w_k_h{head_idx}", f"k_cur_h{head_idx}", bias=f"b_k_h{head_idx}", in_dtype=DType.INT16, out_dtype=DType.INT16),
-                MatMulOp(f"op_v_h{head_idx}", "x_norm1_q", f"w_v_h{head_idx}", f"v_cur_h{head_idx}", bias=f"b_v_h{head_idx}", in_dtype=DType.INT16, out_dtype=DType.INT16),
+                b.matmul(f"op_q_h{head_idx}", "x_norm1_q", f"w_q_h{head_idx}", f"q_int_h{head_idx}", bias=f"b_q_h{head_idx}", in_dtype=DType.INT16, out_dtype=DType.INT16),
+                b.matmul(f"op_k_h{head_idx}", "x_norm1_q", f"w_k_h{head_idx}", f"k_cur_h{head_idx}", bias=f"b_k_h{head_idx}", in_dtype=DType.INT16, out_dtype=DType.INT16),
+                b.matmul(f"op_v_h{head_idx}", "x_norm1_q", f"w_v_h{head_idx}", f"v_cur_h{head_idx}", bias=f"b_v_h{head_idx}", in_dtype=DType.INT16, out_dtype=DType.INT16),
             ]
         )
-        score_ops.append(MatMulOp(f"op_qk_h{head_idx}", f"q_a_h{head_idx}", f"k_cache_h{head_idx}", f"scores_h{head_idx}", in_dtype=DType.INT16, out_dtype=DType.INT16))
-        value_ops.append(MatMulOp(f"op_av_h{head_idx}", f"probs_q_h{head_idx}", f"v_cache_h{head_idx}", f"attn_h{head_idx}", shift=8, in_dtype=DType.INT16, out_dtype=DType.INT16))
-
-        if prev_attn_name is None:
-            prev_attn_name = f"attn_h{head_idx}"
-        else:
-            cat_name = f"attn_cat_{head_idx}"
-            tensors[cat_name] = TensorSpec(cat_name, (1, (head_idx + 1) * d_head), DType.INT16, TensorKind.INTERMEDIATE)
-            concat_steps.append(HostOp(f"concat_attn_{head_idx}", "concat_lastdim2", inputs=[prev_attn_name, f"attn_h{head_idx}"], outputs=[cat_name]))
-            prev_attn_name = cat_name
-
-    steps: list[HostOp | NpuSegment] = [
-        HostOp("layernorm1", "layernorm", inputs=["x_in", "ln1_wb"], outputs=["x_norm1"], attrs={"eps": 1.0e-5, "output_encoding": "fp16_bits"}),
-        HostOp("quant_x_norm1", "quantize", inputs=["x_norm1"], outputs=["x_norm1_q"], attrs={"scale": act_scale, "zero_point": 0, "dtype": DType.INT16, "input_encoding": "fp16_bits"}),
-        NpuSegment("seg_qkv", qkv_ops, inputs=["x_norm1_q"], outputs=[name for name in tensors if name.startswith(("q_int_h", "k_cur_h", "v_cur_h"))]),
-    ]
-    for head_idx in range(n_heads):
-        steps.extend(
-            [
-                HostOp(f"k_append_h{head_idx}", "k_cache_scatter_write", inputs=[f"k_cur_h{head_idx}"], outputs=[f"k_cache_h{head_idx}_{decode_token_name}"], attrs={"token_index": prompt_len, "k_cache_base": f"k_cache_h{head_idx}"}),
-                HostOp(f"v_append_h{head_idx}", "v_cache_scatter_write", inputs=[f"v_cur_h{head_idx}"], outputs=[f"v_cache_h{head_idx}_{decode_token_name}"], attrs={"token_index": prompt_len, "v_cache_base": f"v_cache_h{head_idx}"}),
-                HostOp(f"alias_q_a_h{head_idx}", "alias", inputs=[f"q_int_h{head_idx}"], outputs=[f"q_a_h{head_idx}"]),
-            ]
-        )
-    steps.append(NpuSegment("seg_score", score_ops, inputs=[f"q_a_h{i}" for i in range(n_heads)], outputs=[f"scores_h{i}" for i in range(n_heads)]))
-    for head_idx in range(n_heads):
-        steps.extend(
-            [
-                HostOp(f"scale_scores_h{head_idx}", "mul", inputs=[f"scores_h{head_idx}", f"score_scale_h{head_idx}"], outputs=[f"scores_scaled_h{head_idx}"]),
-                HostOp(f"softmax_h{head_idx}", "softmax_f16", inputs=[f"scores_scaled_h{head_idx}"], outputs=[f"probs_h{head_idx}"], attrs={"axis": -1}),
-                HostOp(f"quant_probs_h{head_idx}", "quantize", inputs=[f"probs_h{head_idx}"], outputs=[f"probs_q_h{head_idx}"], attrs={"scale": attn_scale, "zero_point": 0, "dtype": DType.INT16, "input_encoding": "fp16_bits"}),
-            ]
-        )
-    steps.append(NpuSegment("seg_value", value_ops, inputs=[f"probs_q_h{i}" for i in range(n_heads)], outputs=[f"attn_h{i}" for i in range(n_heads)]))
-    steps.extend(concat_steps)
-    if n_heads == 1:
-        steps.append(HostOp("alias_attn_cat", "alias", inputs=[prev_attn_name or "attn_h0"], outputs=["attn_cat"]))
-    elif prev_attn_name != "attn_cat":
-        steps.append(HostOp("alias_attn_cat", "alias", inputs=[prev_attn_name or "attn_h0"], outputs=["attn_cat"]))
-    steps.extend(
-        [
-            HostOp("alias_attn_cat_a", "alias", inputs=["attn_cat"], outputs=["attn_cat_a"]),
-            NpuSegment("seg_o_proj", [MatMulOp("op_o_proj", "attn_cat_a", "w_o", "o_int", bias="b_o", in_dtype=DType.INT16, out_dtype=DType.INT16)], inputs=["attn_cat_a"], outputs=["o_int"]),
-            HostOp("dequant_o", "dequantize", inputs=["o_int"], outputs=["o_f"], attrs={"scale": act_scale, "zero_point": 0}),
-            HostOp("residual1", "add", inputs=["x_in", "o_f"], outputs=["resid1"]),
-            HostOp("layernorm2", "layernorm", inputs=["resid1", "ln2_wb"], outputs=["x_norm2"], attrs={"eps": 1.0e-5, "output_encoding": "fp16_bits"}),
-            HostOp("quant_x_norm2", "quantize", inputs=["x_norm2"], outputs=["x_norm2_q"], attrs={"scale": act_scale, "zero_point": 0, "dtype": DType.INT16, "input_encoding": "fp16_bits"}),
-            NpuSegment("seg_ffn_fc", [MatMulOp("op_ffn_fc", "x_norm2_q", "w_fc", "ffn_fc_int", bias="b_fc", activation="h_gelu", in_dtype=DType.INT16, out_dtype=DType.INT16)], inputs=["x_norm2_q"], outputs=["ffn_fc_int"]),
-            NpuSegment("seg_ffn_proj", [MatMulOp("op_ffn_proj", "ffn_fc_int", "w_proj", "ffn_out_int", bias="b_proj", in_dtype=DType.INT16, out_dtype=DType.INT16)], inputs=["ffn_fc_int"], outputs=["ffn_out_int"]),
-            HostOp("dequant_ffn_out", "dequantize", inputs=["ffn_out_int"], outputs=["ffn_out_f"], attrs={"scale": act_scale, "zero_point": 0}),
-            HostOp("residual2", "add", inputs=["resid1", "ffn_out_f"], outputs=["out"]),
-        ]
+    b.segment(
+        "seg_qkv",
+        ops=qkv_ops,
+        inputs=["x_norm1_q"],
+        outputs=[f"{kind}_h{head_idx}" for head_idx in range(n_heads) for kind in ("q_int", "k_cur", "v_cur")],
     )
+    for head_idx in range(n_heads):
+        b.host(
+            f"k_append_h{head_idx}",
+            "k_cache_scatter_write",
+            inputs=[f"k_cur_h{head_idx}"],
+            outputs=[f"k_cache_h{head_idx}_{decode_token_name}"],
+            attrs={"token_index": prompt_len, "k_cache_base": f"k_cache_h{head_idx}"},
+        )
+        b.host(
+            f"v_append_h{head_idx}",
+            "v_cache_scatter_write",
+            inputs=[f"v_cur_h{head_idx}"],
+            outputs=[f"v_cache_h{head_idx}_{decode_token_name}"],
+            attrs={"token_index": prompt_len, "v_cache_base": f"v_cache_h{head_idx}"},
+        )
+        b.host(f"alias_q_a_h{head_idx}", "alias", inputs=[f"q_int_h{head_idx}"], outputs=[f"q_a_h{head_idx}"])
+    b.segment(
+        "seg_score",
+        ops=[
+            b.matmul(f"op_qk_h{head_idx}", f"q_a_h{head_idx}", f"k_cache_h{head_idx}", f"scores_h{head_idx}", in_dtype=DType.INT16, out_dtype=DType.INT16)
+            for head_idx in range(n_heads)
+        ],
+        inputs=[f"q_a_h{i}" for i in range(n_heads)],
+        outputs=[f"scores_h{i}" for i in range(n_heads)],
+    )
+    _append_attention_post_score_steps(b, n_heads=n_heads, attn_scale=attn_scale, include_causal_mask=False)
+    b.segment(
+        "seg_value",
+        ops=[
+            b.matmul(f"op_av_h{head_idx}", f"probs_q_h{head_idx}", f"v_cache_h{head_idx}", f"attn_h{head_idx}", shift=8, in_dtype=DType.INT16, out_dtype=DType.INT16)
+            for head_idx in range(n_heads)
+        ],
+        inputs=[f"probs_q_h{i}" for i in range(n_heads)],
+        outputs=[f"attn_h{i}" for i in range(n_heads)],
+    )
+    _append_concat_alias_steps(b, n_heads=n_heads, seq_len=1)
+    _append_transformer_tail(b, act_scale=act_scale)
 
-    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=[], outputs=["out"])
+    plan = b.finalize(inputs=[], outputs=["out"])
     plan.add_verification_step("out", "gpt2_decode_out")
     artifact = compile_plan(plan, {"gpt2_decode_out": np.array(decode_ref["out"], dtype=np.float32, copy=True)})
     return artifact, state, prefill_ref, decode_ref

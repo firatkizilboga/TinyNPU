@@ -11,6 +11,10 @@ from tinynpu import TinyNPUProgram
 from .artifact import CompiledArtifact
 from .ir import DType, HostOp, NpuSegment, TensorKind, TensorSpec, VerifyTensor
 
+# TODO(refactor): once typed IR lowering exists, keep this file focused on
+# low-level emission only. High-level program meaning should be resolved before
+# the emitter gets here. After v1 is deleted, split v2 by emission category
+# (matmul/xform/host/runtime glue). See MIGRATION_TODO.md.
 
 _DTYPE_TO_ENUM = {
     DType.INT4: "TNPU_DTYPE_INT4",
