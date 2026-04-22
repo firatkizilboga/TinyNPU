@@ -317,9 +317,9 @@ def canonicalize_npu_boundary_policy(plan: ExecutionPlan) -> None:
         source_spec = plan.tensors[source_name]
         output_spec = plan.tensors[output_name]
         if output_spec.dtype != DType.INT16:
-            raise ValueError(
-                f"NPU boundary quantize '{step.name}' must output INT16, got {output_spec.dtype}."
-            )
+            # INT8/INT4 NPU paths are still valid, but the current runtime transform
+            # contract only has direct absorbed/XFORM ingress support for INT16.
+            continue
 
         source_producer = producer_by_output.get(source_name)
         if (
@@ -407,6 +407,8 @@ def validate_npu_boundary_policy(plan: ExecutionPlan) -> None:
             uses = consumers.get(output_name, [])
             non_verify_uses = [use for use in uses if not isinstance(use, VerifyTensor)]
             if not non_verify_uses or not all(isinstance(use, NpuSegment) for use in non_verify_uses):
+                continue
+            if plan.tensors[output_name].dtype != DType.INT16:
                 continue
             transform = str(step.attrs.get("_npu_write_transform", ""))
             if transform not in {"quantize_f32_i16", "xform_q_f16_i16"}:

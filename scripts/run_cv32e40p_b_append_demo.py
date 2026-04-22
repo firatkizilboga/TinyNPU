@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import os
 import re
 import shutil
@@ -26,13 +27,31 @@ TNPU_RISCV_MARCH = os.environ.get("TINYNPU_RISCV_MARCH", "rv32imfc")
 TNPU_RISCV_MABI = os.environ.get("TINYNPU_RISCV_MABI", "ilp32f")
 
 
+@dataclass(frozen=True)
+class RunnerConfig:
+    repeat_count: int = 1
+    dump_final_outputs: bool = True
+    verbose_steps: bool = True
+    force_mmio: bool = False
+    banner: str | None = None
+
+
 def _sanitize(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_]", "_", name)
 
 
-def _runner_source(program_symbol: str) -> str:
+def _runner_source(program_symbol: str, config: RunnerConfig | None = None) -> str:
+    cfg = config or RunnerConfig()
+    run_call = (
+        f"    return tinynpu_run_repeat(program, ip, op, NULL, 0u, {cfg.repeat_count}u);\n"
+        if cfg.repeat_count > 1
+        else "    return tinynpu_run(program, ip, op, NULL, 0u);\n"
+    )
+    banner = f'    puts("{cfg.banner}");\n' if cfg.banner else ""
+    force_mmio = "    tinynpu_set_force_mmio(1);\n" if cfg.force_mmio else ""
     return f"""#include <stdlib.h>
 #include <stdint.h>
+#include <stdio.h>
 #include "tinynpu_runtime_v2.h"
 
 extern const TnpuProgram {program_symbol};
@@ -60,9 +79,111 @@ int main(void)
         outs[i].elem_count = program->tensors[t].elem_count;
         op[i] = &outs[i];
     }}
-    return tinynpu_run(program, ip, op, NULL, 0u);
-}}
+{banner}{force_mmio}{run_call}}}
 """
+
+
+def build_v2_elf_and_hex(
+    program_name: str,
+    program_source: str,
+    *,
+    runner_config: RunnerConfig | None = None,
+    extra_cflags: list[str] | None = None,
+) -> tuple[Path, Path, Path, Path]:
+    cfg = runner_config or RunnerConfig()
+    program_symbol = _sanitize(program_name)
+    program_path = GENERATED_DIR / f"{program_name}_program.c"
+    runner_path = GENERATED_DIR / f"{program_name}_runner.c"
+    GENERATED_DIR.mkdir(exist_ok=True)
+    program_path.write_text(program_source)
+    runner_path.write_text(_runner_source(program_symbol, cfg))
+
+    prefix = _toolchain_prefix()
+    gcc = f"{prefix}gcc"
+    objcopy = f"{prefix}objcopy"
+    toolchain_root = _toolchain_root(prefix)
+    include_dir = toolchain_root / "riscv32-unknown-elf" / "include"
+    lib_dir = toolchain_root / "riscv32-unknown-elf" / "lib"
+    elf_path = CUSTOM_DIR / f"{program_name}.elf"
+    hex_path = CUSTOM_DIR / f"{program_name}.hex"
+
+    build_env = dict(os.environ)
+    build_env["CCACHE_DISABLE"] = "1"
+    build_env["TMPDIR"] = "/tmp"
+    _run(["make", "verilator-build-npu"], cwd=CORE_DIR, env=build_env)
+
+    cflags = [
+        "-w",
+        "-O3",
+        "-g",
+        "-nostdlib",
+        "-DTINYNPU_USE_SHARED_SRAM=1",
+        f"-DTNPU_RUNTIME_V2_DUMP_FINAL_OUTPUTS={1 if cfg.dump_final_outputs else 0}",
+        f"-DTNPU_RUNTIME_V2_VERBOSE_STEPS={1 if cfg.verbose_steps else 0}",
+    ]
+    if extra_cflags:
+        cflags.extend(extra_cflags)
+
+    _run(
+        [
+            gcc,
+            f"-march={TNPU_RISCV_MARCH}",
+            f"-mabi={TNPU_RISCV_MABI}",
+            "-o",
+            str(elf_path),
+            *cflags,
+            "-T",
+            "custom/link.ld",
+            "-static",
+            "custom/crt0.S",
+            str(runner_path),
+            str(program_path),
+            str(RUNTIME_DIR / "tinynpu_runtime_v2.c"),
+            "mem_stall/mem_stall.c",
+            "custom/syscalls.c",
+            "custom/vectors.S",
+            "-I",
+            str(include_dir),
+            "-I",
+            "mem_stall",
+            "-I",
+            str(RUNTIME_DIR),
+            "-L",
+            str(lib_dir),
+            "-lc",
+            "-lm",
+            "-lgcc",
+        ],
+        cwd=CORE_DIR,
+        env=build_env,
+    )
+    _run([objcopy, "-O", "verilog", str(elf_path), str(hex_path)], cwd=CORE_DIR, env=build_env)
+    return program_path, runner_path, elf_path, hex_path
+
+
+def run_vlt_npu(
+    hex_path: Path,
+    *,
+    maxcycles: int,
+    verilator_max_ticks: int = 3_000_000_000,
+    timeout_s: int | None = None,
+    noassert: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    env = dict(os.environ)
+    env["VERILATOR_MAX_TICKS"] = str(verilator_max_ticks)
+    cmd = [str(CORE_DIR / "obj_dir" / "cv32e40p_tb_vlt_npu")]
+    if noassert:
+        cmd.append("+verilator+noassert")
+    cmd.extend([f"+firmware={hex_path}", f"+maxcycles={maxcycles}"])
+    return subprocess.run(
+        cmd,
+        cwd=str(CORE_DIR),
+        env=env,
+        check=True,
+        text=True,
+        capture_output=True,
+        timeout=timeout_s,
+    )
 
 
 def _emit_u32x4_image(name: str, words: list[int]) -> str:
@@ -308,80 +429,13 @@ def _emit_program_source(program_name: str, program: TinyNPUProgram, expected_ca
 
 def main() -> int:
     program_name = "cv32e40p_b_append_demo_v2"
-    program_symbol = _sanitize(program_name)
-    program_path = GENERATED_DIR / f"{program_name}_program.c"
-    runner_path = GENERATED_DIR / f"{program_name}_runner.c"
-
     program, expected_cache = build_program()
-    GENERATED_DIR.mkdir(exist_ok=True)
-    program_path.write_text(_emit_program_source(program_name, program, expected_cache))
-    runner_path.write_text(_runner_source(program_symbol))
-
-    prefix = _toolchain_prefix()
-    gcc = f"{prefix}gcc"
-    objcopy = f"{prefix}objcopy"
-    toolchain_root = _toolchain_root(prefix)
-    include_dir = toolchain_root / "riscv32-unknown-elf" / "include"
-    lib_dir = toolchain_root / "riscv32-unknown-elf" / "lib"
-    elf_path = CUSTOM_DIR / f"{program_name}.elf"
-    hex_path = CUSTOM_DIR / f"{program_name}.hex"
-
-    build_env = dict(os.environ)
-    build_env["CCACHE_DISABLE"] = "1"
-    build_env["TMPDIR"] = "/tmp"
-    _run(["make", "verilator-build-npu"], cwd=CORE_DIR, env=build_env)
-    _run(
-        [
-            gcc,
-            f"-march={TNPU_RISCV_MARCH}",
-            f"-mabi={TNPU_RISCV_MABI}",
-            "-o",
-            str(elf_path),
-            "-w",
-            "-O3",
-            "-g",
-            "-nostdlib",
-            "-DTINYNPU_USE_SHARED_SRAM=1",
-            "-DTNPU_RUNTIME_V2_DUMP_FINAL_OUTPUTS=1",
-            "-T",
-            "custom/link.ld",
-            "-static",
-            "custom/crt0.S",
-            str(runner_path),
-            str(program_path),
-            str(RUNTIME_DIR / "tinynpu_runtime_v2.c"),
-            "mem_stall/mem_stall.c",
-            "custom/syscalls.c",
-            "custom/vectors.S",
-            "-I",
-            str(include_dir),
-            "-I",
-            "mem_stall",
-            "-I",
-            str(RUNTIME_DIR),
-            "-L",
-            str(lib_dir),
-            "-lc",
-            "-lm",
-            "-lgcc",
-        ],
-        cwd=CORE_DIR,
+    _, _, _, hex_path = build_v2_elf_and_hex(
+        program_name,
+        _emit_program_source(program_name, program, expected_cache),
+        runner_config=RunnerConfig(dump_final_outputs=True, verbose_steps=True),
     )
-    _run([objcopy, "-O", "verilog", str(elf_path), str(hex_path)], cwd=CORE_DIR)
-
-    env = dict(os.environ)
-    env["VERILATOR_MAX_TICKS"] = "3000000000"
-    proc = _run(
-        [
-            str(CORE_DIR / "obj_dir" / "cv32e40p_tb_vlt_npu"),
-            "+verilator+noassert",
-            f"+firmware={hex_path}",
-            "+maxcycles=250000",
-        ],
-        cwd=CORE_DIR,
-        env=env,
-        capture=True,
-    )
+    proc = run_vlt_npu(hex_path, maxcycles=250000, verilator_max_ticks=3_000_000_000, noassert=True)
     print(f"program={program_name}")
     print(f"cache_addr=0x{program.symbols['cache'].addr:04x}")
     print(f"expected_checksum={int(expected_cache.astype(np.int64).sum())}")
