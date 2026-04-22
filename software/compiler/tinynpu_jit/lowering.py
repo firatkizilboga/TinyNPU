@@ -537,7 +537,7 @@ class SegmentCompiler:
             return str(cache_kind)
         base_name = spec.metadata.get("storage_view_of")
         if base_name:
-            return LoweringPass._cache_kind_for_tensor(plan, str(base_name))
+            return SegmentCompiler._cache_kind_for_tensor(plan, str(base_name))
         return None
 
     def _annotate_output_layouts(self, plan: ExecutionPlan) -> None:

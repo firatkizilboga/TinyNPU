@@ -43,6 +43,9 @@ from tinynpu_jit.blocks.gpt2_block import (
     build_decode_artifact as build_gpt2_decode_artifact,
     build_prefill_artifact as build_gpt2_prefill_artifact,
     build_shared_state as build_gpt2_shared_state,
+    extend_kv_cache as extend_gpt2_kv_cache,
+    reference_decode as reference_gpt2_decode,
+    reference_prefill as reference_gpt2_prefill,
 )
 from run_cv32e40p_prefill_transformer_block_jit_demo import build_artifact as build_prefill_transformer_block_artifact
 
@@ -1468,6 +1471,135 @@ def test_qgpt2_block_matches_hf_style_fused_shapes():
     assert [b.shape for b in b_q] == [(1, 8)] * 4
     assert [b.shape for b in b_k] == [(1, 8)] * 4
     assert [b.shape for b in b_v] == [(1, 8)] * 4
+
+
+def test_gpt2_two_block_prefill_decode_reuse_matches_full_sequence():
+    d_model = 8
+    d_head = 8
+    n_heads = 1
+    ffn_dim = 8
+    prompt_len = 8
+    act_scale = 1.0 / 32.0
+    attn_scale = 1.0 / 256.0
+
+    layer0 = build_gpt2_shared_state(
+        d_model=d_model,
+        d_head=d_head,
+        n_heads=n_heads,
+        ffn_dim=ffn_dim,
+        prompt_len=prompt_len,
+        seed=0,
+    )
+    layer1 = build_gpt2_shared_state(
+        d_model=d_model,
+        d_head=d_head,
+        n_heads=n_heads,
+        ffn_dim=ffn_dim,
+        prompt_len=prompt_len,
+        seed=1,
+    )
+    layers = [layer0, layer1]
+
+    prompt_x0 = np.asarray(layer0["x_prompt_in"], dtype=np.float32)
+    decode1_x0 = np.asarray(layer0["x_decode_in"], dtype=np.float32)
+    decode2_x0 = np.random.default_rng(123).uniform(-0.25, 0.25, size=(1, d_model)).astype(np.float32)
+
+    def run_stack_prefill(x_prompt: np.ndarray) -> tuple[np.ndarray, list[dict[str, object]]]:
+        caches: list[dict[str, object]] = []
+        x = np.asarray(x_prompt, dtype=np.float32)
+        for layer_state in layers:
+            ref = reference_gpt2_prefill(
+                layer_state,
+                d_head=d_head,
+                n_heads=n_heads,
+                act_scale=act_scale,
+                attn_scale=attn_scale,
+                x_in=x,
+            )
+            caches.append(ref)
+            x = np.asarray(ref["out"], dtype=np.float32)
+        return x, caches
+
+    def run_stack_decode(
+        cache_refs: list[dict[str, object]],
+        x_decode: np.ndarray,
+    ) -> tuple[np.ndarray, list[dict[str, object]], list[dict[str, object]]]:
+        decode_refs: list[dict[str, object]] = []
+        updated_caches: list[dict[str, object]] = []
+        x = np.asarray(x_decode, dtype=np.float32)
+        for layer_state, cache_ref in zip(layers, cache_refs):
+            ref = reference_gpt2_decode(
+                layer_state,
+                cache_ref,
+                d_head=d_head,
+                n_heads=n_heads,
+                act_scale=act_scale,
+                attn_scale=attn_scale,
+                x_in=x,
+            )
+            decode_refs.append(ref)
+            updated_caches.append(extend_gpt2_kv_cache(cache_ref, ref))
+            x = np.asarray(ref["out"], dtype=np.float32)
+        return x, decode_refs, updated_caches
+
+    prompt_out, prompt_cache_refs = run_stack_prefill(prompt_x0)
+    assert prompt_out.shape == (prompt_len, d_model)
+
+    decode1_out, decode1_refs, decode1_cache_refs = run_stack_decode(prompt_cache_refs, decode1_x0)
+    assert decode1_out.shape == (1, d_model)
+
+    full_seq1_layer0 = reference_gpt2_prefill(
+        layer0,
+        d_head=d_head,
+        n_heads=n_heads,
+        act_scale=act_scale,
+        attn_scale=attn_scale,
+        x_in=np.concatenate([prompt_x0, decode1_x0], axis=0),
+    )
+    full_seq1_layer1 = reference_gpt2_prefill(
+        layer1,
+        d_head=d_head,
+        n_heads=n_heads,
+        act_scale=act_scale,
+        attn_scale=attn_scale,
+        x_in=np.asarray(full_seq1_layer0["out"], dtype=np.float32),
+    )
+
+    np.testing.assert_allclose(decode1_out, np.asarray(full_seq1_layer1["out"], dtype=np.float32)[-1:], atol=1.0e-5, rtol=1.0e-5)
+    for head_idx in range(n_heads):
+        np.testing.assert_array_equal(decode1_cache_refs[0]["k_heads"][head_idx], full_seq1_layer0["k_heads"][head_idx])
+        np.testing.assert_array_equal(decode1_cache_refs[0]["v_heads"][head_idx], full_seq1_layer0["v_heads"][head_idx])
+        np.testing.assert_array_equal(decode1_cache_refs[1]["k_heads"][head_idx], full_seq1_layer1["k_heads"][head_idx])
+        np.testing.assert_array_equal(decode1_cache_refs[1]["v_heads"][head_idx], full_seq1_layer1["v_heads"][head_idx])
+
+    decode2_out, decode2_refs, decode2_cache_refs = run_stack_decode(decode1_cache_refs, decode2_x0)
+    assert decode2_out.shape == (1, d_model)
+    assert decode2_refs[0]["out"].shape == (1, d_model)
+    assert decode2_refs[1]["out"].shape == (1, d_model)
+
+    full_seq2_layer0 = reference_gpt2_prefill(
+        layer0,
+        d_head=d_head,
+        n_heads=n_heads,
+        act_scale=act_scale,
+        attn_scale=attn_scale,
+        x_in=np.concatenate([prompt_x0, decode1_x0, decode2_x0], axis=0),
+    )
+    full_seq2_layer1 = reference_gpt2_prefill(
+        layer1,
+        d_head=d_head,
+        n_heads=n_heads,
+        act_scale=act_scale,
+        attn_scale=attn_scale,
+        x_in=np.asarray(full_seq2_layer0["out"], dtype=np.float32),
+    )
+
+    np.testing.assert_allclose(decode2_out, np.asarray(full_seq2_layer1["out"], dtype=np.float32)[-1:], atol=1.0e-5, rtol=1.0e-5)
+    for head_idx in range(n_heads):
+        np.testing.assert_array_equal(decode2_cache_refs[0]["k_heads"][head_idx], full_seq2_layer0["k_heads"][head_idx])
+        np.testing.assert_array_equal(decode2_cache_refs[0]["v_heads"][head_idx], full_seq2_layer0["v_heads"][head_idx])
+        np.testing.assert_array_equal(decode2_cache_refs[1]["k_heads"][head_idx], full_seq2_layer1["k_heads"][head_idx])
+        np.testing.assert_array_equal(decode2_cache_refs[1]["v_heads"][head_idx], full_seq2_layer1["v_heads"][head_idx])
 
 
 def test_describe_int16_k_cache_append_requires_lane_partial_writes():

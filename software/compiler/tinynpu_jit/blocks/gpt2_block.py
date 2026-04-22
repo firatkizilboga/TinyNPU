@@ -282,10 +282,14 @@ def reference_prefill(
     n_heads: int,
     act_scale: float,
     attn_scale: float,
+    x_in: np.ndarray | None = None,
 ) -> dict[str, object]:
     golden = GoldenModel()
     block: QGPT2Block = state["block"]
-    x_in = np.array(state["x_prompt_in"], dtype=np.float32, copy=True)
+    if x_in is None:
+        x_in = np.array(state["x_prompt_in"], dtype=np.float32, copy=True)
+    else:
+        x_in = np.array(x_in, dtype=np.float32, copy=True)
     prompt_len = x_in.shape[0]
     ln1_wb = np.array(block.ln_1_wb, dtype=np.float32, copy=True)
     ln2_wb = np.array(block.ln_2_wb, dtype=np.float32, copy=True)
@@ -350,6 +354,34 @@ def reference_prefill(
         "ffn_out_int": ffn_out_int,
         "ffn_out_f": ffn_out_f,
         "out": out,
+    }
+
+
+def extend_kv_cache(
+    prefill_ref: dict[str, object],
+    decode_ref: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "k_heads": [
+            np.concatenate(
+                [
+                    np.asarray(prefill_ref["k_heads"][head_idx], dtype=np.int16),
+                    np.asarray(decode_ref["k_cur_heads"][head_idx], dtype=np.int16),
+                ],
+                axis=0,
+            ).astype(np.int16)
+            for head_idx in range(len(prefill_ref["k_heads"]))
+        ],
+        "v_heads": [
+            np.concatenate(
+                [
+                    np.asarray(prefill_ref["v_heads"][head_idx], dtype=np.int16),
+                    np.asarray(decode_ref["v_cur_heads"][head_idx], dtype=np.int16),
+                ],
+                axis=0,
+            ).astype(np.int16)
+            for head_idx in range(len(prefill_ref["v_heads"]))
+        ],
     }
 
 
@@ -435,10 +467,14 @@ def reference_decode(
     n_heads: int,
     act_scale: float,
     attn_scale: float,
+    x_in: np.ndarray | None = None,
 ) -> dict[str, object]:
     golden = GoldenModel()
     block: QGPT2Block = state["block"]
-    x_in = np.array(state["x_decode_in"], dtype=np.float32, copy=True)
+    if x_in is None:
+        x_in = np.array(state["x_decode_in"], dtype=np.float32, copy=True)
+    else:
+        x_in = np.array(x_in, dtype=np.float32, copy=True)
     ln1_wb = np.array(block.ln_1_wb, dtype=np.float32, copy=True)
     ln2_wb = np.array(block.ln_2_wb, dtype=np.float32, copy=True)
     w_q, w_k, w_v = block.split_c_attn_weights()

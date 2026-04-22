@@ -22,6 +22,10 @@
 #define TNPU_RUNTIME_V2_DUMP_FINAL_OUTPUTS 1
 #endif
 
+#ifndef TNPU_RUNTIME_V2_VERBOSE_STEPS
+#define TNPU_RUNTIME_V2_VERBOSE_STEPS 1
+#endif
+
 static const char *tnpu_role_or_default(const char *role, const char *fallback)
 {
     if (role == NULL || role[0] == '\0') {
@@ -1010,7 +1014,9 @@ static int tnpu_execute_preloads(const TnpuProgram *program, uint32_t *preload_t
             load_ub_image(load->base_addr, load->image, (int)load->word_count);
             t1 = read_mcycle32();
             preload_total += (t0 - t1);
-            print_cycle_delta32(load->label ? load->label : "preload.ub_image", t0, t1);
+            if (TNPU_RUNTIME_V2_VERBOSE_STEPS) {
+                print_cycle_delta32(load->label ? load->label : "preload.ub_image", t0, t1);
+            }
         } else if (op->kind == TNPU_OP_PRELOAD_IM) {
             const TnpuImageLoad *load = &program->im_preloads[op->index];
             uint32_t t0 = read_mcycle32();
@@ -1018,7 +1024,9 @@ static int tnpu_execute_preloads(const TnpuProgram *program, uint32_t *preload_t
             load_im_image(load->base_addr, load->image, (int)load->word_count);
             t1 = read_mcycle32();
             preload_total += (t0 - t1);
-            print_cycle_delta32(load->label ? load->label : "preload.im_image", t0, t1);
+            if (TNPU_RUNTIME_V2_VERBOSE_STEPS) {
+                print_cycle_delta32(load->label ? load->label : "preload.im_image", t0, t1);
+            }
         }
     }
 
@@ -1119,7 +1127,7 @@ int tinynpu_run(
         free(runtime_tensors);
         return EXIT_FAILURE;
     }
-    if (tnpu_execute_body(runtime_tensors, program, 1) != 0) {
+    if (tnpu_execute_body(runtime_tensors, program, TNPU_RUNTIME_V2_VERBOSE_STEPS) != 0) {
         free(runtime_tensors);
         return EXIT_FAILURE;
     }
