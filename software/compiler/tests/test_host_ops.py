@@ -1,5 +1,6 @@
 import os
 import sys
+from enum import Enum
 
 import numpy as np
 import pytest
@@ -97,6 +98,26 @@ def test_quantize_validation_fails_on_non_positive_scale():
 
     with pytest.raises(ValueError, match="scale > 0"):
         compile_plan(plan, expected_tensors={})
+
+
+def test_quantize_accepts_dtype_like_enum_from_alternate_module_path():
+    class AlternateDType(str, Enum):
+        INT16 = "int16"
+
+    step = HostOp(
+        name="q0",
+        kind="quantize",
+        inputs=["x"],
+        outputs=["y"],
+        attrs={"scale": 0.25, "dtype": AlternateDType.INT16},
+    )
+    artifact = _artifact_for_host_op(step, input_dtype=DType.FLOAT32, output_dtype=DType.INT16)
+    source = np.array([[1.0, -2.0], [3.0, -4.0]], dtype=np.float32)
+
+    result = HostEmulationExecutor().run(artifact, {"x": source})
+
+    expected = np.array([[4, -8], [12, -16]], dtype=np.int16)
+    np.testing.assert_array_equal(result.tensors["y"], expected)
 
 
 def test_mean_validation_requires_input_quantization_scale():

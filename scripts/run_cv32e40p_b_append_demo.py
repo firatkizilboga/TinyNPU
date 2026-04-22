@@ -40,9 +40,19 @@ extern const TnpuProgram {program_symbol};
 int main(void)
 {{
     const TnpuProgram *program = &{program_symbol};
+    TnpuTensor ins[8];
+    const TnpuTensor *ip[8];
     TnpuTensor outs[8];
     const TnpuTensor *op[8];
+    if (program->input_count > 8u) return EXIT_FAILURE;
     if (program->output_count > 8u) return EXIT_FAILURE;
+    for (uint32_t i = 0; i < program->input_count; ++i) {{
+        uint16_t t = program->input_tensor_indices[i];
+        ins[i].data = program->tensors[t].data;
+        ins[i].desc = &program->tensors[t];
+        ins[i].elem_count = program->tensors[t].elem_count;
+        ip[i] = &ins[i];
+    }}
     for (uint32_t i = 0; i < program->output_count; ++i) {{
         uint16_t t = program->output_tensor_indices[i];
         outs[i].data = program->tensors[t].data;
@@ -50,7 +60,7 @@ int main(void)
         outs[i].elem_count = program->tensors[t].elem_count;
         op[i] = &outs[i];
     }}
-    return tinynpu_run(program, NULL, op, NULL, 0u);
+    return tinynpu_run(program, ip, op, NULL, 0u);
 }}
 """
 

@@ -53,6 +53,15 @@ def _counts(**kwargs: int):
 def _dtype_attr(value: Any) -> DType:
     if isinstance(value, DType):
         return value
+    enum_value = getattr(value, "value", None)
+    if isinstance(enum_value, str):
+        try:
+            return DType(enum_value)
+        except ValueError:
+            pass
+    enum_name = getattr(value, "name", None)
+    if isinstance(enum_name, str) and enum_name in DType.__members__:
+        return DType[enum_name]
     return DType(str(value))
 
 
