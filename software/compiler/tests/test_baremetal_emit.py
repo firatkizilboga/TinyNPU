@@ -238,7 +238,7 @@ def test_emit_cv32e40p_program_v2_structured_program():
     assert "TNPU_OP_PRELOAD_UB" in source
 
 
-def test_emit_cv32e40p_program_v2_absorbs_quantize_into_segment_write():
+def test_compile_plan_canonicalizes_runtime_input_to_fp16_xform():
     x_f = np.array(
         [
             [1.0, -2.0, 3.0, -4.0, 0.5, -0.5, 2.5, -1.5],
@@ -270,14 +270,53 @@ def test_emit_cv32e40p_program_v2_absorbs_quantize_into_segment_write():
     plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=["x_f"], outputs=["y"])
     plan.add_verification_step("y", "final_y")
     artifact = compile_plan(plan, {"y": y})
+    quant = next(step for step in artifact.plan.steps if isinstance(step, HostOp) and step.name == "quant_x")
 
-    source = emit_cv32e40p_program_v2(artifact, {"x_f": x_f}, program_name="unit_test_v2_quant_absorb")
+    assert artifact.plan.tensors["x_f"].dtype == DType.INT16
+    assert artifact.plan.tensors["x_f"].metadata.get("value_encoding") == "fp16_bits"
+    assert quant.attrs.get("input_encoding") == "fp16_bits"
+    assert quant.attrs.get("_npu_write_transform") == "xform_q_f16_i16"
 
-    assert "TNPU_WRITE_QUANTIZE_F32_TO_INT16" in source
-    assert ".transform = TNPU_WRITE_QUANTIZE_F32_TO_INT16" in source
+    source = emit_cv32e40p_program_v2(artifact, {"x_f": x_f}, program_name="unit_test_v2_runtime_input_xform")
+
+    assert "TNPU_WRITE_XFORM_Q_F16_I16" in source
+    assert ".transform = TNPU_WRITE_XFORM_Q_F16_I16" in source
     assert "TNPU_HOST_QUANTIZE" not in source
     assert "TNPU_OP_SEGMENT" in source
     assert "TNPU_OP_VERIFY" in source
+
+
+def test_emit_cv32e40p_program_v2_falls_back_to_float_quantize_for_generic_host_output():
+    x_f = np.arange(64, dtype=np.float32).reshape(8, 8) / 16.0
+    bias_f = np.ones((8, 8), dtype=np.float32)
+    x_sum = x_f + bias_f
+    x_q = np.clip(np.rint(x_sum / 0.5), -32768, 32767).astype(np.int16)
+    w = np.eye(8, dtype=np.int16)
+    y = x_q.copy()
+
+    tensors = {
+        "x_f": TensorSpec("x_f", x_f.shape, DType.FLOAT32, TensorKind.INPUT),
+        "bias_f": TensorSpec("bias_f", bias_f.shape, DType.FLOAT32, TensorKind.CONSTANT, data=bias_f),
+        "x_sum": TensorSpec("x_sum", x_f.shape, DType.FLOAT32, TensorKind.INTERMEDIATE),
+        "x_q": TensorSpec("x_q", x_q.shape, DType.INT16, TensorKind.INTERMEDIATE),
+        "w": TensorSpec("w", w.shape, DType.INT16, TensorKind.CONSTANT, data=w),
+        "y": TensorSpec("y", y.shape, DType.INT16, TensorKind.OUTPUT, is_final_output=True),
+    }
+    steps = [
+        HostOp("add_bias", "add", inputs=["x_f", "bias_f"], outputs=["x_sum"]),
+        HostOp("quant_x", "quantize", inputs=["x_sum"], outputs=["x_q"], attrs={"scale": 0.5, "zero_point": 0}),
+        NpuSegment("seg0", [MatMulOp("op0", "x_q", "w", "y")], inputs=["x_q", "w"], outputs=["y"]),
+    ]
+    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=["x_f"], outputs=["y"])
+    plan.add_verification_step("y", "final_y")
+    artifact = compile_plan(plan, {"y": y})
+    quant = next(step for step in artifact.plan.steps if isinstance(step, HostOp) and step.name == "quant_x")
+
+    assert quant.attrs.get("_npu_write_transform") == "quantize_f32_i16"
+
+    source = emit_cv32e40p_program_v2(artifact, {"x_f": x_f}, program_name="unit_test_v2_float_quant_fallback")
+    assert "TNPU_WRITE_QUANTIZE_F32_TO_INT16" in source
+    assert ".transform = TNPU_WRITE_QUANTIZE_F32_TO_INT16" in source
 
 
 def test_emit_cv32e40p_program_v2_absorbs_f16_quantize_into_xform_write():
@@ -309,6 +348,46 @@ def test_emit_cv32e40p_program_v2_absorbs_f16_quantize_into_xform_write():
     assert ".transform = TNPU_WRITE_XFORM_Q_F16_I16" in source
     assert "TNPU_HOST_SOFTMAX_F16" in source
     assert "TNPU_HOST_QUANTIZE" not in source
+
+
+def test_compile_plan_canonicalizes_layernorm_boundary_to_fp16_xform():
+    x_f = np.arange(64, dtype=np.float32).reshape(8, 8) / 16.0
+    ln_wb = np.concatenate(
+        [
+            np.ones((8,), dtype=np.float32),
+            np.zeros((8,), dtype=np.float32),
+        ]
+    ).astype(np.float32)
+    x_norm_q = np.zeros((8, 8), dtype=np.int16)
+    w = np.eye(8, dtype=np.int16)
+    y = np.zeros((8, 8), dtype=np.int16)
+
+    tensors = {
+        "x_f": TensorSpec("x_f", x_f.shape, DType.FLOAT32, TensorKind.INPUT),
+        "ln_wb": TensorSpec("ln_wb", ln_wb.shape, DType.FLOAT32, TensorKind.CONSTANT, data=ln_wb),
+        "x_norm": TensorSpec("x_norm", x_f.shape, DType.FLOAT32, TensorKind.INTERMEDIATE),
+        "x_norm_q": TensorSpec("x_norm_q", x_norm_q.shape, DType.INT16, TensorKind.INTERMEDIATE),
+        "w": TensorSpec("w", w.shape, DType.INT16, TensorKind.CONSTANT, data=w),
+        "y": TensorSpec("y", y.shape, DType.INT16, TensorKind.OUTPUT, is_final_output=True),
+    }
+    steps = [
+        HostOp("ln", "layernorm", inputs=["x_f", "ln_wb"], outputs=["x_norm"], attrs={"eps": 1.0e-5}),
+        HostOp("quant_x_norm", "quantize", inputs=["x_norm"], outputs=["x_norm_q"], attrs={"scale": 0.5, "zero_point": 0}),
+        NpuSegment("seg0", [MatMulOp("op0", "x_norm_q", "w", "y")], inputs=["x_norm_q", "w"], outputs=["y"]),
+    ]
+    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=["x_f"], outputs=["y"])
+    plan.add_verification_step("y", "final_y")
+
+    artifact = compile_plan(plan, {"y": y})
+    layernorm = next(step for step in artifact.plan.steps if isinstance(step, HostOp) and step.name == "ln")
+    quant = next(step for step in artifact.plan.steps if isinstance(step, HostOp) and step.name == "quant_x_norm")
+
+    assert layernorm.attrs.get("output_encoding") == "fp16_bits"
+    assert quant.attrs.get("input_encoding") == "fp16_bits"
+    assert quant.attrs.get("_npu_write_transform") == "xform_q_f16_i16"
+
+    source = emit_cv32e40p_program_v2(artifact, {"x_f": x_f}, program_name="unit_test_v2_ln_xform")
+    assert "TNPU_WRITE_XFORM_Q_F16_I16" in source
 
 
 def test_emit_cv32e40p_program_v2_absorbs_dequantize_into_segment_read():
@@ -349,6 +428,167 @@ def test_emit_cv32e40p_program_v2_absorbs_dequantize_into_segment_read():
     assert "TNPU_READ_DEQUANTIZE_INT16_TO_FLOAT32" in source
     assert ".transform = TNPU_READ_DEQUANTIZE_INT16_TO_FLOAT32" in source
     assert "TNPU_HOST_DEQUANTIZE" not in source
+
+
+def test_compile_plan_rejects_float32_npu_weight_constant():
+    x = np.eye(8, dtype=np.int16)
+    w_f = np.eye(8, dtype=np.float32)
+    y = np.eye(8, dtype=np.int16)
+
+    tensors = {
+        "x": TensorSpec("x", x.shape, DType.INT16, TensorKind.INPUT),
+        "w_f": TensorSpec("w_f", w_f.shape, DType.FLOAT32, TensorKind.CONSTANT, data=w_f),
+        "y": TensorSpec("y", y.shape, DType.INT16, TensorKind.OUTPUT, is_final_output=True),
+    }
+    steps = [
+        NpuSegment("seg0", [MatMulOp("op0", "x", "w_f", "y")], inputs=["x", "w_f"], outputs=["y"]),
+    ]
+    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=["x"], outputs=["y"])
+
+    with pytest.raises(ValueError, match="INT4/INT8/INT16|FLOAT32 constant"):
+        compile_plan(plan, {"y": y})
+
+
+def test_compile_plan_folds_leading_input_quantize_into_int16_input_contract():
+    x_f = (np.arange(9, dtype=np.float32).reshape(1, 1, 3, 3) / 8.0) - 0.5
+    x_q = np.clip(np.rint(x_f / 0.25), -32768, 32767).astype(np.int16)
+    x_im2col = x_q.reshape(9, 1)
+    w = np.array([[3]], dtype=np.int16)
+    y_q = (x_im2col.astype(np.int32) * 3).astype(np.int16)
+    y_f = y_q.astype(np.float32) * 0.5
+
+    tensors = {
+        "x_f": TensorSpec("x_f", x_f.shape, DType.FLOAT32, TensorKind.INPUT),
+        "x_q": TensorSpec("x_q", x_q.shape, DType.INT16, TensorKind.INTERMEDIATE),
+        "x_im2col": TensorSpec("x_im2col", x_im2col.shape, DType.INT16, TensorKind.INTERMEDIATE),
+        "w": TensorSpec("w", w.shape, DType.INT16, TensorKind.CONSTANT, data=w),
+        "y_q": TensorSpec("y_q", y_q.shape, DType.INT16, TensorKind.INTERMEDIATE),
+        "y_f": TensorSpec("y_f", y_f.shape, DType.FLOAT32, TensorKind.OUTPUT, is_final_output=True),
+    }
+    steps = [
+        HostOp("q_in", "quantize", inputs=["x_f"], outputs=["x_q"], attrs={"scale": 0.25, "zero_point": 0}),
+        HostOp(
+            "im2col",
+            "im2col",
+            inputs=["x_q"],
+            outputs=["x_im2col"],
+            attrs={"kernel_size": 1, "stride": 1, "padding": 0, "input_layout": "chw"},
+        ),
+        NpuSegment("seg0", [MatMulOp("op0", "x_im2col", "w", "y_q")], inputs=["x_im2col", "w"], outputs=["y_q"]),
+        HostOp("dq_out", "dequantize", inputs=["y_q"], outputs=["y_f"], attrs={"scale": 0.5, "zero_point": 0}),
+    ]
+    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=["x_f"], outputs=["y_f"])
+    plan.add_verification_step("y_f", "final_y")
+
+    artifact = compile_plan(plan, {"y_f": y_f})
+    x_spec = artifact.plan.tensors["x_f"]
+
+    assert x_spec.dtype == DType.INT16
+    assert x_spec.metadata.get("runtime_input_transform") == "quantize_f32_i16"
+    assert float(x_spec.metadata.get("runtime_input_scale", 0.0)) == pytest.approx(0.25)
+    assert int(x_spec.metadata.get("runtime_input_zero_point", 123)) == 0
+    assert "x_q" not in artifact.plan.tensors
+    assert all(not (isinstance(step, HostOp) and step.name == "q_in") for step in artifact.plan.steps)
+
+    result = artifact.run_host_emulation({"x_f": x_f}, verification=VerificationMode.DEBUG)
+    np.testing.assert_allclose(result.tensors["y_f"], y_f, rtol=1e-5, atol=1e-6)
+
+    source = emit_cv32e40p_program_v2(artifact, {"x_f": x_f}, program_name="unit_test_input_contract_fold")
+    assert "TNPU_HOST_QUANTIZE" not in source
+    assert '"x_f", .data = x_f_data, .dtype = TNPU_DTYPE_INT16' in source
+
+
+def test_compile_plan_fuses_layout_restore_relu_im2col_chain():
+    x = np.eye(4, dtype=np.int16)
+    w0 = np.eye(4, dtype=np.int16)
+    w1 = np.eye(4, dtype=np.int16)
+    y = np.eye(4, dtype=np.int16)
+
+    tensors = {
+        "x": TensorSpec("x", x.shape, DType.INT16, TensorKind.INPUT),
+        "w0": TensorSpec("w0", w0.shape, DType.INT16, TensorKind.CONSTANT, data=w0),
+        "mat0": TensorSpec("mat0", (4, 4), DType.INT16, TensorKind.INTERMEDIATE),
+        "restored0": TensorSpec("restored0", (1, 1, 2, 2), DType.INT16, TensorKind.INTERMEDIATE),
+        "relu0": TensorSpec("relu0", (1, 1, 2, 2), DType.INT16, TensorKind.INTERMEDIATE),
+        "cols1": TensorSpec("cols1", (4, 4), DType.INT16, TensorKind.INTERMEDIATE),
+        "w1": TensorSpec("w1", w1.shape, DType.INT16, TensorKind.CONSTANT, data=w1),
+        "y": TensorSpec("y", y.shape, DType.INT16, TensorKind.OUTPUT, is_final_output=True),
+    }
+    steps = [
+        NpuSegment("seg0", [MatMulOp("op0", "x", "w0", "mat0")], inputs=["x", "w0"], outputs=["mat0"]),
+        HostOp(
+            "restore0",
+            "layout_restore",
+            inputs=["mat0"],
+            outputs=["restored0"],
+            attrs={"layout": "chw", "original_shape": (1, 2, 2), "out_h": 2, "out_w": 2, "out_channels": 1},
+        ),
+        HostOp("relu0_step", "relu", inputs=["restored0"], outputs=["relu0"]),
+        HostOp(
+            "im2col1",
+            "im2col",
+            inputs=["relu0"],
+            outputs=["cols1"],
+            attrs={"kernel_size": 1, "stride": 1, "padding": 0, "input_layout": "chw", "input_channels": 1},
+        ),
+        NpuSegment("seg1", [MatMulOp("op1", "cols1", "w1", "y")], inputs=["cols1", "w1"], outputs=["y"]),
+    ]
+    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=["x"], outputs=["y"])
+    plan.add_verification_step("y", "final_y")
+
+    artifact = compile_plan(plan, {"y": y})
+
+    kinds = [getattr(step, "kind", type(step).__name__) for step in artifact.plan.steps]
+    assert "relu" not in kinds
+    assert "layout_restore" not in kinds
+    im2col = next(step for step in artifact.plan.steps if isinstance(step, HostOp) and step.kind == "im2col")
+    assert im2col.inputs == ["mat0"]
+    assert im2col.attrs["input_layout"] == "matrix_hwc"
+    assert im2col.attrs["matrix_h"] == 2
+    assert im2col.attrs["matrix_w"] == 2
+    assert im2col.attrs["matrix_c"] == 1
+    seg0 = next(step for step in artifact.plan.steps if isinstance(step, NpuSegment) and step.name == "seg0")
+    assert seg0.ops[0].activation == "relu"
+
+
+def test_compile_plan_fuses_layout_restore_sigmoid_dequantize_tail():
+    x = np.eye(4, dtype=np.int16)
+    w = np.eye(4, dtype=np.int16)
+    y = np.ones((1, 1, 2, 2), dtype=np.float32)
+
+    tensors = {
+        "x": TensorSpec("x", x.shape, DType.INT16, TensorKind.INPUT),
+        "w": TensorSpec("w", w.shape, DType.INT16, TensorKind.CONSTANT, data=w),
+        "mat": TensorSpec("mat", (4, 4), DType.INT16, TensorKind.INTERMEDIATE),
+        "restored": TensorSpec("restored", (1, 1, 2, 2), DType.INT16, TensorKind.INTERMEDIATE),
+        "sigm": TensorSpec("sigm", (1, 1, 2, 2), DType.INT16, TensorKind.INTERMEDIATE),
+        "y": TensorSpec("y", y.shape, DType.FLOAT32, TensorKind.OUTPUT, is_final_output=True),
+    }
+    steps = [
+        NpuSegment("seg0", [MatMulOp("op0", "x", "w", "mat")], inputs=["x", "w"], outputs=["mat"]),
+        HostOp(
+            "restore",
+            "layout_restore",
+            inputs=["mat"],
+            outputs=["restored"],
+            attrs={"layout": "chw", "original_shape": (1, 2, 2), "out_h": 2, "out_w": 2, "out_channels": 1},
+        ),
+        HostOp("sigmoid_step", "sigmoid", inputs=["restored"], outputs=["sigm"]),
+        HostOp("dq", "dequantize", inputs=["sigm"], outputs=["y"], attrs={"scale": 1.0, "zero_point": 0}),
+    ]
+    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=["x"], outputs=["y"])
+    plan.add_verification_step("y", "final_y")
+
+    artifact = compile_plan(plan, {"y": y})
+
+    kinds = [getattr(step, "kind", type(step).__name__) for step in artifact.plan.steps]
+    assert "sigmoid" not in kinds
+    seg0 = next(step for step in artifact.plan.steps if isinstance(step, NpuSegment) and step.name == "seg0")
+    assert seg0.ops[0].activation == "sigmoid"
+    restore = next(step for step in artifact.plan.steps if isinstance(step, HostOp) and step.kind == "layout_restore")
+    assert restore.outputs == ["sigm"]
+    dequant = next(step for step in artifact.plan.steps if isinstance(step, HostOp) and step.kind == "dequantize")
+    assert dequant.inputs == ["sigm"]
 
 
 def test_compile_plan_marks_rhs_chaining_output_as_b_layout():

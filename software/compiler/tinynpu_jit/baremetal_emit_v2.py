@@ -85,6 +85,23 @@ def _as_float32_array(data: np.ndarray) -> np.ndarray:
     return np.asarray(data, dtype=np.float32)
 
 
+def _float32_to_fp16_bits_array(data: np.ndarray) -> np.ndarray:
+    return np.asarray(data, dtype=np.float32).astype(np.float16).view(np.uint16).astype(np.int16)
+
+
+def _round_away_from_zero(data: np.ndarray) -> np.ndarray:
+    values = np.asarray(data, dtype=np.float32)
+    return np.where(values >= 0.0, np.floor(values + 0.5), np.ceil(values - 0.5))
+
+
+def _quantize_float32_to_int16_array(data: np.ndarray, *, scale: float, zero_point: int) -> np.ndarray:
+    if scale <= 0:
+        raise ValueError(f"Quantization scale must be positive, got {scale}.")
+    quantized = _round_away_from_zero(np.asarray(data, dtype=np.float32) / np.float32(scale)).astype(np.int64)
+    quantized += np.int64(zero_point)
+    return np.clip(quantized, -32768, 32767).astype(np.int16)
+
+
 def _format_scalar(value: Any, *, dtype: DType) -> str:
     if dtype == DType.FLOAT32:
         number = float(value)
@@ -191,6 +208,20 @@ def emit_cv32e40p_program_v2(
                 initial = np.array(inputs[spec.name], copy=True)
             elif spec.data is not None:
                 initial = np.array(spec.data, copy=True)
+        runtime_input_transform = str(spec.metadata.get("runtime_input_transform", ""))
+        if (
+            initial is not None
+            and runtime_input_transform == "quantize_f32_i16"
+            and np.issubdtype(np.asarray(initial).dtype, np.floating)
+        ):
+            initial = _quantize_float32_to_int16_array(
+                np.asarray(initial),
+                scale=float(spec.metadata["runtime_input_scale"]),
+                zero_point=int(spec.metadata.get("runtime_input_zero_point", 0)),
+            )
+        value_encoding = str(spec.metadata.get("value_encoding", ""))
+        if initial is not None and value_encoding == "fp16_bits" and np.issubdtype(np.asarray(initial).dtype, np.floating):
+            initial = _float32_to_fp16_bits_array(np.asarray(initial))
         elem_count = int(np.prod(spec.shape, dtype=np.int64)) if spec.shape else 1
         shape4 = _shape4(spec.shape if spec.shape else (1,))
         dtype_enum = _DTYPE_TO_ENUM[spec.dtype]
@@ -371,8 +402,10 @@ def emit_cv32e40p_program_v2(
                 producer = producer_by_output[tensor_name]
                 source_name = producer.inputs[0]
                 source_spec = artifact.plan.tensors[source_name]
+                transform_policy = str(producer.attrs.get("_npu_write_transform", ""))
                 if (
-                    source_spec.dtype == DType.FLOAT32
+                    transform_policy == "quantize_f32_i16"
+                    and source_spec.dtype == DType.FLOAT32
                     and int(sym["precision"]) == 2
                     and str(sym["role"]) == "A"
                 ):
@@ -381,7 +414,28 @@ def emit_cv32e40p_program_v2(
                     attrs_i32[0] = int(producer.attrs.get("zero_point", 0))
                     attrs_f32[0] = 1.0 / float(producer.attrs["scale"])
                 elif (
-                    source_spec.dtype == DType.INT16
+                    transform_policy == "xform_q_f16_i16"
+                    and source_spec.dtype == DType.INT16
+                    and int(sym["precision"]) == 2
+                    and str(sym["role"]) == "A"
+                    and int(producer.attrs.get("zero_point", 0)) == 0
+                ):
+                    write_tensor_name = source_name
+                    transform = "TNPU_WRITE_XFORM_Q_F16_I16"
+                    attrs_f32[0] = 1.0 / float(producer.attrs["scale"])
+                elif (
+                    not transform_policy
+                    and source_spec.dtype == DType.FLOAT32
+                    and int(sym["precision"]) == 2
+                    and str(sym["role"]) == "A"
+                ):
+                    write_tensor_name = source_name
+                    transform = "TNPU_WRITE_QUANTIZE_F32_TO_INT16"
+                    attrs_i32[0] = int(producer.attrs.get("zero_point", 0))
+                    attrs_f32[0] = 1.0 / float(producer.attrs["scale"])
+                elif (
+                    not transform_policy
+                    and source_spec.dtype == DType.INT16
                     and int(sym["precision"]) == 2
                     and str(sym["role"]) == "A"
                     and int(producer.attrs.get("zero_point", 0)) == 0
@@ -431,10 +485,12 @@ def emit_cv32e40p_program_v2(
             dequant_step = absorbed_dequantize_by_input.get(output_name)
             if dequant_step is not None:
                 read_tensor_name = dequant_step.outputs[0]
-                read_transform = "TNPU_READ_DEQUANTIZE_INT16_TO_FLOAT32"
-                read_attrs_i32[0] = int(dequant_step.attrs.get("zero_point", 0))
-                read_attrs_f32[0] = float(dequant_step.attrs["scale"])
-                absorbed_dequantize_step_names.add(dequant_step.name)
+                transform_policy = str(dequant_step.attrs.get("_npu_read_transform", ""))
+                if transform_policy in {"", "dequantize_int16_to_float32"}:
+                    read_transform = "TNPU_READ_DEQUANTIZE_INT16_TO_FLOAT32"
+                    read_attrs_i32[0] = int(dequant_step.attrs.get("zero_point", 0))
+                    read_attrs_f32[0] = float(dequant_step.attrs["scale"])
+                    absorbed_dequantize_step_names.add(dequant_step.name)
             reads.append(
                 "    {"
                 f".tensor_idx = {tensor_index[read_tensor_name]}, .addr = 0x{int(sym['addr']):04x}u, "

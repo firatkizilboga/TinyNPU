@@ -39,7 +39,25 @@ class HostEmulationExecutor:
         for name in artifact.plan.inputs:
             if name not in inputs:
                 raise KeyError(f"Missing runtime input '{name}'.")
-            values[name] = np.array(inputs[name], copy=True)
+            spec = artifact.plan.tensors[name]
+            incoming = np.array(inputs[name], copy=True)
+            runtime_input_transform = str(spec.metadata.get("runtime_input_transform", ""))
+            if (
+                runtime_input_transform == "quantize_f32_i16"
+                and np.issubdtype(incoming.dtype, np.floating)
+            ):
+                incoming = self.golden.quantize(
+                    incoming,
+                    scale=float(spec.metadata["runtime_input_scale"]),
+                    zero_point=int(spec.metadata.get("runtime_input_zero_point", 0)),
+                    out_dtype=DType.INT16,
+                )
+            if (
+                str(spec.metadata.get("value_encoding", "")) == "fp16_bits"
+                and np.issubdtype(incoming.dtype, np.floating)
+            ):
+                incoming = incoming.astype(np.float16).view(np.uint16).astype(np.int16)
+            values[name] = incoming
 
         verified: list[str] = []
         debug_trace: list[dict[str, np.ndarray | str | dict[str, object] | list[str] | bool]] = []

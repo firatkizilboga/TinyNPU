@@ -18,6 +18,10 @@
 #define TINYNPU_USE_SHARED_SRAM 1
 #endif
 
+#ifndef TNPU_RUNTIME_V2_DUMP_PRELOAD_PROGRESS
+#define TNPU_RUNTIME_V2_DUMP_PRELOAD_PROGRESS 0
+#endif
+
 #ifndef TINYNPU_SHARED_PACKED_READ_MMIO_FALLBACK
 #define TINYNPU_SHARED_PACKED_READ_MMIO_FALLBACK 0
 #endif
@@ -612,8 +616,8 @@ static void host_quantize(TinyTensor *dst, const TinyTensor *src, float inv_scal
     runtime_assert(dst->elem_count == src->elem_count, "quantize size mismatch");
     for (int i = 0; i < src->elem_count; ++i) {
         float source = tensor_get_float(src, i);
-        int64_t quantized = host_round_to_i64(source * inv_scale) + (int64_t)zero_point;
-        tensor_set_i32(dst, i, clip_for_dtype(quantized, dst->dtype));
+        int32_t quantized = host_round_to_i32(source * inv_scale) + zero_point;
+        tensor_set_i32(dst, i, clip_for_dtype((int64_t)quantized, dst->dtype));
     }
 }
 
@@ -654,8 +658,8 @@ static void host_quantize_fp16bits(TinyTensor *dst, const TinyTensor *src, float
             out.u = sign | ((exp + 112u) << 23) | (mant << 13);
         }
         {
-            int64_t quantized = host_round_to_i64(out.f * inv_scale) + (int64_t)zero_point;
-            tensor_set_i32(dst, i, clip_for_dtype(quantized, dst->dtype));
+            int32_t quantized = host_round_to_i32(out.f * inv_scale) + zero_point;
+            tensor_set_i32(dst, i, clip_for_dtype((int64_t)quantized, dst->dtype));
         }
     }
 }
@@ -677,8 +681,8 @@ static void host_requantize(TinyTensor *dst, const TinyTensor *src, float scale,
     runtime_assert(dst->elem_count == src->elem_count, "requantize size mismatch");
     for (int i = 0; i < src->elem_count; ++i) {
         float source = tensor_get_float(src, i);
-        int64_t quantized = host_round_to_i64(source * scale) + (int64_t)zero_point;
-        tensor_set_i32(dst, i, clip_for_dtype(quantized, dst->dtype));
+        int32_t quantized = host_round_to_i32(source * scale) + zero_point;
+        tensor_set_i32(dst, i, clip_for_dtype((int64_t)quantized, dst->dtype));
     }
 }
 
@@ -1642,6 +1646,34 @@ static void host_im2col(
     const int out_w = ((w + (2 * padding) - kernel_size) / stride) + 1;
     runtime_assert(dst->elem_count == out_h * out_w * kernel_size * kernel_size * c, "im2col output shape mismatch");
 
+    if (padding == 0 && stride == 1) {
+        int32_t *dst_data = tensor_i32(dst);
+        const int32_t *src_data = tensor_i32(src);
+        int patch_index = 0;
+        for (int y = 0; y < out_h; ++y) {
+            for (int x = 0; x < out_w; ++x) {
+                int out_linear = patch_index * (kernel_size * kernel_size * c);
+                for (int channel = 0; channel < c; ++channel) {
+                    for (int ky = 0; ky < kernel_size; ++ky) {
+                        if (input_layout_is_chw) {
+                            const int row_base = channel * h * w + (y + ky) * w + x;
+                            for (int kx = 0; kx < kernel_size; ++kx) {
+                                dst_data[out_linear++] = src_data[row_base + kx];
+                            }
+                        } else {
+                            const int row_base = ((y + ky) * w + x) * c + channel;
+                            for (int kx = 0; kx < kernel_size; ++kx) {
+                                dst_data[out_linear++] = src_data[row_base + kx * c];
+                            }
+                        }
+                    }
+                }
+                patch_index += 1;
+            }
+        }
+        return;
+    }
+
     int patch_index = 0;
     for (int y = 0; y <= (h + 2 * padding - kernel_size); y += stride) {
         for (int x = 0; x <= (w + 2 * padding - kernel_size); x += stride) {
@@ -1692,6 +1724,27 @@ static void host_im2col_matrix(
     const int out_h = ((matrix_h + (2 * padding) - kernel_size) / stride) + 1;
     const int out_w = ((matrix_w + (2 * padding) - kernel_size) / stride) + 1;
     runtime_assert(dst->elem_count == out_h * out_w * kernel_size * kernel_size * matrix_c, "im2col_matrix output shape mismatch");
+
+    if (padding == 0 && stride == 1) {
+        int32_t *dst_data = tensor_i32(dst);
+        const int32_t *src_data = tensor_i32(src);
+        int patch_index = 0;
+        for (int y = 0; y < out_h; ++y) {
+            for (int x = 0; x < out_w; ++x) {
+                int out_linear = patch_index * (kernel_size * kernel_size * matrix_c);
+                for (int channel = 0; channel < matrix_c; ++channel) {
+                    for (int ky = 0; ky < kernel_size; ++ky) {
+                        const int row_base = ((y + ky) * matrix_w + x) * matrix_c + channel;
+                        for (int kx = 0; kx < kernel_size; ++kx) {
+                            dst_data[out_linear++] = src_data[row_base + kx * matrix_c];
+                        }
+                    }
+                }
+                patch_index += 1;
+            }
+        }
+        return;
+    }
 
     int patch_index = 0;
     for (int y = 0; y <= (matrix_h + 2 * padding - kernel_size); y += stride) {
@@ -2040,12 +2093,18 @@ static void npu_shared_write_image(
 
 static void print_preload_progress(const char *label, int completed, int total)
 {
+#if TNPU_RUNTIME_V2_DUMP_PRELOAD_PROGRESS
     if (total < 512) {
         return;
     }
     if (completed == 1 || completed == total || (completed % 256) == 0) {
         printf("%s %d/%d\n", label, completed, total);
     }
+#else
+    (void)label;
+    (void)completed;
+    (void)total;
+#endif
 }
 
 static void npu_shared_read_word(uint16_t addr, uint32_t chunks[TINY_BUFFER_WORDS_32])
@@ -2153,8 +2212,8 @@ static void lanes_to_chunks(const uint16_t lanes[TINY_ARRAY_SIZE], uint32_t chun
 
 static int16_t quantize_f32_to_int16(float value, float inv_scale, int zero_point)
 {
-    int64_t quantized = host_round_to_i64(value * inv_scale) + (int64_t)zero_point;
-    return (int16_t)clip_for_dtype(quantized, TINY_DTYPE_INT16);
+    int32_t quantized = host_round_to_i32(value * inv_scale) + zero_point;
+    return (int16_t)clip_for_dtype((int64_t)quantized, TINY_DTYPE_INT16);
 }
 
 static void pack_tensor_word(

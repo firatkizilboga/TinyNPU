@@ -26,6 +26,12 @@ from .memory_planner import (
 )
 
 
+_NPU_DATA_DTYPES = {DType.INT4, DType.INT8, DType.INT16}
+_NPU_BIAS_DTYPES = {DType.INT16, DType.INT32}
+_FP16_BOUNDARY_HOST_KINDS = {"layernorm", "gelu"}
+_INT_INPUT_HOST_KINDS = {"alias", "reshape", "slice_row", "transpose", "im2col", "layout_restore"}
+
+
 def _tensor_use_counts(plan: ExecutionPlan) -> dict[str, int]:
     counts: dict[str, int] = defaultdict(int)
     for step in plan.steps:
@@ -43,8 +49,58 @@ def _tensor_use_counts(plan: ExecutionPlan) -> dict[str, int]:
     return counts
 
 
+def _build_tensor_consumers(steps: list[HostOp | NpuSegment | VerifyTensor]) -> dict[str, list[HostOp | NpuSegment | VerifyTensor]]:
+    consumers: dict[str, list[HostOp | NpuSegment | VerifyTensor]] = defaultdict(list)
+    for step in steps:
+        if isinstance(step, HostOp):
+            for name in step.inputs:
+                consumers[name].append(step)
+        elif isinstance(step, NpuSegment):
+            for name in step.inputs:
+                consumers[name].append(step)
+        elif isinstance(step, VerifyTensor):
+            consumers[step.tensor_name].append(step)
+    return consumers
+
+
+def _build_producer_by_output(plan: ExecutionPlan) -> dict[str, HostOp]:
+    producer_by_output: dict[str, HostOp] = {}
+    for step in plan.steps:
+        if isinstance(step, HostOp):
+            for output_name in step.outputs:
+                producer_by_output[output_name] = step
+    return producer_by_output
+
+
 def _replace_segment_output(segment: NpuSegment, old_name: str, new_name: str) -> None:
     segment.outputs = [new_name if name == old_name else name for name in segment.outputs]
+
+
+def _replace_tensor_uses(plan: ExecutionPlan, old_name: str, new_name: str) -> None:
+    if old_name == new_name:
+        return
+    for step in plan.steps:
+        if isinstance(step, HostOp):
+            step.inputs = [new_name if name == old_name else name for name in step.inputs]
+            step.outputs = [new_name if name == old_name else name for name in step.outputs]
+        elif isinstance(step, NpuSegment):
+            step.inputs = [new_name if name == old_name else name for name in step.inputs]
+            step.outputs = [new_name if name == old_name else name for name in step.outputs]
+            for op in step.ops:
+                if op.lhs == old_name:
+                    op.lhs = new_name
+                if op.rhs == old_name:
+                    op.rhs = new_name
+                if op.out == old_name:
+                    op.out = new_name
+                if op.bias == old_name:
+                    op.bias = new_name
+                if op.rope_cs_name == old_name:
+                    op.rope_cs_name = new_name
+        elif isinstance(step, VerifyTensor) and step.tensor_name == old_name:
+            step.tensor_name = new_name
+    plan.inputs = [new_name if name == old_name else name for name in plan.inputs]
+    plan.outputs = [new_name if name == old_name else name for name in plan.outputs]
 
 
 def _can_lower_rope_pattern(
@@ -193,6 +249,176 @@ def prune_unused_tensors(plan: ExecutionPlan) -> None:
     plan.tensors = {name: spec for name, spec in plan.tensors.items() if name in referenced}
 
 
+def fold_input_quantize_into_input_contract(plan: ExecutionPlan) -> None:
+    consumers = _build_tensor_consumers(plan.steps)
+    new_steps: list[HostOp | NpuSegment | VerifyTensor] = []
+
+    for step in plan.steps:
+        if not isinstance(step, HostOp) or step.kind != "quantize" or len(step.inputs) != 1 or len(step.outputs) != 1:
+            new_steps.append(step)
+            continue
+
+        source_name = step.inputs[0]
+        output_name = step.outputs[0]
+        source_spec = plan.tensors[source_name]
+        output_spec = plan.tensors[output_name]
+        source_uses = consumers.get(source_name, [])
+        output_uses = [use for use in consumers.get(output_name, []) if not isinstance(use, VerifyTensor)]
+
+        if (
+            source_spec.kind != TensorKind.INPUT
+            or source_spec.dtype != DType.FLOAT32
+            or output_spec.dtype != DType.INT16
+            or source_uses != [step]
+            or not output_uses
+            or all(isinstance(use, NpuSegment) for use in output_uses)
+        ):
+            new_steps.append(step)
+            continue
+
+        can_fold = True
+        for use in output_uses:
+            if isinstance(use, NpuSegment):
+                continue
+            if not isinstance(use, HostOp) or use.kind not in _INT_INPUT_HOST_KINDS:
+                can_fold = False
+                break
+        if not can_fold:
+            new_steps.append(step)
+            continue
+
+        source_spec.dtype = DType.INT16
+        source_spec.metadata["runtime_input_transform"] = "quantize_f32_i16"
+        source_spec.metadata["runtime_input_scale"] = float(step.attrs["scale"])
+        source_spec.metadata["runtime_input_zero_point"] = int(step.attrs.get("zero_point", 0))
+        source_spec.metadata["original_input_dtype"] = DType.FLOAT32.value
+        _replace_tensor_uses(plan, output_name, source_name)
+        continue
+
+    plan.steps = new_steps
+
+
+def canonicalize_npu_boundary_policy(plan: ExecutionPlan) -> None:
+    consumers = _build_tensor_consumers(plan.steps)
+    producer_by_output = _build_producer_by_output(plan)
+
+    for step in plan.steps:
+        if not isinstance(step, HostOp):
+            continue
+        if step.kind != "quantize" or len(step.inputs) != 1 or len(step.outputs) != 1:
+            continue
+        output_name = step.outputs[0]
+        uses = consumers.get(output_name, [])
+        non_verify_uses = [use for use in uses if not isinstance(use, VerifyTensor)]
+        if not non_verify_uses or not all(isinstance(use, NpuSegment) for use in non_verify_uses):
+            continue
+
+        source_name = step.inputs[0]
+        source_spec = plan.tensors[source_name]
+        output_spec = plan.tensors[output_name]
+        if output_spec.dtype != DType.INT16:
+            raise ValueError(
+                f"NPU boundary quantize '{step.name}' must output INT16, got {output_spec.dtype}."
+            )
+
+        source_producer = producer_by_output.get(source_name)
+        if (
+            source_spec.dtype == DType.FLOAT32
+            and source_spec.kind == TensorKind.INPUT
+        ):
+            source_spec.dtype = DType.INT16
+            source_spec.metadata["value_encoding"] = "fp16_bits"
+            step.attrs["input_encoding"] = "fp16_bits"
+        elif (
+            source_spec.dtype == DType.FLOAT32
+            and source_producer is not None
+            and source_producer.kind in _FP16_BOUNDARY_HOST_KINDS
+        ):
+            source_producer.attrs["output_encoding"] = "fp16_bits"
+            step.attrs["input_encoding"] = "fp16_bits"
+            source_spec.dtype = DType.INT16
+            source_spec.metadata["value_encoding"] = "fp16_bits"
+
+        transform = "quantize_f32_i16"
+        if source_spec.dtype == DType.INT16:
+            if (
+                str(step.attrs.get("input_encoding", "")) == "fp16_bits"
+                or (source_producer is not None and source_producer.kind == "softmax_f16")
+                or (source_producer is not None and str(source_producer.attrs.get("output_encoding", "")) == "fp16_bits")
+            ):
+                transform = "xform_q_f16_i16"
+        step.attrs["_npu_write_transform"] = transform
+
+    for step in plan.steps:
+        if not isinstance(step, HostOp):
+            continue
+        if step.kind != "dequantize" or len(step.inputs) != 1 or len(step.outputs) != 1:
+            continue
+        source_name = step.inputs[0]
+        output_name = step.outputs[0]
+        uses = consumers.get(source_name, [])
+        non_verify_uses = [use for use in uses if not isinstance(use, VerifyTensor)]
+        if len(non_verify_uses) != 1 or non_verify_uses[0] is not step:
+            continue
+        source_spec = plan.tensors[source_name]
+        output_spec = plan.tensors[output_name]
+        if source_spec.dtype == DType.INT16 and output_spec.dtype == DType.FLOAT32:
+            step.attrs["_npu_read_transform"] = "dequantize_int16_to_float32"
+
+
+def validate_npu_boundary_policy(plan: ExecutionPlan) -> None:
+    consumers = _build_tensor_consumers(plan.steps)
+
+    for step in plan.steps:
+        if isinstance(step, NpuSegment):
+            for op in step.ops:
+                lhs_spec = plan.tensors[op.lhs]
+                rhs_spec = plan.tensors[op.rhs]
+                out_spec = plan.tensors[op.out]
+                if lhs_spec.dtype not in _NPU_DATA_DTYPES:
+                    raise ValueError(
+                        f"NPU op '{op.name}' lhs tensor '{op.lhs}' must be INT4/INT8/INT16, got {lhs_spec.dtype}."
+                    )
+                if rhs_spec.dtype not in _NPU_DATA_DTYPES:
+                    raise ValueError(
+                        f"NPU op '{op.name}' rhs tensor '{op.rhs}' must be INT4/INT8/INT16, got {rhs_spec.dtype}."
+                    )
+                if out_spec.dtype not in _NPU_DATA_DTYPES:
+                    raise ValueError(
+                        f"NPU op '{op.name}' output tensor '{op.out}' must be INT4/INT8/INT16, got {out_spec.dtype}."
+                    )
+                if op.bias:
+                    bias_spec = plan.tensors[op.bias]
+                    if bias_spec.dtype not in _NPU_BIAS_DTYPES:
+                        raise ValueError(
+                            f"NPU op '{op.name}' bias tensor '{op.bias}' must be INT16/INT32, got {bias_spec.dtype}."
+                        )
+                for name in (op.lhs, op.rhs, op.bias, op.rope_cs_name):
+                    if not name:
+                        continue
+                    spec = plan.tensors[name]
+                    if spec.kind == TensorKind.CONSTANT and spec.dtype == DType.FLOAT32:
+                        raise ValueError(
+                            f"NPU segment '{step.name}' references FLOAT32 constant '{name}'. "
+                            "NPU plans must quantize weights/constants before lowering."
+                        )
+        elif isinstance(step, HostOp) and step.kind == "quantize" and len(step.outputs) == 1:
+            output_name = step.outputs[0]
+            uses = consumers.get(output_name, [])
+            non_verify_uses = [use for use in uses if not isinstance(use, VerifyTensor)]
+            if not non_verify_uses or not all(isinstance(use, NpuSegment) for use in non_verify_uses):
+                continue
+            transform = str(step.attrs.get("_npu_write_transform", ""))
+            if transform not in {"quantize_f32_i16", "xform_q_f16_i16"}:
+                raise ValueError(
+                    f"NPU boundary quantize '{step.name}' is missing canonical boundary transform metadata."
+                )
+        elif isinstance(step, HostOp) and step.kind == "dequantize":
+            transform = step.attrs.get("_npu_read_transform")
+            if transform is not None and transform != "dequantize_int16_to_float32":
+                raise ValueError(f"Unsupported NPU read transform on '{step.name}': {transform!r}.")
+
+
 class SegmentCompiler:
     def __init__(self, defines_path: str | None = None):
         self.defines_path = defines_path
@@ -201,7 +427,10 @@ class SegmentCompiler:
         _tmp = TinyNPUProgram(defines_path=self.defines_path)
         array_size = int(_tmp.hw.params.get("ARRAY_SIZE", 8))
         rewrite_host_rope_patterns(plan)
+        fold_input_quantize_into_input_contract(plan)
         prune_unused_tensors(plan)
+        canonicalize_npu_boundary_policy(plan)
+        validate_npu_boundary_policy(plan)
         self._fuse_layout_restore_im2col(plan)
         self._annotate_output_layouts(plan)
         # Read UB capacity from hardware config
@@ -237,7 +466,68 @@ class SegmentCompiler:
         )
 
     def _fuse_layout_restore_im2col(self, plan: ExecutionPlan) -> None:
-        return
+        producer_by_tensor: dict[str, tuple[int, HostOp | NpuSegment | VerifyTensor]] = {}
+        for index, step in enumerate(plan.steps):
+            if isinstance(step, (HostOp, NpuSegment)):
+                for output_name in step.outputs:
+                    producer_by_tensor[output_name] = (index, step)
+
+        new_steps: list[HostOp | NpuSegment | VerifyTensor] = []
+        index = 0
+        while index < len(plan.steps):
+            step = plan.steps[index]
+            if (
+                isinstance(step, HostOp)
+                and step.kind == "layout_restore"
+                and len(step.inputs) == 1
+                and len(step.outputs) == 1
+            ):
+                matrix_name = step.inputs[0]
+                producer = producer_by_tensor.get(matrix_name)
+                if (
+                    producer is not None
+                    and producer[0] < index
+                    and isinstance(producer[1], NpuSegment)
+                ):
+                    segment = producer[1]
+                    segment_op = next((op for op in reversed(segment.ops) if op.out == matrix_name), None)
+                    if segment_op is not None and segment_op.activation == "none":
+                        if (
+                            index + 2 < len(plan.steps)
+                            and isinstance(plan.steps[index + 1], HostOp)
+                            and isinstance(plan.steps[index + 2], HostOp)
+                        ):
+                            activation_step = plan.steps[index + 1]
+                            next_step = plan.steps[index + 2]
+                            if (
+                                activation_step.kind == "relu"
+                                and activation_step.inputs == step.outputs
+                                and next_step.kind == "im2col"
+                                and next_step.inputs == activation_step.outputs
+                            ):
+                                segment_op.activation = "relu"
+                                next_step.inputs[0] = matrix_name
+                                next_step.attrs["input_layout"] = "matrix_hwc"
+                                next_step.attrs["matrix_h"] = int(step.attrs["out_h"])
+                                next_step.attrs["matrix_w"] = int(step.attrs["out_w"])
+                                next_step.attrs["matrix_c"] = int(step.attrs["out_channels"])
+                                index += 2
+                                continue
+                            if (
+                                activation_step.kind == "sigmoid"
+                                and activation_step.inputs == step.outputs
+                                and next_step.kind == "dequantize"
+                                and next_step.inputs == activation_step.outputs
+                            ):
+                                segment_op.activation = "sigmoid"
+                                step.outputs[0] = activation_step.outputs[0]
+                                producer_by_tensor[activation_step.outputs[0]] = (index, step)
+                                index += 2
+                                new_steps.append(step)
+                                continue
+            new_steps.append(step)
+            index += 1
+        plan.steps = new_steps
 
     @staticmethod
     def _cache_kind_for_tensor(plan: ExecutionPlan, tensor_name: str) -> str | None:
