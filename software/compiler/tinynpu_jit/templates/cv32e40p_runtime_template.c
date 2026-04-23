@@ -400,12 +400,36 @@ static float host_absf(float x)
 
 static int32_t host_round_to_i32(float x)
 {
-    return x >= 0.0f ? (int32_t)(x + 0.5f) : (int32_t)(x - 0.5f);
+    int32_t floor_v = (int32_t)x;
+    float frac;
+    if ((float)floor_v > x) {
+        floor_v -= 1;
+    }
+    frac = x - (float)floor_v;
+    if (frac < 0.5f) {
+        return floor_v;
+    }
+    if (frac > 0.5f) {
+        return floor_v + 1;
+    }
+    return (floor_v & 1) ? (floor_v + 1) : floor_v;
 }
 
 static int64_t host_round_to_i64(float x)
 {
-    return x >= 0.0f ? (int64_t)(x + 0.5f) : (int64_t)(x - 0.5f);
+    int64_t floor_v = (int64_t)x;
+    float frac;
+    if ((float)floor_v > x) {
+        floor_v -= 1;
+    }
+    frac = x - (float)floor_v;
+    if (frac < 0.5f) {
+        return floor_v;
+    }
+    if (frac > 0.5f) {
+        return floor_v + 1;
+    }
+    return (floor_v & 1LL) ? (floor_v + 1) : floor_v;
 }
 
 static float host_exp_approx(float x)
@@ -434,6 +458,10 @@ static float host_exp_approx(float x)
         return 1.0f;
     }
     if (x > 0.0f) {
+        if (x >= 16.0f) {
+            /* Saturate large positive inputs instead of feeding 1/0 into the reciprocal path. */
+            return 8.8861100e6f;
+        }
         return host_recip_approx(host_exp_approx(-x));
     }
     if (x <= -16.0f) {
@@ -1028,21 +1056,428 @@ static void host_layernorm(TinyTensor *dst, const TinyTensor *src, const TinyTen
 
 static void host_mul(TinyTensor *dst, const TinyTensor *lhs, const TinyTensor *rhs)
 {
+    int out_idx[4] = {0, 0, 0, 0};
+    int lhs_idx[4] = {0, 0, 0, 0};
+    int rhs_idx[4] = {0, 0, 0, 0};
+
     runtime_assert(dst->dtype == TINY_DTYPE_FLOAT32, "mul expects float output");
-    runtime_assert(lhs->elem_count == rhs->elem_count, "mul input size mismatch");
-    runtime_assert(dst->elem_count == lhs->elem_count, "mul output size mismatch");
-    for (int i = 0; i < lhs->elem_count; ++i) {
-        tensor_set_float(dst, i, tensor_get_float(lhs, i) * tensor_get_float(rhs, i));
+    runtime_assert(lhs->dtype == TINY_DTYPE_FLOAT32 && rhs->dtype == TINY_DTYPE_FLOAT32, "mul expects float inputs");
+    for (int linear = 0; linear < dst->elem_count; ++linear) {
+        tensor_unravel(dst, linear, out_idx);
+        for (int axis = 0; axis < 4; ++axis) {
+            lhs_idx[axis] = 0;
+            rhs_idx[axis] = 0;
+        }
+        for (int axis = 0; axis < lhs->rank; ++axis) {
+            int out_axis = dst->rank - lhs->rank + axis;
+            lhs_idx[axis] = (lhs->shape[axis] == 1) ? 0 : out_idx[out_axis];
+        }
+        for (int axis = 0; axis < rhs->rank; ++axis) {
+            int out_axis = dst->rank - rhs->rank + axis;
+            rhs_idx[axis] = (rhs->shape[axis] == 1) ? 0 : out_idx[out_axis];
+        }
+        tensor_set_float(
+            dst,
+            linear,
+            tensor_get_float(lhs, tensor_ravel(lhs, lhs_idx)) * tensor_get_float(rhs, tensor_ravel(rhs, rhs_idx)));
     }
 }
 
 static void host_add(TinyTensor *dst, const TinyTensor *lhs, const TinyTensor *rhs)
 {
+    int out_idx[4] = {0, 0, 0, 0};
+    int lhs_idx[4] = {0, 0, 0, 0};
+    int rhs_idx[4] = {0, 0, 0, 0};
+
     runtime_assert(dst->dtype == TINY_DTYPE_FLOAT32, "add expects float output");
-    runtime_assert(lhs->elem_count == rhs->elem_count, "add input size mismatch");
-    runtime_assert(dst->elem_count == lhs->elem_count, "add output size mismatch");
-    for (int i = 0; i < lhs->elem_count; ++i) {
-        tensor_set_float(dst, i, tensor_get_float(lhs, i) + tensor_get_float(rhs, i));
+    runtime_assert(lhs->dtype == TINY_DTYPE_FLOAT32 && rhs->dtype == TINY_DTYPE_FLOAT32, "add expects float inputs");
+    for (int linear = 0; linear < dst->elem_count; ++linear) {
+        tensor_unravel(dst, linear, out_idx);
+        for (int axis = 0; axis < 4; ++axis) {
+            lhs_idx[axis] = 0;
+            rhs_idx[axis] = 0;
+        }
+        for (int axis = 0; axis < lhs->rank; ++axis) {
+            int out_axis = dst->rank - lhs->rank + axis;
+            lhs_idx[axis] = (lhs->shape[axis] == 1) ? 0 : out_idx[out_axis];
+        }
+        for (int axis = 0; axis < rhs->rank; ++axis) {
+            int out_axis = dst->rank - rhs->rank + axis;
+            rhs_idx[axis] = (rhs->shape[axis] == 1) ? 0 : out_idx[out_axis];
+        }
+        tensor_set_float(
+            dst,
+            linear,
+            tensor_get_float(lhs, tensor_ravel(lhs, lhs_idx)) + tensor_get_float(rhs, tensor_ravel(rhs, rhs_idx)));
+    }
+}
+
+static void host_linear(TinyTensor *dst, const TinyTensor *src, const TinyTensor *weight, const TinyTensor *bias)
+{
+    int rows = 1;
+    int in_features;
+    int out_features;
+
+    runtime_assert(src->dtype == TINY_DTYPE_FLOAT32, "linear expects float input");
+    runtime_assert(weight->dtype == TINY_DTYPE_FLOAT32, "linear expects float weight");
+    runtime_assert(dst->dtype == TINY_DTYPE_FLOAT32, "linear expects float output");
+    runtime_assert(src->rank >= 1, "linear expects rank >= 1 input");
+    runtime_assert(weight->rank == 2, "linear expects rank-2 weight");
+
+    in_features = src->shape[src->rank - 1];
+    out_features = weight->shape[0];
+    runtime_assert(weight->shape[1] == in_features, "linear in_features mismatch");
+    for (int i = 0; i < src->rank - 1; ++i) {
+        rows *= src->shape[i];
+    }
+    runtime_assert(dst->elem_count == rows * out_features, "linear output size mismatch");
+    if (bias != NULL) {
+        runtime_assert(bias->dtype == TINY_DTYPE_FLOAT32, "linear expects float bias");
+        runtime_assert(bias->elem_count == out_features, "linear bias size mismatch");
+    }
+
+    for (int row = 0; row < rows; ++row) {
+        for (int out_idx = 0; out_idx < out_features; ++out_idx) {
+            float acc = 0.0f;
+            for (int in_idx = 0; in_idx < in_features; ++in_idx) {
+                float lhs = tensor_get_float(src, row * in_features + in_idx);
+                float rhs = tensor_get_float(weight, out_idx * in_features + in_idx);
+                acc += lhs * rhs;
+            }
+            if (bias != NULL) {
+                acc += tensor_get_float(bias, out_idx);
+            }
+            tensor_set_float(dst, row * out_features + out_idx, acc);
+        }
+    }
+}
+
+static void host_conv2d(TinyTensor *dst, const TinyTensor *src, const TinyTensor *weight, const TinyTensor *bias, int stride, int padding)
+{
+    int batch;
+    int in_channels;
+    int in_h;
+    int in_w;
+    int out_channels;
+    int kernel_h;
+    int kernel_w;
+    int out_h;
+    int out_w;
+
+    runtime_assert(src->dtype == TINY_DTYPE_FLOAT32, "conv2d expects float input");
+    runtime_assert(weight->dtype == TINY_DTYPE_FLOAT32, "conv2d expects float weight");
+    runtime_assert(dst->dtype == TINY_DTYPE_FLOAT32, "conv2d expects float output");
+    runtime_assert(src->rank == 3 || src->rank == 4, "conv2d expects rank-3 or rank-4 input");
+    runtime_assert(weight->rank == 4, "conv2d expects rank-4 weight");
+    runtime_assert(stride > 0, "conv2d stride must be positive");
+    runtime_assert(padding >= 0, "conv2d padding must be non-negative");
+
+    if (src->rank == 3) {
+        batch = 1;
+        in_channels = src->shape[0];
+        in_h = src->shape[1];
+        in_w = src->shape[2];
+    } else {
+        batch = src->shape[0];
+        in_channels = src->shape[1];
+        in_h = src->shape[2];
+        in_w = src->shape[3];
+    }
+
+    out_channels = weight->shape[0];
+    runtime_assert(weight->shape[1] == in_channels, "conv2d in_channels mismatch");
+    kernel_h = weight->shape[2];
+    kernel_w = weight->shape[3];
+    runtime_assert(kernel_h == kernel_w, "conv2d expects square kernels");
+
+    out_h = ((in_h + (2 * padding) - kernel_h) / stride) + 1;
+    out_w = ((in_w + (2 * padding) - kernel_w) / stride) + 1;
+    runtime_assert(out_h > 0 && out_w > 0, "conv2d output shape must be positive");
+    if (src->rank == 3) {
+        runtime_assert(dst->rank == 3, "conv2d rank-3 input expects rank-3 output");
+        runtime_assert(dst->shape[0] == out_channels, "conv2d output channels mismatch");
+        runtime_assert(dst->shape[1] == out_h && dst->shape[2] == out_w, "conv2d output shape mismatch");
+    } else {
+        runtime_assert(dst->rank == 4, "conv2d rank-4 input expects rank-4 output");
+        runtime_assert(dst->shape[0] == batch && dst->shape[1] == out_channels, "conv2d batch/channels mismatch");
+        runtime_assert(dst->shape[2] == out_h && dst->shape[3] == out_w, "conv2d output shape mismatch");
+    }
+    if (bias != NULL) {
+        runtime_assert(bias->dtype == TINY_DTYPE_FLOAT32, "conv2d expects float bias");
+        runtime_assert(bias->elem_count == out_channels, "conv2d bias size mismatch");
+    }
+
+    for (int n = 0; n < batch; ++n) {
+        for (int oc = 0; oc < out_channels; ++oc) {
+            for (int oh = 0; oh < out_h; ++oh) {
+                const int h_start = oh * stride - padding;
+                for (int ow = 0; ow < out_w; ++ow) {
+                    const int w_start = ow * stride - padding;
+                    float acc = 0.0f;
+                    for (int ic = 0; ic < in_channels; ++ic) {
+                        for (int kh = 0; kh < kernel_h; ++kh) {
+                            const int in_y = h_start + kh;
+                            if (in_y < 0 || in_y >= in_h) {
+                                continue;
+                            }
+                            for (int kw = 0; kw < kernel_w; ++kw) {
+                                const int in_x = w_start + kw;
+                                int src_linear;
+                                int weight_linear;
+                                if (in_x < 0 || in_x >= in_w) {
+                                    continue;
+                                }
+                                if (src->rank == 3) {
+                                    src_linear = ((ic * in_h) + in_y) * in_w + in_x;
+                                } else {
+                                    src_linear = ((((n * in_channels) + ic) * in_h) + in_y) * in_w + in_x;
+                                }
+                                weight_linear = ((((oc * in_channels) + ic) * kernel_h) + kh) * kernel_w + kw;
+                                acc += tensor_get_float(src, src_linear) * tensor_get_float(weight, weight_linear);
+                            }
+                        }
+                    }
+                    if (bias != NULL) {
+                        acc += tensor_get_float(bias, oc);
+                    }
+                    if (dst->rank == 3) {
+                        tensor_set_float(dst, ((oc * out_h) + oh) * out_w + ow, acc);
+                    } else {
+                        tensor_set_float(dst, ((((n * out_channels) + oc) * out_h) + oh) * out_w + ow, acc);
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void host_maxpool2d(TinyTensor *dst, const TinyTensor *src, int kernel_h, int kernel_w, int stride_h, int stride_w, int pad_h, int pad_w)
+{
+    int batch;
+    int channels;
+    int in_h;
+    int in_w;
+    int out_h;
+    int out_w;
+
+    runtime_assert(src->dtype == TINY_DTYPE_FLOAT32, "maxpool2d expects float input");
+    runtime_assert(dst->dtype == TINY_DTYPE_FLOAT32, "maxpool2d expects float output");
+    runtime_assert(src->rank == 3 || src->rank == 4, "maxpool2d expects rank-3 or rank-4 input");
+    runtime_assert(kernel_h > 0 && kernel_w > 0, "maxpool2d kernel must be positive");
+    runtime_assert(stride_h > 0 && stride_w > 0, "maxpool2d stride must be positive");
+    runtime_assert(pad_h >= 0 && pad_w >= 0, "maxpool2d padding must be non-negative");
+
+    if (src->rank == 3) {
+        batch = 1;
+        channels = src->shape[0];
+        in_h = src->shape[1];
+        in_w = src->shape[2];
+    } else {
+        batch = src->shape[0];
+        channels = src->shape[1];
+        in_h = src->shape[2];
+        in_w = src->shape[3];
+    }
+
+    out_h = ((in_h + (2 * pad_h) - kernel_h) / stride_h) + 1;
+    out_w = ((in_w + (2 * pad_w) - kernel_w) / stride_w) + 1;
+    runtime_assert(out_h > 0 && out_w > 0, "maxpool2d output shape must be positive");
+    if (src->rank == 3) {
+        runtime_assert(dst->rank == 3, "maxpool2d rank-3 input expects rank-3 output");
+        runtime_assert(dst->shape[0] == channels, "maxpool2d channels mismatch");
+        runtime_assert(dst->shape[1] == out_h && dst->shape[2] == out_w, "maxpool2d output shape mismatch");
+    } else {
+        runtime_assert(dst->rank == 4, "maxpool2d rank-4 input expects rank-4 output");
+        runtime_assert(dst->shape[0] == batch && dst->shape[1] == channels, "maxpool2d batch/channels mismatch");
+        runtime_assert(dst->shape[2] == out_h && dst->shape[3] == out_w, "maxpool2d output shape mismatch");
+    }
+
+    for (int n = 0; n < batch; ++n) {
+        for (int c = 0; c < channels; ++c) {
+            for (int oh = 0; oh < out_h; ++oh) {
+                const int h_start = oh * stride_h - pad_h;
+                for (int ow = 0; ow < out_w; ++ow) {
+                    const int w_start = ow * stride_w - pad_w;
+                    float best = -3.402823466e+38f;
+                    for (int kh = 0; kh < kernel_h; ++kh) {
+                        const int in_y = h_start + kh;
+                        if (in_y < 0 || in_y >= in_h) {
+                            continue;
+                        }
+                        for (int kw = 0; kw < kernel_w; ++kw) {
+                            const int in_x = w_start + kw;
+                            float value;
+                            if (in_x < 0 || in_x >= in_w) {
+                                continue;
+                            }
+                            if (src->rank == 3) {
+                                value = tensor_get_float(src, ((c * in_h) + in_y) * in_w + in_x);
+                            } else {
+                                value = tensor_get_float(src, ((((n * channels) + c) * in_h) + in_y) * in_w + in_x);
+                            }
+                            if (value > best) {
+                                best = value;
+                            }
+                        }
+                    }
+                    if (dst->rank == 3) {
+                        tensor_set_float(dst, ((c * out_h) + oh) * out_w + ow, best);
+                    } else {
+                        tensor_set_float(dst, ((((n * channels) + c) * out_h) + oh) * out_w + ow, best);
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void host_avgpool2d(
+    TinyTensor *dst,
+    const TinyTensor *src,
+    int kernel_h,
+    int kernel_w,
+    int stride_h,
+    int stride_w,
+    int pad_h,
+    int pad_w,
+    int count_include_pad)
+{
+    int batch;
+    int channels;
+    int in_h;
+    int in_w;
+    int out_h;
+    int out_w;
+
+    runtime_assert(src->dtype == TINY_DTYPE_FLOAT32, "avgpool2d expects float input");
+    runtime_assert(dst->dtype == TINY_DTYPE_FLOAT32, "avgpool2d expects float output");
+    runtime_assert(src->rank == 3 || src->rank == 4, "avgpool2d expects rank-3 or rank-4 input");
+    runtime_assert(kernel_h > 0 && kernel_w > 0, "avgpool2d kernel must be positive");
+    runtime_assert(stride_h > 0 && stride_w > 0, "avgpool2d stride must be positive");
+    runtime_assert(pad_h >= 0 && pad_w >= 0, "avgpool2d padding must be non-negative");
+
+    if (src->rank == 3) {
+        batch = 1;
+        channels = src->shape[0];
+        in_h = src->shape[1];
+        in_w = src->shape[2];
+    } else {
+        batch = src->shape[0];
+        channels = src->shape[1];
+        in_h = src->shape[2];
+        in_w = src->shape[3];
+    }
+
+    out_h = ((in_h + (2 * pad_h) - kernel_h) / stride_h) + 1;
+    out_w = ((in_w + (2 * pad_w) - kernel_w) / stride_w) + 1;
+    runtime_assert(out_h > 0 && out_w > 0, "avgpool2d output shape must be positive");
+    if (src->rank == 3) {
+        runtime_assert(dst->rank == 3, "avgpool2d rank-3 input expects rank-3 output");
+        runtime_assert(dst->shape[0] == channels, "avgpool2d channels mismatch");
+        runtime_assert(dst->shape[1] == out_h && dst->shape[2] == out_w, "avgpool2d output shape mismatch");
+    } else {
+        runtime_assert(dst->rank == 4, "avgpool2d rank-4 input expects rank-4 output");
+        runtime_assert(dst->shape[0] == batch && dst->shape[1] == channels, "avgpool2d batch/channels mismatch");
+        runtime_assert(dst->shape[2] == out_h && dst->shape[3] == out_w, "avgpool2d output shape mismatch");
+    }
+
+    for (int n = 0; n < batch; ++n) {
+        for (int c = 0; c < channels; ++c) {
+            for (int oh = 0; oh < out_h; ++oh) {
+                const int h_start = oh * stride_h - pad_h;
+                for (int ow = 0; ow < out_w; ++ow) {
+                    const int w_start = ow * stride_w - pad_w;
+                    float acc = 0.0f;
+                    int count = 0;
+                    for (int kh = 0; kh < kernel_h; ++kh) {
+                        const int in_y = h_start + kh;
+                        for (int kw = 0; kw < kernel_w; ++kw) {
+                            const int in_x = w_start + kw;
+                            if (in_y < 0 || in_y >= in_h || in_x < 0 || in_x >= in_w) {
+                                if (count_include_pad) {
+                                    count += 1;
+                                }
+                                continue;
+                            }
+                            if (src->rank == 3) {
+                                acc += tensor_get_float(src, ((c * in_h) + in_y) * in_w + in_x);
+                            } else {
+                                acc += tensor_get_float(src, ((((n * channels) + c) * in_h) + in_y) * in_w + in_x);
+                            }
+                            count += 1;
+                        }
+                    }
+                    runtime_assert(count > 0, "avgpool2d window must have positive count");
+                    if (dst->rank == 3) {
+                        tensor_set_float(dst, ((c * out_h) + oh) * out_w + ow, acc / (float)count);
+                    } else {
+                        tensor_set_float(dst, ((((n * channels) + c) * out_h) + oh) * out_w + ow, acc / (float)count);
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void host_adaptive_avg_pool2d(TinyTensor *dst, const TinyTensor *src, int out_h, int out_w)
+{
+    int batch;
+    int channels;
+    int in_h;
+    int in_w;
+
+    runtime_assert(src->dtype == TINY_DTYPE_FLOAT32, "adaptive_avg_pool2d expects float input");
+    runtime_assert(dst->dtype == TINY_DTYPE_FLOAT32, "adaptive_avg_pool2d expects float output");
+    runtime_assert(src->rank == 3 || src->rank == 4, "adaptive_avg_pool2d expects rank-3 or rank-4 input");
+    runtime_assert(out_h > 0 && out_w > 0, "adaptive_avg_pool2d output size must be positive");
+
+    if (src->rank == 3) {
+        batch = 1;
+        channels = src->shape[0];
+        in_h = src->shape[1];
+        in_w = src->shape[2];
+        runtime_assert(dst->rank == 3, "adaptive_avg_pool2d rank-3 input expects rank-3 output");
+        runtime_assert(dst->shape[0] == channels, "adaptive_avg_pool2d channels mismatch");
+        runtime_assert(dst->shape[1] == out_h && dst->shape[2] == out_w, "adaptive_avg_pool2d output shape mismatch");
+    } else {
+        batch = src->shape[0];
+        channels = src->shape[1];
+        in_h = src->shape[2];
+        in_w = src->shape[3];
+        runtime_assert(dst->rank == 4, "adaptive_avg_pool2d rank-4 input expects rank-4 output");
+        runtime_assert(dst->shape[0] == batch && dst->shape[1] == channels, "adaptive_avg_pool2d batch/channels mismatch");
+        runtime_assert(dst->shape[2] == out_h && dst->shape[3] == out_w, "adaptive_avg_pool2d output shape mismatch");
+    }
+
+    for (int n = 0; n < batch; ++n) {
+        for (int c = 0; c < channels; ++c) {
+            for (int oh = 0; oh < out_h; ++oh) {
+                const int h_start = (oh * in_h) / out_h;
+                const int h_end = ((oh + 1) * in_h + out_h - 1) / out_h;
+                for (int ow = 0; ow < out_w; ++ow) {
+                    const int w_start = (ow * in_w) / out_w;
+                    const int w_end = ((ow + 1) * in_w + out_w - 1) / out_w;
+                    float acc = 0.0f;
+                    int count = 0;
+                    for (int ih = h_start; ih < h_end; ++ih) {
+                        for (int iw = w_start; iw < w_end; ++iw) {
+                            if (src->rank == 3) {
+                                acc += tensor_get_float(src, ((c * in_h) + ih) * in_w + iw);
+                            } else {
+                                acc += tensor_get_float(src, ((((n * channels) + c) * in_h) + ih) * in_w + iw);
+                            }
+                            count += 1;
+                        }
+                    }
+                    runtime_assert(count > 0, "adaptive_avg_pool2d window must have positive count");
+                    if (dst->rank == 3) {
+                        tensor_set_float(dst, ((c * out_h) + oh) * out_w + ow, acc / (float)count);
+                    } else {
+                        tensor_set_float(dst, ((((n * channels) + c) * out_h) + oh) * out_w + ow, acc / (float)count);
+                    }
+                }
+            }
+        }
     }
 }
 

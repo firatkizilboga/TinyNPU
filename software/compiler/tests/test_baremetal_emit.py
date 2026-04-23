@@ -47,6 +47,16 @@ from tinynpu_jit.blocks.gpt2_block import (
     reference_decode as reference_gpt2_decode,
     reference_prefill as reference_gpt2_prefill,
 )
+from tinynpu_jit.blocks.llama_block import (
+    QLlamaBlock,
+    QLlamaBlockConfig,
+    build_decode_artifact as build_llama_decode_artifact,
+    build_prefill_artifact as build_llama_prefill_artifact,
+    build_shared_state as build_llama_shared_state,
+    extend_kv_cache as extend_llama_kv_cache,
+    reference_decode as reference_llama_decode,
+    reference_prefill as reference_llama_prefill,
+)
 from run_cv32e40p_prefill_transformer_block_jit_demo import build_artifact as build_prefill_transformer_block_artifact
 
 
@@ -1596,6 +1606,216 @@ def test_gpt2_two_block_prefill_decode_reuse_matches_full_sequence():
 
     np.testing.assert_allclose(decode2_out, np.asarray(full_seq2_layer1["out"], dtype=np.float32)[-1:], atol=1.0e-5, rtol=1.0e-5)
     for head_idx in range(n_heads):
+        np.testing.assert_array_equal(decode2_cache_refs[0]["k_heads"][head_idx], full_seq2_layer0["k_heads"][head_idx])
+        np.testing.assert_array_equal(decode2_cache_refs[0]["v_heads"][head_idx], full_seq2_layer0["v_heads"][head_idx])
+        np.testing.assert_array_equal(decode2_cache_refs[1]["k_heads"][head_idx], full_seq2_layer1["k_heads"][head_idx])
+        np.testing.assert_array_equal(decode2_cache_refs[1]["v_heads"][head_idx], full_seq2_layer1["v_heads"][head_idx])
+
+
+def test_llama_block_module_builds_prefill_and_decode():
+    prefill_artifact, _, prefill_ref = build_llama_prefill_artifact(
+        d_model=32,
+        d_head=8,
+        n_heads=4,
+        n_kv_heads=2,
+        ffn_hidden_dim=128,
+        prompt_len=8,
+        seed=0,
+    )
+    decode_artifact, _, _, decode_ref = build_llama_decode_artifact(
+        d_model=32,
+        d_head=8,
+        n_heads=4,
+        n_kv_heads=2,
+        ffn_hidden_dim=128,
+        prompt_len=8,
+        seed=0,
+    )
+
+    assert sorted(prefill_artifact.segment_artifacts.keys()) == [
+        "seg_ffn_down",
+        "seg_ffn_up",
+        "seg_o_proj",
+        "seg_qkv",
+        "seg_score",
+        "seg_value",
+    ]
+    assert sorted(decode_artifact.segment_artifacts.keys()) == [
+        "seg_ffn_down",
+        "seg_ffn_up",
+        "seg_o_proj",
+        "seg_qkv",
+        "seg_score",
+        "seg_value",
+    ]
+    assert prefill_artifact.plan.outputs == ["out"]
+    assert decode_artifact.plan.outputs == ["out"]
+    assert prefill_ref["out"].shape == (8, 32)
+    assert decode_ref["out"].shape == (1, 32)
+
+
+def test_qllama_block_matches_hf_style_fused_shapes():
+    state = build_llama_shared_state(
+        d_model=32,
+        d_head=8,
+        n_heads=4,
+        n_kv_heads=2,
+        ffn_hidden_dim=128,
+        prompt_len=8,
+        seed=0,
+    )
+    block = state["block"]
+
+    assert isinstance(block, QLlamaBlock)
+    assert block.config == QLlamaBlockConfig(d_model=32, d_head=8, n_heads=4, n_kv_heads=2, ffn_hidden_dim=128)
+    assert block.input_layernorm_w.shape == (32,)
+    assert block.self_attn_q_proj_w.shape == (32, 32)
+    assert block.self_attn_k_proj_w.shape == (32, 16)
+    assert block.self_attn_v_proj_w.shape == (32, 16)
+    assert block.self_attn_o_proj_w.shape == (32, 32)
+    assert block.post_attention_layernorm_w.shape == (32,)
+    assert block.mlp_gate_proj_w.shape == (32, 128)
+    assert block.mlp_up_proj_w.shape == (32, 128)
+    assert block.mlp_down_proj_w.shape == (128, 32)
+
+    q_weights = block.split_q_proj_weights()
+    k_weights = block.split_k_proj_weights()
+    v_weights = block.split_v_proj_weights()
+    assert [w.shape for w in q_weights] == [(32, 8)] * 4
+    assert [w.shape for w in k_weights] == [(32, 8)] * 2
+    assert [w.shape for w in v_weights] == [(32, 8)] * 2
+
+
+def test_llama_two_block_prefill_decode_reuse_matches_full_sequence():
+    d_model = 8
+    d_head = 8
+    n_heads = 1
+    n_kv_heads = 1
+    ffn_hidden_dim = 8
+    prompt_len = 8
+    act_scale = 1.0 / 32.0
+    attn_scale = 1.0 / 256.0
+
+    layer0 = build_llama_shared_state(
+        d_model=d_model,
+        d_head=d_head,
+        n_heads=n_heads,
+        n_kv_heads=n_kv_heads,
+        ffn_hidden_dim=ffn_hidden_dim,
+        prompt_len=prompt_len,
+        seed=0,
+    )
+    layer1 = build_llama_shared_state(
+        d_model=d_model,
+        d_head=d_head,
+        n_heads=n_heads,
+        n_kv_heads=n_kv_heads,
+        ffn_hidden_dim=ffn_hidden_dim,
+        prompt_len=prompt_len,
+        seed=1,
+    )
+    layers = [layer0, layer1]
+
+    prompt_x0 = np.asarray(layer0["x_prompt_in"], dtype=np.float32)
+    decode1_x0 = np.asarray(layer0["x_decode_in"], dtype=np.float32)
+    decode2_x0 = np.random.default_rng(123).uniform(-0.25, 0.25, size=(1, d_model)).astype(np.float32)
+
+    def run_stack_prefill(x_prompt: np.ndarray) -> tuple[np.ndarray, list[dict[str, object]]]:
+        caches: list[dict[str, object]] = []
+        x = np.asarray(x_prompt, dtype=np.float32)
+        for layer_state in layers:
+            ref = reference_llama_prefill(
+                layer_state,
+                d_head=d_head,
+                n_heads=n_heads,
+                n_kv_heads=n_kv_heads,
+                act_scale=act_scale,
+                attn_scale=attn_scale,
+                x_in=x,
+            )
+            caches.append(ref)
+            x = np.asarray(ref["out"], dtype=np.float32)
+        return x, caches
+
+    def run_stack_decode(
+        cache_refs: list[dict[str, object]],
+        x_decode: np.ndarray,
+    ) -> tuple[np.ndarray, list[dict[str, object]], list[dict[str, object]]]:
+        decode_refs: list[dict[str, object]] = []
+        updated_caches: list[dict[str, object]] = []
+        x = np.asarray(x_decode, dtype=np.float32)
+        for layer_state, cache_ref in zip(layers, cache_refs):
+            ref = reference_llama_decode(
+                layer_state,
+                cache_ref,
+                d_head=d_head,
+                n_heads=n_heads,
+                n_kv_heads=n_kv_heads,
+                act_scale=act_scale,
+                attn_scale=attn_scale,
+                x_in=x,
+            )
+            decode_refs.append(ref)
+            updated_caches.append(extend_llama_kv_cache(cache_ref, ref))
+            x = np.asarray(ref["out"], dtype=np.float32)
+        return x, decode_refs, updated_caches
+
+    prompt_out, prompt_cache_refs = run_stack_prefill(prompt_x0)
+    assert prompt_out.shape == (prompt_len, d_model)
+
+    decode1_out, _, decode1_cache_refs = run_stack_decode(prompt_cache_refs, decode1_x0)
+    assert decode1_out.shape == (1, d_model)
+
+    full_seq1_layer0 = reference_llama_prefill(
+        layer0,
+        d_head=d_head,
+        n_heads=n_heads,
+        n_kv_heads=n_kv_heads,
+        act_scale=act_scale,
+        attn_scale=attn_scale,
+        x_in=np.concatenate([prompt_x0, decode1_x0], axis=0),
+    )
+    full_seq1_layer1 = reference_llama_prefill(
+        layer1,
+        d_head=d_head,
+        n_heads=n_heads,
+        n_kv_heads=n_kv_heads,
+        act_scale=act_scale,
+        attn_scale=attn_scale,
+        x_in=np.asarray(full_seq1_layer0["out"], dtype=np.float32),
+    )
+
+    np.testing.assert_allclose(decode1_out, np.asarray(full_seq1_layer1["out"], dtype=np.float32)[-1:], atol=1.0e-5, rtol=1.0e-5)
+    for head_idx in range(n_kv_heads):
+        np.testing.assert_array_equal(decode1_cache_refs[0]["k_heads"][head_idx], full_seq1_layer0["k_heads"][head_idx])
+        np.testing.assert_array_equal(decode1_cache_refs[0]["v_heads"][head_idx], full_seq1_layer0["v_heads"][head_idx])
+        np.testing.assert_array_equal(decode1_cache_refs[1]["k_heads"][head_idx], full_seq1_layer1["k_heads"][head_idx])
+        np.testing.assert_array_equal(decode1_cache_refs[1]["v_heads"][head_idx], full_seq1_layer1["v_heads"][head_idx])
+
+    decode2_out, _, decode2_cache_refs = run_stack_decode(decode1_cache_refs, decode2_x0)
+    assert decode2_out.shape == (1, d_model)
+
+    full_seq2_layer0 = reference_llama_prefill(
+        layer0,
+        d_head=d_head,
+        n_heads=n_heads,
+        n_kv_heads=n_kv_heads,
+        act_scale=act_scale,
+        attn_scale=attn_scale,
+        x_in=np.concatenate([prompt_x0, decode1_x0, decode2_x0], axis=0),
+    )
+    full_seq2_layer1 = reference_llama_prefill(
+        layer1,
+        d_head=d_head,
+        n_heads=n_heads,
+        n_kv_heads=n_kv_heads,
+        act_scale=act_scale,
+        attn_scale=attn_scale,
+        x_in=np.asarray(full_seq2_layer0["out"], dtype=np.float32),
+    )
+
+    np.testing.assert_allclose(decode2_out, np.asarray(full_seq2_layer1["out"], dtype=np.float32)[-1:], atol=1.0e-5, rtol=1.0e-5)
+    for head_idx in range(n_kv_heads):
         np.testing.assert_array_equal(decode2_cache_refs[0]["k_heads"][head_idx], full_seq2_layer0["k_heads"][head_idx])
         np.testing.assert_array_equal(decode2_cache_refs[0]["v_heads"][head_idx], full_seq2_layer0["v_heads"][head_idx])
         np.testing.assert_array_equal(decode2_cache_refs[1]["k_heads"][head_idx], full_seq2_layer1["k_heads"][head_idx])
