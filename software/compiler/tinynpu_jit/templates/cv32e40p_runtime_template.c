@@ -1646,8 +1646,8 @@ static void host_rope_precomputed(
     int outer = 1;
     int seq_len = 1;
     if (src->rank == 2) {
-        outer = src->shape[0];
-        seq_len = 1;
+        outer = 1;
+        seq_len = src->shape[0];
     } else {
         for (int axis = 0; axis < src->rank - 2; ++axis) {
             outer *= src->shape[axis];
@@ -1902,8 +1902,8 @@ static void host_rope(TinyTensor *dst, const TinyTensor *src, int head_dim, int 
     int outer = 1;
     int seq_len = 1;
     if (src->rank == 2) {
-        outer = src->shape[0];
-        seq_len = 1;
+        outer = 1;
+        seq_len = src->shape[0];
     } else {
         for (int axis = 0; axis < src->rank - 2; ++axis) {
             outer *= src->shape[axis];
@@ -1966,7 +1966,7 @@ static void host_rope(TinyTensor *dst, const TinyTensor *src, int head_dim, int 
                     dst_data[base + i] = first * c - second * s;
                     dst_data[base + half + i] = second * c + first * s;
                 }
-                if (src->rank != 2 && seq_idx + 1 < seq_len) {
+                if (seq_idx + 1 < seq_len) {
                     for (int i = 0; i < half; ++i) {
                         float c = cur_cos[i];
                         float s = cur_sin[i];

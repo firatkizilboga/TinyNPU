@@ -1,3 +1,29 @@
+"""Quantized GPT-2 decoder block for the TinyNPU compiler.
+
+This module defines :class:`QGPT2Block`, the reference implementations used as
+correctness oracles, and the plan builders that emit NPU artifacts for the
+prefill and decode paths.
+
+Two families of reference functions are provided and should be used for
+different purposes:
+
+- :func:`reference_prefill` / :func:`reference_decode` are
+  **hardware-faithful** references. They mirror the NPU exactly: INT16
+  weights with implicit ``weight_scale == 1``, INT32 biases scaled at
+  ``act_scale``, fp16-roundtripped LayerNorm and softmax, and ``h_gelu``
+  fused into ``c_fc``. Use these to validate that the compiled artifact
+  numerically matches the plan.
+- :func:`reference_prefill_float` / :func:`reference_decode_float` are
+  **HF-faithful fp32** references. They use plain fp32 math, the tanh GELU
+  approximation (matching HF ``new_gelu``), and no quantization. Use these
+  as the architectural oracle and to quantify the quantization + fp16 +
+  hard-GELU error budget.
+
+Positional embeddings are added **outside** the block: callers build
+``x_in = wte + wpe[positions]`` via :func:`_materialize_inputs` and feed
+that as the block input.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -13,6 +39,7 @@ from tinynpu_jit import (
     make_native_int16_kv_cache_specs,
 )
 from tinynpu_jit.golden import GoldenModel
+from tinynpu_jit.runtime_approx import quantize_fp16_to_i16_xform, softmax_f16_approx
 
 
 def _rand_i16(rng: np.random.Generator, shape: tuple[int, ...], low: int = -2, high: int = 3) -> np.ndarray:
@@ -24,6 +51,15 @@ def _rand_f32(rng: np.random.Generator, shape: tuple[int, ...], low: float = -0.
 
 
 def _quantize_bias_fp32(bias: np.ndarray, *, out_scale: float) -> np.ndarray:
+    """Quantize an fp32 bias to INT32 at ``out_scale``.
+
+    The matmul integer output has scale ``input_scale * weight_scale``. This
+    implementation passes ``out_scale = act_scale``, which **implicitly assumes
+    ``weight_scale == 1``** (the same assumption baked into
+    :func:`_quantize_weight_fp32`). Once scale-aware weight import lands, this
+    function's ``out_scale`` must become ``act_scale * weight_scale`` for the
+    matmul whose bias is being quantized.
+    """
     if out_scale <= 0.0:
         raise ValueError(f"Bias quantization scale must be positive, got {out_scale}.")
     bias_fp = np.asarray(bias, dtype=np.float32)
@@ -31,6 +67,12 @@ def _quantize_bias_fp32(bias: np.ndarray, *, out_scale: float) -> np.ndarray:
 
 
 def _quantize_weight_fp32(weight: np.ndarray) -> np.ndarray:
+    """Quantize an fp32 weight to INT16 by plain rounding.
+
+    This is **not** scale-aware: effective ``weight_scale == 1``. Real HF
+    weights (~N(0, 0.02)) collapse to near-zero under this rounding. Used for
+    the random-weight plumbing path and as a placeholder in :meth:`from_fp32`.
+    """
     weight_fp = np.asarray(weight, dtype=np.float32)
     return np.clip(np.rint(weight_fp), -32768, 32767).astype(np.int16)
 
@@ -48,7 +90,17 @@ def _fp16_roundtrip(value: np.ndarray) -> np.ndarray:
     return np.asarray(value, dtype=np.float32).astype(np.float16).astype(np.float32)
 
 
-def _layernorm_runtime_approx(x: np.ndarray, wb: np.ndarray, eps: float) -> np.ndarray:
+def _quantize_fp16_boundary(source: np.ndarray, *, scale: float) -> np.ndarray:
+    return quantize_fp16_to_i16_xform(source, scale=scale)
+
+
+def _layernorm_fp32(x: np.ndarray, wb: np.ndarray, eps: float) -> np.ndarray:
+    """Fp32 LayerNorm matching what the NPU layernorm host op computes before any
+    output-encoding cast. Numerically equivalent to :func:`_layernorm_exact` up to
+    ulp-level casting differences; the actual hardware approximation in the
+    quantized path is the fp16 roundtrip (:func:`_fp16_roundtrip`) that callers
+    apply on top of this result, not anything this function does.
+    """
     x_f = np.asarray(x, dtype=np.float32)
     wb_f = np.asarray(wb, dtype=np.float32)
     gamma = wb_f[0]
@@ -72,6 +124,10 @@ def _layernorm_exact(x: np.ndarray, wb: np.ndarray, eps: float) -> np.ndarray:
     return (norm * gamma.reshape(1, -1) + beta.reshape(1, -1)).astype(np.float32)
 
 
+def _resolve_layer_norm_epsilon(block: "QGPT2Block", layer_norm_epsilon: float | None) -> float:
+    return float(block.config.layer_norm_epsilon if layer_norm_epsilon is None else layer_norm_epsilon)
+
+
 def _gpt2_gelu_tanh(x: np.ndarray) -> np.ndarray:
     x_f = np.asarray(x, dtype=np.float32)
     coeff = np.float32(np.sqrt(2.0 / np.pi))
@@ -90,6 +146,20 @@ class QGPT2BlockConfig:
     - ln_2
     - mlp.c_fc
     - mlp.c_proj
+
+    Notes on NPU-specific divergences from HF GPT-2:
+
+    - The quantized reference and the NPU IR fuse ``h_gelu`` (piecewise-linear
+      hard GELU) into the ``c_fc`` matmul. Real HF GPT-2 uses the tanh
+      approximation (``new_gelu``). :func:`reference_prefill_float` /
+      :func:`reference_decode_float` preserve the tanh GELU as an architectural
+      oracle; the quantized path diverges from HF output by the
+      ``h_gelu``-vs-``tanh_gelu`` gap on every FFN.
+    - Positional information (``wpe``) is applied **outside** the block in
+      :func:`_materialize_inputs` so the block sees pre-positioned ``x_in``.
+    - Activation scale (``act_scale``) is per-tensor scalar and shared across
+      all matmul inputs/outputs; bias quantization assumes ``weight_scale == 1``
+      (see :func:`_quantize_bias_fp32`).
     """
 
     d_model: int
@@ -98,6 +168,7 @@ class QGPT2BlockConfig:
     ffn_dim: int
     act_scale: float = 1.0 / 32.0
     attn_scale: float = 1.0 / 256.0
+    layer_norm_epsilon: float = 1.0e-5
 
     @property
     def attn_dim(self) -> int:
@@ -106,7 +177,25 @@ class QGPT2BlockConfig:
 
 @dataclass(frozen=True)
 class QGPT2Block:
-    """Quantized GPT-2 block weights with Hugging Face-style component naming."""
+    """Quantized GPT-2 block weights with Hugging Face-style component naming.
+
+    Weight layout:
+
+    - ``attn_c_attn_w`` is the **fused** QKV projection of shape
+      ``(d_model, 3 * attn_dim)``, matching HF's ``transformer.h.N.attn.c_attn``.
+      The IR and reference paths split it into ``3 * n_heads`` per-head
+      ``(d_model, d_head)`` matmuls via :meth:`split_c_attn_weights`.
+      Mathematically equivalent, but a loader must slice, not tile.
+    - ``ln_*_wb`` packs ``(weight, bias)`` along axis 0 into ``(2, d_model)``.
+
+    KV cache layout (used by :func:`build_decode_artifact`):
+
+    - ``K`` is stored pre-transposed as ``(d_head, cache_len)`` so the score
+      matmul can read ``K`` as the RHS operand directly. ``V`` is stored in
+      the natural ``(cache_len, d_head)`` layout. Callers seeding the cache
+      from prefill must apply the transpose on ``K`` (see
+      :func:`_add_decode_head_runtime_tensors`).
+    """
 
     config: QGPT2BlockConfig
     ln_1_wb: np.ndarray
@@ -122,6 +211,13 @@ class QGPT2Block:
 
     @classmethod
     def random(cls, rng: np.random.Generator, config: QGPT2BlockConfig) -> QGPT2Block:
+        """Construct a randomly-initialised block for plumbing tests.
+
+        Weights are synthetic tiny int16 values in ``[-2, 3)`` and biases are
+        small fp32 in ``[-0.05, 0.05]``. These are intentionally well inside
+        the INT16 range and do **not** reflect real HF GPT-2 checkpoint
+        statistics; they exist only to exercise the compile/execute path.
+        """
         attn_dim = config.attn_dim
         return cls(
             config=config,
@@ -174,6 +270,17 @@ class QGPT2Block:
         - ln_2.{weight,bias} packed as `ln_2_wb`
         - mlp.c_fc.{weight,bias}
         - mlp.c_proj.{weight,bias}
+
+        .. warning::
+
+            This quantization path is **not checkpoint-faithful** for real HF
+            weights. Weights go through :func:`_quantize_weight_fp32`, which
+            does ``clip(round(w), -32768, 32767)`` — equivalent to assuming a
+            weight scale of 1.0. Real HF GPT-2 weights are ~N(0, 0.02) in fp32
+            and will collapse to near-zero under this rounding. A
+            scale-aware import path (per-tensor or per-channel max-abs
+            scaling, threaded into bias quantization and matmul dequant) is
+            still TODO; see ``QGPT2_BLOCK_TODO.md``.
         """
 
         return cls(
@@ -225,6 +332,9 @@ def build_shared_state(
     ffn_dim: int,
     prompt_len: int,
     seed: int,
+    act_scale: float = 1.0 / 32.0,
+    attn_scale: float = 1.0 / 256.0,
+    layer_norm_epsilon: float = 1.0e-5,
 ) -> dict[str, object]:
     rng = np.random.default_rng(seed)
     pos_capacity = prompt_len + 1
@@ -233,6 +343,9 @@ def build_shared_state(
         d_head=d_head,
         n_heads=n_heads,
         ffn_dim=ffn_dim,
+        act_scale=act_scale,
+        attn_scale=attn_scale,
+        layer_norm_epsilon=layer_norm_epsilon,
     )
     block = QGPT2Block.random(rng, config)
     state: dict[str, object] = {
@@ -283,9 +396,11 @@ def reference_prefill(
     act_scale: float,
     attn_scale: float,
     x_in: np.ndarray | None = None,
+    layer_norm_epsilon: float | None = None,
 ) -> dict[str, object]:
     golden = GoldenModel()
     block: QGPT2Block = state["block"]
+    resolved_layer_norm_epsilon = _resolve_layer_norm_epsilon(block, layer_norm_epsilon)
     if x_in is None:
         x_in = np.array(state["x_prompt_in"], dtype=np.float32, copy=True)
     else:
@@ -305,36 +420,45 @@ def reference_prefill(
     w_proj = np.array(block.mlp_c_proj_w, dtype=np.int16, copy=True)
     b_proj = _quantize_bias_fp32(np.array(block.mlp_c_proj_b, dtype=np.float32, copy=True), out_scale=act_scale)
 
-    x_norm1 = _fp16_roundtrip(_layernorm_runtime_approx(x_in, ln1_wb, 1.0e-5))
-    x_norm1_q = golden.quantize(x_norm1, scale=act_scale, zero_point=0, out_dtype=DType.INT16)
+    x_norm1 = _fp16_roundtrip(_layernorm_fp32(x_in, ln1_wb, resolved_layer_norm_epsilon))
+    x_norm1_q = _quantize_fp16_boundary(x_norm1, scale=act_scale)
 
     attn_heads: list[np.ndarray] = []
     k_heads: list[np.ndarray] = []
     v_heads: list[np.ndarray] = []
+    scores_heads: list[np.ndarray] = []
+    scores_scaled_heads: list[np.ndarray] = []
+    probs_heads: list[np.ndarray] = []
+    probs_q_heads: list[np.ndarray] = []
     score_scale = np.float32((float(act_scale) * float(act_scale)) / np.sqrt(float(d_head)))
     for head_idx in range(n_heads):
         q_int = golden.matmul(x_norm1_q, w_q[head_idx], bias=b_q[head_idx], out_dtype=DType.INT16)
         k_int = golden.matmul(x_norm1_q, w_k[head_idx], bias=b_k[head_idx], out_dtype=DType.INT16)
         v_int = golden.matmul(x_norm1_q, w_v[head_idx], bias=b_v[head_idx], out_dtype=DType.INT16)
-        scores = golden.matmul(q_int, np.array(k_int.T, dtype=np.int16, copy=True), out_dtype=DType.INT16).astype(np.float32)
-        scores = (scores * score_scale).astype(np.float32)
-        masked = np.array(scores, copy=True)
+        scores_int = golden.matmul(q_int, np.array(k_int.T, dtype=np.int16, copy=True), out_dtype=DType.INT16)
+        scores = scores_int.astype(np.float32)
+        scores_scaled = (scores * score_scale).astype(np.float32)
+        masked = np.array(scores_scaled, copy=True)
         for row in range(prompt_len):
             if row + 1 < prompt_len:
                 masked[row, row + 1 :] = np.float32(-1.0e10)
-        probs = _fp16_roundtrip(golden.softmax(masked, axis=-1).astype(np.float32))
-        probs_q = golden.quantize(probs, scale=attn_scale, zero_point=0, out_dtype=DType.INT16)
+        probs = softmax_f16_approx(masked, axis=-1)
+        probs_q = _quantize_fp16_boundary(probs, scale=attn_scale)
         attn = golden.matmul(probs_q, v_int, shift=8, out_dtype=DType.INT16)
         attn_heads.append(attn)
         k_heads.append(k_int)
         v_heads.append(v_int)
+        scores_heads.append(scores_int)
+        scores_scaled_heads.append(scores_scaled)
+        probs_heads.append(probs)
+        probs_q_heads.append(probs_q)
 
     attn_cat = np.concatenate(attn_heads, axis=-1).astype(np.int16) if n_heads > 1 else np.array(attn_heads[0], copy=True)
     o_int = golden.matmul(attn_cat, w_o, bias=b_o, out_dtype=DType.INT16)
     o_f = golden.dequantize(o_int, scale=act_scale, zero_point=0)
     resid1 = (x_in + o_f).astype(np.float32)
-    x_norm2 = _fp16_roundtrip(_layernorm_runtime_approx(resid1, ln2_wb, 1.0e-5))
-    x_norm2_q = golden.quantize(x_norm2, scale=act_scale, zero_point=0, out_dtype=DType.INT16)
+    x_norm2 = _fp16_roundtrip(_layernorm_fp32(resid1, ln2_wb, resolved_layer_norm_epsilon))
+    x_norm2_q = _quantize_fp16_boundary(x_norm2, scale=act_scale)
     ffn_fc_int = golden.matmul(x_norm2_q, w_fc, bias=b_fc, activation="h_gelu", out_dtype=DType.INT16)
     ffn_out_int = golden.matmul(ffn_fc_int, w_proj, bias=b_proj, out_dtype=DType.INT16)
     ffn_out_f = golden.dequantize(ffn_out_int, scale=act_scale, zero_point=0)
@@ -344,6 +468,10 @@ def reference_prefill(
         "x_norm1_q": x_norm1_q,
         "k_heads": k_heads,
         "v_heads": v_heads,
+        "scores_heads": scores_heads,
+        "scores_scaled_heads": scores_scaled_heads,
+        "probs_heads": probs_heads,
+        "probs_q_heads": probs_q_heads,
         "attn_cat": attn_cat,
         "o_int": o_int,
         "o_f": o_f,
@@ -390,8 +518,10 @@ def reference_prefill_float(
     *,
     d_head: int,
     n_heads: int,
+    layer_norm_epsilon: float | None = None,
 ) -> dict[str, object]:
     block: QGPT2Block = state["block"]
+    resolved_layer_norm_epsilon = _resolve_layer_norm_epsilon(block, layer_norm_epsilon)
     x_in = np.array(state["x_prompt_in"], dtype=np.float32, copy=True)
     prompt_len = x_in.shape[0]
     ln1_wb = np.array(block.ln_1_wb, dtype=np.float32, copy=True)
@@ -405,7 +535,7 @@ def reference_prefill_float(
     w_proj = np.array(block.mlp_c_proj_w, dtype=np.float32, copy=True)
     b_proj = np.array(block.mlp_c_proj_b, dtype=np.float32, copy=True)
 
-    x_norm1 = _layernorm_exact(x_in, ln1_wb, 1.0e-5)
+    x_norm1 = _layernorm_exact(x_in, ln1_wb, resolved_layer_norm_epsilon)
     attn_heads: list[np.ndarray] = []
     q_heads: list[np.ndarray] = []
     k_heads: list[np.ndarray] = []
@@ -436,7 +566,7 @@ def reference_prefill_float(
     attn_cat = np.concatenate(attn_heads, axis=-1).astype(np.float32) if n_heads > 1 else np.array(attn_heads[0], copy=True)
     o_f = (attn_cat @ w_o + b_o).astype(np.float32)
     resid1 = (x_in + o_f).astype(np.float32)
-    x_norm2 = _layernorm_exact(resid1, ln2_wb, 1.0e-5)
+    x_norm2 = _layernorm_exact(resid1, ln2_wb, resolved_layer_norm_epsilon)
     ffn_fc = (x_norm2 @ w_fc + b_fc).astype(np.float32)
     ffn_gelu = _gpt2_gelu_tanh(ffn_fc)
     ffn_out_f = (ffn_gelu @ w_proj + b_proj).astype(np.float32)
@@ -468,9 +598,11 @@ def reference_decode(
     act_scale: float,
     attn_scale: float,
     x_in: np.ndarray | None = None,
+    layer_norm_epsilon: float | None = None,
 ) -> dict[str, object]:
     golden = GoldenModel()
     block: QGPT2Block = state["block"]
+    resolved_layer_norm_epsilon = _resolve_layer_norm_epsilon(block, layer_norm_epsilon)
     if x_in is None:
         x_in = np.array(state["x_decode_in"], dtype=np.float32, copy=True)
     else:
@@ -489,12 +621,16 @@ def reference_decode(
     w_proj = np.array(block.mlp_c_proj_w, dtype=np.int16, copy=True)
     b_proj = _quantize_bias_fp32(np.array(block.mlp_c_proj_b, dtype=np.float32, copy=True), out_scale=act_scale)
 
-    x_norm1 = _fp16_roundtrip(_layernorm_runtime_approx(x_in, ln1_wb, 1.0e-5))
-    x_norm1_q = golden.quantize(x_norm1, scale=act_scale, zero_point=0, out_dtype=DType.INT16)
+    x_norm1 = _fp16_roundtrip(_layernorm_fp32(x_in, ln1_wb, resolved_layer_norm_epsilon))
+    x_norm1_q = _quantize_fp16_boundary(x_norm1, scale=act_scale)
 
     attn_heads: list[np.ndarray] = []
     k_cur_heads: list[np.ndarray] = []
     v_cur_heads: list[np.ndarray] = []
+    scores_heads: list[np.ndarray] = []
+    scores_scaled_heads: list[np.ndarray] = []
+    probs_heads: list[np.ndarray] = []
+    probs_q_heads: list[np.ndarray] = []
     score_scale = np.float32((float(act_scale) * float(act_scale)) / np.sqrt(float(d_head)))
     for head_idx in range(n_heads):
         q_int = golden.matmul(x_norm1_q, w_q[head_idx], bias=b_q[head_idx], out_dtype=DType.INT16)
@@ -504,21 +640,26 @@ def reference_decode(
         v_prefill = np.array(prefill_ref["v_heads"][head_idx], dtype=np.int16, copy=True)
         k_full = np.concatenate([k_prefill, k_cur], axis=0).astype(np.int16)
         v_full = np.concatenate([v_prefill, v_cur], axis=0).astype(np.int16)
-        scores = golden.matmul(q_int, np.array(k_full.T, dtype=np.int16, copy=True), out_dtype=DType.INT16).astype(np.float32)
-        scores = (scores * score_scale).astype(np.float32)
-        probs = _fp16_roundtrip(golden.softmax(scores, axis=-1).astype(np.float32))
-        probs_q = golden.quantize(probs, scale=attn_scale, zero_point=0, out_dtype=DType.INT16)
+        scores_int = golden.matmul(q_int, np.array(k_full.T, dtype=np.int16, copy=True), out_dtype=DType.INT16)
+        scores = scores_int.astype(np.float32)
+        scores_scaled = (scores * score_scale).astype(np.float32)
+        probs = softmax_f16_approx(scores_scaled, axis=-1)
+        probs_q = _quantize_fp16_boundary(probs, scale=attn_scale)
         attn = golden.matmul(probs_q, v_full, shift=8, out_dtype=DType.INT16)
         attn_heads.append(attn)
         k_cur_heads.append(k_cur)
         v_cur_heads.append(v_cur)
+        scores_heads.append(scores_int)
+        scores_scaled_heads.append(scores_scaled)
+        probs_heads.append(probs)
+        probs_q_heads.append(probs_q)
 
     attn_cat = np.concatenate(attn_heads, axis=-1).astype(np.int16) if n_heads > 1 else np.array(attn_heads[0], copy=True)
     o_int = golden.matmul(attn_cat, w_o, bias=b_o, out_dtype=DType.INT16)
     o_f = golden.dequantize(o_int, scale=act_scale, zero_point=0)
     resid1 = (x_in + o_f).astype(np.float32)
-    x_norm2 = _fp16_roundtrip(_layernorm_runtime_approx(resid1, ln2_wb, 1.0e-5))
-    x_norm2_q = golden.quantize(x_norm2, scale=act_scale, zero_point=0, out_dtype=DType.INT16)
+    x_norm2 = _fp16_roundtrip(_layernorm_fp32(resid1, ln2_wb, resolved_layer_norm_epsilon))
+    x_norm2_q = _quantize_fp16_boundary(x_norm2, scale=act_scale)
     ffn_fc_int = golden.matmul(x_norm2_q, w_fc, bias=b_fc, activation="h_gelu", out_dtype=DType.INT16)
     ffn_out_int = golden.matmul(ffn_fc_int, w_proj, bias=b_proj, out_dtype=DType.INT16)
     ffn_out_f = golden.dequantize(ffn_out_int, scale=act_scale, zero_point=0)
@@ -528,6 +669,10 @@ def reference_decode(
         "x_norm1_q": x_norm1_q,
         "k_cur_heads": k_cur_heads,
         "v_cur_heads": v_cur_heads,
+        "scores_heads": scores_heads,
+        "scores_scaled_heads": scores_scaled_heads,
+        "probs_heads": probs_heads,
+        "probs_q_heads": probs_q_heads,
         "attn_cat": attn_cat,
         "o_int": o_int,
         "o_f": o_f,
@@ -547,8 +692,10 @@ def reference_decode_float(
     *,
     d_head: int,
     n_heads: int,
+    layer_norm_epsilon: float | None = None,
 ) -> dict[str, object]:
     block: QGPT2Block = state["block"]
+    resolved_layer_norm_epsilon = _resolve_layer_norm_epsilon(block, layer_norm_epsilon)
     x_in = np.array(state["x_decode_in"], dtype=np.float32, copy=True)
     ln1_wb = np.array(block.ln_1_wb, dtype=np.float32, copy=True)
     ln2_wb = np.array(block.ln_2_wb, dtype=np.float32, copy=True)
@@ -561,7 +708,7 @@ def reference_decode_float(
     w_proj = np.array(block.mlp_c_proj_w, dtype=np.float32, copy=True)
     b_proj = np.array(block.mlp_c_proj_b, dtype=np.float32, copy=True)
 
-    x_norm1 = _layernorm_exact(x_in, ln1_wb, 1.0e-5)
+    x_norm1 = _layernorm_exact(x_in, ln1_wb, resolved_layer_norm_epsilon)
     attn_heads: list[np.ndarray] = []
     q_heads: list[np.ndarray] = []
     k_cur_heads: list[np.ndarray] = []
@@ -590,7 +737,7 @@ def reference_decode_float(
     attn_cat = np.concatenate(attn_heads, axis=-1).astype(np.float32) if n_heads > 1 else np.array(attn_heads[0], copy=True)
     o_f = (attn_cat @ w_o + b_o).astype(np.float32)
     resid1 = (x_in + o_f).astype(np.float32)
-    x_norm2 = _layernorm_exact(resid1, ln2_wb, 1.0e-5)
+    x_norm2 = _layernorm_exact(resid1, ln2_wb, resolved_layer_norm_epsilon)
     ffn_fc = (x_norm2 @ w_fc + b_fc).astype(np.float32)
     ffn_gelu = _gpt2_gelu_tanh(ffn_fc)
     ffn_out_f = (ffn_gelu @ w_proj + b_proj).astype(np.float32)
@@ -634,14 +781,14 @@ def _common_io_tensors(
         "b_fc": TensorSpec("b_fc", (1, ffn_dim), DType.INT32, TensorKind.CONSTANT, data=_quantize_bias_fp32(np.array(block.mlp_c_fc_b, dtype=np.float32, copy=True), out_scale=act_scale)),
         "w_proj": TensorSpec("w_proj", (ffn_dim, d_model), DType.INT16, TensorKind.CONSTANT, data=np.array(block.mlp_c_proj_w, dtype=np.int16, copy=True)),
         "b_proj": TensorSpec("b_proj", (1, d_model), DType.INT32, TensorKind.CONSTANT, data=_quantize_bias_fp32(np.array(block.mlp_c_proj_b, dtype=np.float32, copy=True), out_scale=act_scale)),
-        "x_norm1": TensorSpec("x_norm1", (seq_len, d_model), DType.INT16, TensorKind.INTERMEDIATE),
+        "x_norm1": TensorSpec("x_norm1", (seq_len, d_model), DType.INT16, TensorKind.INTERMEDIATE, metadata={"value_encoding": "fp16_bits"}),
         "x_norm1_q": TensorSpec("x_norm1_q", (seq_len, d_model), DType.INT16, TensorKind.INTERMEDIATE, metadata={"storage_role": "A"}),
         "attn_cat": TensorSpec("attn_cat", (seq_len, attn_dim), DType.INT16, TensorKind.INTERMEDIATE),
         "attn_cat_a": TensorSpec("attn_cat_a", (seq_len, attn_dim), DType.INT16, TensorKind.INTERMEDIATE, metadata={"storage_role": "A"}),
         "o_int": TensorSpec("o_int", (seq_len, d_model), DType.INT16, TensorKind.INTERMEDIATE),
         "o_f": TensorSpec("o_f", (seq_len, d_model), DType.FLOAT32, TensorKind.INTERMEDIATE),
         "resid1": TensorSpec("resid1", (seq_len, d_model), DType.FLOAT32, TensorKind.INTERMEDIATE),
-        "x_norm2": TensorSpec("x_norm2", (seq_len, d_model), DType.INT16, TensorKind.INTERMEDIATE),
+        "x_norm2": TensorSpec("x_norm2", (seq_len, d_model), DType.INT16, TensorKind.INTERMEDIATE, metadata={"value_encoding": "fp16_bits"}),
         "x_norm2_q": TensorSpec("x_norm2_q", (seq_len, d_model), DType.INT16, TensorKind.INTERMEDIATE, metadata={"storage_role": "A"}),
         "ffn_fc_int": TensorSpec("ffn_fc_int", (seq_len, ffn_dim), DType.INT16, TensorKind.INTERMEDIATE, metadata={"storage_role": "A"}),
         "ffn_out_int": TensorSpec("ffn_out_int", (seq_len, d_model), DType.INT16, TensorKind.INTERMEDIATE),
@@ -759,6 +906,7 @@ def _add_prefill_head_runtime_tensors(
             )
         )
         builder.add_tensor(TensorSpec(f"scores_h{head_idx}", (prompt_len, prompt_len), DType.INT16, TensorKind.INTERMEDIATE))
+        builder.add_tensor(TensorSpec(f"scores_f_h{head_idx}", (prompt_len, prompt_len), DType.FLOAT32, TensorKind.INTERMEDIATE))
         builder.add_tensor(
             TensorSpec(
                 f"score_scale_h{head_idx}",
@@ -813,7 +961,9 @@ def _add_decode_head_runtime_tensors(
         v_prefill = np.array(prefill_ref["v_heads"][head_idx], dtype=np.int16, copy=True)
         k_base[:, :prompt_len] = k_prefill.T
         v_base[:prompt_len, :] = v_prefill
+        builder.tensors[f"k_cache_h{head_idx}"].kind = TensorKind.CONSTANT
         builder.tensors[f"k_cache_h{head_idx}"].data = k_base
+        builder.tensors[f"v_cache_h{head_idx}"].kind = TensorKind.CONSTANT
         builder.tensors[f"v_cache_h{head_idx}"].data = v_base
         builder.add_tensor(TensorSpec(f"q_int_h{head_idx}", (1, d_head), DType.INT16, TensorKind.INTERMEDIATE))
         builder.add_tensor(TensorSpec(f"k_cur_h{head_idx}", (1, d_head), DType.INT16, TensorKind.INTERMEDIATE))
@@ -828,6 +978,7 @@ def _add_decode_head_runtime_tensors(
             )
         )
         builder.add_tensor(TensorSpec(f"scores_h{head_idx}", (1, cache_len), DType.INT16, TensorKind.INTERMEDIATE))
+        builder.add_tensor(TensorSpec(f"scores_f_h{head_idx}", (1, cache_len), DType.FLOAT32, TensorKind.INTERMEDIATE))
         builder.add_tensor(
             TensorSpec(
                 f"score_scale_h{head_idx}",
@@ -873,9 +1024,16 @@ def _append_attention_post_score_steps(
 ) -> None:
     for head_idx in range(n_heads):
         builder.host(
+            f"dequant_scores_h{head_idx}",
+            "dequantize",
+            inputs=[f"scores_h{head_idx}"],
+            outputs=[f"scores_f_h{head_idx}"],
+            attrs={"scale": 1.0, "zero_point": 0},
+        )
+        builder.host(
             f"scale_scores_h{head_idx}",
             "mul",
-            inputs=[f"scores_h{head_idx}", f"score_scale_h{head_idx}"],
+            inputs=[f"scores_f_h{head_idx}", f"score_scale_h{head_idx}"],
             outputs=[f"scores_scaled_h{head_idx}"],
         )
         if include_causal_mask:
@@ -920,7 +1078,7 @@ def _append_concat_alias_steps(builder: IRBuilder, *, n_heads: int, seq_len: int
     builder.host("alias_attn_cat_a", "alias", inputs=["attn_cat"], outputs=["attn_cat_a"])
 
 
-def _append_transformer_tail(builder: IRBuilder, *, act_scale: float) -> None:
+def _append_transformer_tail(builder: IRBuilder, *, act_scale: float, layer_norm_epsilon: float = 1.0e-5) -> None:
     builder.segment(
         "seg_o_proj",
         ops=[builder.matmul("op_o_proj", "attn_cat_a", "w_o", "o_int", bias="b_o", in_dtype=DType.INT16, out_dtype=DType.INT16)],
@@ -934,7 +1092,7 @@ def _append_transformer_tail(builder: IRBuilder, *, act_scale: float) -> None:
         "layernorm",
         inputs=["resid1", "ln2_wb"],
         outputs=["x_norm2"],
-        attrs={"eps": 1.0e-5, "output_encoding": "fp16_bits"},
+        attrs={"eps": layer_norm_epsilon, "output_encoding": "fp16_bits"},
     )
     builder.host(
         "quant_x_norm2",
@@ -969,6 +1127,7 @@ def build_prefill_artifact(
     seed: int = 0,
     act_scale: float = 1.0 / 32.0,
     attn_scale: float = 1.0 / 256.0,
+    layer_norm_epsilon: float = 1.0e-5,
 ):
     if d_model <= 0 or d_model % 8 != 0:
         raise ValueError("d_model must be a positive multiple of 8")
@@ -980,6 +1139,8 @@ def build_prefill_artifact(
         raise ValueError("ffn_dim must be a positive multiple of 8")
     if prompt_len <= 0 or prompt_len % 8 != 0:
         raise ValueError("prompt_len must be a positive multiple of 8")
+    if layer_norm_epsilon <= 0.0:
+        raise ValueError("layer_norm_epsilon must be positive")
 
     state = build_shared_state(
         d_model=d_model,
@@ -988,15 +1149,22 @@ def build_prefill_artifact(
         ffn_dim=ffn_dim,
         prompt_len=prompt_len,
         seed=seed,
+        act_scale=act_scale,
+        attn_scale=attn_scale,
+        layer_norm_epsilon=layer_norm_epsilon,
     )
+    block = state["block"]
+    act_scale = block.config.act_scale
+    attn_scale = block.config.attn_scale
+    layer_norm_epsilon = block.config.layer_norm_epsilon
     ref = reference_prefill(
         state,
         d_head=d_head,
         n_heads=n_heads,
         act_scale=act_scale,
         attn_scale=attn_scale,
+        layer_norm_epsilon=layer_norm_epsilon,
     )
-    block = state["block"]
 
     attn_dim = n_heads * d_head
     b = IRBuilder()
@@ -1016,7 +1184,7 @@ def build_prefill_artifact(
     _add_prefill_head_runtime_tensors(b, d_head=d_head, n_heads=n_heads, prompt_len=prompt_len, act_scale=act_scale)
     _add_attention_concat_tensors(b, seq_len=prompt_len, d_head=d_head, n_heads=n_heads)
 
-    b.host("layernorm1", "layernorm", inputs=["x_in", "ln1_wb"], outputs=["x_norm1"], attrs={"eps": 1.0e-5, "output_encoding": "fp16_bits"})
+    b.host("layernorm1", "layernorm", inputs=["x_in", "ln1_wb"], outputs=["x_norm1"], attrs={"eps": layer_norm_epsilon, "output_encoding": "fp16_bits"})
     b.host(
         "quant_x_norm1",
         "quantize",
@@ -1049,7 +1217,7 @@ def build_prefill_artifact(
             b.matmul(f"op_qk_h{head_idx}", f"q_a_h{head_idx}", f"prefill_k_cache_h{head_idx}", f"scores_h{head_idx}", in_dtype=DType.INT16, out_dtype=DType.INT16)
             for head_idx in range(n_heads)
         ],
-        inputs=[f"q_a_h{i}" for i in range(n_heads)],
+        inputs=[*(f"q_a_h{i}" for i in range(n_heads)), *(f"prefill_k_cache_h{i}" for i in range(n_heads))],
         outputs=[f"scores_h{i}" for i in range(n_heads)],
     )
     _append_attention_post_score_steps(b, n_heads=n_heads, attn_scale=attn_scale, include_causal_mask=True, past_kv_len=0)
@@ -1059,15 +1227,15 @@ def build_prefill_artifact(
             b.matmul(f"op_av_h{head_idx}", f"probs_q_h{head_idx}", f"prefill_v_cache_h{head_idx}", f"attn_h{head_idx}", shift=8, in_dtype=DType.INT16, out_dtype=DType.INT16)
             for head_idx in range(n_heads)
         ],
-        inputs=[f"probs_q_h{i}" for i in range(n_heads)],
+        inputs=[*(f"probs_q_h{i}" for i in range(n_heads)), *(f"prefill_v_cache_h{i}" for i in range(n_heads))],
         outputs=[f"attn_h{i}" for i in range(n_heads)],
     )
     _append_concat_alias_steps(b, n_heads=n_heads, seq_len=prompt_len)
-    _append_transformer_tail(b, act_scale=act_scale)
+    _append_transformer_tail(b, act_scale=act_scale, layer_norm_epsilon=layer_norm_epsilon)
 
     plan = b.finalize(inputs=[], outputs=["out"])
     plan.add_verification_step("out", "gpt2_prefill_out")
-    artifact = compile_plan(plan, {"gpt2_prefill_out": np.array(ref["out"], dtype=np.float32, copy=True)})
+    artifact = compile_plan(plan, {"out": np.array(ref["out"], dtype=np.float32, copy=True)})
     return artifact, state, ref
 
 
@@ -1081,7 +1249,11 @@ def build_decode_artifact(
     seed: int = 0,
     act_scale: float = 1.0 / 32.0,
     attn_scale: float = 1.0 / 256.0,
+    layer_norm_epsilon: float = 1.0e-5,
 ):
+    if layer_norm_epsilon <= 0.0:
+        raise ValueError("layer_norm_epsilon must be positive")
+
     state = build_shared_state(
         d_model=d_model,
         d_head=d_head,
@@ -1089,13 +1261,21 @@ def build_decode_artifact(
         ffn_dim=ffn_dim,
         prompt_len=prompt_len,
         seed=seed,
+        act_scale=act_scale,
+        attn_scale=attn_scale,
+        layer_norm_epsilon=layer_norm_epsilon,
     )
+    block = state["block"]
+    act_scale = block.config.act_scale
+    attn_scale = block.config.attn_scale
+    layer_norm_epsilon = block.config.layer_norm_epsilon
     prefill_ref = reference_prefill(
         state,
         d_head=d_head,
         n_heads=n_heads,
         act_scale=act_scale,
         attn_scale=attn_scale,
+        layer_norm_epsilon=layer_norm_epsilon,
     )
     decode_ref = reference_decode(
         state,
@@ -1104,8 +1284,8 @@ def build_decode_artifact(
         n_heads=n_heads,
         act_scale=act_scale,
         attn_scale=attn_scale,
+        layer_norm_epsilon=layer_norm_epsilon,
     )
-    block = state["block"]
 
     cache_len = prompt_len + 1
     attn_dim = n_heads * d_head
@@ -1138,7 +1318,7 @@ def build_decode_artifact(
     )
     _add_attention_concat_tensors(b, seq_len=1, d_head=d_head, n_heads=n_heads)
 
-    b.host("layernorm1", "layernorm", inputs=["x_in", "ln1_wb"], outputs=["x_norm1"], attrs={"eps": 1.0e-5, "output_encoding": "fp16_bits"})
+    b.host("layernorm1", "layernorm", inputs=["x_in", "ln1_wb"], outputs=["x_norm1"], attrs={"eps": layer_norm_epsilon, "output_encoding": "fp16_bits"})
     b.host(
         "quant_x_norm1",
         "quantize",
@@ -1165,14 +1345,14 @@ def build_decode_artifact(
         b.host(
             f"k_append_h{head_idx}",
             "k_cache_scatter_write",
-            inputs=[f"k_cur_h{head_idx}"],
+            inputs=[f"k_cur_h{head_idx}", f"k_cache_h{head_idx}"],
             outputs=[f"k_cache_h{head_idx}_{decode_token_name}"],
             attrs={"token_index": prompt_len, "k_cache_base": f"k_cache_h{head_idx}"},
         )
         b.host(
             f"v_append_h{head_idx}",
             "v_cache_scatter_write",
-            inputs=[f"v_cur_h{head_idx}"],
+            inputs=[f"v_cur_h{head_idx}", f"v_cache_h{head_idx}"],
             outputs=[f"v_cache_h{head_idx}_{decode_token_name}"],
             attrs={"token_index": prompt_len, "v_cache_base": f"v_cache_h{head_idx}"},
         )
@@ -1197,9 +1377,9 @@ def build_decode_artifact(
         outputs=[f"attn_h{i}" for i in range(n_heads)],
     )
     _append_concat_alias_steps(b, n_heads=n_heads, seq_len=1)
-    _append_transformer_tail(b, act_scale=act_scale)
+    _append_transformer_tail(b, act_scale=act_scale, layer_norm_epsilon=layer_norm_epsilon)
 
     plan = b.finalize(inputs=[], outputs=["out"])
     plan.add_verification_step("out", "gpt2_decode_out")
-    artifact = compile_plan(plan, {"gpt2_decode_out": np.array(decode_ref["out"], dtype=np.float32, copy=True)})
+    artifact = compile_plan(plan, {"out": np.array(decode_ref["out"], dtype=np.float32, copy=True)})
     return artifact, state, prefill_ref, decode_ref

@@ -26,6 +26,23 @@
 #define TNPU_RUNTIME_V2_VERBOSE_STEPS 1
 #endif
 
+static const char *tnpu_body_kind(const TnpuProgram *program)
+{
+    const int has_segments = program != NULL && program->segment_count > 0u;
+    const int has_host_ops = program != NULL && program->host_op_count > 0u;
+
+    if (has_segments && has_host_ops) {
+        return "hybrid";
+    }
+    if (has_segments) {
+        return "npu_only";
+    }
+    if (has_host_ops) {
+        return "cpu_only";
+    }
+    return "empty";
+}
+
 static const char *tnpu_role_or_default(const char *role, const char *fallback)
 {
     if (role == NULL || role[0] == '\0') {
@@ -572,6 +589,7 @@ static int tnpu_execute_host_op(TinyTensor *runtime_tensors, const TnpuHostOp *o
     TinyTensor *out;
     const TinyTensor *in;
     const TinyTensor *in1 = NULL;
+    const TinyTensor *in2 = NULL;
     if (op->input_idx >= 0xFFFFu || op->output_idx >= 0xFFFFu) {
         printf("runtime v2: invalid host tensor indices\n");
         return 1;
@@ -580,6 +598,9 @@ static int tnpu_execute_host_op(TinyTensor *runtime_tensors, const TnpuHostOp *o
     in = &runtime_tensors[op->input_idx];
     if (op->input1_idx < 0xFFFFu) {
         in1 = &runtime_tensors[op->input1_idx];
+    }
+    if (op->input2_idx < 0xFFFFu) {
+        in2 = &runtime_tensors[op->input2_idx];
     }
 
     switch (op->kind) {
@@ -633,6 +654,24 @@ static int tnpu_execute_host_op(TinyTensor *runtime_tensors, const TnpuHostOp *o
                 op->attrs_i32[1],
                 op->attrs_f32[0],
                 op->attrs_i32[2]);
+            return 0;
+        case TNPU_HOST_MAXPOOL2D:
+            host_maxpool2d(out, in, op->attrs_i32[0], op->attrs_i32[1], op->attrs_i32[2], op->attrs_i32[3], op->attrs_i32[4], op->attrs_i32[5]);
+            return 0;
+        case TNPU_HOST_AVGPOOL2D:
+            host_avgpool2d(
+                out,
+                in,
+                op->attrs_i32[0],
+                op->attrs_i32[1],
+                op->attrs_i32[2],
+                op->attrs_i32[3],
+                op->attrs_i32[4],
+                op->attrs_i32[5],
+                op->attrs_i32[6]);
+            return 0;
+        case TNPU_HOST_ADAPTIVE_AVGPOOL2D:
+            host_adaptive_avg_pool2d(out, in, op->attrs_i32[0], op->attrs_i32[1]);
             return 0;
         case TNPU_HOST_IM2COL:
             if (op->attrs_i32[3] == 2) {
@@ -705,9 +744,21 @@ static int tnpu_execute_host_op(TinyTensor *runtime_tensors, const TnpuHostOp *o
             return 0;
         case TNPU_HOST_K_CACHE_SCATTER_WRITE:
             host_k_cache_scatter_write(in, (const int *)op->arr0, op->attrs_i32[0]);
+            if (out != NULL) {
+                host_alias(out, in);
+            }
+            if (in1 != NULL) {
+                host_commit_k_cache_slot(in1, in, op->attrs_i32[1]);
+            }
             return 0;
         case TNPU_HOST_V_CACHE_SCATTER_WRITE:
             host_v_cache_scatter_write(in, (const int *)op->arr0, (int)op->arr0_len);
+            if (out != NULL) {
+                host_alias(out, in);
+            }
+            if (in1 != NULL) {
+                host_commit_v_cache_slot(in1, in, op->attrs_i32[1]);
+            }
             return 0;
         case TNPU_HOST_K_CACHE_SCATTER_MATRIX:
             host_k_cache_scatter_matrix(out, in, op->attrs_i32[0]);
@@ -724,6 +775,20 @@ static int tnpu_execute_host_op(TinyTensor *runtime_tensors, const TnpuHostOp *o
                 return 1;
             }
             host_concat_lastdim2(out, in, in1);
+            return 0;
+        case TNPU_HOST_LINEAR:
+            if (in1 == NULL) {
+                printf("runtime v2: linear missing weight input\n");
+                return 1;
+            }
+            host_linear(out, in, in1, in2);
+            return 0;
+        case TNPU_HOST_CONV2D:
+            if (in1 == NULL) {
+                printf("runtime v2: conv2d missing weight input\n");
+                return 1;
+            }
+            host_conv2d(out, in, in1, in2, op->attrs_i32[0], op->attrs_i32[1]);
             return 0;
         default:
             printf("runtime v2: unsupported host op kind=%u (%s)\n", (unsigned)op->kind, op->name ? op->name : "?");
@@ -1151,10 +1216,11 @@ int tinynpu_run_repeat(
 {
     TinyTensor *runtime_tensors;
     uint32_t preload_total = 0;
-    uint32_t cold_npu = 0;
+    uint32_t cold_body = 0;
     uint32_t warm_sum = 0;
     uint32_t warm_avg = 0;
-    uint32_t e2e_npu_10 = 0;
+    uint32_t e2e_10 = 0;
+    const char *body_kind = tnpu_body_kind(program);
     (void)scratch;
     (void)scratch_words;
 
@@ -1169,6 +1235,7 @@ int tinynpu_run_repeat(
     }
 
     printf("TinyNPU runtime v2 program: %s\n", program->name ? program->name : "program_v2");
+    printf("body.kind=%s\n", body_kind);
     tb_timer_reset_counter();
 
     if (tnpu_execute_preloads(program, &preload_total) != 0) {
@@ -1197,21 +1264,21 @@ int tinynpu_run_repeat(
         }
 
         if (iter == 0u) {
-            cold_npu = delta;
-            printf("cold.npu cycles=%lu\n", (unsigned long)cold_npu);
-            printf("cold.e2e.npu cycles=%lu\n", (unsigned long)(preload_total + cold_npu));
+            cold_body = delta;
+            printf("cold.body cycles=%lu\n", (unsigned long)cold_body);
+            printf("cold.e2e cycles=%lu\n", (unsigned long)(preload_total + cold_body));
         } else {
             warm_sum += delta;
-            printf("warm%lu.npu cycles=%lu\n", (unsigned long)iter, (unsigned long)delta);
+            printf("warm%lu.body cycles=%lu\n", (unsigned long)iter, (unsigned long)delta);
         }
     }
 
     if (repeat_count > 1u) {
         warm_avg = (warm_sum + ((repeat_count - 1u) / 2u)) / (repeat_count - 1u);
-        printf("warm.avg.npu cycles=%lu\n", (unsigned long)warm_avg);
+        printf("warm.avg.body cycles=%lu\n", (unsigned long)warm_avg);
     }
-    e2e_npu_10 = preload_total + cold_npu + (9u * (repeat_count > 1u ? warm_avg : cold_npu));
-    printf("extrapolated.10x.e2e.npu cycles=%lu\n", (unsigned long)e2e_npu_10);
+    e2e_10 = preload_total + cold_body + (9u * (repeat_count > 1u ? warm_avg : cold_body));
+    printf("extrapolated.10x.e2e cycles=%lu\n", (unsigned long)e2e_10);
 
     tnpu_dump_final_outputs(runtime_tensors, program);
     free(runtime_tensors);

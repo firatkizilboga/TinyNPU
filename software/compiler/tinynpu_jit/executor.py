@@ -26,7 +26,7 @@ class HostEmulationExecutor:
     ) -> ExecutionResult:
         values: dict[str, np.ndarray] = {}
         for name, spec in artifact.plan.tensors.items():
-            if spec.kind == TensorKind.CONSTANT and spec.data is not None:
+            if spec.data is not None:
                 values[name] = np.array(spec.data, copy=True)
             elif (
                 spec.kind != TensorKind.CONSTANT

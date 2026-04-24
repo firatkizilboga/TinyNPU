@@ -45,6 +45,7 @@ from tinynpu_jit.blocks.gpt2_block import (
     build_shared_state as build_gpt2_shared_state,
     extend_kv_cache as extend_gpt2_kv_cache,
     reference_decode as reference_gpt2_decode,
+    reference_prefill_float as reference_gpt2_prefill_float,
     reference_prefill as reference_gpt2_prefill,
 )
 from tinynpu_jit.blocks.llama_block import (
@@ -58,6 +59,10 @@ from tinynpu_jit.blocks.llama_block import (
     reference_prefill as reference_llama_prefill,
 )
 from run_cv32e40p_prefill_transformer_block_jit_demo import build_artifact as build_prefill_transformer_block_artifact
+
+
+def _fp16_bits(value: np.ndarray) -> np.ndarray:
+    return np.asarray(value, dtype=np.float32).astype(np.float16).view(np.uint16).astype(np.int16)
 
 
 def test_emit_cv32e40p_c_for_two_segment_relu_chain():
@@ -1481,6 +1486,106 @@ def test_qgpt2_block_matches_hf_style_fused_shapes():
     assert [b.shape for b in b_q] == [(1, 8)] * 4
     assert [b.shape for b in b_k] == [(1, 8)] * 4
     assert [b.shape for b in b_v] == [(1, 8)] * 4
+    assert block.config.layer_norm_epsilon == pytest.approx(1.0e-5)
+
+
+def test_qgpt2_prefill_host_emulation_matches_reference_trace():
+    artifact, _, ref = build_gpt2_prefill_artifact(
+        d_model=16,
+        d_head=16,
+        n_heads=1,
+        ffn_dim=16,
+        prompt_len=8,
+        seed=0,
+    )
+
+    result = run_host_emulation(artifact, {}, verification=VerificationMode.DEBUG)
+
+    assert result.verified == ["gpt2_prefill_out"]
+    np.testing.assert_array_equal(result.trace_tensors["x_norm1"], _fp16_bits(ref["x_norm1"]))
+    np.testing.assert_array_equal(result.trace_tensors["x_norm1_q"], ref["x_norm1_q"])
+    np.testing.assert_array_equal(result.trace_tensors["scores_h0"], ref["scores_heads"][0])
+    np.testing.assert_allclose(result.trace_tensors["scores_scaled_h0"], ref["scores_scaled_heads"][0], atol=1.0e-6, rtol=1.0e-6)
+    np.testing.assert_array_equal(result.trace_tensors["probs_h0"], _fp16_bits(ref["probs_heads"][0]))
+    np.testing.assert_array_equal(result.trace_tensors["probs_q_h0"], ref["probs_q_heads"][0])
+    np.testing.assert_array_equal(result.trace_tensors["prefill_k_cache_h0"], np.asarray(ref["k_heads"][0], dtype=np.int16).T)
+    np.testing.assert_array_equal(result.trace_tensors["prefill_v_cache_h0"], ref["v_heads"][0])
+    np.testing.assert_array_equal(result.trace_tensors["x_norm2"], _fp16_bits(ref["x_norm2"]))
+    np.testing.assert_array_equal(result.trace_tensors["x_norm2_q"], ref["x_norm2_q"])
+    np.testing.assert_array_equal(result.trace_tensors["ffn_fc_int"], ref["ffn_fc_int"])
+    np.testing.assert_allclose(result.tensors["out"], ref["out"], atol=1.0e-5, rtol=1.0e-5)
+
+
+def test_qgpt2_decode_host_emulation_matches_reference_trace_and_cache_seed():
+    artifact, _, prefill_ref, decode_ref = build_gpt2_decode_artifact(
+        d_model=16,
+        d_head=16,
+        n_heads=1,
+        ffn_dim=16,
+        prompt_len=8,
+        seed=0,
+    )
+
+    result = run_host_emulation(artifact, {}, verification=VerificationMode.DEBUG)
+    expected_k_cache = np.concatenate(
+        [
+            np.asarray(prefill_ref["k_heads"][0], dtype=np.int16),
+            np.asarray(decode_ref["k_cur_heads"][0], dtype=np.int16),
+        ],
+        axis=0,
+    ).T
+    expected_v_cache = np.concatenate(
+        [
+            np.asarray(prefill_ref["v_heads"][0], dtype=np.int16),
+            np.asarray(decode_ref["v_cur_heads"][0], dtype=np.int16),
+        ],
+        axis=0,
+    )
+
+    assert result.verified == ["gpt2_decode_out"]
+    np.testing.assert_array_equal(result.trace_tensors["x_norm1"], _fp16_bits(decode_ref["x_norm1"]))
+    np.testing.assert_array_equal(result.trace_tensors["x_norm1_q"], decode_ref["x_norm1_q"])
+    np.testing.assert_array_equal(result.trace_tensors["scores_h0"], decode_ref["scores_heads"][0])
+    np.testing.assert_allclose(result.trace_tensors["scores_scaled_h0"], decode_ref["scores_scaled_heads"][0], atol=1.0e-6, rtol=1.0e-6)
+    np.testing.assert_array_equal(result.trace_tensors["probs_h0"], _fp16_bits(decode_ref["probs_heads"][0]))
+    np.testing.assert_array_equal(result.trace_tensors["probs_q_h0"], decode_ref["probs_q_heads"][0])
+    np.testing.assert_array_equal(result.trace_tensors["k_cache_h0"], expected_k_cache)
+    np.testing.assert_array_equal(result.trace_tensors["v_cache_h0"], expected_v_cache)
+    np.testing.assert_array_equal(result.trace_tensors["x_norm2"], _fp16_bits(decode_ref["x_norm2"]))
+    np.testing.assert_array_equal(result.trace_tensors["x_norm2_q"], decode_ref["x_norm2_q"])
+    np.testing.assert_array_equal(result.trace_tensors["ffn_fc_int"], decode_ref["ffn_fc_int"])
+    np.testing.assert_allclose(result.tensors["out"], decode_ref["out"], atol=1.0e-5, rtol=1.0e-5)
+
+
+def test_qgpt2_quantized_reference_float_gap_budget():
+    state = build_gpt2_shared_state(
+        d_model=16,
+        d_head=16,
+        n_heads=1,
+        ffn_dim=16,
+        prompt_len=8,
+        seed=0,
+    )
+    quant_ref = reference_gpt2_prefill(
+        state,
+        d_head=16,
+        n_heads=1,
+        act_scale=1.0 / 32.0,
+        attn_scale=1.0 / 256.0,
+    )
+    float_ref = reference_gpt2_prefill_float(
+        state,
+        d_head=16,
+        n_heads=1,
+    )
+
+    x_norm1_diff = np.abs(np.asarray(quant_ref["x_norm1"], dtype=np.float32) - np.asarray(float_ref["x_norm1"], dtype=np.float32))
+    out_diff = np.abs(np.asarray(quant_ref["out"], dtype=np.float32) - np.asarray(float_ref["out"], dtype=np.float32))
+
+    assert float(x_norm1_diff.max()) == pytest.approx(0.0009417533874511719, abs=1.0e-9)
+    assert float(x_norm1_diff.mean()) == pytest.approx(0.00014864235708955675, abs=1.0e-12)
+    assert float(out_diff.max()) == pytest.approx(91.71892547607422, abs=1.0e-6)
+    assert float(out_diff.mean()) == pytest.approx(17.648956298828125, abs=1.0e-6)
 
 
 def test_gpt2_two_block_prefill_decode_reuse_matches_full_sequence():
@@ -1684,6 +1789,68 @@ def test_qllama_block_matches_hf_style_fused_shapes():
     assert [w.shape for w in q_weights] == [(32, 8)] * 4
     assert [w.shape for w in k_weights] == [(32, 8)] * 2
     assert [w.shape for w in v_weights] == [(32, 8)] * 2
+    assert block.config.rms_norm_eps == pytest.approx(1.0e-5)
+    assert block.config.rope_theta == pytest.approx(500000.0)
+    assert block.config.rope_scaling is None
+
+
+def test_qllama_prefill_host_emulation_matches_reference_trace():
+    artifact, _, ref = build_llama_prefill_artifact(
+        d_model=16,
+        d_head=16,
+        n_heads=1,
+        n_kv_heads=1,
+        ffn_hidden_dim=16,
+        prompt_len=8,
+        seed=0,
+    )
+
+    result = run_host_emulation(artifact, {}, verification=VerificationMode.DEBUG)
+
+    assert result.verified == ["llama_prefill_out"]
+    np.testing.assert_array_equal(result.trace_tensors["q_rope_q_h0"], ref["q_rope_heads"][0])
+    np.testing.assert_array_equal(result.trace_tensors["k_rope_q_h0"], ref["k_heads"][0])
+    np.testing.assert_array_equal(
+        result.trace_tensors["prefill_k_cache_h0"],
+        np.asarray(ref["k_heads"][0], dtype=np.int16).T,
+    )
+    np.testing.assert_array_equal(result.trace_tensors["prefill_v_cache_h0"], ref["v_heads"][0])
+    np.testing.assert_allclose(result.tensors["out"], ref["out"], atol=1.0e-5, rtol=1.0e-5)
+
+
+def test_qllama_decode_host_emulation_matches_reference_trace_and_cache_seed():
+    artifact, _, prefill_ref, decode_ref = build_llama_decode_artifact(
+        d_model=16,
+        d_head=16,
+        n_heads=1,
+        n_kv_heads=1,
+        ffn_hidden_dim=16,
+        prompt_len=8,
+        seed=0,
+    )
+
+    result = run_host_emulation(artifact, {}, verification=VerificationMode.DEBUG)
+    expected_k_cache = np.concatenate(
+        [
+            np.asarray(prefill_ref["k_heads"][0], dtype=np.int16),
+            np.asarray(decode_ref["k_cur_heads"][0], dtype=np.int16),
+        ],
+        axis=0,
+    ).T
+    expected_v_cache = np.concatenate(
+        [
+            np.asarray(prefill_ref["v_heads"][0], dtype=np.int16),
+            np.asarray(decode_ref["v_cur_heads"][0], dtype=np.int16),
+        ],
+        axis=0,
+    )
+
+    assert result.verified == ["llama_decode_out"]
+    np.testing.assert_array_equal(result.trace_tensors["q_rope_q_h0"], decode_ref["q_rope_heads"][0])
+    np.testing.assert_array_equal(result.trace_tensors["k_rope_q_h0"], decode_ref["k_cur_heads"][0])
+    np.testing.assert_array_equal(result.trace_tensors["k_cache_h0"], expected_k_cache)
+    np.testing.assert_array_equal(result.trace_tensors["v_cache_h0"], expected_v_cache)
+    np.testing.assert_allclose(result.tensors["out"], decode_ref["out"], atol=1.0e-5, rtol=1.0e-5)
 
 
 def test_llama_two_block_prefill_decode_reuse_matches_full_sequence():

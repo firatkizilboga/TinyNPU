@@ -13,6 +13,12 @@ from tinynpu_jit import (
     make_native_int16_kv_cache_specs,
 )
 from tinynpu_jit.golden import GoldenModel
+from tinynpu_jit.runtime_approx import (
+    quantize_fp16_to_i16_xform,
+    rmsnorm_approx,
+    silu_approx,
+    softmax_f16_approx,
+)
 
 
 def _rand_i16(rng: np.random.Generator, shape: tuple[int, ...], low: int = -2, high: int = 3) -> np.ndarray:
@@ -28,23 +34,24 @@ def _quantize_weight_fp32(weight: np.ndarray) -> np.ndarray:
     return np.clip(np.rint(weight_fp), -32768, 32767).astype(np.int16)
 
 
-def _fp16_roundtrip(value: np.ndarray) -> np.ndarray:
-    return np.asarray(value, dtype=np.float32).astype(np.float16).astype(np.float32)
-
-
 def _rmsnorm(x: np.ndarray, weight: np.ndarray, eps: float) -> np.ndarray:
-    x_f = np.asarray(x, dtype=np.float32)
-    w_f = np.asarray(weight, dtype=np.float32).reshape(1, -1)
-    rms = np.sqrt(np.mean(x_f * x_f, axis=-1, keepdims=True, dtype=np.float32) + np.float32(eps)).astype(np.float32)
-    return ((x_f / rms) * w_f).astype(np.float32)
+    return rmsnorm_approx(x, weight, eps)
 
 
 def _silu(x: np.ndarray) -> np.ndarray:
-    x_f = np.asarray(x, dtype=np.float32)
-    return (x_f / (np.float32(1.0) + np.exp(-x_f).astype(np.float32))).astype(np.float32)
+    return silu_approx(x)
+
+
+def _quantize_fp16_boundary(source: np.ndarray, *, scale: float) -> np.ndarray:
+    return quantize_fp16_to_i16_xform(source, scale=scale)
 
 
 def _rope_ref(x: np.ndarray, *, positions: np.ndarray, head_dim: int, theta: float) -> np.ndarray:
+    """Apply HF-style split-halves RoPE.
+
+    Raw Meta Llama checkpoints use interleaved Q/K rotary pairs, so callers
+    importing those weights need to permute them into this layout first.
+    """
     x_f = np.asarray(x, dtype=np.float32)
     if x_f.shape[-1] != head_dim:
         raise ValueError(f"rope_ref expects last dimension {head_dim}, got {x_f.shape[-1]}")
@@ -86,6 +93,9 @@ class QLlamaBlockConfig:
     ffn_hidden_dim: int
     act_scale: float = 1.0 / 32.0
     attn_scale: float = 1.0 / 256.0
+    rms_norm_eps: float = 1.0e-5
+    rope_theta: float = 500000.0
+    rope_scaling: dict[str, object] | None = None
 
     @property
     def attn_dim(self) -> int:
@@ -98,7 +108,11 @@ class QLlamaBlockConfig:
 
 @dataclass(frozen=True)
 class QLlamaBlock:
-    """Quantized LLaMA block weights with Hugging Face-style component naming."""
+    """Quantized LLaMA block weights with HF-style naming and RoPE layout.
+
+    This block expects the Hugging Face split-halves rotary convention. Raw
+    Meta Llama checkpoints need their rotary Q/K weights permuted on import.
+    """
 
     config: QLlamaBlockConfig
     input_layernorm_w: np.ndarray
@@ -113,6 +127,7 @@ class QLlamaBlock:
 
     @classmethod
     def random(cls, rng: np.random.Generator, config: QLlamaBlockConfig) -> QLlamaBlock:
+        """Generate synthetic low-magnitude weights for plumbing tests only."""
         return cls(
             config=config,
             input_layernorm_w=rng.uniform(0.5, 1.5, size=(config.d_model,)).astype(np.float32),
@@ -141,6 +156,7 @@ class QLlamaBlock:
         mlp_up_proj_w: np.ndarray,
         mlp_down_proj_w: np.ndarray,
     ) -> QLlamaBlock:
+        """Build an HF-shaped block by naively rounding float weights to INT16."""
         return cls(
             config=config,
             input_layernorm_w=np.asarray(input_layernorm_w, dtype=np.float32),
@@ -170,6 +186,21 @@ class QLlamaBlock:
         return [np.array(w[:, i * d_head : (i + 1) * d_head], copy=True) for i in range(self.config.n_kv_heads)]
 
 
+def _require_supported_rope_scaling(rope_scaling: dict[str, object] | None) -> None:
+    if rope_scaling is not None:
+        raise NotImplementedError("QLlamaBlock rope_scaling is not implemented yet.")
+
+
+def _resolve_rope_theta(block: QLlamaBlock, rope_theta: float | None) -> float:
+    return float(block.config.rope_theta if rope_theta is None else rope_theta)
+
+
+def _resolve_rope_scaling(block: QLlamaBlock, rope_scaling: dict[str, object] | None) -> dict[str, object] | None:
+    resolved = block.config.rope_scaling if rope_scaling is None else rope_scaling
+    _require_supported_rope_scaling(resolved)
+    return resolved
+
+
 def build_shared_state(
     *,
     d_model: int,
@@ -179,6 +210,11 @@ def build_shared_state(
     ffn_hidden_dim: int,
     prompt_len: int,
     seed: int,
+    act_scale: float = 1.0 / 32.0,
+    attn_scale: float = 1.0 / 256.0,
+    rms_norm_eps: float = 1.0e-5,
+    rope_theta: float = 500000.0,
+    rope_scaling: dict[str, object] | None = None,
 ) -> dict[str, object]:
     rng = np.random.default_rng(seed)
     config = QLlamaBlockConfig(
@@ -187,6 +223,11 @@ def build_shared_state(
         n_heads=n_heads,
         n_kv_heads=n_kv_heads,
         ffn_hidden_dim=ffn_hidden_dim,
+        act_scale=act_scale,
+        attn_scale=attn_scale,
+        rms_norm_eps=rms_norm_eps,
+        rope_theta=rope_theta,
+        rope_scaling=rope_scaling,
     )
     block = QLlamaBlock.random(rng, config)
     return {
@@ -205,11 +246,15 @@ def reference_prefill(
     n_kv_heads: int,
     act_scale: float,
     attn_scale: float,
-    rope_theta: float = 10000.0,
+    rope_theta: float | None = None,
+    rope_scaling: dict[str, object] | None = None,
     x_in: np.ndarray | None = None,
 ) -> dict[str, object]:
+    """Hardware-faithful quantized prefill reference for the compiled block."""
     golden = GoldenModel()
     block: QLlamaBlock = state["block"]
+    resolved_rope_theta = _resolve_rope_theta(block, rope_theta)
+    _resolve_rope_scaling(block, rope_scaling)
     if x_in is None:
         x_in = np.array(state["x_prompt_in"], dtype=np.float32, copy=True)
     else:
@@ -221,7 +266,7 @@ def reference_prefill(
     v_weights = block.split_v_proj_weights()
     positions = np.arange(prompt_len, dtype=np.int32)
 
-    x_norm1 = _rmsnorm(x_in, block.input_layernorm_w, 1.0e-5)
+    x_norm1 = _rmsnorm(x_in, block.input_layernorm_w, block.config.rms_norm_eps)
     x_norm1_q = golden.quantize(x_norm1, scale=act_scale, zero_point=0, out_dtype=DType.INT16)
 
     q_rope_heads: list[np.ndarray] = []
@@ -232,7 +277,7 @@ def reference_prefill(
     for q_head in range(n_heads):
         q_int = golden.matmul(x_norm1_q, q_weights[q_head], out_dtype=DType.INT16)
         q_f = golden.dequantize(q_int, scale=act_scale, zero_point=0)
-        q_rope_f = _rope_ref(q_f, positions=positions, head_dim=d_head, theta=rope_theta)
+        q_rope_f = _rope_ref(q_f, positions=positions, head_dim=d_head, theta=resolved_rope_theta)
         q_rope_q = golden.quantize(q_rope_f, scale=act_scale, zero_point=0, out_dtype=DType.INT16)
         q_rope_heads.append(q_rope_q)
 
@@ -240,9 +285,10 @@ def reference_prefill(
         k_int = golden.matmul(x_norm1_q, k_weights[kv_head], out_dtype=DType.INT16)
         v_int = golden.matmul(x_norm1_q, v_weights[kv_head], out_dtype=DType.INT16)
         k_f = golden.dequantize(k_int, scale=act_scale, zero_point=0)
-        k_rope_f = _rope_ref(k_f, positions=positions, head_dim=d_head, theta=rope_theta)
+        k_rope_f = _rope_ref(k_f, positions=positions, head_dim=d_head, theta=resolved_rope_theta)
         k_rope_q = golden.quantize(k_rope_f, scale=act_scale, zero_point=0, out_dtype=DType.INT16)
         k_rope_heads.append(k_rope_q)
+        # V stays in projected INT16 space because it is not rotary-transformed.
         v_heads.append(v_int)
 
     for q_head in range(n_heads):
@@ -257,8 +303,8 @@ def reference_prefill(
         for row in range(prompt_len):
             if row + 1 < prompt_len:
                 masked[row, row + 1 :] = np.float32(-1.0e10)
-        probs = _fp16_roundtrip(golden.softmax(masked, axis=-1).astype(np.float32))
-        probs_q = golden.quantize(probs, scale=attn_scale, zero_point=0, out_dtype=DType.INT16)
+        probs = softmax_f16_approx(masked, axis=-1)
+        probs_q = _quantize_fp16_boundary(probs, scale=attn_scale)
         attn = golden.matmul(probs_q, v_heads[kv_head], shift=8, out_dtype=DType.INT16)
         attn_heads.append(attn)
 
@@ -266,7 +312,7 @@ def reference_prefill(
     o_int = golden.matmul(attn_cat, np.asarray(block.self_attn_o_proj_w, dtype=np.int16), out_dtype=DType.INT16)
     o_f = golden.dequantize(o_int, scale=act_scale, zero_point=0)
     resid1 = (x_in + o_f).astype(np.float32)
-    x_norm2 = _rmsnorm(resid1, block.post_attention_layernorm_w, 1.0e-5)
+    x_norm2 = _rmsnorm(resid1, block.post_attention_layernorm_w, block.config.rms_norm_eps)
     x_norm2_q = golden.quantize(x_norm2, scale=act_scale, zero_point=0, out_dtype=DType.INT16)
     gate_int = golden.matmul(x_norm2_q, np.asarray(block.mlp_gate_proj_w, dtype=np.int16), out_dtype=DType.INT16)
     up_int = golden.matmul(x_norm2_q, np.asarray(block.mlp_up_proj_w, dtype=np.int16), out_dtype=DType.INT16)
@@ -308,11 +354,15 @@ def reference_decode(
     n_kv_heads: int,
     act_scale: float,
     attn_scale: float,
-    rope_theta: float = 10000.0,
+    rope_theta: float | None = None,
+    rope_scaling: dict[str, object] | None = None,
     x_in: np.ndarray | None = None,
 ) -> dict[str, object]:
+    """Hardware-faithful quantized decode reference for the compiled block."""
     golden = GoldenModel()
     block: QLlamaBlock = state["block"]
+    resolved_rope_theta = _resolve_rope_theta(block, rope_theta)
+    _resolve_rope_scaling(block, rope_scaling)
     if x_in is None:
         x_in = np.array(state["x_decode_in"], dtype=np.float32, copy=True)
     else:
@@ -324,7 +374,7 @@ def reference_decode(
     k_weights = block.split_k_proj_weights()
     v_weights = block.split_v_proj_weights()
 
-    x_norm1 = _rmsnorm(x_in, block.input_layernorm_w, 1.0e-5)
+    x_norm1 = _rmsnorm(x_in, block.input_layernorm_w, block.config.rms_norm_eps)
     x_norm1_q = golden.quantize(x_norm1, scale=act_scale, zero_point=0, out_dtype=DType.INT16)
 
     q_rope_heads: list[np.ndarray] = []
@@ -335,7 +385,7 @@ def reference_decode(
     for q_head in range(n_heads):
         q_int = golden.matmul(x_norm1_q, q_weights[q_head], out_dtype=DType.INT16)
         q_f = golden.dequantize(q_int, scale=act_scale, zero_point=0)
-        q_rope_f = _rope_ref(q_f, positions=decode_pos, head_dim=d_head, theta=rope_theta)
+        q_rope_f = _rope_ref(q_f, positions=decode_pos, head_dim=d_head, theta=resolved_rope_theta)
         q_rope_q = golden.quantize(q_rope_f, scale=act_scale, zero_point=0, out_dtype=DType.INT16)
         q_rope_heads.append(q_rope_q)
 
@@ -343,9 +393,10 @@ def reference_decode(
         k_int = golden.matmul(x_norm1_q, k_weights[kv_head], out_dtype=DType.INT16)
         v_int = golden.matmul(x_norm1_q, v_weights[kv_head], out_dtype=DType.INT16)
         k_f = golden.dequantize(k_int, scale=act_scale, zero_point=0)
-        k_rope_f = _rope_ref(k_f, positions=decode_pos, head_dim=d_head, theta=rope_theta)
+        k_rope_f = _rope_ref(k_f, positions=decode_pos, head_dim=d_head, theta=resolved_rope_theta)
         k_rope_q = golden.quantize(k_rope_f, scale=act_scale, zero_point=0, out_dtype=DType.INT16)
         k_cur_heads.append(k_rope_q)
+        # V stays in projected INT16 space because it is not rotary-transformed.
         v_cur_heads.append(v_int)
 
     for q_head in range(n_heads):
@@ -370,8 +421,8 @@ def reference_decode(
             out_dtype=DType.INT16,
         ).astype(np.float32)
         scores = (scores * score_scale).astype(np.float32)
-        probs = _fp16_roundtrip(golden.softmax(scores, axis=-1).astype(np.float32))
-        probs_q = golden.quantize(probs, scale=attn_scale, zero_point=0, out_dtype=DType.INT16)
+        probs = softmax_f16_approx(scores, axis=-1)
+        probs_q = _quantize_fp16_boundary(probs, scale=attn_scale)
         attn = golden.matmul(probs_q, v_full, shift=8, out_dtype=DType.INT16)
         attn_heads.append(attn)
 
@@ -379,7 +430,7 @@ def reference_decode(
     o_int = golden.matmul(attn_cat, np.asarray(block.self_attn_o_proj_w, dtype=np.int16), out_dtype=DType.INT16)
     o_f = golden.dequantize(o_int, scale=act_scale, zero_point=0)
     resid1 = (x_in + o_f).astype(np.float32)
-    x_norm2 = _rmsnorm(resid1, block.post_attention_layernorm_w, 1.0e-5)
+    x_norm2 = _rmsnorm(resid1, block.post_attention_layernorm_w, block.config.rms_norm_eps)
     x_norm2_q = golden.quantize(x_norm2, scale=act_scale, zero_point=0, out_dtype=DType.INT16)
     gate_int = golden.matmul(x_norm2_q, np.asarray(block.mlp_gate_proj_w, dtype=np.int16), out_dtype=DType.INT16)
     up_int = golden.matmul(x_norm2_q, np.asarray(block.mlp_up_proj_w, dtype=np.int16), out_dtype=DType.INT16)
@@ -560,6 +611,12 @@ def _add_decode_head_runtime_tensors(
     act_scale: float,
     cache_token_names: list[str],
 ) -> None:
+    """Seed decode caches.
+
+    K cache uses `(d_head, cache_len)` storage, while V cache uses
+    `(cache_len, d_head)`. The K transpose is owned by the scatter helpers and
+    by this decode seeding path.
+    """
     for q_head in range(n_heads):
         builder.add_tensor(TensorSpec(f"q_int_h{q_head}", (1, d_head), DType.INT16, TensorKind.INTERMEDIATE))
         builder.add_tensor(TensorSpec(f"q_f_h{q_head}", (1, d_head), DType.FLOAT32, TensorKind.INTERMEDIATE))
@@ -589,7 +646,9 @@ def _add_decode_head_runtime_tensors(
         v_prefill = np.array(prefill_ref["v_heads"][kv_head], dtype=np.int16, copy=True)
         k_base[:, :prompt_len] = k_prefill.T
         v_base[:prompt_len, :] = v_prefill
+        builder.tensors[f"k_cache_h{kv_head}"].kind = TensorKind.CONSTANT
         builder.tensors[f"k_cache_h{kv_head}"].data = k_base
+        builder.tensors[f"v_cache_h{kv_head}"].kind = TensorKind.CONSTANT
         builder.tensors[f"v_cache_h{kv_head}"].data = v_base
         builder.add_tensor(TensorSpec(f"k_cur_h{kv_head}", (1, d_head), DType.INT16, TensorKind.INTERMEDIATE))
         builder.add_tensor(TensorSpec(f"v_cur_h{kv_head}", (1, d_head), DType.INT16, TensorKind.INTERMEDIATE))
@@ -667,7 +726,7 @@ def _append_concat_alias_steps(builder: IRBuilder, *, n_heads: int) -> None:
     builder.host("alias_attn_cat_a", "alias", inputs=["attn_cat"], outputs=["attn_cat_a"])
 
 
-def _append_transformer_tail(builder: IRBuilder, *, act_scale: float) -> None:
+def _append_transformer_tail(builder: IRBuilder, *, act_scale: float, rms_norm_eps: float) -> None:
     builder.segment(
         "seg_o_proj",
         ops=[builder.matmul("op_o_proj", "attn_cat_a", "w_o", "o_int", in_dtype=DType.INT16, out_dtype=DType.INT16)],
@@ -676,7 +735,7 @@ def _append_transformer_tail(builder: IRBuilder, *, act_scale: float) -> None:
     )
     builder.host("dequant_o", "dequantize", inputs=["o_int"], outputs=["o_f"], attrs={"scale": act_scale, "zero_point": 0})
     builder.host("residual1", "add", inputs=["x_in", "o_f"], outputs=["resid1"])
-    builder.host("rmsnorm2", "rmsnorm", inputs=["resid1", "rms2_w"], outputs=["x_norm2"], attrs={"eps": 1.0e-5})
+    builder.host("rmsnorm2", "rmsnorm", inputs=["resid1", "rms2_w"], outputs=["x_norm2"], attrs={"eps": rms_norm_eps})
     builder.host(
         "quant_x_norm2",
         "quantize",
@@ -725,7 +784,9 @@ def build_prefill_artifact(
     seed: int = 0,
     act_scale: float = 1.0 / 32.0,
     attn_scale: float = 1.0 / 256.0,
-    rope_theta: float = 10000.0,
+    rms_norm_eps: float = 1.0e-5,
+    rope_theta: float = 500000.0,
+    rope_scaling: dict[str, object] | None = None,
 ):
     if d_model <= 0 or d_model % 8 != 0:
         raise ValueError("d_model must be a positive multiple of 8")
@@ -741,6 +802,11 @@ def build_prefill_artifact(
         raise ValueError("ffn_hidden_dim must be a positive multiple of 8")
     if prompt_len <= 0 or prompt_len % 8 != 0:
         raise ValueError("prompt_len must be a positive multiple of 8")
+    if rms_norm_eps <= 0.0:
+        raise ValueError("rms_norm_eps must be positive")
+    if rope_theta <= 0.0:
+        raise ValueError("rope_theta must be positive")
+    _require_supported_rope_scaling(rope_scaling)
 
     state = build_shared_state(
         d_model=d_model,
@@ -750,7 +816,17 @@ def build_prefill_artifact(
         ffn_hidden_dim=ffn_hidden_dim,
         prompt_len=prompt_len,
         seed=seed,
+        act_scale=act_scale,
+        attn_scale=attn_scale,
+        rms_norm_eps=rms_norm_eps,
+        rope_theta=rope_theta,
+        rope_scaling=rope_scaling,
     )
+    block: QLlamaBlock = state["block"]
+    act_scale = block.config.act_scale
+    attn_scale = block.config.attn_scale
+    rms_norm_eps = block.config.rms_norm_eps
+    rope_theta = block.config.rope_theta
     ref = reference_prefill(
         state,
         d_head=d_head,
@@ -759,8 +835,8 @@ def build_prefill_artifact(
         act_scale=act_scale,
         attn_scale=attn_scale,
         rope_theta=rope_theta,
+        rope_scaling=block.config.rope_scaling,
     )
-    block: QLlamaBlock = state["block"]
     attn_dim = n_heads * d_head
 
     b = IRBuilder()
@@ -780,7 +856,7 @@ def build_prefill_artifact(
     _add_prefill_head_runtime_tensors(b, d_head=d_head, n_heads=n_heads, n_kv_heads=n_kv_heads, prompt_len=prompt_len, act_scale=act_scale)
     _add_attention_concat_tensors(b, seq_len=prompt_len, d_head=d_head, n_heads=n_heads)
 
-    b.host("rmsnorm1", "rmsnorm", inputs=["x_in", "rms1_w"], outputs=["x_norm1"], attrs={"eps": 1.0e-5})
+    b.host("rmsnorm1", "rmsnorm", inputs=["x_in", "rms1_w"], outputs=["x_norm1"], attrs={"eps": rms_norm_eps})
     b.host(
         "quant_x_norm1",
         "quantize",
@@ -845,7 +921,10 @@ def build_prefill_artifact(
             )
             for q_head in range(n_heads)
         ],
-        inputs=[f"q_rope_q_h{i}" for i in range(n_heads)],
+        inputs=[
+            *(f"q_rope_q_h{i}" for i in range(n_heads)),
+            *(f"prefill_k_cache_h{i}" for i in range(n_kv_heads)),
+        ],
         outputs=[f"scores_h{i}" for i in range(n_heads)],
     )
     _append_attention_post_score_steps(b, n_heads=n_heads, attn_scale=attn_scale, include_causal_mask=True, past_kv_len=0)
@@ -863,15 +942,18 @@ def build_prefill_artifact(
             )
             for q_head in range(n_heads)
         ],
-        inputs=[f"probs_q_h{i}" for i in range(n_heads)],
+        inputs=[
+            *(f"probs_q_h{i}" for i in range(n_heads)),
+            *(f"prefill_v_cache_h{i}" for i in range(n_kv_heads)),
+        ],
         outputs=[f"attn_h{i}" for i in range(n_heads)],
     )
     _append_concat_alias_steps(b, n_heads=n_heads)
-    _append_transformer_tail(b, act_scale=act_scale)
+    _append_transformer_tail(b, act_scale=act_scale, rms_norm_eps=rms_norm_eps)
 
     plan = b.finalize(inputs=[], outputs=["out"])
     plan.add_verification_step("out", "llama_prefill_out")
-    artifact = compile_plan(plan, {"llama_prefill_out": np.array(ref["out"], dtype=np.float32, copy=True)})
+    artifact = compile_plan(plan, {"out": np.array(ref["out"], dtype=np.float32, copy=True)})
     return artifact, state, ref
 
 
@@ -886,8 +968,16 @@ def build_decode_artifact(
     seed: int = 0,
     act_scale: float = 1.0 / 32.0,
     attn_scale: float = 1.0 / 256.0,
-    rope_theta: float = 10000.0,
+    rms_norm_eps: float = 1.0e-5,
+    rope_theta: float = 500000.0,
+    rope_scaling: dict[str, object] | None = None,
 ):
+    if rms_norm_eps <= 0.0:
+        raise ValueError("rms_norm_eps must be positive")
+    if rope_theta <= 0.0:
+        raise ValueError("rope_theta must be positive")
+    _require_supported_rope_scaling(rope_scaling)
+
     state = build_shared_state(
         d_model=d_model,
         d_head=d_head,
@@ -896,7 +986,17 @@ def build_decode_artifact(
         ffn_hidden_dim=ffn_hidden_dim,
         prompt_len=prompt_len,
         seed=seed,
+        act_scale=act_scale,
+        attn_scale=attn_scale,
+        rms_norm_eps=rms_norm_eps,
+        rope_theta=rope_theta,
+        rope_scaling=rope_scaling,
     )
+    block: QLlamaBlock = state["block"]
+    act_scale = block.config.act_scale
+    attn_scale = block.config.attn_scale
+    rms_norm_eps = block.config.rms_norm_eps
+    rope_theta = block.config.rope_theta
     prefill_ref = reference_prefill(
         state,
         d_head=d_head,
@@ -905,6 +1005,7 @@ def build_decode_artifact(
         act_scale=act_scale,
         attn_scale=attn_scale,
         rope_theta=rope_theta,
+        rope_scaling=block.config.rope_scaling,
     )
     decode_ref = reference_decode(
         state,
@@ -915,8 +1016,8 @@ def build_decode_artifact(
         act_scale=act_scale,
         attn_scale=attn_scale,
         rope_theta=rope_theta,
+        rope_scaling=block.config.rope_scaling,
     )
-    block: QLlamaBlock = state["block"]
     cache_len = prompt_len + 1
     attn_dim = n_heads * d_head
     decode_token_name = "td"
@@ -949,7 +1050,7 @@ def build_decode_artifact(
     )
     _add_attention_concat_tensors(b, seq_len=1, d_head=d_head, n_heads=n_heads)
 
-    b.host("rmsnorm1", "rmsnorm", inputs=["x_in", "rms1_w"], outputs=["x_norm1"], attrs={"eps": 1.0e-5})
+    b.host("rmsnorm1", "rmsnorm", inputs=["x_in", "rms1_w"], outputs=["x_norm1"], attrs={"eps": rms_norm_eps})
     b.host(
         "quant_x_norm1",
         "quantize",
@@ -1002,14 +1103,14 @@ def build_decode_artifact(
         b.host(
             f"k_append_h{kv_head}",
             "k_cache_scatter_write",
-            inputs=[f"k_rope_q_h{kv_head}"],
+            inputs=[f"k_rope_q_h{kv_head}", f"k_cache_h{kv_head}"],
             outputs=[f"k_cache_h{kv_head}_{decode_token_name}"],
             attrs={"token_index": prompt_len, "k_cache_base": f"k_cache_h{kv_head}"},
         )
         b.host(
             f"v_append_h{kv_head}",
             "v_cache_scatter_write",
-            inputs=[f"v_cur_h{kv_head}"],
+            inputs=[f"v_cur_h{kv_head}", f"v_cache_h{kv_head}"],
             outputs=[f"v_cache_h{kv_head}_{decode_token_name}"],
             attrs={"token_index": prompt_len, "v_cache_base": f"v_cache_h{kv_head}"},
         )
@@ -1048,9 +1149,9 @@ def build_decode_artifact(
         outputs=[f"attn_h{i}" for i in range(n_heads)],
     )
     _append_concat_alias_steps(b, n_heads=n_heads)
-    _append_transformer_tail(b, act_scale=act_scale)
+    _append_transformer_tail(b, act_scale=act_scale, rms_norm_eps=rms_norm_eps)
 
     plan = b.finalize(inputs=[], outputs=["out"])
     plan.add_verification_step("out", "llama_decode_out")
-    artifact = compile_plan(plan, {"llama_decode_out": np.array(decode_ref["out"], dtype=np.float32, copy=True)})
+    artifact = compile_plan(plan, {"out": np.array(decode_ref["out"], dtype=np.float32, copy=True)})
     return artifact, state, prefill_ref, decode_ref

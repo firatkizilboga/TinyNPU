@@ -160,6 +160,11 @@ def _can_lower_rope_pattern(
         return False
     if source_spec.shape[-1] != head_dim:
         return False
+    if len(source_spec.shape) < 2:
+        return False
+    seq_len = source_spec.shape[0] if len(source_spec.shape) == 2 else source_spec.shape[-2]
+    if seq_len != 1:
+        return False
     return True
 
 

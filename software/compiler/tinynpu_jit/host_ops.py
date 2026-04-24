@@ -8,6 +8,13 @@ import numpy as np
 
 from .golden import GoldenModel
 from .ir import DType, HostOp
+from .runtime_approx import (
+    quantize_fp16_bits_to_i16_xform as _quantize_fp16_bits_to_i16_xform,
+    rmsnorm_approx as _rmsnorm_runtime_approx,
+    sigmoid_approx as _sigmoid_runtime_approx,
+    silu_approx as _silu_runtime_approx,
+    softmax_f16_approx as _softmax_f16_runtime_approx,
+)
 
 
 HostOpEvaluatorFn = Callable[[HostOp, dict[str, np.ndarray], GoldenModel], None]
@@ -171,6 +178,51 @@ def _validate_binary_same_shape(step: HostOp) -> None:
     return
 
 
+def _validate_linear(step: HostOp) -> None:
+    if len(step.inputs) not in {2, 3}:
+        raise ValueError(f"Host op 'linear' expects 2 or 3 inputs, got {len(step.inputs)}.")
+
+
+def _validate_conv2d(step: HostOp) -> None:
+    if len(step.inputs) not in {2, 3}:
+        raise ValueError(f"Host op 'conv2d' expects 2 or 3 inputs, got {len(step.inputs)}.")
+    stride = int(step.attrs.get("stride", 1))
+    padding = int(step.attrs.get("padding", 0))
+    kernel_size = int(step.attrs.get("kernel_size", 0))
+    in_channels = int(step.attrs.get("in_channels", 0))
+    out_channels = int(step.attrs.get("out_channels", 0))
+    if stride <= 0:
+        raise ValueError(f"Host op 'conv2d' requires stride > 0, got {stride}.")
+    if padding < 0:
+        raise ValueError(f"Host op 'conv2d' requires padding >= 0, got {padding}.")
+    if kernel_size <= 0:
+        raise ValueError(f"Host op 'conv2d' requires kernel_size > 0, got {kernel_size}.")
+    if in_channels <= 0 or out_channels <= 0:
+        raise ValueError("Host op 'conv2d' requires positive in_channels and out_channels.")
+
+
+def _validate_pool2d(step: HostOp) -> None:
+    kernel_size = tuple(int(v) for v in step.attrs.get("kernel_size", ()))
+    stride = tuple(int(v) for v in step.attrs.get("stride", ()))
+    padding = tuple(int(v) for v in step.attrs.get("padding", ()))
+    if len(kernel_size) != 2 or len(stride) != 2 or len(padding) != 2:
+        raise ValueError(f"Host op {step.kind!r} expects 2D kernel/stride/padding tuples.")
+    if any(v <= 0 for v in kernel_size):
+        raise ValueError(f"Host op {step.kind!r} requires kernel_size > 0, got {kernel_size}.")
+    if any(v <= 0 for v in stride):
+        raise ValueError(f"Host op {step.kind!r} requires stride > 0, got {stride}.")
+    if any(v < 0 for v in padding):
+        raise ValueError(f"Host op {step.kind!r} requires padding >= 0, got {padding}.")
+
+
+def _validate_adaptive_avg_pool2d(step: HostOp) -> None:
+    output_size = tuple(int(v) for v in step.attrs.get("output_size", ()))
+    if len(output_size) != 2:
+        raise ValueError("Host op 'adaptive_avg_pool2d' expects output_size to have length 2.")
+    if any(v <= 0 for v in output_size):
+        raise ValueError(f"Host op 'adaptive_avg_pool2d' requires positive output_size, got {output_size}.")
+
+
 def _validate_causal_mask(step: HostOp) -> None:
     past_kv_len = int(step.attrs.get("past_kv_len", 0))
     if past_kv_len < 0:
@@ -207,9 +259,264 @@ def _softmax_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str
 
 def _softmax_f16_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
     axis = int(step.attrs.get("axis", -1))
-    probs = np.asarray(golden.softmax(values[step.inputs[0]], axis=axis), dtype=np.float32)
+    probs = _softmax_f16_runtime_approx(values[step.inputs[0]], axis=axis)
     probs_f16_bits = probs.astype(np.float16).view(np.uint16).astype(np.int16)
     values[step.outputs[0]] = probs_f16_bits
+
+
+def _linear_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
+    x = np.asarray(values[step.inputs[0]], dtype=np.float32)
+    weight = np.asarray(values[step.inputs[1]], dtype=np.float32)
+    bias = None if len(step.inputs) < 3 else np.asarray(values[step.inputs[2]], dtype=np.float32)
+    if weight.ndim != 2:
+        raise ValueError(f"linear expects rank-2 weight, got shape {weight.shape}.")
+    if x.shape[-1] != weight.shape[1]:
+        raise ValueError(f"linear input last dim {x.shape[-1]} does not match weight in_features {weight.shape[1]}.")
+    x_rows = x.reshape(-1, x.shape[-1])
+    out = x_rows @ weight.T
+    if bias is not None:
+        if bias.ndim != 1 or bias.shape[0] != weight.shape[0]:
+            raise ValueError(f"linear bias shape {bias.shape} does not match out_features {weight.shape[0]}.")
+        out = out + bias.reshape(1, -1)
+    values[step.outputs[0]] = out.reshape(*x.shape[:-1], weight.shape[0]).astype(np.float32)
+
+
+def _linear_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
+    x = np.asarray(values[step.inputs[0]])
+    weight = np.asarray(values[step.inputs[1]])
+    rows = int(np.prod(x.shape[:-1], dtype=np.int64)) if x.ndim > 1 else 1
+    in_features = int(weight.shape[1])
+    out_features = int(weight.shape[0])
+    out_elems = rows * out_features
+    bias_reads = out_elems if len(step.inputs) >= 3 else 0
+    return "host_intrinsic", _counts(
+        reads=rows * in_features + rows * out_features * in_features + bias_reads,
+        muls=rows * out_features * in_features,
+        adds=rows * out_features * max(in_features - 1, 0) + bias_reads,
+        writes=out_elems,
+        branches=rows,
+    )
+
+
+def _conv2d_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
+    x = np.asarray(values[step.inputs[0]], dtype=np.float32)
+    weight = np.asarray(values[step.inputs[1]], dtype=np.float32)
+    bias = None if len(step.inputs) < 3 else np.asarray(values[step.inputs[2]], dtype=np.float32)
+    stride = int(step.attrs["stride"])
+    padding = int(step.attrs["padding"])
+    if weight.ndim != 4:
+        raise ValueError(f"conv2d expects rank-4 weight, got shape {weight.shape}.")
+    if x.ndim == 3:
+        batch = 1
+        in_channels, in_h, in_w = x.shape
+        x_nchw = x.reshape(1, in_channels, in_h, in_w)
+        restore_rank3 = True
+    elif x.ndim == 4:
+        batch, in_channels, in_h, in_w = x.shape
+        x_nchw = x
+        restore_rank3 = False
+    else:
+        raise ValueError(f"conv2d expects rank-3 or rank-4 input, got shape {x.shape}.")
+    out_channels, weight_in_channels, kernel_h, kernel_w = weight.shape
+    if kernel_h != kernel_w:
+        raise ValueError(f"conv2d expects square kernels, got shape {weight.shape}.")
+    if in_channels != weight_in_channels:
+        raise ValueError(f"conv2d input channels {in_channels} do not match weight channels {weight_in_channels}.")
+    out_h = ((in_h + (2 * padding) - kernel_h) // stride) + 1
+    out_w = ((in_w + (2 * padding) - kernel_w) // stride) + 1
+    padded = np.pad(x_nchw, ((0, 0), (0, 0), (padding, padding), (padding, padding)), mode="constant")
+    out = np.zeros((batch, out_channels, out_h, out_w), dtype=np.float32)
+    for n in range(batch):
+        for oc in range(out_channels):
+            for oh in range(out_h):
+                h_start = oh * stride
+                for ow in range(out_w):
+                    w_start = ow * stride
+                    acc = 0.0
+                    for ic in range(in_channels):
+                        window = padded[n, ic, h_start : h_start + kernel_h, w_start : w_start + kernel_w]
+                        acc += float(np.sum(window * weight[oc, ic], dtype=np.float32))
+                    if bias is not None:
+                        acc += float(bias[oc])
+                    out[n, oc, oh, ow] = np.float32(acc)
+    values[step.outputs[0]] = out[0] if restore_rank3 else out
+
+
+def _conv2d_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
+    x = np.asarray(values[step.inputs[0]])
+    weight = np.asarray(values[step.inputs[1]])
+    batch = 1 if x.ndim == 3 else int(x.shape[0])
+    in_h = int(x.shape[-2])
+    in_w = int(x.shape[-1])
+    out_channels = int(weight.shape[0])
+    in_channels = int(weight.shape[1])
+    kernel_h = int(weight.shape[2])
+    kernel_w = int(weight.shape[3])
+    stride = int(step.attrs["stride"])
+    padding = int(step.attrs["padding"])
+    out_h = ((in_h + (2 * padding) - kernel_h) // stride) + 1
+    out_w = ((in_w + (2 * padding) - kernel_w) // stride) + 1
+    macs = batch * out_channels * out_h * out_w * in_channels * kernel_h * kernel_w
+    out_elems = batch * out_channels * out_h * out_w
+    bias_reads = out_elems if len(step.inputs) >= 3 else 0
+    return "host_intrinsic", _counts(
+        reads=macs * 2 + bias_reads,
+        muls=macs,
+        adds=macs + bias_reads,
+        writes=out_elems,
+        branches=batch * out_channels * out_h,
+    )
+
+
+def _pool2d_shapes(source: np.ndarray) -> tuple[np.ndarray, int, int, int, int, bool]:
+    if source.ndim == 3:
+        channels, in_h, in_w = source.shape
+        return source.reshape(1, channels, in_h, in_w), 1, channels, in_h, in_w, True
+    if source.ndim == 4:
+        batch, channels, in_h, in_w = source.shape
+        return source, batch, channels, in_h, in_w, False
+    raise ValueError(f"pool2d expects rank-3 or rank-4 input, got shape {source.shape}.")
+
+
+def _maxpool2d_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
+    source = np.asarray(values[step.inputs[0]], dtype=np.float32)
+    x, batch, channels, in_h, in_w, restore_rank3 = _pool2d_shapes(source)
+    kernel_h, kernel_w = (int(v) for v in step.attrs["kernel_size"])
+    stride_h, stride_w = (int(v) for v in step.attrs["stride"])
+    pad_h, pad_w = (int(v) for v in step.attrs["padding"])
+    out_h = ((in_h + (2 * pad_h) - kernel_h) // stride_h) + 1
+    out_w = ((in_w + (2 * pad_w) - kernel_w) // stride_w) + 1
+    padded = np.pad(
+        x,
+        ((0, 0), (0, 0), (pad_h, pad_h), (pad_w, pad_w)),
+        mode="constant",
+        constant_values=-np.inf,
+    )
+    out = np.empty((batch, channels, out_h, out_w), dtype=np.float32)
+    for n in range(batch):
+        for c in range(channels):
+            for oh in range(out_h):
+                h_start = oh * stride_h
+                for ow in range(out_w):
+                    w_start = ow * stride_w
+                    window = padded[n, c, h_start : h_start + kernel_h, w_start : w_start + kernel_w]
+                    out[n, c, oh, ow] = np.float32(np.max(window))
+    values[step.outputs[0]] = out[0] if restore_rank3 else out
+
+
+def _maxpool2d_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
+    source = np.asarray(values[step.inputs[0]])
+    _, batch, channels, in_h, in_w, _ = _pool2d_shapes(source)
+    kernel_h, kernel_w = (int(v) for v in step.attrs["kernel_size"])
+    stride_h, stride_w = (int(v) for v in step.attrs["stride"])
+    pad_h, pad_w = (int(v) for v in step.attrs["padding"])
+    out_h = ((in_h + (2 * pad_h) - kernel_h) // stride_h) + 1
+    out_w = ((in_w + (2 * pad_w) - kernel_w) // stride_w) + 1
+    windows = batch * channels * out_h * out_w
+    window_elems = kernel_h * kernel_w
+    out_elems = windows
+    return "host_intrinsic", _counts(
+        reads=windows * window_elems,
+        clamps=windows * max(window_elems - 1, 0),
+        writes=out_elems,
+        branches=windows,
+    )
+
+
+def _avgpool2d_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
+    source = np.asarray(values[step.inputs[0]], dtype=np.float32)
+    x, batch, channels, in_h, in_w, restore_rank3 = _pool2d_shapes(source)
+    kernel_h, kernel_w = (int(v) for v in step.attrs["kernel_size"])
+    stride_h, stride_w = (int(v) for v in step.attrs["stride"])
+    pad_h, pad_w = (int(v) for v in step.attrs["padding"])
+    count_include_pad = bool(step.attrs.get("count_include_pad", True))
+    out_h = ((in_h + (2 * pad_h) - kernel_h) // stride_h) + 1
+    out_w = ((in_w + (2 * pad_w) - kernel_w) // stride_w) + 1
+    padded = np.pad(x, ((0, 0), (0, 0), (pad_h, pad_h), (pad_w, pad_w)), mode="constant")
+    out = np.empty((batch, channels, out_h, out_w), dtype=np.float32)
+    for n in range(batch):
+        for c in range(channels):
+            for oh in range(out_h):
+                h_start = oh * stride_h
+                h_end = h_start + kernel_h
+                valid_h_start = max(h_start - pad_h, 0)
+                valid_h_end = min(h_end - pad_h, in_h)
+                for ow in range(out_w):
+                    w_start = ow * stride_w
+                    w_end = w_start + kernel_w
+                    valid_w_start = max(w_start - pad_w, 0)
+                    valid_w_end = min(w_end - pad_w, in_w)
+                    window = padded[n, c, h_start : h_start + kernel_h, w_start : w_start + kernel_w]
+                    if count_include_pad:
+                        denom = kernel_h * kernel_w
+                    else:
+                        denom = max(valid_h_end - valid_h_start, 0) * max(valid_w_end - valid_w_start, 0)
+                    if denom <= 0:
+                        out[n, c, oh, ow] = 0.0
+                    else:
+                        out[n, c, oh, ow] = np.float32(np.sum(window, dtype=np.float32) / np.float32(denom))
+    values[step.outputs[0]] = out[0] if restore_rank3 else out
+
+
+def _avgpool2d_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
+    source = np.asarray(values[step.inputs[0]])
+    _, batch, channels, in_h, in_w, _ = _pool2d_shapes(source)
+    kernel_h, kernel_w = (int(v) for v in step.attrs["kernel_size"])
+    stride_h, stride_w = (int(v) for v in step.attrs["stride"])
+    pad_h, pad_w = (int(v) for v in step.attrs["padding"])
+    out_h = ((in_h + (2 * pad_h) - kernel_h) // stride_h) + 1
+    out_w = ((in_w + (2 * pad_w) - kernel_w) // stride_w) + 1
+    windows = batch * channels * out_h * out_w
+    window_elems = kernel_h * kernel_w
+    out_elems = windows
+    return "host_intrinsic", _counts(
+        reads=windows * window_elems,
+        adds=windows * max(window_elems - 1, 0),
+        divs=windows,
+        writes=out_elems,
+        branches=windows,
+    )
+
+
+def _adaptive_avg_pool2d_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
+    source = np.asarray(values[step.inputs[0]], dtype=np.float32)
+    x, batch, channels, in_h, in_w, restore_rank3 = _pool2d_shapes(source)
+    out_h, out_w = (int(v) for v in step.attrs["output_size"])
+    out = np.empty((batch, channels, out_h, out_w), dtype=np.float32)
+    for n in range(batch):
+        for c in range(channels):
+            for oh in range(out_h):
+                h_start = int(np.floor((oh * in_h) / out_h))
+                h_end = int(np.ceil(((oh + 1) * in_h) / out_h))
+                for ow in range(out_w):
+                    w_start = int(np.floor((ow * in_w) / out_w))
+                    w_end = int(np.ceil(((ow + 1) * in_w) / out_w))
+                    window = x[n, c, h_start:h_end, w_start:w_end]
+                    out[n, c, oh, ow] = np.float32(np.mean(window, dtype=np.float32))
+    values[step.outputs[0]] = out[0] if restore_rank3 else out
+
+
+def _adaptive_avg_pool2d_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
+    source = np.asarray(values[step.inputs[0]])
+    _, batch, channels, in_h, in_w, _ = _pool2d_shapes(source)
+    out_h, out_w = (int(v) for v in step.attrs["output_size"])
+    total_reads = 0
+    for oh in range(out_h):
+        h_start = int(np.floor((oh * in_h) / out_h))
+        h_end = int(np.ceil(((oh + 1) * in_h) / out_h))
+        for ow in range(out_w):
+            w_start = int(np.floor((ow * in_w) / out_w))
+            w_end = int(np.ceil(((ow + 1) * in_w) / out_w))
+            total_reads += max(h_end - h_start, 0) * max(w_end - w_start, 0)
+    total_reads *= batch * channels
+    out_elems = batch * channels * out_h * out_w
+    return "host_intrinsic", _counts(
+        reads=total_reads,
+        adds=max(total_reads - out_elems, 0),
+        divs=out_elems,
+        writes=out_elems,
+        branches=out_elems,
+    )
 
 
 def _fp16_bits_to_float32_array(value: np.ndarray) -> np.ndarray:
@@ -300,6 +607,16 @@ def _softmax_f16_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple
 def _quantize_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
     source = values[step.inputs[0]]
     if str(step.attrs.get("input_encoding", "")) == "fp16_bits":
+        if str(step.attrs.get("_npu_write_transform", "")) == "xform_q_f16_i16":
+            if int(step.attrs.get("zero_point", 0)) != 0:
+                raise ValueError("xform_q_f16_i16 quantize does not support non-zero zero_point.")
+            if _dtype_attr(step.attrs.get("dtype", DType.INT8)) != DType.INT16:
+                raise ValueError("xform_q_f16_i16 quantize only supports INT16 output.")
+            values[step.outputs[0]] = _quantize_fp16_bits_to_i16_xform(
+                np.asarray(source),
+                scale=float(step.attrs["scale"]),
+            )
+            return
         source = _fp16_bits_to_float32_array(np.asarray(source))
     values[step.outputs[0]] = golden.quantize(
         source,
@@ -345,7 +662,7 @@ def _dequantize_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[
 
 def _sigmoid_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
     source = np.array(values[step.inputs[0]], dtype=np.float32)
-    values[step.outputs[0]] = 1.0 / (1.0 + np.exp(-source))
+    values[step.outputs[0]] = _sigmoid_runtime_approx(source)
 
 
 def _sigmoid_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
@@ -393,7 +710,7 @@ def _k_cache_scatter_write_eval(step: HostOp, values: dict[str, np.ndarray], gol
     """
     key = np.asarray(values[step.inputs[0]], dtype=np.int16)  # [1, d_head]
     token_index = int(step.attrs["token_index"])
-    k_cache_base = str(step.attrs["k_cache_base"])
+    k_cache_base = step.inputs[1] if len(step.inputs) > 1 else str(step.attrs["k_cache_base"])
     values[step.outputs[0]] = key
     if k_cache_base in values:
         values[k_cache_base][:, token_index] = key.flatten()
@@ -407,7 +724,7 @@ def _k_cache_scatter_write_benchmark(step: HostOp, values: dict[str, np.ndarray]
 def _v_cache_scatter_write_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
     value = np.asarray(values[step.inputs[0]], dtype=np.int16)
     token_index = int(step.attrs["token_index"])
-    v_cache_base = str(step.attrs["v_cache_base"])
+    v_cache_base = step.inputs[1] if len(step.inputs) > 1 else str(step.attrs["v_cache_base"])
     values[step.outputs[0]] = value
     if v_cache_base in values:
         values[v_cache_base][token_index, :] = value.reshape(-1)
@@ -444,7 +761,7 @@ def _v_cache_scatter_matrix_benchmark(step: HostOp, values: dict[str, np.ndarray
 
 def _silu_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
     source = np.asarray(values[step.inputs[0]], dtype=np.float32)
-    values[step.outputs[0]] = (source / (np.float32(1.0) + np.exp(-source))).astype(np.float32)
+    values[step.outputs[0]] = _silu_runtime_approx(source)
 
 
 def _silu_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
@@ -617,13 +934,8 @@ def _requantize_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[
 def _rmsnorm_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
     x = np.asarray(values[step.inputs[0]], dtype=np.float32)
     weight = np.asarray(values[step.inputs[1]], dtype=np.float32).reshape(-1)
-    hidden = x.shape[-1]
-    if weight.size != hidden:
-        raise ValueError(f"rmsnorm weight size mismatch: hidden={hidden}, weight={weight.size}.")
     eps = np.float32(step.attrs.get("eps", 1.0e-6))
-    mean_sq = np.mean(np.square(x, dtype=np.float32), axis=-1, keepdims=True, dtype=np.float32)
-    rms = np.sqrt(mean_sq + eps).astype(np.float32)
-    values[step.outputs[0]] = ((x / rms) * weight.reshape((1,) * (x.ndim - 1) + (hidden,))).astype(np.float32)
+    values[step.outputs[0]] = _rmsnorm_runtime_approx(x, weight, float(eps))
 
 
 def _rmsnorm_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
@@ -679,8 +991,6 @@ def _layernorm_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[s
 def _mul_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
     lhs = np.asarray(values[step.inputs[0]], dtype=np.float32)
     rhs = np.asarray(values[step.inputs[1]], dtype=np.float32)
-    if lhs.shape != rhs.shape:
-        raise ValueError(f"mul requires same-shape inputs, got {lhs.shape} and {rhs.shape}.")
     values[step.outputs[0]] = (lhs * rhs).astype(np.float32)
 
 
@@ -697,8 +1007,6 @@ def _mul_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, An
 def _add_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
     lhs = np.asarray(values[step.inputs[0]], dtype=np.float32)
     rhs = np.asarray(values[step.inputs[1]], dtype=np.float32)
-    if lhs.shape != rhs.shape:
-        raise ValueError(f"add requires same-shape inputs, got {lhs.shape} and {rhs.shape}.")
     values[step.outputs[0]] = (lhs + rhs).astype(np.float32)
 
 
@@ -792,7 +1100,7 @@ def _rope_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel)
     inv_freq = 1.0 / (theta ** (np.arange(0, half, dtype=np.float32) / np.float32(half)))
 
     if x.ndim == 2:
-        positions = np.full((x.shape[0],), position, dtype=np.float32)
+        positions = np.arange(position, position + x.shape[0], dtype=np.float32)
         reshape = (x.shape[0], 1)
     elif x.ndim >= 3:
         positions = np.arange(position, position + x.shape[-2], dtype=np.float32)
@@ -873,6 +1181,36 @@ for _spec in (
         quant_boundary_policy="npu_to_host",
         semantic_validator=_require_positive_scale,
     ),
+    HostOpSpec("linear", _linear_eval, _linear_benchmark, input_arity=None, semantic_validator=_validate_linear),
+    HostOpSpec(
+        "conv2d",
+        _conv2d_eval,
+        _conv2d_benchmark,
+        input_arity=None,
+        required_attrs=("stride", "padding", "kernel_size", "in_channels", "out_channels"),
+        semantic_validator=_validate_conv2d,
+    ),
+    HostOpSpec(
+        "maxpool2d",
+        _maxpool2d_eval,
+        _maxpool2d_benchmark,
+        required_attrs=("kernel_size", "stride", "padding"),
+        semantic_validator=_validate_pool2d,
+    ),
+    HostOpSpec(
+        "avgpool2d",
+        _avgpool2d_eval,
+        _avgpool2d_benchmark,
+        required_attrs=("kernel_size", "stride", "padding"),
+        semantic_validator=_validate_pool2d,
+    ),
+    HostOpSpec(
+        "adaptive_avg_pool2d",
+        _adaptive_avg_pool2d_eval,
+        _adaptive_avg_pool2d_benchmark,
+        required_attrs=("output_size",),
+        semantic_validator=_validate_adaptive_avg_pool2d,
+    ),
     HostOpSpec(
         "im2col",
         _im2col_eval,
@@ -886,6 +1224,7 @@ for _spec in (
         "k_cache_scatter_write",
         _k_cache_scatter_write_eval,
         _k_cache_scatter_write_benchmark,
+        input_arity=None,
         required_attrs=("token_index", "k_cache_base"),
         quant_boundary_policy="host_to_npu",
     ),
@@ -893,6 +1232,7 @@ for _spec in (
         "v_cache_scatter_write",
         _v_cache_scatter_write_eval,
         _v_cache_scatter_write_benchmark,
+        input_arity=None,
         required_attrs=("token_index", "v_cache_base"),
         quant_boundary_policy="host_to_npu",
     ),

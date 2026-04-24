@@ -254,6 +254,26 @@ def _pack_data(spec: TensorSpec, role: str, packer: Packer, array_size: int) -> 
     if data.ndim == 1:
         data = data.reshape(1, -1)
 
+    if role == "B" and spec.metadata.get("cache_kind") == "K" and spec.dtype == DType.INT16:
+        k_tiles = (rows + sz - 1) // sz
+        token_blocks = (cols + sz - 1) // sz
+        packed: list[int] = []
+        # K-cache read mode is token-block-major:
+        # addr = base + token_block * k_tiles * 8 + k_tile * 8 + row_in_tile.
+        for token_block in range(token_blocks):
+            for k_tile in range(k_tiles):
+                for row_in_tile in range(sz):
+                    row = k_tile * sz + row_in_tile
+                    word = 0
+                    for lane in range(sz):
+                        token = token_block * sz + lane
+                        value = 0
+                        if row < rows and token < cols:
+                            value = int(data[row, token])
+                        word |= (value & 0xFFFF) << (lane * 16)
+                    packed.append(word)
+        return packed
+
     if role == "A":
         m = (rows + sz - 1) // sz
         k = (cols // p + sz - 1) // sz

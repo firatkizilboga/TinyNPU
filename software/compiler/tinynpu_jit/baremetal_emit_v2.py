@@ -38,6 +38,9 @@ _HOST_KIND_ENUM = {
     "softmax": "TNPU_HOST_SOFTMAX",
     "softmax_f16": "TNPU_HOST_SOFTMAX_F16",
     "mean": "TNPU_HOST_MEAN",
+    "maxpool2d": "TNPU_HOST_MAXPOOL2D",
+    "avgpool2d": "TNPU_HOST_AVGPOOL2D",
+    "adaptive_avg_pool2d": "TNPU_HOST_ADAPTIVE_AVGPOOL2D",
     "im2col": "TNPU_HOST_IM2COL",
     "layout_restore": "TNPU_HOST_LAYOUT_RESTORE",
     "rmsnorm": "TNPU_HOST_RMSNORM",
@@ -52,6 +55,8 @@ _HOST_KIND_ENUM = {
     "v_cache_scatter_matrix": "TNPU_HOST_V_CACHE_SCATTER_MATRIX",
     "causal_mask": "TNPU_HOST_CAUSAL_MASK",
     "concat_lastdim2": "TNPU_HOST_CONCAT_LASTDIM2",
+    "linear": "TNPU_HOST_LINEAR",
+    "conv2d": "TNPU_HOST_CONV2D",
 }
 
 
@@ -598,6 +603,22 @@ def emit_cv32e40p_program_v2(
                     attrs_i32[1] = 1
                     attrs_f32[0] = float(input_quant["scale"])
                     attrs_i32[2] = int(input_quant.get("zero_point", 0))
+            elif step.kind in {"maxpool2d", "avgpool2d"}:
+                kernel_h, kernel_w = (int(v) for v in step.attrs["kernel_size"])
+                stride_h, stride_w = (int(v) for v in step.attrs["stride"])
+                pad_h, pad_w = (int(v) for v in step.attrs["padding"])
+                attrs_i32[0] = kernel_h
+                attrs_i32[1] = kernel_w
+                attrs_i32[2] = stride_h
+                attrs_i32[3] = stride_w
+                attrs_i32[4] = pad_h
+                attrs_i32[5] = pad_w
+                if step.kind == "avgpool2d":
+                    attrs_i32[6] = 1 if bool(step.attrs.get("count_include_pad", True)) else 0
+            elif step.kind == "adaptive_avg_pool2d":
+                out_h, out_w = (int(v) for v in step.attrs["output_size"])
+                attrs_i32[0] = out_h
+                attrs_i32[1] = out_w
             elif step.kind == "im2col":
                 attrs_i32[0] = int(step.attrs["kernel_size"])
                 attrs_i32[1] = int(step.attrs.get("stride", 1))
@@ -641,8 +662,9 @@ def emit_cv32e40p_program_v2(
                 base_name = str(out_spec.metadata.get("storage_view_of", step.outputs[0]))
                 base_addr = resolve_tensor_addr(base_name)
                 scatter_addrs = tuple(base_addr + int(offset) for offset in out_spec.metadata["cache_scatter_word_addrs"])
-                token_lane = int(out_spec.metadata["cache_token_index"]) % 8
-                attrs_i32[0] = token_lane
+                token_index = int(out_spec.metadata["cache_token_index"])
+                attrs_i32[0] = token_index % 8
+                attrs_i32[1] = token_index
                 arr0_name = f"{symbol}_host_{_sanitize(step.name)}_scatter_addrs"
                 arr0_len = len(scatter_addrs)
                 decls.append(
@@ -656,6 +678,7 @@ def emit_cv32e40p_program_v2(
                 base_name = str(out_spec.metadata.get("storage_view_of", step.outputs[0]))
                 base_addr = resolve_tensor_addr(base_name)
                 scatter_addrs = tuple(base_addr + int(offset) for offset in out_spec.metadata["cache_scatter_word_addrs"])
+                attrs_i32[1] = int(out_spec.metadata["cache_token_index"])
                 arr0_name = f"{symbol}_host_{_sanitize(step.name)}_scatter_addrs"
                 arr0_len = len(scatter_addrs)
                 decls.append(
@@ -669,12 +692,19 @@ def emit_cv32e40p_program_v2(
             elif step.kind == "causal_mask":
                 attrs_i32[0] = int(step.attrs.get("past_kv_len", 0))
                 attrs_f32[0] = float(step.attrs.get("fill_value", -32768.0))
+            elif step.kind == "conv2d":
+                attrs_i32[0] = int(step.attrs["stride"])
+                attrs_i32[1] = int(step.attrs["padding"])
+                attrs_i32[2] = int(step.attrs["kernel_size"])
+                attrs_i32[3] = int(step.attrs["in_channels"])
+                attrs_i32[4] = int(step.attrs["out_channels"])
 
             host_entries.append(
                 "    {"
                 f'.name = "{step.name}", .kind = {_HOST_KIND_ENUM[step.kind]}, '
                 f".input_idx = {tensor_index[step.inputs[0]]}, "
                 f".input1_idx = {tensor_index[step.inputs[1]] if len(step.inputs) > 1 else 0xFFFF}, "
+                f".input2_idx = {tensor_index[step.inputs[2]] if len(step.inputs) > 2 else 0xFFFF}, "
                 f".output_idx = {tensor_index[step.outputs[0]]}, "
                 ".attrs_i32 = {"
                 + ", ".join(str(v) for v in attrs_i32)
