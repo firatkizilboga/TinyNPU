@@ -14,10 +14,14 @@ verification/cocotb/buffer_init_*.hex
 verification/cocotb/buffer_init_*.json
 verification/cocotb/ub_dump_rtl.hex
 
-# Docs (local only)
-docs/sv_guide.pdf
-docs/project-description.pdf
-docs/tiled_matmul.md
+# Docs / notes (local only)
+docs/
+AGENT_HANDOFF_2026-04-01.md
+ATTENTION_NATIVE_TRACKER.md
+ATTENTION_PERF_FINDINGS.md
+CPU_NATIVE_RTL_RESULTS_2026-04-21.md
+RUNTIME_V2_COVERAGE.md
+UB_GROWTH_FINDINGS.md
 
 # Data / model artifacts
 data/
