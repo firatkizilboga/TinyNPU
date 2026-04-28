@@ -22,7 +22,7 @@ from tinynpu_jit.blocks.gpt2_block import (  # noqa: E402
     reference_decode,
     reference_prefill,
 )
-from run_cv32e40p_b_append_demo import (  # noqa: E402
+from tinynpu_jit.rtl_runner import (  # noqa: E402
     GENERATED_DIR,
     RunnerConfig,
     build_v2_elf_and_hex,

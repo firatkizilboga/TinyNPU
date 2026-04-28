@@ -82,6 +82,24 @@ class MatMulOp:
     b_word_offset: int = 0
     b_read_mode: str = "normal"
     rope_cs_name: str | None = None  # if set, emit XFORM ROPE_K16 after this matmul
+    rope_cs_names: list[str] = field(default_factory=list)
+    rope_row_indices: list[int] = field(default_factory=list)
+    dequantize_to_fp16: bool = False
+    dequantize_multiplier: int = 1
+    dequantize_shift: int = 0
+
+    def rope_xforms(self) -> list[tuple[str, int]]:
+        if self.rope_cs_names:
+            if self.rope_row_indices and len(self.rope_row_indices) != len(self.rope_cs_names):
+                raise ValueError(
+                    f"MatMulOp '{self.name}' has {len(self.rope_cs_names)} RoPE tables "
+                    f"but {len(self.rope_row_indices)} row indices."
+                )
+            rows = self.rope_row_indices or list(range(len(self.rope_cs_names)))
+            return [(name, int(row)) for name, row in zip(self.rope_cs_names, rows, strict=True)]
+        if self.rope_cs_name:
+            return [(self.rope_cs_name, 0)]
+        return []
 
 
 @dataclass

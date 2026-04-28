@@ -14,6 +14,7 @@ from tinynpu_jit import (
 )
 from tinynpu_jit.golden import GoldenModel
 from tinynpu_jit.runtime_approx import (
+    dequantize_i16_to_fp16_bits_xform,
     quantize_fp16_to_i16_xform,
     rmsnorm_approx,
     silu_approx,
@@ -44,6 +45,25 @@ def _silu(x: np.ndarray) -> np.ndarray:
 
 def _quantize_fp16_boundary(source: np.ndarray, *, scale: float) -> np.ndarray:
     return quantize_fp16_to_i16_xform(source, scale=scale)
+
+
+def _dequantize_fp16_boundary(source: np.ndarray, *, scale: float) -> np.ndarray:
+    bits = dequantize_i16_to_fp16_bits_xform(source, scale=scale, zero_point=0)
+    return np.asarray(bits, dtype=np.int16).view(np.uint16).view(np.float16).astype(np.float32)
+
+
+def _dq_fp16_attrs(scale: float) -> dict[str, object]:
+    return {"scale": float(scale), "zero_point": 0, "output_encoding": "fp16_bits"}
+
+
+def _dq_attrs(scale: float, *, enable_dq_xform: bool) -> dict[str, object]:
+    return _dq_fp16_attrs(scale) if enable_dq_xform else {"scale": float(scale), "zero_point": 0}
+
+
+def _dequant_boundary(source: np.ndarray, *, scale: float, enable_dq_xform: bool, golden: GoldenModel) -> np.ndarray:
+    if enable_dq_xform:
+        return _dequantize_fp16_boundary(source, scale=scale)
+    return golden.dequantize(source, scale=scale, zero_point=0)
 
 
 def _rope_ref(x: np.ndarray, *, positions: np.ndarray, head_dim: int, theta: float) -> np.ndarray:
@@ -80,6 +100,10 @@ def _kv_head_for_q_head(q_head: int, *, n_heads: int, n_kv_heads: int) -> int:
     if n_heads % n_kv_heads != 0:
         raise ValueError(f"n_heads={n_heads} must be divisible by n_kv_heads={n_kv_heads}")
     return q_head // (n_heads // n_kv_heads)
+
+
+def _rope_uses_dq_fallback(d_head: int) -> bool:
+    return int(d_head) % 16 != 0
 
 
 @dataclass(frozen=True)
@@ -249,6 +273,7 @@ def reference_prefill(
     rope_theta: float | None = None,
     rope_scaling: dict[str, object] | None = None,
     x_in: np.ndarray | None = None,
+    enable_dq_xform: bool = False,
 ) -> dict[str, object]:
     """Hardware-faithful quantized prefill reference for the compiled block."""
     golden = GoldenModel()
@@ -273,10 +298,11 @@ def reference_prefill(
     k_rope_heads: list[np.ndarray] = []
     v_heads: list[np.ndarray] = []
     attn_heads: list[np.ndarray] = []
+    rope_dq_fallback = enable_dq_xform and _rope_uses_dq_fallback(d_head)
     score_scale = np.float32((float(act_scale) * float(act_scale)) / np.sqrt(float(d_head)))
     for q_head in range(n_heads):
         q_int = golden.matmul(x_norm1_q, q_weights[q_head], out_dtype=DType.INT16)
-        q_f = golden.dequantize(q_int, scale=act_scale, zero_point=0)
+        q_f = _dequantize_fp16_boundary(q_int, scale=act_scale) if rope_dq_fallback else golden.dequantize(q_int, scale=act_scale, zero_point=0)
         q_rope_f = _rope_ref(q_f, positions=positions, head_dim=d_head, theta=resolved_rope_theta)
         q_rope_q = golden.quantize(q_rope_f, scale=act_scale, zero_point=0, out_dtype=DType.INT16)
         q_rope_heads.append(q_rope_q)
@@ -284,7 +310,7 @@ def reference_prefill(
     for kv_head in range(n_kv_heads):
         k_int = golden.matmul(x_norm1_q, k_weights[kv_head], out_dtype=DType.INT16)
         v_int = golden.matmul(x_norm1_q, v_weights[kv_head], out_dtype=DType.INT16)
-        k_f = golden.dequantize(k_int, scale=act_scale, zero_point=0)
+        k_f = _dequantize_fp16_boundary(k_int, scale=act_scale) if rope_dq_fallback else golden.dequantize(k_int, scale=act_scale, zero_point=0)
         k_rope_f = _rope_ref(k_f, positions=positions, head_dim=d_head, theta=resolved_rope_theta)
         k_rope_q = golden.quantize(k_rope_f, scale=act_scale, zero_point=0, out_dtype=DType.INT16)
         k_rope_heads.append(k_rope_q)
@@ -293,11 +319,12 @@ def reference_prefill(
 
     for q_head in range(n_heads):
         kv_head = _kv_head_for_q_head(q_head, n_heads=n_heads, n_kv_heads=n_kv_heads)
-        scores = golden.matmul(
+        scores_int = golden.matmul(
             q_rope_heads[q_head],
             np.array(k_rope_heads[kv_head].T, dtype=np.int16, copy=True),
             out_dtype=DType.INT16,
-        ).astype(np.float32)
+        )
+        scores = _dequant_boundary(scores_int, scale=1.0, enable_dq_xform=enable_dq_xform, golden=golden)
         scores = (scores * score_scale).astype(np.float32)
         masked = np.array(scores, copy=True)
         for row in range(prompt_len):
@@ -310,19 +337,19 @@ def reference_prefill(
 
     attn_cat = np.concatenate(attn_heads, axis=-1).astype(np.int16) if n_heads > 1 else np.array(attn_heads[0], copy=True)
     o_int = golden.matmul(attn_cat, np.asarray(block.self_attn_o_proj_w, dtype=np.int16), out_dtype=DType.INT16)
-    o_f = golden.dequantize(o_int, scale=act_scale, zero_point=0)
+    o_f = _dequant_boundary(o_int, scale=act_scale, enable_dq_xform=enable_dq_xform, golden=golden)
     resid1 = (x_in + o_f).astype(np.float32)
     x_norm2 = _rmsnorm(resid1, block.post_attention_layernorm_w, block.config.rms_norm_eps)
     x_norm2_q = golden.quantize(x_norm2, scale=act_scale, zero_point=0, out_dtype=DType.INT16)
     gate_int = golden.matmul(x_norm2_q, np.asarray(block.mlp_gate_proj_w, dtype=np.int16), out_dtype=DType.INT16)
     up_int = golden.matmul(x_norm2_q, np.asarray(block.mlp_up_proj_w, dtype=np.int16), out_dtype=DType.INT16)
-    gate_f = golden.dequantize(gate_int, scale=act_scale, zero_point=0)
-    up_f = golden.dequantize(up_int, scale=act_scale, zero_point=0)
+    gate_f = _dequant_boundary(gate_int, scale=act_scale, enable_dq_xform=enable_dq_xform, golden=golden)
+    up_f = _dequant_boundary(up_int, scale=act_scale, enable_dq_xform=enable_dq_xform, golden=golden)
     gate_act = _silu(gate_f)
     ffn_hidden = (gate_act * up_f).astype(np.float32)
     ffn_hidden_q = golden.quantize(ffn_hidden, scale=act_scale, zero_point=0, out_dtype=DType.INT16)
     ffn_out_int = golden.matmul(ffn_hidden_q, np.asarray(block.mlp_down_proj_w, dtype=np.int16), out_dtype=DType.INT16)
-    ffn_out_f = golden.dequantize(ffn_out_int, scale=act_scale, zero_point=0)
+    ffn_out_f = _dequant_boundary(ffn_out_int, scale=act_scale, enable_dq_xform=enable_dq_xform, golden=golden)
     out = (resid1 + ffn_out_f).astype(np.float32)
     return {
         "x_norm1": x_norm1,
@@ -357,6 +384,7 @@ def reference_decode(
     rope_theta: float | None = None,
     rope_scaling: dict[str, object] | None = None,
     x_in: np.ndarray | None = None,
+    enable_dq_xform: bool = False,
 ) -> dict[str, object]:
     """Hardware-faithful quantized decode reference for the compiled block."""
     golden = GoldenModel()
@@ -381,10 +409,11 @@ def reference_decode(
     k_cur_heads: list[np.ndarray] = []
     v_cur_heads: list[np.ndarray] = []
     attn_heads: list[np.ndarray] = []
+    rope_dq_fallback = enable_dq_xform and _rope_uses_dq_fallback(d_head)
     score_scale = np.float32((float(act_scale) * float(act_scale)) / np.sqrt(float(d_head)))
     for q_head in range(n_heads):
         q_int = golden.matmul(x_norm1_q, q_weights[q_head], out_dtype=DType.INT16)
-        q_f = golden.dequantize(q_int, scale=act_scale, zero_point=0)
+        q_f = _dequantize_fp16_boundary(q_int, scale=act_scale) if rope_dq_fallback else golden.dequantize(q_int, scale=act_scale, zero_point=0)
         q_rope_f = _rope_ref(q_f, positions=decode_pos, head_dim=d_head, theta=resolved_rope_theta)
         q_rope_q = golden.quantize(q_rope_f, scale=act_scale, zero_point=0, out_dtype=DType.INT16)
         q_rope_heads.append(q_rope_q)
@@ -392,7 +421,7 @@ def reference_decode(
     for kv_head in range(n_kv_heads):
         k_int = golden.matmul(x_norm1_q, k_weights[kv_head], out_dtype=DType.INT16)
         v_int = golden.matmul(x_norm1_q, v_weights[kv_head], out_dtype=DType.INT16)
-        k_f = golden.dequantize(k_int, scale=act_scale, zero_point=0)
+        k_f = _dequantize_fp16_boundary(k_int, scale=act_scale) if rope_dq_fallback else golden.dequantize(k_int, scale=act_scale, zero_point=0)
         k_rope_f = _rope_ref(k_f, positions=decode_pos, head_dim=d_head, theta=resolved_rope_theta)
         k_rope_q = golden.quantize(k_rope_f, scale=act_scale, zero_point=0, out_dtype=DType.INT16)
         k_cur_heads.append(k_rope_q)
@@ -415,11 +444,12 @@ def reference_decode(
             ],
             axis=0,
         ).astype(np.int16)
-        scores = golden.matmul(
+        scores_int = golden.matmul(
             q_rope_heads[q_head],
             np.array(k_full.T, dtype=np.int16, copy=True),
             out_dtype=DType.INT16,
-        ).astype(np.float32)
+        )
+        scores = _dequant_boundary(scores_int, scale=1.0, enable_dq_xform=enable_dq_xform, golden=golden)
         scores = (scores * score_scale).astype(np.float32)
         probs = softmax_f16_approx(scores, axis=-1)
         probs_q = _quantize_fp16_boundary(probs, scale=attn_scale)
@@ -428,19 +458,19 @@ def reference_decode(
 
     attn_cat = np.concatenate(attn_heads, axis=-1).astype(np.int16) if n_heads > 1 else np.array(attn_heads[0], copy=True)
     o_int = golden.matmul(attn_cat, np.asarray(block.self_attn_o_proj_w, dtype=np.int16), out_dtype=DType.INT16)
-    o_f = golden.dequantize(o_int, scale=act_scale, zero_point=0)
+    o_f = _dequant_boundary(o_int, scale=act_scale, enable_dq_xform=enable_dq_xform, golden=golden)
     resid1 = (x_in + o_f).astype(np.float32)
     x_norm2 = _rmsnorm(resid1, block.post_attention_layernorm_w, block.config.rms_norm_eps)
     x_norm2_q = golden.quantize(x_norm2, scale=act_scale, zero_point=0, out_dtype=DType.INT16)
     gate_int = golden.matmul(x_norm2_q, np.asarray(block.mlp_gate_proj_w, dtype=np.int16), out_dtype=DType.INT16)
     up_int = golden.matmul(x_norm2_q, np.asarray(block.mlp_up_proj_w, dtype=np.int16), out_dtype=DType.INT16)
-    gate_f = golden.dequantize(gate_int, scale=act_scale, zero_point=0)
-    up_f = golden.dequantize(up_int, scale=act_scale, zero_point=0)
+    gate_f = _dequant_boundary(gate_int, scale=act_scale, enable_dq_xform=enable_dq_xform, golden=golden)
+    up_f = _dequant_boundary(up_int, scale=act_scale, enable_dq_xform=enable_dq_xform, golden=golden)
     gate_act = _silu(gate_f)
     ffn_hidden = (gate_act * up_f).astype(np.float32)
     ffn_hidden_q = golden.quantize(ffn_hidden, scale=act_scale, zero_point=0, out_dtype=DType.INT16)
     ffn_out_int = golden.matmul(ffn_hidden_q, np.asarray(block.mlp_down_proj_w, dtype=np.int16), out_dtype=DType.INT16)
-    ffn_out_f = golden.dequantize(ffn_out_int, scale=act_scale, zero_point=0)
+    ffn_out_f = _dequant_boundary(ffn_out_int, scale=act_scale, enable_dq_xform=enable_dq_xform, golden=golden)
     out = (resid1 + ffn_out_f).astype(np.float32)
     return {
         "x_norm1": x_norm1,
@@ -528,7 +558,7 @@ def _common_io_tensors(
         "ffn_hidden_q": TensorSpec("ffn_hidden_q", (seq_len, ffn_hidden_dim), DType.INT16, TensorKind.INTERMEDIATE, metadata={"storage_role": "A"}),
         "ffn_out_int": TensorSpec("ffn_out_int", (seq_len, d_model), DType.INT16, TensorKind.INTERMEDIATE),
         "ffn_out_f": TensorSpec("ffn_out_f", (seq_len, d_model), DType.FLOAT32, TensorKind.INTERMEDIATE),
-        out_name: TensorSpec(out_name, (seq_len, d_model), DType.FLOAT32, TensorKind.OUTPUT, is_final_output=True),
+        out_name: TensorSpec(out_name, (seq_len, d_model), DType.FLOAT32, TensorKind.OUTPUT, is_final_output=True, metadata={"verify_atol": 0.25}),
     }
 
 
@@ -669,6 +699,7 @@ def _append_attention_post_score_steps(
     attn_scale: float,
     include_causal_mask: bool,
     past_kv_len: int = 0,
+    enable_dq_xform: bool = False,
 ) -> None:
     for q_head in range(n_heads):
         builder.host(
@@ -676,13 +707,15 @@ def _append_attention_post_score_steps(
             "dequantize",
             inputs=[f"scores_h{q_head}"],
             outputs=[f"scores_f_h{q_head}"],
-            attrs={"scale": 1.0, "zero_point": 0},
+            attrs=_dq_attrs(1.0, enable_dq_xform=enable_dq_xform),
         )
+        mul_attrs = {"lhs_encoding": "fp16_bits"} if enable_dq_xform else {}
         builder.host(
             f"scale_scores_h{q_head}",
             "mul",
             inputs=[f"scores_f_h{q_head}", f"score_scale_h{q_head}"],
             outputs=[f"scores_scaled_h{q_head}"],
+            attrs=mul_attrs,
         )
         if include_causal_mask:
             builder.host(
@@ -726,15 +759,16 @@ def _append_concat_alias_steps(builder: IRBuilder, *, n_heads: int) -> None:
     builder.host("alias_attn_cat_a", "alias", inputs=["attn_cat"], outputs=["attn_cat_a"])
 
 
-def _append_transformer_tail(builder: IRBuilder, *, act_scale: float, rms_norm_eps: float) -> None:
+def _append_transformer_tail(builder: IRBuilder, *, act_scale: float, rms_norm_eps: float, enable_dq_xform: bool = False) -> None:
     builder.segment(
         "seg_o_proj",
         ops=[builder.matmul("op_o_proj", "attn_cat_a", "w_o", "o_int", in_dtype=DType.INT16, out_dtype=DType.INT16)],
         inputs=["attn_cat_a"],
         outputs=["o_int"],
     )
-    builder.host("dequant_o", "dequantize", inputs=["o_int"], outputs=["o_f"], attrs={"scale": act_scale, "zero_point": 0})
-    builder.host("residual1", "add", inputs=["x_in", "o_f"], outputs=["resid1"])
+    builder.host("dequant_o", "dequantize", inputs=["o_int"], outputs=["o_f"], attrs=_dq_attrs(act_scale, enable_dq_xform=enable_dq_xform))
+    residual1_attrs = {"rhs_encoding": "fp16_bits"} if enable_dq_xform else {}
+    builder.host("residual1", "add", inputs=["x_in", "o_f"], outputs=["resid1"], attrs=residual1_attrs)
     builder.host("rmsnorm2", "rmsnorm", inputs=["resid1", "rms2_w"], outputs=["x_norm2"], attrs={"eps": rms_norm_eps})
     builder.host(
         "quant_x_norm2",
@@ -752,10 +786,12 @@ def _append_transformer_tail(builder: IRBuilder, *, act_scale: float, rms_norm_e
         inputs=["x_norm2_q"],
         outputs=["gate_int", "up_int"],
     )
-    builder.host("dequant_gate", "dequantize", inputs=["gate_int"], outputs=["gate_f"], attrs={"scale": act_scale, "zero_point": 0})
-    builder.host("dequant_up", "dequantize", inputs=["up_int"], outputs=["up_f"], attrs={"scale": act_scale, "zero_point": 0})
-    builder.host("silu_gate", "silu", inputs=["gate_f"], outputs=["gate_act"])
-    builder.host("ffn_mul", "mul", inputs=["gate_act", "up_f"], outputs=["ffn_hidden"])
+    builder.host("dequant_gate", "dequantize", inputs=["gate_int"], outputs=["gate_f"], attrs=_dq_attrs(act_scale, enable_dq_xform=enable_dq_xform))
+    builder.host("dequant_up", "dequantize", inputs=["up_int"], outputs=["up_f"], attrs=_dq_attrs(act_scale, enable_dq_xform=enable_dq_xform))
+    silu_attrs = {"input_encoding": "fp16_bits"} if enable_dq_xform else {}
+    ffn_mul_attrs = {"rhs_encoding": "fp16_bits"} if enable_dq_xform else {}
+    builder.host("silu_gate", "silu", inputs=["gate_f"], outputs=["gate_act"], attrs=silu_attrs)
+    builder.host("ffn_mul", "mul", inputs=["gate_act", "up_f"], outputs=["ffn_hidden"], attrs=ffn_mul_attrs)
     builder.host(
         "quant_ffn_hidden",
         "quantize",
@@ -769,8 +805,9 @@ def _append_transformer_tail(builder: IRBuilder, *, act_scale: float, rms_norm_e
         inputs=["ffn_hidden_q"],
         outputs=["ffn_out_int"],
     )
-    builder.host("dequant_ffn_out", "dequantize", inputs=["ffn_out_int"], outputs=["ffn_out_f"], attrs={"scale": act_scale, "zero_point": 0})
-    builder.host("residual2", "add", inputs=["resid1", "ffn_out_f"], outputs=["out"])
+    builder.host("dequant_ffn_out", "dequantize", inputs=["ffn_out_int"], outputs=["ffn_out_f"], attrs=_dq_attrs(act_scale, enable_dq_xform=enable_dq_xform))
+    residual2_attrs = {"rhs_encoding": "fp16_bits"} if enable_dq_xform else {}
+    builder.host("residual2", "add", inputs=["resid1", "ffn_out_f"], outputs=["out"], attrs=residual2_attrs)
 
 
 def build_prefill_artifact(
@@ -787,6 +824,7 @@ def build_prefill_artifact(
     rms_norm_eps: float = 1.0e-5,
     rope_theta: float = 500000.0,
     rope_scaling: dict[str, object] | None = None,
+    enable_dq_xform: bool = False,
 ):
     if d_model <= 0 or d_model % 8 != 0:
         raise ValueError("d_model must be a positive multiple of 8")
@@ -836,6 +874,7 @@ def build_prefill_artifact(
         attn_scale=attn_scale,
         rope_theta=rope_theta,
         rope_scaling=block.config.rope_scaling,
+        enable_dq_xform=enable_dq_xform,
     )
     attn_dim = n_heads * d_head
 
@@ -874,14 +913,17 @@ def build_prefill_artifact(
         inputs=["x_norm1_q"],
         outputs=[*(f"q_int_h{i}" for i in range(n_heads)), *(f"k_seq_h{i}" for i in range(n_kv_heads)), *(f"v_seq_h{i}" for i in range(n_kv_heads))],
     )
+    rope_dq_fallback = enable_dq_xform and _rope_uses_dq_fallback(d_head)
+    qk_dq_attrs = _dq_fp16_attrs(act_scale) if rope_dq_fallback else {"scale": act_scale, "zero_point": 0}
+    rope_input_attrs = {"input_encoding": "fp16_bits"} if rope_dq_fallback else {}
     for q_head in range(n_heads):
-        b.host(f"dequant_q_h{q_head}", "dequantize", inputs=[f"q_int_h{q_head}"], outputs=[f"q_f_h{q_head}"], attrs={"scale": act_scale, "zero_point": 0})
+        b.host(f"dequant_q_h{q_head}", "dequantize", inputs=[f"q_int_h{q_head}"], outputs=[f"q_f_h{q_head}"], attrs=qk_dq_attrs)
         b.host(
             f"rope_q_h{q_head}",
             "rope",
             inputs=[f"q_f_h{q_head}"],
             outputs=[f"q_rope_f_h{q_head}"],
-            attrs={"head_dim": d_head, "position": 0, "theta": rope_theta},
+            attrs={"head_dim": d_head, "position": 0, "theta": rope_theta, **rope_input_attrs},
         )
         b.host(
             f"quant_q_rope_h{q_head}",
@@ -891,13 +933,13 @@ def build_prefill_artifact(
             attrs={"scale": act_scale, "zero_point": 0, "dtype": DType.INT16},
         )
     for kv_head in range(n_kv_heads):
-        b.host(f"dequant_k_h{kv_head}", "dequantize", inputs=[f"k_seq_h{kv_head}"], outputs=[f"k_f_h{kv_head}"], attrs={"scale": act_scale, "zero_point": 0})
+        b.host(f"dequant_k_h{kv_head}", "dequantize", inputs=[f"k_seq_h{kv_head}"], outputs=[f"k_f_h{kv_head}"], attrs=qk_dq_attrs)
         b.host(
             f"rope_k_h{kv_head}",
             "rope",
             inputs=[f"k_f_h{kv_head}"],
             outputs=[f"k_rope_f_h{kv_head}"],
-            attrs={"head_dim": d_head, "position": 0, "theta": rope_theta},
+            attrs={"head_dim": d_head, "position": 0, "theta": rope_theta, **rope_input_attrs},
         )
         b.host(
             f"quant_k_rope_h{kv_head}",
@@ -927,7 +969,7 @@ def build_prefill_artifact(
         ],
         outputs=[f"scores_h{i}" for i in range(n_heads)],
     )
-    _append_attention_post_score_steps(b, n_heads=n_heads, attn_scale=attn_scale, include_causal_mask=True, past_kv_len=0)
+    _append_attention_post_score_steps(b, n_heads=n_heads, attn_scale=attn_scale, include_causal_mask=True, past_kv_len=0, enable_dq_xform=enable_dq_xform)
     b.segment(
         "seg_value",
         ops=[
@@ -949,7 +991,7 @@ def build_prefill_artifact(
         outputs=[f"attn_h{i}" for i in range(n_heads)],
     )
     _append_concat_alias_steps(b, n_heads=n_heads)
-    _append_transformer_tail(b, act_scale=act_scale, rms_norm_eps=rms_norm_eps)
+    _append_transformer_tail(b, act_scale=act_scale, rms_norm_eps=rms_norm_eps, enable_dq_xform=enable_dq_xform)
 
     plan = b.finalize(inputs=[], outputs=["out"])
     plan.add_verification_step("out", "llama_prefill_out")
@@ -971,6 +1013,7 @@ def build_decode_artifact(
     rms_norm_eps: float = 1.0e-5,
     rope_theta: float = 500000.0,
     rope_scaling: dict[str, object] | None = None,
+    enable_dq_xform: bool = False,
 ):
     if rms_norm_eps <= 0.0:
         raise ValueError("rms_norm_eps must be positive")
@@ -1006,6 +1049,7 @@ def build_decode_artifact(
         attn_scale=attn_scale,
         rope_theta=rope_theta,
         rope_scaling=block.config.rope_scaling,
+        enable_dq_xform=enable_dq_xform,
     )
     decode_ref = reference_decode(
         state,
@@ -1017,6 +1061,7 @@ def build_decode_artifact(
         attn_scale=attn_scale,
         rope_theta=rope_theta,
         rope_scaling=block.config.rope_scaling,
+        enable_dq_xform=enable_dq_xform,
     )
     cache_len = prompt_len + 1
     attn_dim = n_heads * d_head
@@ -1068,14 +1113,17 @@ def build_decode_artifact(
         inputs=["x_norm1_q"],
         outputs=[*(f"q_int_h{i}" for i in range(n_heads)), *(f"k_cur_h{i}" for i in range(n_kv_heads)), *(f"v_cur_h{i}" for i in range(n_kv_heads))],
     )
+    rope_dq_fallback = enable_dq_xform and _rope_uses_dq_fallback(d_head)
+    qk_dq_attrs = _dq_fp16_attrs(act_scale) if rope_dq_fallback else {"scale": act_scale, "zero_point": 0}
+    rope_input_attrs = {"input_encoding": "fp16_bits"} if rope_dq_fallback else {}
     for q_head in range(n_heads):
-        b.host(f"dequant_q_h{q_head}", "dequantize", inputs=[f"q_int_h{q_head}"], outputs=[f"q_f_h{q_head}"], attrs={"scale": act_scale, "zero_point": 0})
+        b.host(f"dequant_q_h{q_head}", "dequantize", inputs=[f"q_int_h{q_head}"], outputs=[f"q_f_h{q_head}"], attrs=qk_dq_attrs)
         b.host(
             f"rope_q_h{q_head}",
             "rope",
             inputs=[f"q_f_h{q_head}"],
             outputs=[f"q_rope_f_h{q_head}"],
-            attrs={"head_dim": d_head, "position": prompt_len, "theta": rope_theta},
+            attrs={"head_dim": d_head, "position": prompt_len, "theta": rope_theta, **rope_input_attrs},
         )
         b.host(
             f"quant_q_rope_h{q_head}",
@@ -1085,13 +1133,13 @@ def build_decode_artifact(
             attrs={"scale": act_scale, "zero_point": 0, "dtype": DType.INT16},
         )
     for kv_head in range(n_kv_heads):
-        b.host(f"dequant_k_h{kv_head}", "dequantize", inputs=[f"k_cur_h{kv_head}"], outputs=[f"k_f_h{kv_head}"], attrs={"scale": act_scale, "zero_point": 0})
+        b.host(f"dequant_k_h{kv_head}", "dequantize", inputs=[f"k_cur_h{kv_head}"], outputs=[f"k_f_h{kv_head}"], attrs=qk_dq_attrs)
         b.host(
             f"rope_k_h{kv_head}",
             "rope",
             inputs=[f"k_f_h{kv_head}"],
             outputs=[f"k_rope_f_h{kv_head}"],
-            attrs={"head_dim": d_head, "position": prompt_len, "theta": rope_theta},
+            attrs={"head_dim": d_head, "position": prompt_len, "theta": rope_theta, **rope_input_attrs},
         )
         b.host(
             f"quant_k_rope_h{kv_head}",
@@ -1130,7 +1178,7 @@ def build_decode_artifact(
         inputs=[f"q_rope_q_h{i}" for i in range(n_heads)],
         outputs=[f"scores_h{i}" for i in range(n_heads)],
     )
-    _append_attention_post_score_steps(b, n_heads=n_heads, attn_scale=attn_scale, include_causal_mask=False)
+    _append_attention_post_score_steps(b, n_heads=n_heads, attn_scale=attn_scale, include_causal_mask=False, enable_dq_xform=enable_dq_xform)
     b.segment(
         "seg_value",
         ops=[
@@ -1149,7 +1197,7 @@ def build_decode_artifact(
         outputs=[f"attn_h{i}" for i in range(n_heads)],
     )
     _append_concat_alias_steps(b, n_heads=n_heads)
-    _append_transformer_tail(b, act_scale=act_scale, rms_norm_eps=rms_norm_eps)
+    _append_transformer_tail(b, act_scale=act_scale, rms_norm_eps=rms_norm_eps, enable_dq_xform=enable_dq_xform)
 
     plan = b.finalize(inputs=[], outputs=["out"])
     plan.add_verification_step("out", "llama_decode_out")

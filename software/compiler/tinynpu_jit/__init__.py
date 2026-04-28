@@ -1,4 +1,4 @@
-from .api import compile_module, compile_plan, run_host_emulation
+from .api import compile_module, compile_module_legacy, compile_plan, run_host_emulation
 from .artifact import CompiledArtifact, ExecutionResult, SegmentArtifact
 from .baremetal_emit import emit_cv32e40p_c, write_cv32e40p_c
 from .baremetal_emit_v2 import emit_cv32e40p_program_v2, write_cv32e40p_program_v2
@@ -41,15 +41,51 @@ from .ir import (
 from .markers import im2col_for_npu, mark_for_verify, npu_matmul, quantize_for_npu
 from .memory_planner import GlobalMemoryReport, SegmentMemoryPlan, plan_program_memory, plan_segment_memory
 from .runtime import run
+from .rtl_runner import (
+    CORE_DIR,
+    CUSTOM_DIR,
+    GENERATED_DIR,
+    RUNTIME_DIR,
+    RunnerConfig,
+    build_v2_elf_and_hex,
+    render_runner_source,
+    run_vlt_npu,
+    runtime_cflags,
+)
+from .semantic_capabilities import CapabilityIssue, SemanticCapabilityReport, analyze_semantic_capabilities
+from .semantic_frontend import build_semantic_graph
+from .semantic_ir import (
+    ActivationOp,
+    AdaptiveAvgPool2dOp,
+    AvgPool2dOp,
+    BinaryOp,
+    Conv2dOp,
+    CompilerReadyConv2dOp,
+    CompilerReadyLinearOp,
+    DequantizeOp,
+    LinearOp,
+    MaxPool2dOp,
+    MeanOp,
+    QuantizationSpec,
+    QuantizeOp,
+    ReshapeOp,
+    SemanticGraph,
+    SemanticValue,
+    VerifyOp as SemanticVerifyOp,
+)
 from .simulator import SimulatorExecutor, run_sim
 
 __all__ = [
     "CompiledArtifact",
     "IRBuilder",
     "BenchmarkEntry",
+    "build_semantic_graph",
     "b_slot_word_stride",
     "BenchmarkReport",
     "CostModel",
+    "CapabilityIssue",
+    "SemanticCapabilityReport",
+    "analyze_semantic_capabilities",
     "DType",
     "describe_int16_k_cache_append",
     "describe_int16_v_cache_append",
@@ -62,6 +98,17 @@ __all__ = [
     "Int16VCacheAppendContract",
     "im2col_for_npu",
     "MatMulOp",
+    "ActivationOp",
+    "AdaptiveAvgPool2dOp",
+    "AvgPool2dOp",
+    "BinaryOp",
+    "Conv2dOp",
+    "CompilerReadyConv2dOp",
+    "CompilerReadyLinearOp",
+    "DequantizeOp",
+    "LinearOp",
+    "MaxPool2dOp",
+    "MeanOp",
     "make_b_cache_specs",
     "make_b_cache_view_spec",
     "make_kv_cache_specs",
@@ -72,6 +119,8 @@ __all__ = [
     "make_rope_cs_tensor_spec",
     "NpuSegment",
     "PrimitiveCounts",
+    "QuantizationSpec",
+    "QuantizeOp",
     "five_stage_in_order_model",
     "ideal_issue_1_model",
     "unpipelined_scalar_model",
@@ -79,11 +128,16 @@ __all__ = [
     "SegmentMemoryPlan",
     "SimulatorExecutor",
     "inspect_artifact",
+    "SemanticGraph",
+    "SemanticValue",
+    "SemanticVerifyOp",
+    "ReshapeOp",
     "TensorKind",
     "TensorSpec",
     "VerificationMode",
     "VerifyTensor",
     "compile_module",
+    "compile_module_legacy",
     "compile_plan",
     "emit_cv32e40p_c",
     "emit_cv32e40p_program_v2",
@@ -95,9 +149,18 @@ __all__ = [
     "quantize_for_npu",
     "register_host_op",
     "registered_host_op_kinds",
+    "render_runner_source",
     "run",
     "run_sim",
     "run_host_emulation",
+    "run_vlt_npu",
+    "runtime_cflags",
+    "RunnerConfig",
+    "build_v2_elf_and_hex",
+    "CORE_DIR",
+    "CUSTOM_DIR",
+    "GENERATED_DIR",
+    "RUNTIME_DIR",
     "write_cv32e40p_c",
     "write_cv32e40p_program_v2",
 ]

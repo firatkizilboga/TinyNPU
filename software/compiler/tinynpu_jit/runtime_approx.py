@@ -42,6 +42,28 @@ def choose_xform_q_f16_i16_scale_params(inv_scale: float) -> tuple[int, int]:
     return best_mult, best_shift
 
 
+def choose_xform_i16_f16_scale_params(scale: float) -> tuple[int, int]:
+    return choose_xform_q_f16_i16_scale_params(scale)
+
+
+def dequantize_i16_to_fp16_bits_with_params(source: np.ndarray, *, multiplier: int, shift: int) -> np.ndarray:
+    if int(multiplier) < 0 or int(multiplier) > 65535:
+        raise ValueError(f"xform_dq_i16_f16 multiplier must fit uint16, got {multiplier}.")
+    if int(shift) < 0 or int(shift) > 255:
+        raise ValueError(f"xform_dq_i16_f16 shift must fit uint8, got {shift}.")
+    approx_scale = np.float32(int(multiplier)) / np.float32(1 << int(shift))
+    values = np.asarray(source, dtype=np.int16).astype(np.float32) * approx_scale
+    values = np.clip(values, np.float32(-65504.0), np.float32(65504.0))
+    return values.astype(np.float16).view(np.uint16).astype(np.int16)
+
+
+def dequantize_i16_to_fp16_bits_xform(source: np.ndarray, *, scale: float, zero_point: int = 0) -> np.ndarray:
+    if int(zero_point) != 0:
+        raise ValueError("xform_dq_i16_f16 only supports zero_point=0.")
+    multiplier, shift = choose_xform_i16_f16_scale_params(float(scale))
+    return dequantize_i16_to_fp16_bits_with_params(source, multiplier=multiplier, shift=shift)
+
+
 def _round_shift_right_signed(value: int, shift: int) -> int:
     if shift <= 0:
         return value

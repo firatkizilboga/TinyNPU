@@ -9,6 +9,7 @@ from .benchmark import BenchmarkReport, CostModel, estimate_host_op_counts, esti
 from .golden import GoldenModel
 from .host_ops import execute_host_op
 from .ir import DType, HostOp, NpuSegment, TensorKind, VerificationMode, VerifyTensor
+from .runtime_approx import dequantize_i16_to_fp16_bits_with_params
 
 
 class HostEmulationExecutor:
@@ -123,7 +124,7 @@ class HostEmulationExecutor:
                     expected = artifact.expected_tensors[step.tensor_name]
                     actual = values[step.tensor_name]
                     if np.issubdtype(actual.dtype, np.floating) or np.issubdtype(expected.dtype, np.floating):
-                        matches = np.allclose(actual, expected, rtol=1e-5, atol=1e-6)
+                        matches = np.allclose(actual, expected, rtol=1e-5, atol=step.float_atol)
                     else:
                         matches = np.array_equal(actual, expected)
                     if not matches:
@@ -172,21 +173,35 @@ class HostEmulationExecutor:
                 h_gelu_x_scale_shift=op.h_gelu_x_scale_shift,
                 out_dtype=op.out_dtype,
             )
-            if op.rope_cs_name and op.rope_cs_name in values:
-                # Apply RoPE in-place on K using INT16 Q14 cos/sin table.
-                # cs layout: flat [1, d_head] where [:half]=cos, [half:]=sin (Q14)
-                k = np.asarray(values[op.out], dtype=np.int32).reshape(-1)
-                cs = np.asarray(values[op.rope_cs_name], dtype=np.int32).reshape(-1)
-                d = len(k)
+            if op.dequantize_to_fp16:
+                values[op.out] = dequantize_i16_to_fp16_bits_with_params(
+                    values[op.out],
+                    multiplier=int(op.dequantize_multiplier),
+                    shift=int(op.dequantize_shift),
+                )
+            for rope_cs_name, row_index in op.rope_xforms():
+                if rope_cs_name not in values:
+                    continue
+                # Apply RoPE in-place on one C-layout row using INT16 Q14 cos/sin.
+                k_matrix = np.asarray(values[op.out], dtype=np.int32).reshape(values[op.out].shape)
+                if k_matrix.ndim != 2:
+                    raise ValueError(f"ROPE_K16 emulation expects rank-2 output, got {k_matrix.shape}.")
+                row = int(row_index)
+                if row < 0 or row >= k_matrix.shape[0]:
+                    raise ValueError(f"ROPE_K16 row_index={row} outside output shape {k_matrix.shape}.")
+                cs = np.asarray(values[rope_cs_name], dtype=np.int32).reshape(-1)
+                d = k_matrix.shape[1]
                 half = d // 2
                 cos_q14 = cs[:half]
-                sin_q14 = cs[half:]
-                k_lo = k[:half].copy()
-                k_hi = k[half:].copy()
+                sin_q14 = cs[half:half + half]
+                k_lo = k_matrix[row, :half].copy()
+                k_hi = k_matrix[row, half:d].copy()
                 k_lo_rot = np.clip((k_lo * cos_q14 - k_hi * sin_q14 + (1 << 13)) >> 14, -32768, 32767)
                 k_hi_rot = np.clip((k_hi * cos_q14 + k_lo * sin_q14 + (1 << 13)) >> 14, -32768, 32767)
-                rotated = np.concatenate([k_lo_rot, k_hi_rot]).astype(np.int16)
-                values[op.out] = rotated.reshape(values[op.out].shape)
+                k_matrix = np.array(k_matrix, copy=True)
+                k_matrix[row, :half] = k_lo_rot
+                k_matrix[row, half:d] = k_hi_rot
+                values[op.out] = k_matrix.astype(np.int16)
             out_spec = tensors.get(op.out)
             if out_spec is not None:
                 base_name = out_spec.metadata.get("storage_view_of")

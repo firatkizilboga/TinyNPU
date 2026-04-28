@@ -17,7 +17,7 @@ class HardwareConfig:
             'ARRAY_SIZE': 8,
             'DATA_WIDTH': 16,
             'BUFFER_WIDTH': 128,
-            'IM_BASE_ADDR': 0x8000
+            'IM_BASE_ADDR': 0x9000
         }
 
         if os.path.exists(defines_path):
@@ -266,13 +266,32 @@ class TinyNPUProgram:
             )
         )
 
-    def xform_rope_k16(self, k_name, cs_name, dest_name=None):
+    def xform_dq_i16_f16(self, src_name, dest_name=None, multiplier=1, shift=0):
+        if src_name not in self.symbols:
+            raise ValueError(f"Source symbol '{src_name}' not found.")
+        src = self.symbols[src_name]
+        if dest_name is None:
+            dest_name = src_name
+        if dest_name not in self.symbols:
+            self.symbols[dest_name] = Symbol(dest_name, src.shape, PrecisionMode.INT16, role=src.storage_role)
+        self.instructions.append(
+            Xform(
+                src_name,
+                dest_name,
+                mode=XformMode.DQ_I16_F16,
+                multiplier=multiplier,
+                shift=shift,
+            )
+        )
+
+    def xform_rope_k16(self, k_name, cs_name, dest_name=None, row_index=0):
         """Apply RoPE in-place on a K tensor stored as INT16 Q14.
 
-        k_name:   symbol for the K vector (shape [1, d_head], role C or B).
+        k_name:   symbol for the K tensor (shape [seq, d_head], role C).
         cs_name:  symbol for the cos/sin table (shape [1, d_head], role C or B).
                   Layout: first half = cos[0..half-1], second half = sin[0..half-1].
         dest_name: output symbol (defaults to k_name for in-place rotation).
+        row_index: row inside k_name to rotate. Prefill emits one XFORM per row.
         """
         if k_name not in self.symbols:
             raise ValueError(f"Symbol '{k_name}' not found.")
@@ -283,7 +302,7 @@ class TinyNPUProgram:
             dest_name = k_name
         if dest_name not in self.symbols:
             self.symbols[dest_name] = Symbol(dest_name, src.shape, PrecisionMode.INT16, role=src.storage_role)
-        self.instructions.append(XformRopeK16(k_name, dest_name, cs_name))
+        self.instructions.append(XformRopeK16(k_name, dest_name, cs_name, row_index=row_index))
 
     def halt(self): self.instructions.append(Halt())
 
@@ -332,16 +351,32 @@ class TinyNPUProgram:
                 instr.count = self.symbols[instr.src].word_count
             if isinstance(instr, XformRopeK16):
                 src_sym = self.symbols[instr.src]
-                # K is stored as C-layout for m=1: n_tiles = ceil(shape[1] / ARRAY_SIZE)
-                # Valid tile words are at src + n_tile * ARRAY_SIZE (stride-8).
-                # half_count = n_tiles // 2 (must be even).
+                dst_sym = self.symbols[instr.dest]
+                if src_sym.precision != PrecisionMode.INT16 or dst_sym.precision != PrecisionMode.INT16:
+                    raise ValueError("XFORM ROPE_K16 requires INT16 source and destination tensors.")
+                if src_sym.storage_role != 'C' or dst_sym.storage_role != 'C':
+                    raise ValueError("XFORM ROPE_K16 currently requires C-layout source and destination tensors.")
+                if src_sym.shape != dst_sym.shape:
+                    raise ValueError(
+                        f"XFORM ROPE_K16 source/dest shapes must match (got {src_sym.shape} vs {dst_sym.shape})."
+                    )
                 n_tiles = (src_sym.shape[1] + self.array_size - 1) // self.array_size
                 if n_tiles % 2 != 0:
                     raise ValueError(
                         f"XFORM ROPE_K16 requires an even number of K column tiles (got {n_tiles}) "
                         f"for '{instr.src}' — d_head must be a multiple of {2 * self.array_size}."
                     )
+                row_index = int(instr.row_index)
+                if row_index < 0 or row_index >= src_sym.shape[0]:
+                    raise ValueError(
+                        f"XFORM ROPE_K16 row_index={row_index} is outside tensor '{instr.src}' rows={src_sym.shape[0]}."
+                    )
+                # C-layout INT16 word offset for row r and column tile nt:
+                # base + floor(r/8) * n_tiles * 8 + nt * 8 + (r % 8).
+                row_offset = (row_index // self.array_size) * n_tiles * self.array_size + (row_index % self.array_size)
                 instr.half_count = n_tiles // 2
+                instr.src_word_offset = row_offset
+                instr.dest_word_offset = row_offset
             elif isinstance(instr, Xform):
                 src_words = self.symbols[instr.src].word_count
                 dst_words = self.symbols[instr.dest].word_count

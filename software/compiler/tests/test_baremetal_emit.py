@@ -448,6 +448,50 @@ def test_emit_cv32e40p_program_v2_absorbs_dequantize_into_segment_read():
     assert "TNPU_HOST_DEQUANTIZE" not in source
 
 
+def test_compile_plan_fuses_explicit_dequantize_fp16_to_xform():
+    x = np.eye(8, dtype=np.int16)
+    w = np.eye(8, dtype=np.int16)
+    scale = 0.25
+    expected = _fp16_bits((x.astype(np.float32) @ w.astype(np.float32)) * np.float32(scale))
+    tensors = {
+        "x": TensorSpec("x", x.shape, DType.INT16, TensorKind.INPUT),
+        "w": TensorSpec("w", w.shape, DType.INT16, TensorKind.CONSTANT, data=w),
+        "y_q": TensorSpec("y_q", x.shape, DType.INT16, TensorKind.INTERMEDIATE),
+        "y_f16": TensorSpec("y_f16", x.shape, DType.INT16, TensorKind.OUTPUT, is_final_output=True),
+    }
+    steps = [
+        NpuSegment("seg0", [MatMulOp("op0", "x", "w", "y_q")], inputs=["x", "w"], outputs=["y_q"]),
+        HostOp(
+            "dq_y",
+            "dequantize",
+            inputs=["y_q"],
+            outputs=["y_f16"],
+            attrs={"scale": scale, "zero_point": 0, "output_encoding": "fp16_bits"},
+        ),
+        VerifyTensor("y_f16", "y_f16", is_final_output=True),
+    ]
+    artifact = compile_plan(
+        ExecutionPlan(tensors=tensors, steps=steps, inputs=["x"], outputs=["y_f16"]),
+        {"y_f16": expected},
+    )
+
+    segment = artifact.plan.steps[0]
+    assert isinstance(segment, NpuSegment)
+    assert segment.outputs == ["y_f16"]
+    assert segment.ops[0].out == "y_f16"
+    assert segment.ops[0].dequantize_to_fp16
+    assert not any(isinstance(step, HostOp) and step.name == "dq_y" for step in artifact.plan.steps)
+
+    im = artifact.segment_artifacts["seg0"].binary["im"]
+    xform_inst = int(im[1])
+    assert ((xform_inst >> 252) & 0xF) == 0x4
+    assert ((xform_inst >> 248) & 0xF) == int(XformMode.DQ_I16_F16)
+    multiplier = (xform_inst >> 184) & 0xFFFF
+    shift = (xform_inst >> 176) & 0xFF
+    assert multiplier > 0
+    assert multiplier / float(1 << shift) == scale
+
+
 def test_compile_plan_rejects_float32_npu_weight_constant():
     x = np.eye(8, dtype=np.int16)
     w_f = np.eye(8, dtype=np.float32)
@@ -795,6 +839,24 @@ def test_tinynpu_program_encodes_xform_q_f16_i16_inplace_instruction():
     assert ((inst >> 200) & 0xFFFF) == 8
     assert ((inst >> 184) & 0xFFFF) == 16
     assert ((inst >> 176) & 0xFF) == 1
+
+
+def test_tinynpu_program_encodes_xform_dq_i16_f16_instruction():
+    program = TinyNPUProgram()
+    src = np.zeros((8, 8), dtype=np.int16)
+    dst = np.zeros((8, 8), dtype=np.int16)
+    program.declare_data("src_i16", src, precision=PrecisionMode.INT16, role="C")
+    program.declare_data("dst_f16", dst, precision=PrecisionMode.INT16, role="C")
+    program.xform_dq_i16_f16("src_i16", "dst_f16", multiplier=3, shift=5)
+    program.halt()
+    binary = program.compile()
+
+    inst = int(binary["im"][0])
+    assert ((inst >> 252) & 0xF) == 0x4
+    assert ((inst >> 248) & 0xF) == int(XformMode.DQ_I16_F16)
+    assert ((inst >> 200) & 0xFFFF) == 8
+    assert ((inst >> 184) & 0xFFFF) == 3
+    assert ((inst >> 176) & 0xFF) == 5
 
 
 def test_compile_plan_preserves_output_word_offset_in_segment_binary():
@@ -1394,6 +1456,7 @@ def test_decode_attention_builder_matches_legacy_artifact():
                         op.b_word_offset,
                         op.b_read_mode,
                         op.rope_cs_name,
+                        tuple(op.rope_xforms()),
                     )
                     for op in step.ops
                 ),
@@ -1818,6 +1881,33 @@ def test_qllama_prefill_host_emulation_matches_reference_trace():
     np.testing.assert_allclose(result.tensors["out"], ref["out"], atol=1.0e-5, rtol=1.0e-5)
 
 
+def test_qllama_prefill_lowers_dequant_boundaries_to_fp16_xform():
+    artifact, _, _ = build_llama_prefill_artifact(
+        d_model=8,
+        d_head=8,
+        n_heads=1,
+        n_kv_heads=1,
+        ffn_hidden_dim=8,
+        prompt_len=8,
+        seed=0,
+        enable_dq_xform=True,
+    )
+
+    assert [step.name for step in artifact.plan.steps if isinstance(step, HostOp) and step.kind == "dequantize"] == []
+    encoded_outputs = {"q_f_h0", "k_f_h0", "scores_f_h0", "o_f", "gate_f", "up_f", "ffn_out_f"}
+    lowered_outputs = {
+        op.out
+        for step in artifact.plan.steps
+        if isinstance(step, NpuSegment)
+        for op in step.ops
+        if op.dequantize_to_fp16
+    }
+    assert encoded_outputs <= lowered_outputs
+    for name in encoded_outputs:
+        assert artifact.plan.tensors[name].dtype == DType.INT16
+        assert artifact.plan.tensors[name].metadata.get("value_encoding") == "fp16_bits"
+
+
 def test_qllama_decode_host_emulation_matches_reference_trace_and_cache_seed():
     artifact, _, prefill_ref, decode_ref = build_llama_decode_artifact(
         d_model=16,
@@ -1851,6 +1941,24 @@ def test_qllama_decode_host_emulation_matches_reference_trace_and_cache_seed():
     np.testing.assert_array_equal(result.trace_tensors["k_cache_h0"], expected_k_cache)
     np.testing.assert_array_equal(result.trace_tensors["v_cache_h0"], expected_v_cache)
     np.testing.assert_allclose(result.tensors["out"], decode_ref["out"], atol=1.0e-5, rtol=1.0e-5)
+
+
+def test_qllama_decode_emits_absolute_cache_scatter_addresses():
+    artifact, _, _, _ = build_llama_decode_artifact(
+        d_model=32,
+        d_head=16,
+        n_heads=2,
+        n_kv_heads=1,
+        ffn_hidden_dim=32,
+        prompt_len=7,
+        seed=0,
+    )
+
+    source = emit_cv32e40p_c(artifact, {}, program_name="unit_test_qllama_decode_scatter")
+
+    assert "static const int k_append_h0_scatter_addrs[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};" in source
+    assert "static const int v_append_h0_scatter_addrs[2] = {71, 79};" in source
+    assert "static const int v_append_h0_scatter_addrs[2] = {7, 15};" not in source
 
 
 def test_llama_two_block_prefill_decode_reuse_matches_full_sequence():
@@ -2679,6 +2787,31 @@ def test_npu_program_xform_rope_k16_isa_encoding():
     assert half_count == d_head // 16, f"half_count={half_count}, expected {d_head // 16}"
 
 
+def test_npu_program_xform_rope_k16_row_offset_encoding():
+    """Row-wise prefill RoPE XFORMs encode row-specific C-layout offsets."""
+    from tinynpu.isa import XformMode, Opcode
+
+    d_head = 16
+    row_index = 3
+    k_data = np.ones((8, d_head), dtype=np.int16) * 100
+    cs_data = make_rope_cos_sin_table_q14(d_head, position=row_index).reshape(1, d_head)
+
+    prog = TinyNPUProgram()
+    prog.declare_data("k", k_data, role="C")
+    prog.declare_data("cs", cs_data, role="C")
+    prog.xform_rope_k16("k", "cs", row_index=row_index)
+    prog.halt()
+    binary = prog.compile()
+
+    instr = binary["im"][0]
+    assert ((instr >> 252) & 0xF) == int(Opcode.XFORM)
+    assert ((instr >> 248) & 0xF) == int(XformMode.ROPE_K16)
+    encoded_src = (instr >> 232) & 0xFFFF
+    encoded_dest = (instr >> 216) & 0xFFFF
+    assert encoded_src == prog.symbols["k"].addr + row_index
+    assert encoded_dest == prog.symbols["k"].addr + row_index
+
+
 def test_npu_segment_with_rope_cs_python_simulation():
     """End-to-end test: matmul producing K, then XFORM ROPE_K16, using host emulation."""
     d_head = 16
@@ -2784,4 +2917,60 @@ def test_compile_plan_rewrites_host_rope_chain_to_xform():
     result = run_host_emulation(artifact, {"x": x}, verification=VerificationMode.OFF)
     assert "q_rope_q" in result.tensors
     diff = np.abs(np.asarray(result.tensors["q_rope_q"]).astype(np.int32).reshape(-1) - q_rope_ref.astype(np.int32).reshape(-1))
+    assert diff.max() <= 1
+
+
+def test_compile_plan_rewrites_prefill_rope_chain_to_row_xforms():
+    d_model = 8
+    d_head = 16
+    seq_len = 8
+    position = 2
+    theta = 10000.0
+    rng = np.random.default_rng(11)
+
+    x = rng.integers(-4, 5, size=(seq_len, d_model), dtype=np.int16)
+    w_q = rng.integers(-4, 5, size=(d_model, d_head), dtype=np.int16)
+
+    q_ref = np.clip(x.astype(np.int32) @ w_q.astype(np.int32), -32768, 32767).astype(np.int16)
+    q_rope_ref = np.zeros_like(q_ref)
+    for row in range(seq_len):
+        cs_ref = make_rope_cos_sin_table_q14(d_head, position + row, theta)
+        q_rope_ref[row] = _rope_rotate_half_q14(q_ref[row : row + 1], cs_ref)
+
+    tensors = {
+        "x": TensorSpec("x", x.shape, DType.INT16, TensorKind.INPUT),
+        "w_q": TensorSpec("w_q", w_q.shape, DType.INT16, TensorKind.CONSTANT, data=w_q),
+        "q_int": TensorSpec("q_int", (seq_len, d_head), DType.INT16, TensorKind.INTERMEDIATE),
+        "q_f": TensorSpec("q_f", (seq_len, d_head), DType.FLOAT32, TensorKind.INTERMEDIATE),
+        "q_rope_f": TensorSpec("q_rope_f", (seq_len, d_head), DType.FLOAT32, TensorKind.INTERMEDIATE),
+        "q_rope_q": TensorSpec("q_rope_q", (seq_len, d_head), DType.INT16, TensorKind.OUTPUT, is_final_output=True),
+    }
+    steps = [
+        NpuSegment("seg_q", [MatMulOp("op_q", "x", "w_q", "q_int")], inputs=["x", "w_q"], outputs=["q_int"]),
+        HostOp("dequant_q", "dequantize", inputs=["q_int"], outputs=["q_f"], attrs={"scale": 1.0 / 32.0, "zero_point": 0}),
+        HostOp("rope_q", "rope", inputs=["q_f"], outputs=["q_rope_f"], attrs={"head_dim": d_head, "position": position, "theta": theta}),
+        HostOp(
+            "quant_q_rope",
+            "quantize",
+            inputs=["q_rope_f"],
+            outputs=["q_rope_q"],
+            attrs={"scale": 1.0 / 32.0, "zero_point": 0, "dtype": DType.INT16},
+        ),
+    ]
+    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=["x"], outputs=["q_rope_q"])
+    plan.add_verification_step("q_rope_q", "q_rope_q")
+
+    artifact = compile_plan(plan, {"q_rope_q": q_rope_ref})
+
+    op = artifact.plan.steps[0].ops[0]
+    expected_cs_names = [f"q_rope_q__rope_cs_r{row}" for row in range(seq_len)]
+    assert op.out == "q_rope_q"
+    assert op.rope_cs_name is None
+    assert op.rope_cs_names == expected_cs_names
+    assert op.rope_row_indices == list(range(seq_len))
+    assert all(name in artifact.plan.tensors for name in expected_cs_names)
+    assert all(not (isinstance(step, HostOp) and step.name in {"dequant_q", "rope_q", "quant_q_rope"}) for step in artifact.plan.steps)
+
+    result = run_host_emulation(artifact, {"x": x}, verification=VerificationMode.OFF)
+    diff = np.abs(np.asarray(result.tensors["q_rope_q"]).astype(np.int32) - q_rope_ref.astype(np.int32))
     assert diff.max() <= 1

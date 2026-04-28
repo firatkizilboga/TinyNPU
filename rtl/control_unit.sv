@@ -280,6 +280,7 @@ module control_unit #(
     logic [$clog2(`ARRAY_SIZE)-1:0] cache_lane_idx;
     logic [`ADDR_WIDTH-1:0] mm_c_effective_base;
     logic [`BUFFER_WIDTH-1:0] xform_word_q_f16_i16;
+    logic [`BUFFER_WIDTH-1:0] xform_word_dq_i16_f16;
 
     function automatic logic signed [63:0] round_shift_right_signed(
         input logic signed [63:0] value,
@@ -373,8 +374,104 @@ module control_unit #(
         end
     endfunction
 
+    function automatic int unsigned msb_index_u32(
+        input logic [31:0] value
+    );
+        begin
+            msb_index_u32 = 0;
+            for (int bit_idx = 31; bit_idx >= 0; bit_idx--) begin
+                if (value[bit_idx]) begin
+                    msb_index_u32 = bit_idx;
+                    break;
+                end
+            end
+        end
+    endfunction
+
+    function automatic logic [63:0] round_shift_right_unsigned64(
+        input logic [63:0] value,
+        input int unsigned shift
+    );
+        begin
+            if (shift == 0) begin
+                round_shift_right_unsigned64 = value;
+            end else if (shift >= 64) begin
+                round_shift_right_unsigned64 = '0;
+            end else begin
+                round_shift_right_unsigned64 = (value + (64'd1 << (shift - 1))) >> shift;
+            end
+        end
+    endfunction
+
+    function automatic logic [15:0] dequantize_lane_i16_f16(
+        input logic signed [15:0] value,
+        input logic [15:0] multiplier,
+        input logic [7:0] shift
+    );
+        logic sign;
+        logic [15:0] magnitude;
+        logic [31:0] product;
+        logic [63:0] rounded;
+        logic [10:0] significand;
+        int unsigned msb;
+        int signed exp_unbiased;
+        int signed exp_half;
+        int signed normal_shift;
+        int signed subnormal_shift;
+        begin
+            if (value == 16'sd0 || multiplier == 16'd0) begin
+                dequantize_lane_i16_f16 = 16'h0000;
+            end else begin
+                sign = value[15];
+                magnitude = sign ? ((~value[15:0]) + 16'd1) : value[15:0];
+                product = {16'd0, magnitude} * {16'd0, multiplier};
+                msb = msb_index_u32(product);
+                exp_unbiased = int'(msb) - int'(shift);
+                exp_half = exp_unbiased + 15;
+
+                if (exp_half >= 31) begin
+                    dequantize_lane_i16_f16 = {sign, 5'h1e, 10'h3ff};
+                end else if (exp_half <= 0) begin
+                    // FP16 subnormal: mantissa = round(product * 2^(24 - shift)).
+                    subnormal_shift = int'(shift) - 24;
+                    if (subnormal_shift <= 0) begin
+                        rounded = {32'd0, product} << (-subnormal_shift);
+                    end else begin
+                        rounded = round_shift_right_unsigned64({32'd0, product}, subnormal_shift);
+                    end
+                    if (rounded == 64'd0) begin
+                        dequantize_lane_i16_f16 = 16'h0000;
+                    end else if (rounded >= 64'd1024) begin
+                        dequantize_lane_i16_f16 = {sign, 5'd1, 10'd0};
+                    end else begin
+                        dequantize_lane_i16_f16 = {sign, 5'd0, rounded[9:0]};
+                    end
+                end else begin
+                    normal_shift = int'(msb) - 10;
+                    if (normal_shift >= 0) begin
+                        rounded = round_shift_right_unsigned64({32'd0, product}, normal_shift);
+                    end else begin
+                        rounded = {32'd0, product} << (-normal_shift);
+                    end
+                    if (rounded >= 64'd2048) begin
+                        exp_half = exp_half + 1;
+                        significand = 11'd1024;
+                    end else begin
+                        significand = rounded[10:0];
+                    end
+                    if (exp_half >= 31) begin
+                        dequantize_lane_i16_f16 = {sign, 5'h1e, 10'h3ff};
+                    end else begin
+                        dequantize_lane_i16_f16 = {sign, exp_half[4:0], significand[9:0]};
+                    end
+                end
+            end
+        end
+    endfunction
+
     always_comb begin
         xform_word_q_f16_i16 = ub_rdata_reg;
+        xform_word_dq_i16_f16 = ub_rdata_reg;
         for (int lane = 0; lane < `ARRAY_SIZE; lane++) begin
             xform_word_q_f16_i16[lane*16 +: 16] =
                 quantize_lane_q_f16_i16(
@@ -383,12 +480,22 @@ module control_unit #(
                     xform_shift
                 );
         end
+        if (xform_mode == XFORM_MODE_DQ_I16_F16) begin
+            for (int lane = 0; lane < `ARRAY_SIZE; lane++) begin
+                xform_word_dq_i16_f16[lane*16 +: 16] =
+                    dequantize_lane_i16_f16(
+                        $signed(ub_rdata_reg[lane*16 +: 16]),
+                        xform_multiplier,
+                        xform_shift
+                    );
+            end
+        end
     end
 
     // --- RoPE INT16 Q14 rotation combinational ---
     // Valid during CTRL_EXEC_XFORM phase 4 (ub_rdata_reg = sin word).
-    // rope_k_lo_rot_w[j] = clip_i16((K_lo[j]*cos[j] - K_hi[j]*sin[j]) >> 14)
-    // rope_k_hi_rot_w[j] = clip_i16((K_hi[j]*cos[j] + K_lo[j]*sin[j]) >> 14)
+    // rope_k_lo_rot_w[j] = clip_i16((K_lo[j]*cos[j] - K_hi[j]*sin[j] + 2^13) >> 14)
+    // rope_k_hi_rot_w[j] = clip_i16((K_hi[j]*cos[j] + K_lo[j]*sin[j] + 2^13) >> 14)
     logic [`BUFFER_WIDTH-1:0] rope_k_lo_rot_w;
     logic [`BUFFER_WIDTH-1:0] rope_k_hi_rot_w;
 
@@ -404,8 +511,8 @@ module control_unit #(
             sin_v   = $signed(ub_rdata_reg[rj*16 +: 16]); // sin valid in phase 4
             lo_prod = klo_v * cos_v - khi_v * sin_v;
             hi_prod = khi_v * cos_v + klo_v * sin_v;
-            rope_k_lo_rot_w[rj*16 +: 16] = clip_i16($signed(lo_prod) >>> 14);
-            rope_k_hi_rot_w[rj*16 +: 16] = clip_i16($signed(hi_prod) >>> 14);
+            rope_k_lo_rot_w[rj*16 +: 16] = clip_i16($signed(lo_prod + 32'sd8192) >>> 14);
+            rope_k_hi_rot_w[rj*16 +: 16] = clip_i16($signed(hi_prod + 32'sd8192) >>> 14);
         end
     end
 
@@ -696,6 +803,7 @@ module control_unit #(
           ub_wr_en = 1'b1;
           unique case (xform_mode)
             XFORM_MODE_Q_F16_I16: ub_wdata = xform_word_q_f16_i16;
+            XFORM_MODE_DQ_I16_F16: ub_wdata = xform_word_dq_i16_f16;
             default: ub_wdata = ub_rdata_reg;
           endcase
           xform_src_next = xform_src + 1;

@@ -12,9 +12,9 @@ if str(ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(ROOT / "scripts"))
 
 from tinynpu_jit import emit_cv32e40p_program_v2  # noqa: E402
+from tinynpu_jit.rtl_runner import RunnerConfig, build_v2_elf_and_hex, run_vlt_npu  # noqa: E402
 from software.workload.mnist_mlp_feature_benchmark import build_compiled_artifact_from_run as build_mlp_artifact  # noqa: E402
 from software.workload.mnist_tinynpu_pipeline import build_compiled_artifact_from_run as build_conv_artifact  # noqa: E402
-from run_cv32e40p_b_append_demo import RunnerConfig, build_v2_elf_and_hex, run_vlt_npu  # noqa: E402
 from run_cv32e40p_gpt2_two_block_reuse_jit_demo import build_artifact as build_gpt2_two_block_artifact  # noqa: E402
 
 

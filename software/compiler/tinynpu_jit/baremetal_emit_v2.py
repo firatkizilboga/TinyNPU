@@ -24,6 +24,12 @@ _DTYPE_TO_ENUM = {
     DType.FLOAT32: "TNPU_DTYPE_FLOAT32",
 }
 
+_VALUE_ENCODING_TO_ENUM = {
+    "": "TNPU_VALUE_ENCODING_RAW",
+    "raw": "TNPU_VALUE_ENCODING_RAW",
+    "fp16_bits": "TNPU_VALUE_ENCODING_FP16_BITS",
+}
+
 _HOST_KIND_ENUM = {
     "alias": "TNPU_HOST_ALIAS",
     "relu": "TNPU_HOST_RELU",
@@ -225,6 +231,9 @@ def emit_cv32e40p_program_v2(
                 zero_point=int(spec.metadata.get("runtime_input_zero_point", 0)),
             )
         value_encoding = str(spec.metadata.get("value_encoding", ""))
+        value_encoding_enum = _VALUE_ENCODING_TO_ENUM.get(value_encoding)
+        if value_encoding_enum is None:
+            raise NotImplementedError(f"Unsupported tensor value_encoding={value_encoding!r} for {spec.name}.")
         if initial is not None and value_encoding == "fp16_bits" and np.issubdtype(np.asarray(initial).dtype, np.floating):
             initial = _float32_to_fp16_bits_array(np.asarray(initial))
         elem_count = int(np.prod(spec.shape, dtype=np.int64)) if spec.shape else 1
@@ -248,6 +257,7 @@ def emit_cv32e40p_program_v2(
         tensor_entries.append(
             "    {"
             f'.name = "{key}", .data = {storage_name}, .dtype = {dtype_enum}, .rank = {len(spec.shape) if spec.shape else 1}, '
+            f".value_encoding = {value_encoding_enum}, "
             f".shape = {{{shape4[0]}, {shape4[1]}, {shape4[2]}, {shape4[3]}}}, .elem_count = {elem_count}"
             "}"
         )
@@ -379,6 +389,8 @@ def emit_cv32e40p_program_v2(
         if source_spec.dtype != DType.INT16:
             continue
         if output_spec.dtype != DType.FLOAT32:
+            continue
+        if str(step.attrs.get("output_encoding", "")) == "fp16_bits":
             continue
         absorbed_dequantize_by_input[source_name] = step
 
@@ -561,6 +573,8 @@ def emit_cv32e40p_program_v2(
             if step.kind in {"dequantize", "requantize"}:
                 attrs_f32[0] = float(step.attrs["scale"])
                 attrs_i32[0] = int(step.attrs.get("zero_point", 0))
+                if step.kind == "dequantize":
+                    attrs_i32[1] = 1 if str(step.attrs.get("output_encoding", "")) == "fp16_bits" else 0
             elif step.kind == "quantize":
                 attrs_f32[0] = 1.0 / float(step.attrs["scale"])
                 attrs_i32[0] = int(step.attrs.get("zero_point", 0))

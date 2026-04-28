@@ -124,10 +124,11 @@ class CompilerQuantize(nn.Module):
 
 
 class CompilerDequantize(nn.Module):
-    def __init__(self, *, scale: float, zero_point: int = 0):
+    def __init__(self, *, scale: float, zero_point: int = 0, output_encoding: str = "float32"):
         super().__init__()
         self.scale = float(scale)
         self.zero_point = int(zero_point)
+        self.output_encoding = str(output_encoding)
 
     def forward(self, x):
         return x

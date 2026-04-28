@@ -60,12 +60,18 @@ typedef enum {
     TNPU_OP_VERIFY = 4,
 } TnpuOpKind;
 
+typedef enum {
+    TNPU_VALUE_ENCODING_RAW = 0,
+    TNPU_VALUE_ENCODING_FP16_BITS = 1,
+} TnpuValueEncoding;
+
 typedef struct {
     const char *name;
     void *data;
     uint8_t dtype;
     uint8_t rank;
-    uint16_t reserved0;
+    uint8_t value_encoding;
+    uint8_t reserved0;
     int shape[4];
     int elem_count;
 } TnpuTensorDesc;

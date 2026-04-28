@@ -68,11 +68,17 @@ enum {
     HOST_ACT_H_GELU = 3,
 };
 
+enum {
+    TINY_VALUE_ENCODING_RAW = 0,
+    TINY_VALUE_ENCODING_FP16_BITS = 1,
+};
+
 typedef struct {
     const char *name;
     void *data;
     TinyDType dtype;
     int rank;
+    int value_encoding;
     int shape[4];
     int elem_count;
 } TinyTensor;
@@ -164,6 +170,7 @@ static void runtime_assert(int condition, const char *message)
 static float host_absf(float x);
 static int32_t host_round_to_i32(float x);
 static int64_t host_round_to_i64(float x);
+static float host_fp16_bits_to_float32(uint16_t bits);
 
 static int32_t *tensor_i32(const TinyTensor *tensor)
 {
@@ -226,7 +233,15 @@ static float tensor_get_float(const TinyTensor *tensor, int linear)
     if (tensor->dtype == TINY_DTYPE_FLOAT32) {
         return tensor_f32(tensor)[linear];
     }
+    if (tensor->value_encoding == TINY_VALUE_ENCODING_FP16_BITS) {
+        return host_fp16_bits_to_float32((uint16_t)tensor_i32(tensor)[linear]);
+    }
     return (float)tensor_i32(tensor)[linear];
+}
+
+static int tensor_is_float_compatible(const TinyTensor *tensor)
+{
+    return tensor->dtype == TINY_DTYPE_FLOAT32 || tensor->value_encoding == TINY_VALUE_ENCODING_FP16_BITS;
 }
 
 static int32_t tensor_get_i32(const TinyTensor *tensor, int linear)
@@ -654,6 +669,35 @@ static void host_quantize_fp16bits_attr(TinyTensor *dst, const TinyTensor *src, 
     host_quantize_fp16bits(dst, src, inv_scale, zero_point);
 }
 
+static float host_fp16_bits_to_float32(uint16_t bits)
+{
+    union {
+        uint32_t u;
+        float f;
+    } out;
+    uint32_t sign = ((uint32_t)bits & 0x8000u) << 16;
+    uint32_t exp = ((uint32_t)bits >> 10) & 0x1Fu;
+    uint32_t mant = (uint32_t)bits & 0x03FFu;
+    if (exp == 0u) {
+        if (mant == 0u) {
+            out.u = sign;
+        } else {
+            exp = 1u;
+            while ((mant & 0x0400u) == 0u) {
+                mant <<= 1;
+                exp -= 1u;
+            }
+            mant &= 0x03FFu;
+            out.u = sign | ((exp + 112u) << 23) | (mant << 13);
+        }
+    } else if (exp == 0x1Fu) {
+        out.u = sign | 0x7F800000u | (mant << 13);
+    } else {
+        out.u = sign | ((exp + 112u) << 23) | (mant << 13);
+    }
+    return out.f;
+}
+
 static void host_quantize_fp16bits(TinyTensor *dst, const TinyTensor *src, float inv_scale, int zero_point)
 {
     runtime_assert(inv_scale > 0.0f, "quantize inv_scale must be positive");
@@ -661,32 +705,8 @@ static void host_quantize_fp16bits(TinyTensor *dst, const TinyTensor *src, float
     runtime_assert(dst->elem_count == src->elem_count, "quantize size mismatch");
     for (int i = 0; i < src->elem_count; ++i) {
         uint16_t bits = (uint16_t)tensor_get_i32(src, i);
-        union {
-            uint32_t u;
-            float f;
-        } out;
-        uint32_t sign = ((uint32_t)bits & 0x8000u) << 16;
-        uint32_t exp = ((uint32_t)bits >> 10) & 0x1Fu;
-        uint32_t mant = (uint32_t)bits & 0x03FFu;
-        if (exp == 0u) {
-            if (mant == 0u) {
-                out.u = sign;
-            } else {
-                exp = 1u;
-                while ((mant & 0x0400u) == 0u) {
-                    mant <<= 1;
-                    exp -= 1u;
-                }
-                mant &= 0x03FFu;
-                out.u = sign | ((exp + 112u) << 23) | (mant << 13);
-            }
-        } else if (exp == 0x1Fu) {
-            out.u = sign | 0x7F800000u | (mant << 13);
-        } else {
-            out.u = sign | ((exp + 112u) << 23) | (mant << 13);
-        }
         {
-            int32_t quantized = host_round_to_i32(out.f * inv_scale) + zero_point;
+            int32_t quantized = host_round_to_i32(host_fp16_bits_to_float32(bits) * inv_scale) + zero_point;
             tensor_set_i32(dst, i, clip_for_dtype((int64_t)quantized, dst->dtype));
         }
     }
@@ -1061,7 +1081,7 @@ static void host_mul(TinyTensor *dst, const TinyTensor *lhs, const TinyTensor *r
     int rhs_idx[4] = {0, 0, 0, 0};
 
     runtime_assert(dst->dtype == TINY_DTYPE_FLOAT32, "mul expects float output");
-    runtime_assert(lhs->dtype == TINY_DTYPE_FLOAT32 && rhs->dtype == TINY_DTYPE_FLOAT32, "mul expects float inputs");
+    runtime_assert(tensor_is_float_compatible(lhs) && tensor_is_float_compatible(rhs), "mul expects float-compatible inputs");
     for (int linear = 0; linear < dst->elem_count; ++linear) {
         tensor_unravel(dst, linear, out_idx);
         for (int axis = 0; axis < 4; ++axis) {
@@ -1090,7 +1110,7 @@ static void host_add(TinyTensor *dst, const TinyTensor *lhs, const TinyTensor *r
     int rhs_idx[4] = {0, 0, 0, 0};
 
     runtime_assert(dst->dtype == TINY_DTYPE_FLOAT32, "add expects float output");
-    runtime_assert(lhs->dtype == TINY_DTYPE_FLOAT32 && rhs->dtype == TINY_DTYPE_FLOAT32, "add expects float inputs");
+    runtime_assert(tensor_is_float_compatible(lhs) && tensor_is_float_compatible(rhs), "add expects float-compatible inputs");
     for (int linear = 0; linear < dst->elem_count; ++linear) {
         tensor_unravel(dst, linear, out_idx);
         for (int axis = 0; axis < 4; ++axis) {
@@ -1656,7 +1676,6 @@ static void host_rope_precomputed(
     }
 
     float *dst_data = tensor_f32(dst);
-    float *src_data = tensor_f32(src);
     for (int outer_idx = 0; outer_idx < outer; ++outer_idx) {
         for (int seq_idx = 0; seq_idx < seq_len; ++seq_idx) {
             const int logical_pos = position + seq_idx;
@@ -1666,8 +1685,8 @@ static void host_rope_precomputed(
                 const float angle = (float)logical_pos * inv_freq;
                 const float c = cosf(angle);
                 const float s = sinf(angle);
-                const float first = src_data[base + i];
-                const float second = src_data[base + half + i];
+                const float first = tensor_get_float(src, base + i);
+                const float second = tensor_get_float(src, base + half + i);
                 dst_data[base + i] = first * c - second * s;
                 dst_data[base + half + i] = second * c + first * s;
             }
@@ -1912,7 +1931,6 @@ static void host_rope(TinyTensor *dst, const TinyTensor *src, int head_dim, int 
     }
 
     float *dst_data = tensor_f32(dst);
-    float *src_data = tensor_f32(src);
     if (host_rope_cache_prepare(head_dim, theta, position + seq_len - 1)) {
         for (int outer_idx = 0; outer_idx < outer; ++outer_idx) {
             for (int seq_idx = 0; seq_idx < seq_len; ++seq_idx) {
@@ -1923,8 +1941,8 @@ static void host_rope(TinyTensor *dst, const TinyTensor *src, int head_dim, int 
                 for (int i = 0; i < half; ++i) {
                     float c = cos_row[i];
                     float s = sin_row[i];
-                    float first = src_data[base + i];
-                    float second = src_data[base + half + i];
+                    float first = tensor_get_float(src, base + i);
+                    float second = tensor_get_float(src, base + half + i);
                     dst_data[base + i] = first * c - second * s;
                     dst_data[base + half + i] = second * c + first * s;
                 }
@@ -1961,8 +1979,8 @@ static void host_rope(TinyTensor *dst, const TinyTensor *src, int head_dim, int 
                 for (int i = 0; i < half; ++i) {
                     float c = cur_cos[i];
                     float s = cur_sin[i];
-                    float first = src_data[base + i];
-                    float second = src_data[base + half + i];
+                    float first = tensor_get_float(src, base + i);
+                    float second = tensor_get_float(src, base + half + i);
                     dst_data[base + i] = first * c - second * s;
                     dst_data[base + half + i] = second * c + first * s;
                 }
@@ -1979,7 +1997,7 @@ static void host_rope(TinyTensor *dst, const TinyTensor *src, int head_dim, int 
     }
 }
 
-static void host_rope_k16_q14(TinyTensor *dst, const TinyTensor *src, const TinyTensor *cs)
+static void host_rope_k16_q14_row(TinyTensor *dst, const TinyTensor *src, const TinyTensor *cs, int row)
 {
     runtime_assert(dst->dtype == TINY_DTYPE_INT16, "rope_k16_q14 output must be INT16");
     runtime_assert(src->dtype == TINY_DTYPE_INT16, "rope_k16_q14 input must be INT16");
@@ -1993,21 +2011,30 @@ static void host_rope_k16_q14(TinyTensor *dst, const TinyTensor *src, const Tiny
     const int head_dim = src->shape[src->rank - 1];
     const int half = head_dim / 2;
     const int rows = src->elem_count / head_dim;
+    runtime_assert(row >= 0 && row < rows, "rope_k16_q14 row out of range");
 
+    const int base = row * head_dim;
+    for (int i = 0; i < half; ++i) {
+        const int32_t first = tensor_get_i32(src, base + i);
+        const int32_t second = tensor_get_i32(src, base + half + i);
+        const int32_t c = tensor_get_i32(cs, i);
+        const int32_t s = tensor_get_i32(cs, half + i);
+        const int32_t lo = (first * c - second * s + (1 << 13)) >> 14;
+        const int32_t hi = (second * c + first * s + (1 << 13)) >> 14;
+        const int32_t lo_clip = lo < -32768 ? -32768 : (lo > 32767 ? 32767 : lo);
+        const int32_t hi_clip = hi < -32768 ? -32768 : (hi > 32767 ? 32767 : hi);
+        tensor_set_i32(dst, base + i, lo_clip);
+        tensor_set_i32(dst, base + half + i, hi_clip);
+    }
+}
+
+static void host_rope_k16_q14(TinyTensor *dst, const TinyTensor *src, const TinyTensor *cs)
+{
+    runtime_assert(src->rank >= 2, "rope_k16_q14 expects rank >= 2");
+    const int head_dim = src->shape[src->rank - 1];
+    const int rows = src->elem_count / head_dim;
     for (int row = 0; row < rows; ++row) {
-        const int base = row * head_dim;
-        for (int i = 0; i < half; ++i) {
-            const int32_t first = tensor_get_i32(src, base + i);
-            const int32_t second = tensor_get_i32(src, base + half + i);
-            const int32_t c = tensor_get_i32(cs, i);
-            const int32_t s = tensor_get_i32(cs, half + i);
-            const int32_t lo = (first * c - second * s) >> 14;
-            const int32_t hi = (second * c + first * s) >> 14;
-            const int32_t lo_clip = lo < -32768 ? -32768 : (lo > 32767 ? 32767 : lo);
-            const int32_t hi_clip = hi < -32768 ? -32768 : (hi > 32767 ? 32767 : hi);
-            tensor_set_i32(dst, base + i, lo_clip);
-            tensor_set_i32(dst, base + half + i, hi_clip);
-        }
+        host_rope_k16_q14_row(dst, src, cs, row);
     }
 }
 
@@ -2267,45 +2294,11 @@ static int32_t host_round_shift_i64_to_i32(int64_t value, int32_t shift)
         return (int32_t)value;
     }
     runtime_assert(shift < 64, "64-bit rounded shift requires shift < 64");
-    runtime_assert(value != INT64_MIN, "64-bit rounded shift does not support INT64_MIN");
-
-    int negative = value < 0;
-    HostI64Bits bits = {.s64 = negative ? -value : value};
-    uint32_t lo = bits.words.lo;
-    uint32_t hi = (uint32_t)bits.words.hi;
-    int round_shift = shift - 1;
-
-    if (round_shift < 32) {
-        uint32_t add_lo = 1u << round_shift;
-        uint32_t prev_lo = lo;
-        lo += add_lo;
-        if (lo < prev_lo) {
-            hi += 1u;
-        }
-    } else {
-        hi += 1u << (round_shift - 32);
-    }
-
-    uint32_t out_lo = 0u;
-    uint32_t out_hi = 0u;
-    if (shift < 32) {
-        out_lo = (lo >> shift) | (hi << (32 - shift));
-        out_hi = hi >> shift;
-    } else if (shift == 32) {
-        out_lo = hi;
-    } else {
-        out_lo = hi >> (shift - 32);
-    }
-
-    if (!negative) {
-        runtime_assert(out_hi == 0u && out_lo <= 0x7fffffffu, "requantized value overflow");
-        return (int32_t)out_lo;
-    }
-    runtime_assert(out_hi == 0u && out_lo <= 0x80000000u, "requantized value overflow");
-    if (out_lo == 0x80000000u) {
-        return INT32_MIN;
-    }
-    return -(int32_t)out_lo;
+    const int64_t rounder = (int64_t)1 << (shift - 1);
+    runtime_assert(value <= INT64_MAX - rounder, "requantized value overflow");
+    int64_t shifted = (value + rounder) >> shift;
+    runtime_assert(shifted >= (int64_t)INT32_MIN && shifted <= (int64_t)INT32_MAX, "requantized value overflow");
+    return (int32_t)shifted;
 }
 
 static int32_t host_di_exp(int32_t x_in, int32_t m_i, int32_t k_i)

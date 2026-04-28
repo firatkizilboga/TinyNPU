@@ -309,7 +309,7 @@ class SimulatorExecutor:
                     expected = artifact.expected_tensors[step.tensor_name]
                     actual = values[step.tensor_name]
                     if np.issubdtype(actual.dtype, np.floating) or np.issubdtype(expected.dtype, np.floating):
-                        matches = np.allclose(actual, expected, rtol=1e-5, atol=1e-6)
+                        matches = np.allclose(actual, expected, rtol=1e-5, atol=step.float_atol)
                     else:
                         matches = np.array_equal(actual, expected)
                     if not matches:

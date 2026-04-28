@@ -9,6 +9,7 @@ import numpy as np
 from .golden import GoldenModel
 from .ir import DType, HostOp
 from .runtime_approx import (
+    dequantize_i16_to_fp16_bits_xform as _dequantize_i16_to_fp16_bits_xform,
     quantize_fp16_bits_to_i16_xform as _quantize_fp16_bits_to_i16_xform,
     rmsnorm_approx as _rmsnorm_runtime_approx,
     sigmoid_approx as _sigmoid_runtime_approx,
@@ -241,7 +242,7 @@ def _validate_slice_row(step: HostOp) -> None:
 
 def _softmax_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
     axis = int(step.attrs.get("axis", -1))
-    values[step.outputs[0]] = golden.softmax(values[step.inputs[0]], axis=axis)
+    values[step.outputs[0]] = golden.softmax(_input_as_float32(step, values, 0), axis=axis)
 
 
 def _softmax_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
@@ -259,7 +260,7 @@ def _softmax_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str
 
 def _softmax_f16_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
     axis = int(step.attrs.get("axis", -1))
-    probs = _softmax_f16_runtime_approx(values[step.inputs[0]], axis=axis)
+    probs = _softmax_f16_runtime_approx(_input_as_float32(step, values, 0), axis=axis)
     probs_f16_bits = probs.astype(np.float16).view(np.uint16).astype(np.int16)
     values[step.outputs[0]] = probs_f16_bits
 
@@ -524,6 +525,29 @@ def _fp16_bits_to_float32_array(value: np.ndarray) -> np.ndarray:
     return bits.view(np.float16).astype(np.float32)
 
 
+def _input_encoding(step: HostOp, index: int) -> str:
+    role_keys = ("lhs_encoding", "rhs_encoding") if index < 2 else ()
+    keys = (
+        *role_keys[index : index + 1],
+        f"input{index}_encoding",
+        f"input_{index}_encoding",
+    )
+    if index == 0:
+        keys = (*keys, "input_encoding")
+    for key in keys:
+        encoding = str(step.attrs.get(key, ""))
+        if encoding:
+            return encoding
+    return ""
+
+
+def _input_as_float32(step: HostOp, values: dict[str, np.ndarray], index: int) -> np.ndarray:
+    raw = np.asarray(values[step.inputs[index]])
+    if _input_encoding(step, index) == "fp16_bits":
+        return _fp16_bits_to_float32_array(raw)
+    return raw.astype(np.float32)
+
+
 def _host_exp_approx_scalar(x: float) -> float:
     exp_neg_int = (
         1.0,
@@ -640,6 +664,13 @@ def _quantize_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[st
 
 
 def _dequantize_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
+    if str(step.attrs.get("output_encoding", "")) == "fp16_bits":
+        values[step.outputs[0]] = _dequantize_i16_to_fp16_bits_xform(
+            values[step.inputs[0]],
+            scale=float(step.attrs["scale"]),
+            zero_point=int(step.attrs.get("zero_point", 0)),
+        )
+        return
     values[step.outputs[0]] = golden.dequantize(
         values[step.inputs[0]],
         scale=float(step.attrs["scale"]),
@@ -760,7 +791,7 @@ def _v_cache_scatter_matrix_benchmark(step: HostOp, values: dict[str, np.ndarray
 
 
 def _silu_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
-    source = np.asarray(values[step.inputs[0]], dtype=np.float32)
+    source = _input_as_float32(step, values, 0)
     values[step.outputs[0]] = _silu_runtime_approx(source)
 
 
@@ -932,8 +963,8 @@ def _requantize_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[
 
 
 def _rmsnorm_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
-    x = np.asarray(values[step.inputs[0]], dtype=np.float32)
-    weight = np.asarray(values[step.inputs[1]], dtype=np.float32).reshape(-1)
+    x = _input_as_float32(step, values, 0)
+    weight = _input_as_float32(step, values, 1).reshape(-1)
     eps = np.float32(step.attrs.get("eps", 1.0e-6))
     values[step.outputs[0]] = _rmsnorm_runtime_approx(x, weight, float(eps))
 
@@ -989,8 +1020,8 @@ def _layernorm_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[s
 
 
 def _mul_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
-    lhs = np.asarray(values[step.inputs[0]], dtype=np.float32)
-    rhs = np.asarray(values[step.inputs[1]], dtype=np.float32)
+    lhs = _input_as_float32(step, values, 0)
+    rhs = _input_as_float32(step, values, 1)
     values[step.outputs[0]] = (lhs * rhs).astype(np.float32)
 
 
@@ -1005,8 +1036,8 @@ def _mul_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, An
 
 
 def _add_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
-    lhs = np.asarray(values[step.inputs[0]], dtype=np.float32)
-    rhs = np.asarray(values[step.inputs[1]], dtype=np.float32)
+    lhs = _input_as_float32(step, values, 0)
+    rhs = _input_as_float32(step, values, 1)
     values[step.outputs[0]] = (lhs + rhs).astype(np.float32)
 
 
@@ -1021,7 +1052,7 @@ def _add_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, An
 
 
 def _causal_mask_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
-    source = np.asarray(values[step.inputs[0]])
+    source = _input_as_float32(step, values, 0) if _input_encoding(step, 0) == "fp16_bits" else np.asarray(values[step.inputs[0]])
     if source.ndim < 2:
         raise ValueError(f"causal_mask expects rank >= 2, got rank {source.ndim}.")
     out = np.array(source, copy=True)
@@ -1089,7 +1120,7 @@ def _slice_row_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[s
 
 
 def _rope_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
-    x = np.asarray(values[step.inputs[0]], dtype=np.float32)
+    x = _input_as_float32(step, values, 0)
     out = np.array(x, copy=True)
     head_dim = int(step.attrs["head_dim"])
     position = int(step.attrs.get("position", 0))

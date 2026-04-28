@@ -81,10 +81,11 @@ static inline int tnpu_precision_to_packed_count(int precision)
     return 0;
 }
 
-#define TNPU_XFORM_SCRATCH_IM_ADDR 0x87F8u
+#define TNPU_XFORM_SCRATCH_IM_ADDR (TINY_IM_BASE_ADDR + 0x03F8u)
 #define TNPU_ISA_OP_XFORM 0x4u
-#define TNPU_ISA_OP_HALT 0x2u
+#define TNPU_ISA_OP_HALT 0x1u
 #define TNPU_XFORM_MODE_Q_F16_I16 0x1u
+#define TNPU_XFORM_MODE_DQ_I16_F16 0x2u
 
 static inline uint16_t tnpu_float32_to_fp16_bits(float value)
 {
@@ -141,6 +142,17 @@ static inline uint16_t tnpu_float32_to_fp16_bits(float value)
     }
 }
 
+static void host_dequantize_fp16bits(TinyTensor *dst, const TinyTensor *src, float scale, int zero_point)
+{
+    runtime_assert(scale > 0.0f, "dequantize fp16bits scale must be positive");
+    runtime_assert(dst->dtype != TINY_DTYPE_FLOAT32, "dequantize fp16bits output must be integer storage");
+    runtime_assert(dst->elem_count == src->elem_count, "dequantize fp16bits size mismatch");
+    for (int i = 0; i < src->elem_count; ++i) {
+        const float value = ((float)(tensor_get_i32(src, i) - zero_point)) * scale;
+        tensor_set_i32(dst, i, (int16_t)tnpu_float32_to_fp16_bits(value));
+    }
+}
+
 static void tnpu_write_tensor_a_f16bits_from_float(
     const TinyTensor *tensor,
     uint16_t base_addr,
@@ -191,8 +203,9 @@ static inline void tnpu_pack_field_u32(uint32_t words[8], uint16_t lsb, uint8_t 
     }
 }
 
-static void tnpu_pack_xform_q_f16_i16_words(
+static void tnpu_pack_xform_words(
     uint32_t words[8],
+    uint8_t mode,
     uint16_t src,
     uint16_t dst,
     uint16_t count,
@@ -201,7 +214,7 @@ static void tnpu_pack_xform_q_f16_i16_words(
 {
     memset(words, 0, sizeof(uint32_t) * 8u);
     tnpu_pack_field_u32(words, 252, 4, TNPU_ISA_OP_XFORM);
-    tnpu_pack_field_u32(words, 248, 4, TNPU_XFORM_MODE_Q_F16_I16);
+    tnpu_pack_field_u32(words, 248, 4, mode);
     tnpu_pack_field_u32(words, 232, 16, src);
     tnpu_pack_field_u32(words, 216, 16, dst);
     tnpu_pack_field_u32(words, 200, 16, count);
@@ -225,7 +238,7 @@ static void tnpu_run_xform_q_f16_i16(
     uint32_t xform_words[8];
     uint32_t halt_words[8];
 
-    tnpu_pack_xform_q_f16_i16_words(xform_words, src_addr, dst_addr, count, multiplier, shift);
+    tnpu_pack_xform_words(xform_words, TNPU_XFORM_MODE_Q_F16_I16, src_addr, dst_addr, count, multiplier, shift);
     tnpu_pack_halt_words(halt_words);
     npu_write_mem_word(TNPU_XFORM_SCRATCH_IM_ADDR + 0u, &xform_words[0]);
     npu_write_mem_word(TNPU_XFORM_SCRATCH_IM_ADDR + 1u, &xform_words[4]);
@@ -464,7 +477,7 @@ static void tnpu_read_tensor_c_int16_fast(
                 (uint16_t)(addr + (mt * n_tiles * TNPU_ARRAY_SIZE) + (nt * TNPU_ARRAY_SIZE));
             for (int row_in_tile = 0; row_in_tile < TNPU_ARRAY_SIZE; ++row_in_tile) {
                 runtime_assert(
-                    npu_read_mem_word((uint16_t)(tile_addr + row_in_tile), chunks, 2) == 0,
+                    npu_read_mem_word_mmio((uint16_t)(tile_addr + row_in_tile), chunks) == 0,
                     "readback failed");
                 for (int lane = 0; lane < TNPU_ARRAY_SIZE; ++lane) {
                     const int row_idx = mt * TNPU_ARRAY_SIZE + row_in_tile;
@@ -624,7 +637,11 @@ static int tnpu_execute_host_op(TinyTensor *runtime_tensors, const TnpuHostOp *o
             }
             return 0;
         case TNPU_HOST_DEQUANTIZE:
-            host_dequantize(out, in, op->attrs_f32[0], op->attrs_i32[0]);
+            if (op->attrs_i32[1] != 0) {
+                host_dequantize_fp16bits(out, in, op->attrs_f32[0], op->attrs_i32[0]);
+            } else {
+                host_dequantize(out, in, op->attrs_f32[0], op->attrs_i32[0]);
+            }
             return 0;
         case TNPU_HOST_REQUANTIZE:
             host_requantize(out, in, op->attrs_f32[0], op->attrs_i32[0]);
@@ -1047,6 +1064,7 @@ static TinyTensor *tnpu_prepare_runtime_tensors(
         dst->data = src->data;
         dst->dtype = (TinyDType)src->dtype;
         dst->rank = (int)src->rank;
+        dst->value_encoding = (int)src->value_encoding;
         dst->shape[0] = src->shape[0];
         dst->shape[1] = src->shape[1];
         dst->shape[2] = src->shape[2];

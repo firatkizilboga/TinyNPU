@@ -24,6 +24,7 @@ from .memory_planner import (
     infer_roles,
     plan_program_memory,
 )
+from .runtime_approx import choose_xform_i16_f16_scale_params
 
 
 _NPU_DATA_DTYPES = {DType.INT4, DType.INT8, DType.INT16}
@@ -72,6 +73,16 @@ def _build_producer_by_output(plan: ExecutionPlan) -> dict[str, HostOp]:
     return producer_by_output
 
 
+def _build_segment_producer_by_output(plan: ExecutionPlan) -> dict[str, tuple[NpuSegment, MatMulOp]]:
+    producer_by_output: dict[str, tuple[NpuSegment, MatMulOp]] = {}
+    for step in plan.steps:
+        if not isinstance(step, NpuSegment):
+            continue
+        for op in step.ops:
+            producer_by_output[op.out] = (step, op)
+    return producer_by_output
+
+
 def _replace_segment_output(segment: NpuSegment, old_name: str, new_name: str) -> None:
     segment.outputs = [new_name if name == old_name else name for name in segment.outputs]
 
@@ -97,6 +108,7 @@ def _replace_tensor_uses(plan: ExecutionPlan, old_name: str, new_name: str) -> N
                     op.bias = new_name
                 if op.rope_cs_name == old_name:
                     op.rope_cs_name = new_name
+                op.rope_cs_names = [new_name if name == old_name else name for name in op.rope_cs_names]
         elif isinstance(step, VerifyTensor) and step.tensor_name == old_name:
             step.tensor_name = new_name
     plan.inputs = [new_name if name == old_name else name for name in plan.inputs]
@@ -112,7 +124,7 @@ def _can_lower_rope_pattern(
     quant: HostOp,
     use_counts: dict[str, int],
 ) -> bool:
-    if producer_op.rope_cs_name is not None:
+    if producer_op.rope_xforms():
         return False
     if producer_op.in_dtype != DType.INT16 or producer_op.out_dtype != DType.INT16:
         return False
@@ -162,8 +174,12 @@ def _can_lower_rope_pattern(
         return False
     if len(source_spec.shape) < 2:
         return False
-    seq_len = source_spec.shape[0] if len(source_spec.shape) == 2 else source_spec.shape[-2]
-    if seq_len != 1:
+    if len(source_spec.shape) != 2:
+        # The hardware XFORM is defined for row-wise C-layout matrices. Keep
+        # higher-rank host RoPE until lowering owns those layout semantics.
+        return False
+    seq_len = source_spec.shape[0]
+    if seq_len <= 0:
         return False
     return True
 
@@ -198,17 +214,32 @@ def rewrite_host_rope_patterns(plan: ExecutionPlan) -> None:
                 segment, producer_op = producer
                 if _can_lower_rope_pattern(plan, producer_op, source_name, dequant, rope, quant, use_counts):
                     target_name = quant.outputs[0]
-                    rope_cs_name = f"{target_name}__rope_cs"
-                    if rope_cs_name not in plan.tensors:
-                        plan.tensors[rope_cs_name] = make_rope_cs_tensor_spec(
-                            rope_cs_name,
-                            int(rope.attrs["head_dim"]),
-                            int(rope.attrs["position"]),
-                            float(rope.attrs["theta"]),
-                            kind=TensorKind.CONSTANT,
+                    source_spec = plan.tensors[source_name]
+                    seq_len = int(source_spec.shape[0])
+                    base_position = int(rope.attrs["position"])
+                    theta = float(rope.attrs["theta"])
+                    rope_cs_names: list[str] = []
+                    rope_row_indices: list[int] = []
+                    for row_index in range(seq_len):
+                        rope_cs_name = (
+                            f"{target_name}__rope_cs"
+                            if seq_len == 1
+                            else f"{target_name}__rope_cs_r{row_index}"
                         )
+                        if rope_cs_name not in plan.tensors:
+                            plan.tensors[rope_cs_name] = make_rope_cs_tensor_spec(
+                                rope_cs_name,
+                                int(rope.attrs["head_dim"]),
+                                base_position + row_index,
+                                theta,
+                                kind=TensorKind.CONSTANT,
+                            )
+                        rope_cs_names.append(rope_cs_name)
+                        rope_row_indices.append(row_index)
                     producer_op.out = target_name
-                    producer_op.rope_cs_name = rope_cs_name
+                    producer_op.rope_cs_name = rope_cs_names[0] if len(rope_cs_names) == 1 else None
+                    producer_op.rope_cs_names = rope_cs_names
+                    producer_op.rope_row_indices = rope_row_indices
                     _replace_segment_output(segment, source_name, target_name)
                     producer_by_tensor.pop(source_name, None)
                     producer_by_tensor[target_name] = (segment, producer_op)
@@ -234,8 +265,8 @@ def prune_unused_tensors(plan: ExecutionPlan) -> None:
                 referenced.add(op.out)
                 if op.bias:
                     referenced.add(op.bias)
-                if op.rope_cs_name:
-                    referenced.add(op.rope_cs_name)
+                for rope_cs_name, _ in op.rope_xforms():
+                    referenced.add(rope_cs_name)
         elif isinstance(step, VerifyTensor):
             referenced.add(step.tensor_name)
 
@@ -348,6 +379,7 @@ def canonicalize_npu_boundary_policy(plan: ExecutionPlan) -> None:
         if source_spec.dtype == DType.INT16:
             if (
                 str(step.attrs.get("input_encoding", "")) == "fp16_bits"
+                or str(source_spec.metadata.get("value_encoding", "")) == "fp16_bits"
                 or (source_producer is not None and source_producer.kind == "softmax_f16")
                 or (source_producer is not None and str(source_producer.attrs.get("output_encoding", "")) == "fp16_bits")
             ):
@@ -367,7 +399,11 @@ def canonicalize_npu_boundary_policy(plan: ExecutionPlan) -> None:
             continue
         source_spec = plan.tensors[source_name]
         output_spec = plan.tensors[output_name]
-        if source_spec.dtype == DType.INT16 and output_spec.dtype == DType.FLOAT32:
+        if (
+            source_spec.dtype == DType.INT16
+            and output_spec.dtype == DType.FLOAT32
+            and str(step.attrs.get("output_encoding", "")) != "fp16_bits"
+        ):
             step.attrs["_npu_read_transform"] = "dequantize_int16_to_float32"
 
 
@@ -398,7 +434,8 @@ def validate_npu_boundary_policy(plan: ExecutionPlan) -> None:
                         raise ValueError(
                             f"NPU op '{op.name}' bias tensor '{op.bias}' must be INT16/INT32, got {bias_spec.dtype}."
                         )
-                for name in (op.lhs, op.rhs, op.bias, op.rope_cs_name):
+                extra_names = [name for name, _ in op.rope_xforms()]
+                for name in (op.lhs, op.rhs, op.bias, *extra_names):
                     if not name:
                         continue
                     spec = plan.tensors[name]
@@ -426,6 +463,68 @@ def validate_npu_boundary_policy(plan: ExecutionPlan) -> None:
                 raise ValueError(f"Unsupported NPU read transform on '{step.name}': {transform!r}.")
 
 
+def rewrite_dequantize_fp16_xforms(plan: ExecutionPlan) -> None:
+    """Fuse explicit INT16->FP16-bit dequantize requests into producer segments.
+
+    This pass only handles the safe in-place case: a segment output is consumed by
+    one dequantize op, zero-point is 0, and the requested output encoding is
+    FP16 bits.  The quantized integer value is not preserved.
+    """
+    consumers = _build_tensor_consumers(plan.steps)
+    segment_producers = _build_segment_producer_by_output(plan)
+    new_steps: list[HostOp | NpuSegment | VerifyTensor] = []
+
+    for step in plan.steps:
+        if (
+            not isinstance(step, HostOp)
+            or step.kind != "dequantize"
+            or len(step.inputs) != 1
+            or len(step.outputs) != 1
+            or str(step.attrs.get("output_encoding", "")) != "fp16_bits"
+        ):
+            new_steps.append(step)
+            continue
+
+        source_name = step.inputs[0]
+        output_name = step.outputs[0]
+        source_spec = plan.tensors[source_name]
+        output_spec = plan.tensors[output_name]
+        non_verify_uses = [use for use in consumers.get(source_name, []) if not isinstance(use, VerifyTensor)]
+        producer = segment_producers.get(source_name)
+        if (
+            producer is None
+            or len(non_verify_uses) != 1
+            or non_verify_uses[0] is not step
+            or source_spec.dtype != DType.INT16
+            or int(step.attrs.get("zero_point", 0)) != 0
+            or tuple(source_spec.shape) != tuple(output_spec.shape)
+        ):
+            new_steps.append(step)
+            continue
+
+        segment, op = producer
+        if op.rope_xforms():
+            new_steps.append(step)
+            continue
+
+        multiplier, shift = choose_xform_i16_f16_scale_params(float(step.attrs["scale"]))
+        op.out = output_name
+        op.dequantize_to_fp16 = True
+        op.dequantize_multiplier = int(multiplier)
+        op.dequantize_shift = int(shift)
+        _replace_segment_output(segment, source_name, output_name)
+        output_spec.dtype = DType.INT16
+        output_spec.metadata["value_encoding"] = "fp16_bits"
+        output_spec.metadata["dequantization"] = {
+            "scale": float(step.attrs["scale"]),
+            "zero_point": 0,
+            "multiplier": int(multiplier),
+            "shift": int(shift),
+        }
+
+    plan.steps = new_steps
+
+
 class SegmentCompiler:
     def __init__(self, defines_path: str | None = None):
         self.defines_path = defines_path
@@ -434,6 +533,7 @@ class SegmentCompiler:
         _tmp = TinyNPUProgram(defines_path=self.defines_path)
         array_size = int(_tmp.hw.params.get("ARRAY_SIZE", 8))
         rewrite_host_rope_patterns(plan)
+        rewrite_dequantize_fp16_xforms(plan)
         fold_input_quantize_into_input_contract(plan)
         prune_unused_tensors(plan)
         canonicalize_npu_boundary_policy(plan)
@@ -558,8 +658,8 @@ class SegmentCompiler:
                 if op.writeback_mode == "normal":
                     if out_spec.metadata.get("storage_view_of") and out_spec.metadata.get("storage_role", "B") == "B":
                         if out_cache_kind == "K" and op.in_dtype == DType.INT16 and op.out_dtype == DType.INT16:
-                            if not op.rope_cs_name:
-                                # With rope_cs_name the XFORM needs contiguous C-layout output;
+                            if not op.rope_xforms():
+                                # With RoPE XFORMs the output must remain contiguous C-layout;
                                 # skip K_CACHE_APPEND and let the caller scatter separately.
                                 op.writeback_mode = "k_cache_append_int16"
                         elif out_cache_kind == "V" and op.in_dtype == DType.INT16 and op.out_dtype == DType.INT16:
@@ -611,8 +711,8 @@ class SegmentCompiler:
             referenced.add(op.out)
             if op.bias:
                 referenced.add(op.bias)
-            if op.rope_cs_name:
-                referenced.add(op.rope_cs_name)
+            for rope_cs_name, _ in op.rope_xforms():
+                referenced.add(rope_cs_name)
         for name in list(referenced):
             spec = plan.tensors[name]
             base_name = spec.metadata.get("storage_view_of")
@@ -700,8 +800,15 @@ class SegmentCompiler:
                 b_word_offset=int(op.b_word_offset),
                 b_read_mode=b_read_mode,
             )
-            if op.rope_cs_name:
-                program.xform_rope_k16(op.out, op.rope_cs_name)
+            for rope_cs_name, row_index in op.rope_xforms():
+                program.xform_rope_k16(op.out, rope_cs_name, row_index=row_index)
+            if op.dequantize_to_fp16:
+                program.xform_dq_i16_f16(
+                    op.out,
+                    op.out,
+                    multiplier=int(op.dequantize_multiplier),
+                    shift=int(op.dequantize_shift),
+                )
 
         # Pre-assign globally planned addresses before compile() runs so that
         # program.compile() respects the planner layout instead of bump-allocating.

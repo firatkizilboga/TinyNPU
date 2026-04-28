@@ -20,6 +20,12 @@ _DTYPE_TO_ENUM = {
     DType.FLOAT32: "TINY_DTYPE_FLOAT32",
 }
 
+_VALUE_ENCODING_TO_ENUM = {
+    "": "TINY_VALUE_ENCODING_RAW",
+    "raw": "TINY_VALUE_ENCODING_RAW",
+    "fp16_bits": "TINY_VALUE_ENCODING_FP16_BITS",
+}
+
 
 def _sanitize(name: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9_]", "_", name)
@@ -119,6 +125,10 @@ def _emit_tensor_storage(
     elem_count = int(np.prod(spec.shape, dtype=np.int64)) if spec.shape else 1
     shape4 = _shape4(spec.shape if spec.shape else (1,))
     dtype_enum = _DTYPE_TO_ENUM[spec.dtype]
+    value_encoding = str(spec.metadata.get("value_encoding", ""))
+    value_encoding_enum = _VALUE_ENCODING_TO_ENUM.get(value_encoding)
+    if value_encoding_enum is None:
+        raise NotImplementedError(f"Unsupported tensor value_encoding={value_encoding!r} for {spec.name}.")
 
     if spec.dtype == DType.FLOAT32:
         if initial is None:
@@ -136,6 +146,7 @@ def _emit_tensor_storage(
     tensor_decl = (
         f'static TinyTensor {tensor_name} = {{'
         f'"{spec.name}", {storage_name}, {dtype_enum}, {len(spec.shape) if spec.shape else 1}, '
+        f"{value_encoding_enum}, "
         f'{{{shape4[0]}, {shape4[1]}, {shape4[2]}, {shape4[3]}}}, {elem_count}'
         f"}};"
     )
@@ -166,6 +177,10 @@ def _lookup_tensor_addr(artifact: CompiledArtifact, tensor_name: str) -> int:
             if entry.name == tensor_name:
                 return int(entry.address)
     return 0
+
+
+def _lookup_cache_base_addr(artifact: CompiledArtifact, base_name: str) -> int:
+    return _lookup_tensor_addr(artifact, base_name)
 
 
 def _emit_host_step_attrs(
@@ -320,12 +335,13 @@ def _emit_host_step_attrs(
     elif step.kind == "k_cache_scatter_write":
         out_spec = artifact.plan.tensors[step.outputs[0]]
         token_index = int(step.attrs.get("token_index", out_spec.metadata["cache_token_index"]))
+        base_name = str(step.attrs.get("k_cache_base", out_spec.metadata["storage_view_of"]))
         if cpu_only_baseline:
-            base_name = str(step.attrs.get("k_cache_base", out_spec.metadata["storage_view_of"]))
             base_ref = _emit_tensor_reference(base_name)
             lines.append(f"    host_commit_k_cache_slot({base_ref}, {in_ref}, {token_index});")
         else:
-            scatter_addrs = tuple(int(v) for v in out_spec.metadata["cache_scatter_word_addrs"])
+            base_addr = _lookup_cache_base_addr(artifact, base_name)
+            scatter_addrs = tuple(base_addr + int(v) for v in out_spec.metadata["cache_scatter_word_addrs"])
             token_lane = token_index % 8
             arr_name = f"{prefix}_scatter_addrs"
             decls.append(
@@ -338,12 +354,13 @@ def _emit_host_step_attrs(
     elif step.kind == "v_cache_scatter_write":
         out_spec = artifact.plan.tensors[step.outputs[0]]
         token_index = int(step.attrs.get("token_index", out_spec.metadata["cache_token_index"]))
+        base_name = str(step.attrs.get("v_cache_base", out_spec.metadata["storage_view_of"]))
         if cpu_only_baseline:
-            base_name = str(step.attrs.get("v_cache_base", out_spec.metadata["storage_view_of"]))
             base_ref = _emit_tensor_reference(base_name)
             lines.append(f"    host_commit_v_cache_slot({base_ref}, {in_ref}, {token_index});")
         else:
-            scatter_addrs = tuple(int(v) for v in out_spec.metadata["cache_scatter_word_addrs"])
+            base_addr = _lookup_cache_base_addr(artifact, base_name)
+            scatter_addrs = tuple(base_addr + int(v) for v in out_spec.metadata["cache_scatter_word_addrs"])
             arr_name = f"{prefix}_scatter_addrs"
             decls.append(
                 f"static const int {arr_name}[{len(scatter_addrs)}] = "
@@ -583,9 +600,10 @@ def emit_cv32e40p_c(
                         f"{_segment_ref(op.out)}, {_segment_ref(op.lhs)}, {_segment_ref(op.rhs)}, {_segment_ref(op.bias)}, "
                         f"{int(op.multiplier)}, {int(op.shift)}, {_activation_code(op.activation)}, {int(op.h_gelu_x_scale_shift)});"
                     )
-                    if op.rope_cs_name:
+                    for rope_cs_name, row_index in op.rope_xforms():
                         body_lines.append(
-                            f"    host_rope_k16_q14({_segment_ref(op.out)}, {_segment_ref(op.out)}, {_segment_ref(op.rope_cs_name)});"
+                            f"    host_rope_k16_q14_row({_segment_ref(op.out)}, {_segment_ref(op.out)}, "
+                            f"{_segment_ref(rope_cs_name)}, {int(row_index)});"
                         )
                     body_lines.extend(_cpu_only_sync_output_lines(op.out))
                 body_lines.append("    cycle_t1 = read_mcycle32();")

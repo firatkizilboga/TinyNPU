@@ -935,6 +935,14 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
     compiler_ready_linear_types = tuple(t for t in (CompilerReadyLinear,) if t)
     compiler_ready_conv2d_types = tuple(t for t in (CompilerReadyConv2d,) if t)
 
+    def module_matches(module: Any, candidate_types: tuple[type[Any], ...]) -> bool:
+        if not candidate_types:
+            return False
+        if isinstance(module, candidate_types):
+            return True
+        candidate_names = {candidate_type.__name__ for candidate_type in candidate_types}
+        return type(module).__name__ in candidate_names
+
     def quant_params_from_module(module: Any) -> tuple[float, int, DType]:
         scale = getattr(module, "scale", None)
         zero_point = getattr(module, "zero_point", None)
@@ -1014,23 +1022,23 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             current_ops.append(MatMulOp(name=node.name, lhs=lhs_name, rhs=rhs_name, out=out_name, bias=bias_name))
             continue
 
-        if node.op == "call_module" and quantized_linear_types and isinstance(modules[node.target], quantized_linear_types):
+        if node.op == "call_module" and module_matches(modules[node.target], quantized_linear_types):
             lower_quantized_linear(node.target, modules[node.target], node.args[0].name, node.name)
             continue
 
-        if node.op == "call_module" and quantized_conv2d_types and isinstance(modules[node.target], quantized_conv2d_types):
+        if node.op == "call_module" and module_matches(modules[node.target], quantized_conv2d_types):
             lower_quantized_conv2d(node.target, modules[node.target], node.args[0].name, node.name)
             continue
 
-        if node.op == "call_module" and compiler_ready_linear_types and isinstance(modules[node.target], compiler_ready_linear_types):
+        if node.op == "call_module" and module_matches(modules[node.target], compiler_ready_linear_types):
             lower_compiler_ready_linear(node.target, modules[node.target], node.args[0].name, node.name)
             continue
 
-        if node.op == "call_module" and compiler_ready_conv2d_types and isinstance(modules[node.target], compiler_ready_conv2d_types):
+        if node.op == "call_module" and module_matches(modules[node.target], compiler_ready_conv2d_types):
             lower_compiler_ready_conv2d(node.target, modules[node.target], node.args[0].name, node.name)
             continue
 
-        if node.op == "call_module" and quantize_module_types and isinstance(modules[node.target], quantize_module_types):
+        if node.op == "call_module" and module_matches(modules[node.target], quantize_module_types):
             flush_segment()
             source = node.args[0].name
             scale, zero_point, dtype = quant_params_from_module(modules[node.target])
@@ -1054,8 +1062,9 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             expected_tensors[out_name] = np.array(env[out_name], copy=True)
             continue
 
-        if node.op == "call_module" and dequantize_module_types and isinstance(modules[node.target], dequantize_module_types):
+        if node.op == "call_module" and module_matches(modules[node.target], dequantize_module_types):
             flush_segment()
+            module = modules[node.target]
             source = node.args[0].name
             quant = tensors[source].metadata.get("quantization")
             if quant is None:
@@ -1063,20 +1072,27 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                     f"DeQuantStub/DeQuantize on tensor {source!r} requires upstream quantization metadata."
                 )
             out_name = node.name
+            output_encoding = str(getattr(module, "output_encoding", "float32"))
+            attrs = {"scale": float(quant["scale"]), "zero_point": int(quant.get("zero_point", 0))}
+            if output_encoding == "fp16_bits":
+                attrs["output_encoding"] = "fp16_bits"
             step = HostOp(
                 name=node.name,
                 kind="dequantize",
                 inputs=[source],
                 outputs=[out_name],
-                attrs={"scale": float(quant["scale"]), "zero_point": int(quant.get("zero_point", 0))},
+                attrs=attrs,
             )
             steps.append(step)
             evaluate_host_step(step)
+            dtype = DType.INT16 if output_encoding == "fp16_bits" else DType.FLOAT32
+            metadata = {"value_encoding": "fp16_bits"} if output_encoding == "fp16_bits" else {}
             tensors[out_name] = TensorSpec(
                 out_name,
                 normalize_shape(env[out_name].shape),
-                DType.FLOAT32,
+                dtype,
                 TensorKind.INTERMEDIATE,
+                metadata=metadata,
             )
             expected_tensors[out_name] = np.array(env[out_name], copy=True)
             continue

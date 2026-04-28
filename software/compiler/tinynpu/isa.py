@@ -174,15 +174,18 @@ class XformRopeK16(Instruction):
       [215:200] = half_count (= total_k_words // 2; number of lo/hi word pairs)
       [199:184] = cs_addr    (base address of cos/sin table: cos[0..half-1] then sin[0..half-1])
     """
-    def __init__(self, src, dest, cs_addr):
+    def __init__(self, src, dest, cs_addr, row_index=0):
         self.src = src        # symbol name of K tensor
         self.dest = dest      # symbol name of output K (same as src for in-place)
         self.cs_addr = cs_addr  # symbol name of cos/sin table tensor
+        self.row_index = row_index
         self.half_count = 0   # filled in by program.compile()
+        self.src_word_offset = 0
+        self.dest_word_offset = 0
 
     def encode(self, symbol_to_addr):
-        src_addr = symbol_to_addr[self.src]
-        dest_addr = symbol_to_addr[self.dest]
+        src_addr = symbol_to_addr[self.src] + self.src_word_offset
+        dest_addr = symbol_to_addr[self.dest] + self.dest_word_offset
         cs_base = symbol_to_addr[self.cs_addr]
         instr = 0
         instr |= (Opcode.XFORM & 0xF) << 252

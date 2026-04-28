@@ -19,7 +19,7 @@ def compile_plan(plan: ExecutionPlan, expected_tensors: dict[str, np.ndarray], d
     return SegmentCompiler(defines_path=defines_path).compile(plan, expected_tensors)
 
 
-def compile_module(module: Any, example_inputs: tuple[Any, ...], **kwargs) -> CompiledArtifact:
+def _trace_graph_module(module: Any, example_inputs: tuple[Any, ...]):
     try:
         import torch.fx as fx  # type: ignore
         try:
@@ -51,7 +51,6 @@ def compile_module(module: Any, example_inputs: tuple[Any, ...], **kwargs) -> Co
             "torch is required for compile_module(). Install torch to enable the PyTorch frontend."
         ) from exc
 
-    from .partitioner import partition_fx_graph
     from .markers import im2col_for_npu, mark_for_verify, npu_matmul, quantize_for_npu
 
     class TinyNPUTracer(fx.Tracer):
@@ -75,7 +74,10 @@ def compile_module(module: Any, example_inputs: tuple[Any, ...], **kwargs) -> Co
                 )
                 if t
             )
-            if quant_leaf_types and isinstance(m, quant_leaf_types):
+            if quant_leaf_types and (
+                isinstance(m, quant_leaf_types)
+                or type(m).__name__ in {leaf_type.__name__ for leaf_type in quant_leaf_types}
+            ):
                 return True
             return super().is_leaf_module(m, module_qualified_name)
 
@@ -111,6 +113,20 @@ def compile_module(module: Any, example_inputs: tuple[Any, ...], **kwargs) -> Co
             ShapeProp(graph_module).propagate(*example_inputs)
     except Exception:
         pass
+
+    return graph_module, example_inputs
+
+
+def compile_module(module: Any, example_inputs: tuple[Any, ...], **kwargs) -> CompiledArtifact:
+    graph_module, example_inputs = _trace_graph_module(module, example_inputs)
+    from .semantic_lowering import partition_fx_graph_semantic
+
+    plan, expected = partition_fx_graph_semantic(graph_module, example_inputs, **kwargs)
+    return compile_plan(plan, expected)
+
+def compile_module_legacy(module: Any, example_inputs: tuple[Any, ...], **kwargs) -> CompiledArtifact:
+    graph_module, example_inputs = _trace_graph_module(module, example_inputs)
+    from .partitioner import partition_fx_graph
 
     plan, expected = partition_fx_graph(graph_module, example_inputs, **kwargs)
     return compile_plan(plan, expected)
