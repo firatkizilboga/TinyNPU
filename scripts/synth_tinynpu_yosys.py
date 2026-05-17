@@ -23,6 +23,10 @@ READMEMH_INIT_RE = re.compile(
     r"\n\s*initial begin\n\s*if \(INIT_FILE != \"\"\) begin\n\s*\$readmemh\(INIT_FILE,.*?\n\s*end\n\s*end\n",
     re.S,
 )
+PE00_DEBUG_RE = re.compile(
+    r"\n\s*// DEBUG for PE\[0\]\[0\]\n\s*if \(r == 0 && c == 0\) begin : debug_pe00\n.*?\n\s*end\n\s*end\n\s*end\n",
+    re.S,
+)
 
 UNIFIED_BUFFER_BLACKBOX = '''`include "defines.sv"
 (* blackbox *) module unified_buffer #(parameter INIT_FILE = "") (
@@ -56,6 +60,13 @@ INSTRUCTION_MEMORY_BLACKBOX = '''`include "defines.sv"
     input  logic                     wr_en,
     input  logic [  `ADDR_WIDTH-1:0] wr_addr,
     input  logic [`BUFFER_WIDTH-1:0] wr_data,
+    input  logic [  `ADDR_WIDTH-1:0] host_shared_addr,
+    input  logic [1:0]               host_shared_lane,
+    input  logic [31:0]              host_shared_wr_data,
+    input  logic [3:0]               host_shared_wr_be,
+    input  logic                     host_shared_wr_en,
+    input  logic                     host_shared_rd_en,
+    output logic [31:0]              host_shared_rd_data,
     input  logic [  `ADDR_WIDTH-1:0] rd_addr,
     output logic [  `INST_WIDTH-1:0] rd_data
 );
@@ -80,6 +91,10 @@ def stage_rtl(dst: Path, memory_mode: str) -> None:
     top = TRACE_INIT_RE.sub("\n", top)
     (dst / "tinynpu_top.sv").write_text(top)
 
+    systolic = (dst / "systolic_array.sv").read_text()
+    systolic = PE00_DEBUG_RE.sub("\n", systolic)
+    (dst / "systolic_array.sv").write_text(systolic)
+
     for memory_name in ("unified_buffer.sv", "instruction_memory.sv"):
         memory_path = dst / memory_name
         if memory_path.exists():
@@ -94,7 +109,11 @@ def stage_rtl(dst: Path, memory_mode: str) -> None:
 
 
 def build_script(staged_rtl: Path, script_path: Path) -> None:
-    files = sorted(str(p) for p in staged_rtl.glob("*.sv"))
+    # ub_skewer_wrapper is an old standalone wrapper, not part of tinynpu_top.
+    # Slang type-checks all read files, so keep stale standalone wrappers out of
+    # the synthesis input set instead of letting unused code break the flow.
+    excluded = {"ub_skewer_wrapper.sv"}
+    files = sorted(str(p) for p in staged_rtl.glob("*.sv") if p.name not in excluded)
     script = (
         "read_slang -I {inc} -DSYNTHESIS {files}; hierarchy -top tinynpu_top; "
         "synth_xilinx -family xc7; stat\n"

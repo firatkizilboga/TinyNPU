@@ -113,6 +113,8 @@ module control_unit #(
   logic [`BUFFER_WIDTH-1:0] rope_k_hi_buf;    // K[half..d-1] latched from UB
   logic [`BUFFER_WIDTH-1:0] rope_cos_buf;     // cos table word latched from UB
   logic [`BUFFER_WIDTH-1:0] rope_k_hi_rot_buf; // rotated K_hi latched for phase-5 write
+  logic [`BUFFER_WIDTH-1:0] rope_k_lo_rot_w;
+  logic [`BUFFER_WIDTH-1:0] rope_k_hi_rot_w;
 
   // --- Internal Registers for MATMUL ---
   logic [`ADDR_WIDTH-1:0] mm_a_base, mm_b_base, mm_c_base, mm_bias_base;
@@ -496,9 +498,6 @@ module control_unit #(
     // Valid during CTRL_EXEC_XFORM phase 4 (ub_rdata_reg = sin word).
     // rope_k_lo_rot_w[j] = clip_i16((K_lo[j]*cos[j] - K_hi[j]*sin[j] + 2^13) >> 14)
     // rope_k_hi_rot_w[j] = clip_i16((K_hi[j]*cos[j] + K_lo[j]*sin[j] + 2^13) >> 14)
-    logic [`BUFFER_WIDTH-1:0] rope_k_lo_rot_w;
-    logic [`BUFFER_WIDTH-1:0] rope_k_hi_rot_w;
-
     always_comb begin
         rope_k_lo_rot_w = '0;
         rope_k_hi_rot_w = '0;
