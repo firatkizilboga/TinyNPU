@@ -313,7 +313,21 @@ class SimulatorExecutor:
                     else:
                         matches = np.array_equal(actual, expected)
                     if not matches:
-                        raise AssertionError(f"Verification failed for '{step.label}' ({step.tensor_name}).")
+                        actual_flat = np.asarray(actual).reshape(-1)
+                        expected_flat = np.asarray(expected).reshape(-1)
+                        diff_idx = np.flatnonzero(actual_flat != expected_flat)
+                        if diff_idx.size:
+                            preview = ", ".join(
+                                f"idx {int(idx)}: actual={actual_flat[int(idx)]!r} expected={expected_flat[int(idx)]!r}"
+                                for idx in diff_idx[:8]
+                            )
+                        else:
+                            delta = np.abs(actual_flat.astype(np.float64) - expected_flat.astype(np.float64))
+                            preview = f"max_abs_diff={float(delta.max(initial=0.0)):.6g}"
+                        raise AssertionError(
+                            f"Verification failed for '{step.label}' ({step.tensor_name}); "
+                            f"shape actual={actual.shape} expected={expected.shape}; {preview}"
+                        )
                     verified.append(step.label)
                     if debug:
                         debug_trace.append(

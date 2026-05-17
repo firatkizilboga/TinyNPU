@@ -25,12 +25,31 @@ module ppu (
     // Data from Systolic Array (Bottom Row)
     input logic signed [`ACC_WIDTH-1:0] acc_in[`ARRAY_SIZE-1:0],
 
+    // Completion handshake for the control unit. done pulses when the last
+    // captured row has reached storage and writeback can start safely.
+    output logic busy,
+    output logic done,
+
     // Output to Unified Buffer (64-bit vector)
     output logic [`BUFFER_WIDTH-1:0] ub_wdata
 );
 
   localparam int INT4_WORDS_PER_TILE = (`ARRAY_SIZE / 4);
   localparam int INT8_WORDS_PER_TILE = (`ARRAY_SIZE / 2);
+  localparam int PPU_ACC_WIDTH = 48;
+  localparam int PPU_PRODUCT_WIDTH = PPU_ACC_WIDTH + 16;
+  localparam int PPU_SHIFT_WIDTH = $clog2(PPU_PRODUCT_WIDTH);
+  localparam int PPU_ACT_WIDTH = 48;
+  localparam int PPU_GELU_DIV_WIDTH = 32;
+  // Hardware contract: H-GELU scale shifts are compiler-limited to 0..15.
+  // Keeping this narrow avoids a full 8-bit dynamic barrel shifter in the
+  // activation path without changing any generated model configuration.
+  localparam int PPU_HGELU_SHIFT_WIDTH = 4;
+  localparam int PPU_SIGMOID_SHIFT_WIDTH = 5;
+  localparam logic signed [PPU_ACC_WIDTH-1:0] PPU_ACC_MAX = {1'b0, {(PPU_ACC_WIDTH - 1) {1'b1}}};
+  localparam logic signed [PPU_ACC_WIDTH-1:0] PPU_ACC_MIN = {1'b1, {(PPU_ACC_WIDTH - 1) {1'b0}}};
+  localparam logic [PPU_SHIFT_WIDTH-1:0] PPU_SHIFT_MAX = PPU_SHIFT_WIDTH'(PPU_PRODUCT_WIDTH - 1);
+  localparam logic [PPU_HGELU_SHIFT_WIDTH-1:0] PPU_HGELU_SHIFT_MAX = {PPU_HGELU_SHIFT_WIDTH{1'b1}};
 
   // Internal storage for one full tile (quantized to 16-bit)
   logic [15:0] storage [`ARRAY_SIZE-1:0] [`ARRAY_SIZE-1:0];
@@ -41,145 +60,114 @@ module ppu (
   // Internal state to track which bias word is being loaded (0 or 1)
   logic bias_word_toggle;
 
-  // Logic for quantization pipeline
-  logic [15:0] quantized_row[`ARRAY_SIZE-1:0];
-  logic signed [81:0] pre_activation_row[`ARRAY_SIZE-1:0];
-  logic signed [15:0] sigmoid_in_row[`ARRAY_SIZE-1:0];
-  logic [15:0] sigmoid_out_row[`ARRAY_SIZE-1:0];
-  logic signed [15:0] h_gelu_in_row[`ARRAY_SIZE-1:0];
-  logic signed [15:0] h_gelu_out_row[`ARRAY_SIZE-1:0];
-  logic [7:0] sigmoid_p_out;
+  logic valid_s0, valid_s1, valid_s2, valid_s3, valid_s4, valid_s5, valid_s6, valid_s7, valid_s8;
+  logic last_s0, last_s1, last_s2, last_s3, last_s4, last_s5, last_s6, last_s7, last_s8;
+  logic [$clog2(`ARRAY_SIZE)-1:0] row_s0, row_s1, row_s2, row_s3, row_s4, row_s5, row_s6, row_s7, row_s8;
+  logic [7:0] shift_s0, shift_s1, shift_s2, shift_s3, shift_s4, shift_s5, shift_s6, shift_s7;
+  logic [PPU_SIGMOID_SHIFT_WIDTH-1:0] sigmoid_shift_s0, sigmoid_shift_s1, sigmoid_shift_s2, sigmoid_shift_s3;
+  logic [PPU_SIGMOID_SHIFT_WIDTH-1:0] sigmoid_shift_s4, sigmoid_shift_s5, sigmoid_shift_s6, sigmoid_shift_s7;
+  logic sigmoid_shift_valid_s0, sigmoid_shift_valid_s1, sigmoid_shift_valid_s2, sigmoid_shift_valid_s3;
+  logic sigmoid_shift_valid_s4, sigmoid_shift_valid_s5, sigmoid_shift_valid_s6, sigmoid_shift_valid_s7;
+  logic [7:0] activation_s0, activation_s1, activation_s2, activation_s3, activation_s4, activation_s5, activation_s6, activation_s7;
+  logic [PPU_HGELU_SHIFT_WIDTH-1:0] h_gelu_x_scale_shift_s0, h_gelu_x_scale_shift_s1, h_gelu_x_scale_shift_s2;
+  logic [PPU_HGELU_SHIFT_WIDTH-1:0] h_gelu_x_scale_shift_s3, h_gelu_x_scale_shift_s4, h_gelu_x_scale_shift_s5, h_gelu_x_scale_shift_s6, h_gelu_x_scale_shift_s7;
+  logic [1:0] precision_s0, precision_s1, precision_s2, precision_s3, precision_s4, precision_s5, precision_s6, precision_s7, precision_s8;
+  logic [15:0] multiplier_s0, multiplier_s1, multiplier_s2;
 
-  always_comb begin
-    unique case (precision)
-      2'b00: sigmoid_p_out = 8'd4;
-      2'b01: sigmoid_p_out = 8'd8;
-      default: sigmoid_p_out = 8'd16;
-    endcase
+  logic signed [PPU_ACC_WIDTH-1:0] biased_s0[`ARRAY_SIZE-1:0];
+  logic signed [PPU_PRODUCT_WIDTH-1:0] product_s1[`ARRAY_SIZE-1:0];
+  logic signed [PPU_PRODUCT_WIDTH:0] rounded_s2[`ARRAY_SIZE-1:0];
+  logic signed [PPU_PRODUCT_WIDTH-1:0] shifted_s3[`ARRAY_SIZE-1:0];
+  logic signed [15:0] rescaled_s4[`ARRAY_SIZE-1:0];
+  logic signed [15:0] act_passthrough_s5[`ARRAY_SIZE-1:0];
+  logic signed [PPU_ACT_WIDTH-1:0] act_x_s5[`ARRAY_SIZE-1:0];
+  logic signed [PPU_ACT_WIDTH-1:0] sigmoid_numer_s5[`ARRAY_SIZE-1:0];
+  logic signed [PPU_ACT_WIDTH-1:0] gelu_gate_s5[`ARRAY_SIZE-1:0];
+  logic signed [15:0] act_passthrough_s6[`ARRAY_SIZE-1:0];
+  logic signed [PPU_ACT_WIDTH-1:0] act_x_s6[`ARRAY_SIZE-1:0];
+  logic signed [PPU_ACT_WIDTH-1:0] sigmoid_rounded_s6[`ARRAY_SIZE-1:0];
+  logic signed [PPU_ACT_WIDTH-1:0] gelu_prod_s6[`ARRAY_SIZE-1:0];
+  logic signed [15:0] act_passthrough_s7[`ARRAY_SIZE-1:0];
+  logic signed [PPU_ACT_WIDTH-1:0] sigmoid_rounded_s7[`ARRAY_SIZE-1:0];
+  logic signed [PPU_GELU_DIV_WIDTH-1:0] gelu_div6_s7[`ARRAY_SIZE-1:0];
+  logic signed [15:0] activated_s8[`ARRAY_SIZE-1:0];
+  logic [15:0] quantized_s9[`ARRAY_SIZE-1:0];
+  logic signed [PPU_PRODUCT_WIDTH:0] shifted_wide_s3[`ARRAY_SIZE-1:0];
+  logic signed [PPU_ACT_WIDTH-1:0] sigmoid_bound_s4;
+  logic signed [PPU_ACT_WIDTH-1:0] sigmoid_qmax_s4;
 
-    for (int i = 0; i < `ARRAY_SIZE; i++) begin
-      logic signed [64:0] biased_acc;
-      logic signed [81:0] rescaled; // 65-bit * 17-bit = 82 bits
-      logic signed [82:0] rounded;  // 83 bits for carry
-      logic signed [81:0] shifted;
-
-      // A. High-Precision Bias Addition (32-bit Bias)
-      biased_acc = $signed(acc_in[i]) + $signed({{33{bias_reg[i][31]}}, bias_reg[i]});
-
-      // B. Rescale (Multiplier) - Treat 16-bit multiplier as positive
-      rescaled = biased_acc * $signed({1'b0, multiplier});
-
-      // C. Rounding and Shift Right (Arithmetic)
-      if (shift > 0) begin
-        // Round to nearest: add 2^(shift-1)
-        rounded = rescaled + $signed({1'b0, (82'd1 << (shift - 1))});
-        shifted = rounded >>> shift;
+  function automatic logic [PPU_SHIFT_WIDTH-1:0] ppu_effective_shift(input logic [7:0] raw_shift);
+    begin
+      if (raw_shift >= PPU_PRODUCT_WIDTH) begin
+        ppu_effective_shift = PPU_SHIFT_MAX;
       end else begin
-        shifted = rescaled;
-      end
-
-      pre_activation_row[i] = shifted;
-
-      if (shifted > 32767) begin
-        sigmoid_in_row[i] = 16'sd32767;
-        h_gelu_in_row[i] = 16'sd32767;
-      end else if (shifted < -32768) begin
-        sigmoid_in_row[i] = -16'sd32768;
-        h_gelu_in_row[i] = -16'sd32768;
-      end else begin
-        sigmoid_in_row[i] = shifted[15:0];
-        h_gelu_in_row[i] = shifted[15:0];
+        ppu_effective_shift = raw_shift[PPU_SHIFT_WIDTH-1:0];
       end
     end
+  endfunction
+
+  function automatic logic [PPU_HGELU_SHIFT_WIDTH-1:0] ppu_effective_h_gelu_shift(input logic [7:0] raw_shift);
+    begin
+      if (raw_shift > PPU_HGELU_SHIFT_MAX) begin
+        ppu_effective_h_gelu_shift = PPU_HGELU_SHIFT_MAX;
+      end else begin
+        ppu_effective_h_gelu_shift = raw_shift[PPU_HGELU_SHIFT_WIDTH-1:0];
+      end
+    end
+  endfunction
+
+  function automatic logic [PPU_SIGMOID_SHIFT_WIDTH-1:0] ppu_effective_sigmoid_shift(input logic [7:0] raw_shift);
+    begin
+      ppu_effective_sigmoid_shift = raw_shift[PPU_SIGMOID_SHIFT_WIDTH-1:0];
+    end
+  endfunction
+
+  assign busy = capture_en | valid_s0 | valid_s1 | valid_s2 | valid_s3 | valid_s4 | valid_s5 | valid_s6 | valid_s7 | valid_s8;
+
+  always_comb begin
+    unique case (precision_s4)
+      MODE_INT4:  sigmoid_qmax_s4 = PPU_ACT_WIDTH'(7);
+      MODE_INT8:  sigmoid_qmax_s4 = PPU_ACT_WIDTH'(127);
+      default:    sigmoid_qmax_s4 = PPU_ACT_WIDTH'(32767);
+    endcase
   end
 
-  generate
-    for (genvar i = 0; i < `ARRAY_SIZE; i++) begin : gen_sigmoid
-      di_sigmoid #(
-          .INPUT_WIDTH(16),
-          .OUTPUT_WIDTH(16)
-      ) u_di_sigmoid (
-          .x_in(sigmoid_in_row[i]),
-          .m_i(multiplier),
-          .k_i(shift),
-          .p_out(sigmoid_p_out),
-          .alpha_smooth(8'd1),
-          .y_out(sigmoid_out_row[i])
-      );
-
-      h_gelu #(
-          .INPUT_WIDTH(16),
-          .OUTPUT_WIDTH(16)
-      ) u_h_gelu (
-          .x_in(h_gelu_in_row[i]),
-          .x_scale_shift(h_gelu_x_scale_shift),
-          .slope_num(16'd218),
-          .slope_shift(8'd7),
-          .y_out(h_gelu_out_row[i])
-      );
-    end
-  endgenerate
+  assign sigmoid_bound_s4 = sigmoid_shift_valid_s4 ? (PPU_ACT_WIDTH'(8) <<< sigmoid_shift_s4) : '0;
 
   always_comb begin
     for (int i = 0; i < `ARRAY_SIZE; i++) begin
-      logic signed [81:0] activated;
+      logic signed [15:0] activated;
       logic signed [3:0]  sat4;
       logic signed [7:0]  sat8;
-      logic signed [15:0] sat16;
-      logic [15:0]        result_val;
 
-      activated = pre_activation_row[i];
+      activated = activated_s8[i];
 
-      if (activation == 8'd1) begin
-        if (activated < 0) activated = 0;
-      end else if (activation == 8'd2) begin
-        activated = 82'(signed'({1'b0, sigmoid_out_row[i]}));
-      end else if (activation == 8'd3) begin
-        activated = 82'(signed'(h_gelu_out_row[i]));
-      end
-
-      unique case (precision)
+      unique case (precision_s8)
         2'b00: begin  // INT4: [-8, 7]
-          if (activated > 7)       sat4 = 7;
-          else if (activated < -8) sat4 = -8;
-          else                     sat4 = activated[3:0];
-          // Keep packed offset handling in UB writeback path only.
-          // Shifting here as well would zero out non-zero write_offset lanes.
-          result_val = 16'(unsigned'(sat4));
+          if (activated > 16'sd7) sat4 = 4'sd7;
+          else if (activated < -16'sd8) sat4 = -4'sd8;
+          else sat4 = activated[3:0];
+          quantized_s9[i] = 16'(unsigned'(sat4));
         end
         2'b01: begin  // INT8: [-128, 127]
-          if (activated > 127)       sat8 = 127;
-          else if (activated < -128) sat8 = -128;
-          else                       sat8 = activated[7:0];
-          // Keep packed offset handling in UB writeback path only.
-          // Shifting here as well would zero out non-zero write_offset lanes.
-          result_val = 16'(unsigned'(sat8));
+          if (activated > 16'sd127) sat8 = 8'sd127;
+          else if (activated < -16'sd128) sat8 = -8'sd128;
+          else sat8 = activated[7:0];
+          quantized_s9[i] = 16'(unsigned'(sat8));
         end
         default: begin  // INT16: [-32768, 32767]
-          if (activated > 32767)       sat16 = 32767;
-          else if (activated < -32768) sat16 = -32768;
-          else                         sat16 = activated[15:0];
-          result_val = 16'(unsigned'(sat16));
+          quantized_s9[i] = activated;
         end
       endcase
-
-      quantized_row[i] = result_val;
     end
   end
 
-  always_ff @(posedge clk) begin
-    if (rst_n && capture_en) begin
-`ifdef PPU_DEBUG_CAPTURE
-        $display("PPU CAPTURE: cycle=%d | B0=%d B1=%d B2=%d B3=%d B4=%d B5=%d B6=%d B7=%d | Lane0: acc=%d, res=%x", 
-            ppu_cycle_idx, bias_reg[0], bias_reg[1], bias_reg[2], bias_reg[3],
-            bias_reg[4], bias_reg[5], bias_reg[6], bias_reg[7],
-            acc_in[0], quantized_row[0]);
-        $fflush();
-`endif
+  always_comb begin
+    for (int i = 0; i < `ARRAY_SIZE; i++) begin
+      shifted_wide_s3[i] = rounded_s2[i] >>> ppu_effective_shift(shift_s2);
     end
   end
 
-  // Capture and Quantization Logic
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       for (int r = 0; r < `ARRAY_SIZE; r++) begin
@@ -187,7 +175,108 @@ module ppu (
       end
       for (int i = 0; i < `ARRAY_SIZE; i++) bias_reg[i] <= '0;
       bias_word_toggle <= 1'b0;
+      valid_s0 <= 1'b0;
+      valid_s1 <= 1'b0;
+      valid_s2 <= 1'b0;
+      valid_s3 <= 1'b0;
+      valid_s4 <= 1'b0;
+      valid_s5 <= 1'b0;
+      valid_s6 <= 1'b0;
+      valid_s7 <= 1'b0;
+      valid_s8 <= 1'b0;
+      last_s0 <= 1'b0;
+      last_s1 <= 1'b0;
+      last_s2 <= 1'b0;
+      last_s3 <= 1'b0;
+      last_s4 <= 1'b0;
+      last_s5 <= 1'b0;
+      last_s6 <= 1'b0;
+      last_s7 <= 1'b0;
+      last_s8 <= 1'b0;
+      row_s0 <= '0;
+      row_s1 <= '0;
+      row_s2 <= '0;
+      row_s3 <= '0;
+      row_s4 <= '0;
+      row_s5 <= '0;
+      row_s6 <= '0;
+      row_s7 <= '0;
+      row_s8 <= '0;
+      shift_s0 <= '0;
+      shift_s1 <= '0;
+      shift_s2 <= '0;
+      shift_s3 <= '0;
+      shift_s4 <= '0;
+      shift_s5 <= '0;
+      shift_s6 <= '0;
+      shift_s7 <= '0;
+      sigmoid_shift_s0 <= '0;
+      sigmoid_shift_s1 <= '0;
+      sigmoid_shift_s2 <= '0;
+      sigmoid_shift_s3 <= '0;
+      sigmoid_shift_s4 <= '0;
+      sigmoid_shift_s5 <= '0;
+      sigmoid_shift_s6 <= '0;
+      sigmoid_shift_s7 <= '0;
+      sigmoid_shift_valid_s0 <= 1'b0;
+      sigmoid_shift_valid_s1 <= 1'b0;
+      sigmoid_shift_valid_s2 <= 1'b0;
+      sigmoid_shift_valid_s3 <= 1'b0;
+      sigmoid_shift_valid_s4 <= 1'b0;
+      sigmoid_shift_valid_s5 <= 1'b0;
+      sigmoid_shift_valid_s6 <= 1'b0;
+      sigmoid_shift_valid_s7 <= 1'b0;
+      activation_s0 <= '0;
+      activation_s1 <= '0;
+      activation_s2 <= '0;
+      activation_s3 <= '0;
+      activation_s4 <= '0;
+      activation_s5 <= '0;
+      activation_s6 <= '0;
+      activation_s7 <= '0;
+      h_gelu_x_scale_shift_s0 <= '0;
+      h_gelu_x_scale_shift_s1 <= '0;
+      h_gelu_x_scale_shift_s2 <= '0;
+      h_gelu_x_scale_shift_s3 <= '0;
+      h_gelu_x_scale_shift_s4 <= '0;
+      h_gelu_x_scale_shift_s5 <= '0;
+      h_gelu_x_scale_shift_s6 <= '0;
+      h_gelu_x_scale_shift_s7 <= '0;
+      precision_s0 <= MODE_INT16;
+      precision_s1 <= MODE_INT16;
+      precision_s2 <= MODE_INT16;
+      precision_s3 <= MODE_INT16;
+      precision_s4 <= MODE_INT16;
+      precision_s5 <= MODE_INT16;
+      precision_s6 <= MODE_INT16;
+      precision_s7 <= MODE_INT16;
+      precision_s8 <= MODE_INT16;
+      multiplier_s0 <= '0;
+      multiplier_s1 <= '0;
+      multiplier_s2 <= '0;
+      done <= 1'b0;
+      for (int i = 0; i < `ARRAY_SIZE; i++) begin
+        biased_s0[i] <= '0;
+        product_s1[i] <= '0;
+        rounded_s2[i] <= '0;
+        shifted_s3[i] <= '0;
+        rescaled_s4[i] <= '0;
+        act_passthrough_s5[i] <= '0;
+        act_x_s5[i] <= '0;
+        sigmoid_numer_s5[i] <= '0;
+        gelu_gate_s5[i] <= '0;
+        act_passthrough_s6[i] <= '0;
+        act_x_s6[i] <= '0;
+        sigmoid_rounded_s6[i] <= '0;
+        gelu_prod_s6[i] <= '0;
+        act_passthrough_s7[i] <= '0;
+        sigmoid_rounded_s7[i] <= '0;
+        gelu_div6_s7[i] <= '0;
+        activated_s8[i] <= '0;
+      end
     end else begin
+      done <= valid_s8 && last_s8;
+
       if (bias_clear) begin
         for (int i = 0; i < `ARRAY_SIZE; i++) bias_reg[i] <= '0;
         bias_word_toggle <= 1'b0;
@@ -201,11 +290,206 @@ module ppu (
         end
       end
 
+      valid_s0 <= capture_en;
+      valid_s1 <= valid_s0;
+      valid_s2 <= valid_s1;
+      valid_s3 <= valid_s2;
+      valid_s4 <= valid_s3;
+      valid_s5 <= valid_s4;
+      valid_s6 <= valid_s5;
+      valid_s7 <= valid_s6;
+      valid_s8 <= valid_s7;
+      last_s0 <= capture_en && (ppu_cycle_idx == (`ARRAY_SIZE - 1));
+      last_s1 <= last_s0;
+      last_s2 <= last_s1;
+      last_s3 <= last_s2;
+      last_s4 <= last_s3;
+      last_s5 <= last_s4;
+      last_s6 <= last_s5;
+      last_s7 <= last_s6;
+      last_s8 <= last_s7;
+
       if (capture_en) begin
-        // Drain outputs row N-1 first (cycle 0), row 0 last (cycle N-1).
-        // Reverse the index so storage[0] = row 0, storage[N-1] = row N-1.
+        row_s0 <= (`ARRAY_SIZE - 1) - ppu_cycle_idx;
+        shift_s0 <= shift;
+        sigmoid_shift_s0 <= ppu_effective_sigmoid_shift(shift);
+        sigmoid_shift_valid_s0 <= (shift < 8'd28);
+        activation_s0 <= activation;
+        h_gelu_x_scale_shift_s0 <= ppu_effective_h_gelu_shift(h_gelu_x_scale_shift);
+        precision_s0 <= precision;
+        multiplier_s0 <= multiplier;
         for (int i = 0; i < `ARRAY_SIZE; i++) begin
-          storage[(`ARRAY_SIZE-1) - ppu_cycle_idx][i] <= quantized_row[i];
+          logic signed [`ACC_WIDTH:0] biased_wide;
+          biased_wide = $signed(acc_in[i]) + $signed({{33{bias_reg[i][31]}}, bias_reg[i]});
+          if (biased_wide > $signed(PPU_ACC_MAX)) begin
+            biased_s0[i] <= PPU_ACC_MAX;
+          end else if (biased_wide < $signed(PPU_ACC_MIN)) begin
+            biased_s0[i] <= PPU_ACC_MIN;
+          end else begin
+            biased_s0[i] <= biased_wide[PPU_ACC_WIDTH-1:0];
+          end
+        end
+      end
+
+      row_s1 <= row_s0;
+      shift_s1 <= shift_s0;
+      sigmoid_shift_s1 <= sigmoid_shift_s0;
+      sigmoid_shift_valid_s1 <= sigmoid_shift_valid_s0;
+      activation_s1 <= activation_s0;
+      h_gelu_x_scale_shift_s1 <= h_gelu_x_scale_shift_s0;
+      precision_s1 <= precision_s0;
+      multiplier_s1 <= multiplier_s0;
+      for (int i = 0; i < `ARRAY_SIZE; i++) begin
+        product_s1[i] <= biased_s0[i] * $signed({1'b0, multiplier_s0});
+      end
+
+      row_s2 <= row_s1;
+      shift_s2 <= shift_s1;
+      sigmoid_shift_s2 <= sigmoid_shift_s1;
+      sigmoid_shift_valid_s2 <= sigmoid_shift_valid_s1;
+      activation_s2 <= activation_s1;
+      h_gelu_x_scale_shift_s2 <= h_gelu_x_scale_shift_s1;
+      precision_s2 <= precision_s1;
+      multiplier_s2 <= multiplier_s1;
+      for (int i = 0; i < `ARRAY_SIZE; i++) begin
+        logic [PPU_SHIFT_WIDTH-1:0] eff_shift;
+        eff_shift = ppu_effective_shift(shift_s1);
+        if (shift_s1 > 0) begin
+          rounded_s2[i] <= product_s1[i] + $signed({1'b0, (PPU_PRODUCT_WIDTH'(1) << (eff_shift - 1))});
+        end else begin
+          rounded_s2[i] <= {product_s1[i][PPU_PRODUCT_WIDTH-1], product_s1[i]};
+        end
+      end
+
+      row_s3 <= row_s2;
+      shift_s3 <= shift_s2;
+      sigmoid_shift_s3 <= sigmoid_shift_s2;
+      sigmoid_shift_valid_s3 <= sigmoid_shift_valid_s2;
+      activation_s3 <= activation_s2;
+      h_gelu_x_scale_shift_s3 <= h_gelu_x_scale_shift_s2;
+      precision_s3 <= precision_s2;
+      for (int i = 0; i < `ARRAY_SIZE; i++) begin
+        shifted_s3[i] <= shifted_wide_s3[i][PPU_PRODUCT_WIDTH-1:0];
+      end
+
+      row_s4 <= row_s3;
+      shift_s4 <= shift_s3;
+      sigmoid_shift_s4 <= sigmoid_shift_s3;
+      sigmoid_shift_valid_s4 <= sigmoid_shift_valid_s3;
+      activation_s4 <= activation_s3;
+      h_gelu_x_scale_shift_s4 <= h_gelu_x_scale_shift_s3;
+      precision_s4 <= precision_s3;
+      for (int i = 0; i < `ARRAY_SIZE; i++) begin
+        if (shifted_s3[i] > PPU_PRODUCT_WIDTH'(32767)) begin
+          rescaled_s4[i] <= 16'sd32767;
+        end else if (shifted_s3[i] < -PPU_PRODUCT_WIDTH'(32768)) begin
+          rescaled_s4[i] <= -16'sd32768;
+        end else begin
+          rescaled_s4[i] <= shifted_s3[i][15:0];
+        end
+      end
+
+      row_s5 <= row_s4;
+      shift_s5 <= shift_s4;
+      sigmoid_shift_s5 <= sigmoid_shift_s4;
+      sigmoid_shift_valid_s5 <= sigmoid_shift_valid_s4;
+      activation_s5 <= activation_s4;
+      h_gelu_x_scale_shift_s5 <= h_gelu_x_scale_shift_s4;
+      precision_s5 <= precision_s4;
+      for (int i = 0; i < `ARRAY_SIZE; i++) begin
+        logic signed [PPU_ACT_WIDTH-1:0] x_ext;
+        logic signed [PPU_ACT_WIDTH-1:0] scale;
+        logic signed [PPU_ACT_WIDTH-1:0] gate;
+
+        x_ext = PPU_ACT_WIDTH'($signed(rescaled_s4[i]));
+        scale = PPU_ACT_WIDTH'(1) <<< h_gelu_x_scale_shift_s4;
+        gate = ((x_ext * PPU_ACT_WIDTH'(218) + PPU_ACT_WIDTH'(64)) >>> 7) + (PPU_ACT_WIDTH'(3) * scale);
+        if (gate < 0) gate = 0;
+        else if (gate > (PPU_ACT_WIDTH'(6) * scale)) gate = PPU_ACT_WIDTH'(6) * scale;
+
+        act_passthrough_s5[i] <= rescaled_s4[i];
+        act_x_s5[i] <= x_ext;
+        gelu_gate_s5[i] <= gate;
+        unique case (activation_s4)
+          8'd1: sigmoid_numer_s5[i] <= '0;
+          8'd2: begin
+            if (!sigmoid_shift_valid_s4 || sigmoid_bound_s4 <= 0 || sigmoid_qmax_s4 <= 0 || x_ext <= -sigmoid_bound_s4) begin
+              sigmoid_numer_s5[i] <= '0;
+            end else if (x_ext >= sigmoid_bound_s4) begin
+              sigmoid_numer_s5[i] <= sigmoid_qmax_s4 <<< (sigmoid_shift_s4 + 5'd4);
+            end else begin
+              sigmoid_numer_s5[i] <= (x_ext + sigmoid_bound_s4) * sigmoid_qmax_s4;
+            end
+          end
+          default: sigmoid_numer_s5[i] <= '0;
+        endcase
+      end
+
+      row_s6 <= row_s5;
+      shift_s6 <= shift_s5;
+      sigmoid_shift_s6 <= sigmoid_shift_s5;
+      sigmoid_shift_valid_s6 <= sigmoid_shift_valid_s5;
+      activation_s6 <= activation_s5;
+      h_gelu_x_scale_shift_s6 <= h_gelu_x_scale_shift_s5;
+      precision_s6 <= precision_s5;
+      for (int i = 0; i < `ARRAY_SIZE; i++) begin
+        act_passthrough_s6[i] <= act_passthrough_s5[i];
+        act_x_s6[i] <= act_x_s5[i];
+        if (sigmoid_shift_valid_s5) begin
+          sigmoid_rounded_s6[i] <= sigmoid_numer_s5[i] + (PPU_ACT_WIDTH'(1) <<< (sigmoid_shift_s5 + 5'd3));
+        end else begin
+          sigmoid_rounded_s6[i] <= '0;
+        end
+        gelu_prod_s6[i] <= act_x_s5[i] * gelu_gate_s5[i];
+      end
+
+      row_s7 <= row_s6;
+      shift_s7 <= shift_s6;
+      sigmoid_shift_s7 <= sigmoid_shift_s6;
+      sigmoid_shift_valid_s7 <= sigmoid_shift_valid_s6;
+      activation_s7 <= activation_s6;
+      h_gelu_x_scale_shift_s7 <= h_gelu_x_scale_shift_s6;
+      precision_s7 <= precision_s6;
+      for (int i = 0; i < `ARRAY_SIZE; i++) begin
+        act_passthrough_s7[i] <= act_passthrough_s6[i];
+        sigmoid_rounded_s7[i] <= sigmoid_rounded_s6[i];
+        gelu_div6_s7[i] <= (gelu_prod_s6[i] * PPU_ACT_WIDTH'(10923) + (PPU_ACT_WIDTH'(1) <<< 15)) >>> 16;
+      end
+
+      row_s8 <= row_s7;
+      precision_s8 <= precision_s7;
+      for (int i = 0; i < `ARRAY_SIZE; i++) begin
+        logic signed [PPU_GELU_DIV_WIDTH-1:0] shifted_gelu;
+
+        if (h_gelu_x_scale_shift_s7 > 0) begin
+          shifted_gelu = (gelu_div6_s7[i] >= 0)
+              ? ((gelu_div6_s7[i] + (PPU_GELU_DIV_WIDTH'(1) <<< (h_gelu_x_scale_shift_s7 - 1))) >>> h_gelu_x_scale_shift_s7)
+              : -(((-gelu_div6_s7[i]) + (PPU_GELU_DIV_WIDTH'(1) <<< (h_gelu_x_scale_shift_s7 - 1))) >>> h_gelu_x_scale_shift_s7);
+        end else begin
+          shifted_gelu = gelu_div6_s7[i];
+        end
+
+        unique case (activation_s7)
+          8'd1: activated_s8[i] <= (act_passthrough_s7[i] < 0) ? '0 : act_passthrough_s7[i];
+          8'd2: begin
+            logic signed [PPU_ACT_WIDTH-1:0] sigmoid_out;
+            sigmoid_out = sigmoid_shift_valid_s7 ? (sigmoid_rounded_s7[i] >>> (sigmoid_shift_s7 + 5'd4)) : '0;
+            if (sigmoid_out > PPU_ACT_WIDTH'(32767)) activated_s8[i] <= 16'sd32767;
+            else if (sigmoid_out < -PPU_ACT_WIDTH'(32768)) activated_s8[i] <= -16'sd32768;
+            else activated_s8[i] <= sigmoid_out[15:0];
+          end
+          8'd3: begin
+            if (shifted_gelu > PPU_GELU_DIV_WIDTH'(32767)) activated_s8[i] <= 16'sd32767;
+            else if (shifted_gelu < -PPU_GELU_DIV_WIDTH'(32768)) activated_s8[i] <= -16'sd32768;
+            else activated_s8[i] <= shifted_gelu[15:0];
+          end
+          default: activated_s8[i] <= act_passthrough_s7[i];
+        endcase
+      end
+
+      if (valid_s8) begin
+        for (int i = 0; i < `ARRAY_SIZE; i++) begin
+          storage[row_s8][i] <= quantized_s9[i];
         end
       end
     end

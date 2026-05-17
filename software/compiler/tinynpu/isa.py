@@ -42,6 +42,22 @@ class XformMode(IntEnum):
     DQ_I16_F16 = 2
     ROPE_K16 = 3  # RoPE rotation: INT16 Q14, in-place over K in UB
 
+
+# Matches rtl/ppu.sv PPU_HGELU_SHIFT_WIDTH. Larger values need a wider
+# dynamic shifter in the activation path and are not part of the hardware ABI.
+MAX_H_GELU_X_SCALE_SHIFT = 15
+
+
+def _validate_h_gelu_x_scale_shift(value):
+    value = int(value)
+    if value < 0 or value > MAX_H_GELU_X_SCALE_SHIFT:
+        raise ValueError(
+            f"h_gelu_x_scale_shift={value} is outside the supported hardware range "
+            f"0..{MAX_H_GELU_X_SCALE_SHIFT}."
+        )
+    return value
+
+
 class Instruction:
     def encode(self, symbol_to_addr):
         raise NotImplementedError()
@@ -76,7 +92,7 @@ class MatMul(Instruction):
         self.in_prec = in_prec
         self.out_prec = out_prec
         self.write_offset = write_offset
-        self.h_gelu_x_scale_shift = h_gelu_x_scale_shift
+        self.h_gelu_x_scale_shift = _validate_h_gelu_x_scale_shift(h_gelu_x_scale_shift)
         self.output_layout = output_layout
         self.writeback_mode = writeback_mode
         self.output_word_offset = output_word_offset
@@ -219,6 +235,7 @@ def pack_matmul(
     b_word_offset=0,
     b_read_mode=BReadMode.NORMAL,
 ):
+    h_gelu_x_scale_shift = _validate_h_gelu_x_scale_shift(h_gelu_x_scale_shift)
     instr = 0
     instr |= (opcode & 0xF) << 252
     instr |= (writeback_mode & 0xF) << 248
