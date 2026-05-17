@@ -42,7 +42,6 @@ UNIFIED_BUFFER_BLACKBOX = '''`include "defines.sv"
     output logic                     input_first_out,
     output logic                     input_last_out,
     output logic [`BUFFER_WIDTH-1:0] input_data,
-    output logic [`BUFFER_WIDTH-1:0] input_data_comb,
     input  logic                     weight_first_in,
     input  logic                     weight_last_in,
     input  logic [  `ADDR_WIDTH-1:0] weight_addr,

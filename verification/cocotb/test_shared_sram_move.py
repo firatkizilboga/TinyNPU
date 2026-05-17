@@ -16,7 +16,7 @@ import sys
 
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import ClockCycles, RisingEdge
+from cocotb.triggers import ClockCycles, FallingEdge, ReadOnly, RisingEdge
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if project_root not in sys.path:
@@ -30,7 +30,7 @@ ARRAY_SIZE     = 8
 BUFFER_WIDTH   = 128          # bits per UB word
 LANES_PER_WORD = BUFFER_WIDTH // 32   # 4 lanes of 32 bits each
 
-IM_BASE_ADDR   = 0x8000
+IM_BASE_ADDR   = 0x9000
 CHUNKS_PER_INST = 2           # 256-bit instruction / 128-bit chunk
 
 # MMIO addresses (from npu_driver)
@@ -150,7 +150,7 @@ async def _shared_write_word(dut, ub_addr: int, lanes: list[int]):
 
 async def _shared_read_word(dut, ub_addr: int) -> list[int]:
     """
-    Read one 128-bit UB word via host_shared combinational read tap.
+    Read one 128-bit UB word via the synchronous host_shared port.
     Returns list of 4 uint32 lane values.
     """
     lanes = []
@@ -158,9 +158,12 @@ async def _shared_read_word(dut, ub_addr: int) -> list[int]:
         dut.host_shared_addr.value  = ub_addr
         dut.host_shared_lane.value  = lane_idx
         dut.host_shared_rd_en.value = 1
-        # combinational output; sample after one clock so signal propagates
+        # Synchronous UB read: address/lane are sampled on this edge, and
+        # read data is stable in the read-only phase after registered updates.
         await RisingEdge(dut.clk)
+        await ReadOnly()
         lanes.append(int(dut.host_shared_rd_data.value))
+        await FallingEdge(dut.clk)
 
     dut.host_shared_rd_en.value = 0
     await RisingEdge(dut.clk)

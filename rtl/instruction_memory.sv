@@ -79,30 +79,32 @@ module instruction_memory #(
         end
     end
 
-    // Fetch Logic
+    // Synchronous read path. Normal execution uses rd_addr for instruction
+    // fetch; host_shared_rd_en temporarily uses the same read path while the
+    // NPU is idle. This avoids an asynchronous host tap into the IM array.
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             rd_data <= '0;
+            host_shared_rd_data <= 32'h0;
         end else begin
-            automatic int row_idx = rd_addr_rel / INST_CHUNKS;
-            if (row_idx < `IM_SIZE)
-                rd_data <= memory[row_idx];
-            else
-                rd_data <= '0;
-        end
-    end
+            automatic int row_idx;
+            automatic int chunk_idx;
+            row_idx = host_shared_rd_en ? (host_addr_rel / INST_CHUNKS)
+                                        : (rd_addr_rel / INST_CHUNKS);
+            chunk_idx = host_addr_rel % INST_CHUNKS;
 
-    always_comb begin
-        int row_idx;
-        int chunk_idx;
-        host_shared_rd_data = 32'h0;
-        row_idx = 0;
-        chunk_idx = 0;
-        row_idx = host_addr_rel / INST_CHUNKS;
-        chunk_idx = host_addr_rel % INST_CHUNKS;
-        if (row_idx < `IM_SIZE) begin
-            host_shared_rd_data =
-                memory[row_idx][chunk_idx * `BUFFER_WIDTH + (host_shared_lane * 32) +: 32];
+            if (row_idx < `IM_SIZE) begin
+                rd_data <= memory[row_idx];
+                if (host_shared_rd_en) begin
+                    host_shared_rd_data <=
+                        memory[row_idx][chunk_idx * `BUFFER_WIDTH + (host_shared_lane * 32) +: 32];
+                end
+            end else begin
+                rd_data <= '0;
+                if (host_shared_rd_en) begin
+                    host_shared_rd_data <= 32'h0;
+                end
+            end
         end
     end
 

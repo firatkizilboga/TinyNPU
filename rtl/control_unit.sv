@@ -213,14 +213,14 @@ module control_unit #(
       xform_shift <= xform_shift_next;
 
       // ROPE_K16: latch UB reads into rotation buffers each phase
-      // cycle_cnt here is the CURRENT phase (already updated to next value via cycle_next)
-      // ub_rdata_reg captured this cycle holds data fetched in the previous phase's address.
+      // cycle_cnt here is the CURRENT phase. ub_rdata is the synchronous data
+      // fetched by the previous phase's address.
       if (state == CTRL_EXEC_XFORM && xform_mode == XFORM_MODE_ROPE_K16) begin
         case (cycle_cnt)
-          3'd1: rope_k_lo_buf <= ub_rdata_reg; // phase 0 addressed K_lo; latch now
-          3'd2: rope_k_hi_buf <= ub_rdata_reg; // phase 1 addressed K_hi
-          3'd3: rope_cos_buf  <= ub_rdata_reg; // phase 2 addressed cos
-          3'd4: rope_k_hi_rot_buf <= rope_k_hi_rot_w; // sin in ub_rdata_reg; latch K_hi_rot
+          3'd1: rope_k_lo_buf <= ub_rdata; // phase 0 addressed K_lo; latch now
+          3'd2: rope_k_hi_buf <= ub_rdata; // phase 1 addressed K_hi
+          3'd3: rope_cos_buf  <= ub_rdata; // phase 2 addressed cos
+          3'd4: rope_k_hi_rot_buf <= rope_k_hi_rot_w; // sin in ub_rdata; latch K_hi_rot
           default: ;
         endcase
       end
@@ -472,12 +472,12 @@ module control_unit #(
     endfunction
 
     always_comb begin
-        xform_word_q_f16_i16 = ub_rdata_reg;
-        xform_word_dq_i16_f16 = ub_rdata_reg;
+        xform_word_q_f16_i16 = ub_rdata;
+        xform_word_dq_i16_f16 = ub_rdata;
         for (int lane = 0; lane < `ARRAY_SIZE; lane++) begin
             xform_word_q_f16_i16[lane*16 +: 16] =
                 quantize_lane_q_f16_i16(
-                    ub_rdata_reg[lane*16 +: 16],
+                    ub_rdata[lane*16 +: 16],
                     xform_multiplier,
                     xform_shift
                 );
@@ -486,7 +486,7 @@ module control_unit #(
             for (int lane = 0; lane < `ARRAY_SIZE; lane++) begin
                 xform_word_dq_i16_f16[lane*16 +: 16] =
                     dequantize_lane_i16_f16(
-                        $signed(ub_rdata_reg[lane*16 +: 16]),
+                        $signed(ub_rdata[lane*16 +: 16]),
                         xform_multiplier,
                         xform_shift
                     );
@@ -495,7 +495,7 @@ module control_unit #(
     end
 
     // --- RoPE INT16 Q14 rotation combinational ---
-    // Valid during CTRL_EXEC_XFORM phase 4 (ub_rdata_reg = sin word).
+    // Valid during CTRL_EXEC_XFORM phase 4 (ub_rdata = sin word).
     // rope_k_lo_rot_w[j] = clip_i16((K_lo[j]*cos[j] - K_hi[j]*sin[j] + 2^13) >> 14)
     // rope_k_hi_rot_w[j] = clip_i16((K_hi[j]*cos[j] + K_lo[j]*sin[j] + 2^13) >> 14)
     always_comb begin
@@ -507,7 +507,7 @@ module control_unit #(
             klo_v   = $signed(rope_k_lo_buf[rj*16 +: 16]);
             khi_v   = $signed(rope_k_hi_buf[rj*16 +: 16]);
             cos_v   = $signed(rope_cos_buf[rj*16 +: 16]);
-            sin_v   = $signed(ub_rdata_reg[rj*16 +: 16]); // sin valid in phase 4
+            sin_v   = $signed(ub_rdata[rj*16 +: 16]); // sin valid in phase 4
             lo_prod = klo_v * cos_v - khi_v * sin_v;
             hi_prod = khi_v * cos_v + klo_v * sin_v;
             rope_k_lo_rot_w[rj*16 +: 16] = clip_i16($signed(lo_prod + 32'sd8192) >>> 14);
@@ -734,7 +734,7 @@ module control_unit #(
           move_phase_next = 1'b1;
         end else begin
           ub_addr = move_dest;
-          ub_wdata = ub_rdata_reg;
+          ub_wdata = ub_rdata;
           ub_wr_en = 1'b1;
           move_src_next = move_src + 1;
           move_dest_next = move_dest + 1;
@@ -841,12 +841,18 @@ module control_unit #(
       CTRL_MM_LOAD_BIAS: begin
         status_out = `STATUS_BUSY;
         ub_req = 1'b1;
-        ppu_bias_en = 1'b1;
         if (cycle_cnt == 0) begin
+            // Issue first synchronous bias read.
             ub_addr = mm_bias_base + (n_idx * 2);
             cycle_next = 1;
-        end else begin
+        end else if (cycle_cnt == 1) begin
+            // Capture first bias word while issuing the second read.
+            ppu_bias_en = 1'b1;
             ub_addr = mm_bias_base + (n_idx * 2) + 1;
+            cycle_next = 2;
+        end else begin
+            // Capture second bias word; both bias reads are now resident in PPU.
+            ppu_bias_en = 1'b1;
             cycle_next = 0;
             next_state = CTRL_MM_FEED;
         end

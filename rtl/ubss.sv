@@ -63,6 +63,8 @@ module ubss #(
     // ------------------------------------------------------------------------
     // Outputs
     // ------------------------------------------------------------------------
+    // TODO(remove-results-flat): delete this verification-only accumulator dump
+    // once direct cocotb tests stop depending on the flattened array.
     output logic [(`ARRAY_SIZE * `ARRAY_SIZE * `ACC_WIDTH)-1:0] results_flat,
     output logic                     result_valid,
     output logic                     all_done
@@ -117,15 +119,33 @@ module ubss #(
     
     // Wire up the Skewer ports
     logic [`BUFFER_WIDTH-1:0] skewer_input_data;
-    logic [`BUFFER_WIDTH-1:0] skewer_input_data_comb;
     logic [`BUFFER_WIDTH-1:0] skewer_weight_data;
-    logic [`BUFFER_WIDTH-1:0] host_data_comb;
     logic                     skewer_input_first, skewer_input_last;
     logic                     skewer_weight_first, skewer_weight_last;
     logic [`ADDR_WIDTH-1:0]   ub_port_a_addr;
     logic                     ub_port_a_first_in, ub_port_a_last_in;
     logic [`ADDR_WIDTH-1:0]   ub_port_b_addr;
     logic                     ub_port_b_first_in, ub_port_b_last_in;
+    logic [`ADDR_WIDTH-1:0]   host_shared_rd_addr_q;
+    logic [1:0]               host_shared_rd_lane_q;
+    logic                     host_shared_rd_hold_q;
+    logic                     host_shared_rd_port_a_sel;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            host_shared_rd_addr_q <= '0;
+            host_shared_rd_lane_q <= '0;
+            host_shared_rd_hold_q <= 1'b0;
+        end else begin
+            host_shared_rd_hold_q <= host_shared_allow && host_shared_rd_en;
+            if (host_shared_allow && host_shared_rd_en) begin
+                host_shared_rd_addr_q <= host_shared_addr;
+                host_shared_rd_lane_q <= host_shared_lane;
+            end
+        end
+    end
+
+    assign host_shared_rd_port_a_sel = host_shared_allow && (host_shared_rd_en || host_shared_rd_hold_q);
 
     // Read-port arbiter:
     // - Port A is shared between SA input stream and CU random reads.
@@ -139,6 +159,13 @@ module ubss #(
             ub_port_b_addr     = sa_weight_addr;
             ub_port_b_first_in = sa_weight_first;
             ub_port_b_last_in  = sa_weight_last;
+        end else if (host_shared_rd_port_a_sel) begin
+            ub_port_a_addr     = host_shared_rd_en ? host_shared_addr : host_shared_rd_addr_q;
+            ub_port_a_first_in = 1'b0;
+            ub_port_a_last_in  = 1'b0;
+            ub_port_b_addr     = '0;
+            ub_port_b_first_in = 1'b0;
+            ub_port_b_last_in  = 1'b0;
         end else begin
             ub_port_a_addr     = cu_addr;
             ub_port_a_first_in = 1'b0;
@@ -149,8 +176,9 @@ module ubss #(
         end
     end
 
-    // CU reads observe Port A combinational tap when arbiter routes CU onto Port A.
-    assign cu_rdata = cu_req && !cu_wr_en ? skewer_input_data_comb : '0;
+    // CU/host reads observe Port A's registered synchronous read data. The
+    // control unit issues an address one cycle before consuming this value.
+    assign cu_rdata = skewer_input_data;
 
     always_comb begin
         host_shared_mask = '0;
@@ -164,9 +192,10 @@ module ubss #(
     end
 
     assign host_shared_wr_fire = (host_shared_allow === 1'b1) && (host_shared_wr_en === 1'b1);
-    // Keep read data address-driven (not rd_en-gated). The core samples on
-    // response timing, which can be a cycle after the request pulse.
-    assign host_shared_rd_data = host_data_comb[(host_shared_lane * 32) +: 32];
+    // The CPU wrapper returns peripheral data one cycle after the request, so
+    // shared reads use the registered lane from the request cycle.
+    assign host_shared_rd_data =
+        skewer_input_data[(host_shared_rd_lane_q * 32) +: 32];
 
     unified_buffer #(
         .INIT_FILE(UB_INIT_FILE)
@@ -185,17 +214,14 @@ module ubss #(
         .input_first_out (skewer_input_first),
         .input_last_out  (skewer_input_last),
         .input_data      (skewer_input_data),
-        .input_data_comb (skewer_input_data_comb),
-        
+
         // Port B: Weight Matrix Stream
         .weight_first_in (ub_port_b_first_in),
         .weight_last_in  (ub_port_b_last_in),
         .weight_addr     (ub_port_b_addr),
         .weight_first_out(skewer_weight_first),
         .weight_last_out (skewer_weight_last),
-        .weight_data     (skewer_weight_data),
-        .host_addr       (host_shared_addr),
-        .host_data_comb  (host_data_comb)
+        .weight_data     (skewer_weight_data)
     );
     
     // ========================================================================
