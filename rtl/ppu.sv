@@ -60,10 +60,11 @@ module ppu (
   // Internal state to track which bias word is being loaded (0 or 1)
   logic bias_word_toggle;
 
-  logic valid_s0, valid_s1, valid_s2, valid_s3, valid_s4, valid_s5, valid_s6, valid_s7, valid_s8;
-  logic last_s0, last_s1, last_s2, last_s3, last_s4, last_s5, last_s6, last_s7, last_s8;
-  logic [$clog2(`ARRAY_SIZE)-1:0] row_s0, row_s1, row_s2, row_s3, row_s4, row_s5, row_s6, row_s7, row_s8;
-  logic [7:0] shift_s0, shift_s1, shift_s2, shift_s3, shift_s4, shift_s5, shift_s6, shift_s7;
+  logic valid_s0, valid_s1, valid_s2, valid_s3, valid_s4, valid_s5, valid_s6, valid_s7, valid_s8, valid_s9;
+  logic last_s0, last_s1, last_s2, last_s3, last_s4, last_s5, last_s6, last_s7, last_s8, last_s9;
+  logic [`ARRAY_SIZE-1:0] row_we_s0, row_we_s1, row_we_s2, row_we_s3, row_we_s4;
+  logic [`ARRAY_SIZE-1:0] row_we_s5, row_we_s6, row_we_s7, row_we_s8, row_we_s9;
+  logic [PPU_SHIFT_WIDTH-1:0] shift_s0, shift_s1, shift_s2, shift_s3, shift_s4, shift_s5, shift_s6, shift_s7;
   logic [PPU_SIGMOID_SHIFT_WIDTH-1:0] sigmoid_shift_s0, sigmoid_shift_s1, sigmoid_shift_s2, sigmoid_shift_s3;
   logic [PPU_SIGMOID_SHIFT_WIDTH-1:0] sigmoid_shift_s4, sigmoid_shift_s5, sigmoid_shift_s6, sigmoid_shift_s7;
   logic sigmoid_shift_valid_s0, sigmoid_shift_valid_s1, sigmoid_shift_valid_s2, sigmoid_shift_valid_s3;
@@ -92,6 +93,7 @@ module ppu (
   logic signed [PPU_GELU_DIV_WIDTH-1:0] gelu_div6_s7[`ARRAY_SIZE-1:0];
   logic signed [15:0] activated_s8[`ARRAY_SIZE-1:0];
   logic [15:0] quantized_s9[`ARRAY_SIZE-1:0];
+  logic [15:0] quantized_w_s9[`ARRAY_SIZE-1:0];
   logic signed [PPU_PRODUCT_WIDTH:0] shifted_wide_s3[`ARRAY_SIZE-1:0];
   logic signed [PPU_ACT_WIDTH-1:0] sigmoid_bound_s4;
   logic signed [PPU_ACT_WIDTH-1:0] sigmoid_qmax_s4;
@@ -122,7 +124,7 @@ module ppu (
     end
   endfunction
 
-  assign busy = capture_en | valid_s0 | valid_s1 | valid_s2 | valid_s3 | valid_s4 | valid_s5 | valid_s6 | valid_s7 | valid_s8;
+  assign busy = capture_en | valid_s0 | valid_s1 | valid_s2 | valid_s3 | valid_s4 | valid_s5 | valid_s6 | valid_s7 | valid_s8 | valid_s9;
 
   always_comb begin
     unique case (precision_s4)
@@ -147,16 +149,16 @@ module ppu (
           if (activated > 16'sd7) sat4 = 4'sd7;
           else if (activated < -16'sd8) sat4 = -4'sd8;
           else sat4 = activated[3:0];
-          quantized_s9[i] = 16'(unsigned'(sat4));
+          quantized_w_s9[i] = 16'(unsigned'(sat4));
         end
         2'b01: begin  // INT8: [-128, 127]
           if (activated > 16'sd127) sat8 = 8'sd127;
           else if (activated < -16'sd128) sat8 = -8'sd128;
           else sat8 = activated[7:0];
-          quantized_s9[i] = 16'(unsigned'(sat8));
+          quantized_w_s9[i] = 16'(unsigned'(sat8));
         end
         default: begin  // INT16: [-32768, 32767]
-          quantized_s9[i] = activated;
+          quantized_w_s9[i] = activated;
         end
       endcase
     end
@@ -164,7 +166,7 @@ module ppu (
 
   always_comb begin
     for (int i = 0; i < `ARRAY_SIZE; i++) begin
-      shifted_wide_s3[i] = rounded_s2[i] >>> ppu_effective_shift(shift_s2);
+      shifted_wide_s3[i] = rounded_s2[i] >>> shift_s2;
     end
   end
 
@@ -184,6 +186,7 @@ module ppu (
       valid_s6 <= 1'b0;
       valid_s7 <= 1'b0;
       valid_s8 <= 1'b0;
+      valid_s9 <= 1'b0;
       last_s0 <= 1'b0;
       last_s1 <= 1'b0;
       last_s2 <= 1'b0;
@@ -193,15 +196,17 @@ module ppu (
       last_s6 <= 1'b0;
       last_s7 <= 1'b0;
       last_s8 <= 1'b0;
-      row_s0 <= '0;
-      row_s1 <= '0;
-      row_s2 <= '0;
-      row_s3 <= '0;
-      row_s4 <= '0;
-      row_s5 <= '0;
-      row_s6 <= '0;
-      row_s7 <= '0;
-      row_s8 <= '0;
+      last_s9 <= 1'b0;
+      row_we_s0 <= '0;
+      row_we_s1 <= '0;
+      row_we_s2 <= '0;
+      row_we_s3 <= '0;
+      row_we_s4 <= '0;
+      row_we_s5 <= '0;
+      row_we_s6 <= '0;
+      row_we_s7 <= '0;
+      row_we_s8 <= '0;
+      row_we_s9 <= '0;
       shift_s0 <= '0;
       shift_s1 <= '0;
       shift_s2 <= '0;
@@ -273,9 +278,10 @@ module ppu (
         sigmoid_rounded_s7[i] <= '0;
         gelu_div6_s7[i] <= '0;
         activated_s8[i] <= '0;
+        quantized_s9[i] <= '0;
       end
     end else begin
-      done <= valid_s8 && last_s8;
+      done <= valid_s9 && last_s9;
 
       if (bias_clear) begin
         for (int i = 0; i < `ARRAY_SIZE; i++) bias_reg[i] <= '0;
@@ -299,6 +305,7 @@ module ppu (
       valid_s6 <= valid_s5;
       valid_s7 <= valid_s6;
       valid_s8 <= valid_s7;
+      valid_s9 <= valid_s8;
       last_s0 <= capture_en && (ppu_cycle_idx == (`ARRAY_SIZE - 1));
       last_s1 <= last_s0;
       last_s2 <= last_s1;
@@ -308,10 +315,11 @@ module ppu (
       last_s6 <= last_s5;
       last_s7 <= last_s6;
       last_s8 <= last_s7;
+      last_s9 <= last_s8;
 
       if (capture_en) begin
-        row_s0 <= (`ARRAY_SIZE - 1) - ppu_cycle_idx;
-        shift_s0 <= shift;
+        row_we_s0 <= `ARRAY_SIZE'(1) << ((`ARRAY_SIZE - 1) - ppu_cycle_idx);
+        shift_s0 <= ppu_effective_shift(shift);
         sigmoid_shift_s0 <= ppu_effective_sigmoid_shift(shift);
         sigmoid_shift_valid_s0 <= (shift < 8'd28);
         activation_s0 <= activation;
@@ -329,9 +337,11 @@ module ppu (
             biased_s0[i] <= biased_wide[PPU_ACC_WIDTH-1:0];
           end
         end
+      end else begin
+        row_we_s0 <= '0;
       end
 
-      row_s1 <= row_s0;
+      row_we_s1 <= row_we_s0;
       shift_s1 <= shift_s0;
       sigmoid_shift_s1 <= sigmoid_shift_s0;
       sigmoid_shift_valid_s1 <= sigmoid_shift_valid_s0;
@@ -343,7 +353,7 @@ module ppu (
         product_s1[i] <= biased_s0[i] * $signed({1'b0, multiplier_s0});
       end
 
-      row_s2 <= row_s1;
+      row_we_s2 <= row_we_s1;
       shift_s2 <= shift_s1;
       sigmoid_shift_s2 <= sigmoid_shift_s1;
       sigmoid_shift_valid_s2 <= sigmoid_shift_valid_s1;
@@ -352,16 +362,14 @@ module ppu (
       precision_s2 <= precision_s1;
       multiplier_s2 <= multiplier_s1;
       for (int i = 0; i < `ARRAY_SIZE; i++) begin
-        logic [PPU_SHIFT_WIDTH-1:0] eff_shift;
-        eff_shift = ppu_effective_shift(shift_s1);
-        if (shift_s1 > 0) begin
-          rounded_s2[i] <= product_s1[i] + $signed({1'b0, (PPU_PRODUCT_WIDTH'(1) << (eff_shift - 1))});
+        if (shift_s1 != '0) begin
+          rounded_s2[i] <= product_s1[i] + $signed({1'b0, (PPU_PRODUCT_WIDTH'(1) << (shift_s1 - 1'b1))});
         end else begin
           rounded_s2[i] <= {product_s1[i][PPU_PRODUCT_WIDTH-1], product_s1[i]};
         end
       end
 
-      row_s3 <= row_s2;
+      row_we_s3 <= row_we_s2;
       shift_s3 <= shift_s2;
       sigmoid_shift_s3 <= sigmoid_shift_s2;
       sigmoid_shift_valid_s3 <= sigmoid_shift_valid_s2;
@@ -372,7 +380,7 @@ module ppu (
         shifted_s3[i] <= shifted_wide_s3[i][PPU_PRODUCT_WIDTH-1:0];
       end
 
-      row_s4 <= row_s3;
+      row_we_s4 <= row_we_s3;
       shift_s4 <= shift_s3;
       sigmoid_shift_s4 <= sigmoid_shift_s3;
       sigmoid_shift_valid_s4 <= sigmoid_shift_valid_s3;
@@ -389,7 +397,7 @@ module ppu (
         end
       end
 
-      row_s5 <= row_s4;
+      row_we_s5 <= row_we_s4;
       shift_s5 <= shift_s4;
       sigmoid_shift_s5 <= sigmoid_shift_s4;
       sigmoid_shift_valid_s5 <= sigmoid_shift_valid_s4;
@@ -425,7 +433,7 @@ module ppu (
         endcase
       end
 
-      row_s6 <= row_s5;
+      row_we_s6 <= row_we_s5;
       shift_s6 <= shift_s5;
       sigmoid_shift_s6 <= sigmoid_shift_s5;
       sigmoid_shift_valid_s6 <= sigmoid_shift_valid_s5;
@@ -443,7 +451,7 @@ module ppu (
         gelu_prod_s6[i] <= act_x_s5[i] * gelu_gate_s5[i];
       end
 
-      row_s7 <= row_s6;
+      row_we_s7 <= row_we_s6;
       shift_s7 <= shift_s6;
       sigmoid_shift_s7 <= sigmoid_shift_s6;
       sigmoid_shift_valid_s7 <= sigmoid_shift_valid_s6;
@@ -456,7 +464,7 @@ module ppu (
         gelu_div6_s7[i] <= (gelu_prod_s6[i] * PPU_ACT_WIDTH'(10923) + (PPU_ACT_WIDTH'(1) <<< 15)) >>> 16;
       end
 
-      row_s8 <= row_s7;
+      row_we_s8 <= row_we_s7;
       precision_s8 <= precision_s7;
       for (int i = 0; i < `ARRAY_SIZE; i++) begin
         logic signed [PPU_GELU_DIV_WIDTH-1:0] shifted_gelu;
@@ -487,9 +495,18 @@ module ppu (
         endcase
       end
 
-      if (valid_s8) begin
-        for (int i = 0; i < `ARRAY_SIZE; i++) begin
-          storage[row_s8][i] <= quantized_s9[i];
+      row_we_s9 <= row_we_s8;
+      for (int i = 0; i < `ARRAY_SIZE; i++) begin
+        quantized_s9[i] <= quantized_w_s9[i];
+      end
+
+      if (valid_s9) begin
+        for (int r = 0; r < `ARRAY_SIZE; r++) begin
+          if (row_we_s9[r]) begin
+            for (int i = 0; i < `ARRAY_SIZE; i++) begin
+              storage[r][i] <= quantized_s9[i];
+            end
+          end
         end
       end
     end

@@ -9,6 +9,7 @@ VERILOG_SOURCES += $(PWD)/../../rtl/ppu.sv
 VERILOG_SOURCES += $(PWD)/../../rtl/ubss.sv
 VERILOG_SOURCES += $(PWD)/../../rtl/mmio_interface.sv
 VERILOG_SOURCES += $(PWD)/../../rtl/instruction_memory.sv
+VERILOG_SOURCES += $(PWD)/../../rtl/xform_unit.sv
 VERILOG_SOURCES += $(PWD)/../../rtl/control_unit.sv
 VERILOG_SOURCES += $(PWD)/../../rtl/control_top.sv
 VERILOG_SOURCES += $(PWD)/../../rtl/tinynpu_top.sv
