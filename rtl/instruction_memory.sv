@@ -1,5 +1,29 @@
 `include "defines.sv"
 
+`ifdef TINYNPU_FPGA_BRAM
+(* blackbox *) module instruction_memory #(
+    parameter INIT_FILE = ""
+)(
+    input logic clk,
+    input logic rst_n,
+
+    input  logic                     wr_en,
+    input  logic [  `ADDR_WIDTH-1:0] wr_addr,
+    input  logic [`BUFFER_WIDTH-1:0] wr_data,
+
+    input  logic [  `ADDR_WIDTH-1:0] host_shared_addr,
+    input  logic [1:0]               host_shared_lane,
+    input  logic [31:0]              host_shared_wr_data,
+    input  logic [3:0]               host_shared_wr_be,
+    input  logic                     host_shared_wr_en,
+    input  logic                     host_shared_rd_en,
+    output logic [31:0]              host_shared_rd_data,
+
+    input  logic [  `ADDR_WIDTH-1:0] rd_addr,
+    output logic [  `INST_WIDTH-1:0] rd_data
+);
+endmodule
+`else
 module instruction_memory #(
     parameter INIT_FILE = ""
 )(
@@ -109,3 +133,4 @@ module instruction_memory #(
     end
 
 endmodule
+`endif

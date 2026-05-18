@@ -52,7 +52,7 @@ def npu_files(workdir: Path, *, top: str) -> tuple[list[str], list[Path], str]:
 
     staged = workdir / "rtl_tinynpu_abstract_ram"
     stage_rtl(staged, memory_mode="abstract-ram")
-    excluded = {"ub_skewer_wrapper.sv"}
+    excluded = {"ub_skewer_wrapper.sv", "cv32e40p_tinynpu_synth_top.sv"}
     files = [str(p) for p in sorted(staged.glob("*.sv")) if p.name not in excluded]
     return files, [staged], top
 
@@ -82,6 +82,19 @@ def cpu_files(*, include_fpu: bool) -> tuple[list[str], list[Path], str]:
     rtl = ROOT / "external" / "cv32e40p" / "rtl"
     manifest = ROOT / "external" / "cv32e40p" / ("cv32e40p_fpu_manifest.flist" if include_fpu else "cv32e40p_manifest.flist")
     return parse_manifest(manifest, design_rtl_dir=rtl, include_fpu=include_fpu)
+
+
+def cpu_npu_files(workdir: Path) -> tuple[list[str], list[Path], str]:
+    sys.path.insert(0, str(ROOT / "scripts"))
+    from synth_tinynpu_yosys import stage_rtl
+
+    staged = workdir / "rtl_cpu_npu_abstract_ram"
+    stage_rtl(staged, memory_mode="abstract-ram")
+
+    cpu, cpu_incdirs, _ = cpu_files(include_fpu=False)
+    excluded = {"ub_skewer_wrapper.sv"}
+    npu = [str(p) for p in sorted(staged.glob("*.sv")) if p.name not in excluded]
+    return cpu + npu, cpu_incdirs + [staged], "cv32e40p_tinynpu_synth_top"
 
 
 def write_yosys_script(
@@ -148,7 +161,7 @@ def summarize(log: str) -> list[str]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Rough ASIC-style Yosys synthesis for TinyNPU/CV32E40P.")
-    ap.add_argument("target", choices=["npu", "cpu", "cpu-fpu"])
+    ap.add_argument("target", choices=["npu", "cpu", "cpu-fpu", "cpu-npu"])
     ap.add_argument("--workdir", default=str(ROOT / "runs" / "asic_synth"))
     ap.add_argument("--liberty", default="")
     ap.add_argument("--delay-ps", type=int, default=5000)
@@ -176,6 +189,8 @@ def main() -> int:
 
     if args.target == "npu":
         files, incdirs, top = npu_files(workdir, top=args.npu_top)
+    elif args.target == "cpu-npu":
+        files, incdirs, top = cpu_npu_files(workdir)
     elif args.target == "cpu-fpu":
         files, incdirs, top = cpu_files(include_fpu=True)
     else:

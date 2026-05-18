@@ -107,16 +107,17 @@ def stage_rtl(dst: Path, memory_mode: str) -> None:
         (dst / "instruction_memory.sv").write_text(INSTRUCTION_MEMORY_BLACKBOX)
 
 
-def build_script(staged_rtl: Path, script_path: Path) -> None:
+def build_script(staged_rtl: Path, script_path: Path, *, defines: list[str] | None = None) -> None:
     # ub_skewer_wrapper is an old standalone wrapper, not part of tinynpu_top.
     # Slang type-checks all read files, so keep stale standalone wrappers out of
     # the synthesis input set instead of letting unused code break the flow.
-    excluded = {"ub_skewer_wrapper.sv"}
+    excluded = {"ub_skewer_wrapper.sv", "cv32e40p_tinynpu_synth_top.sv"}
     files = sorted(str(p) for p in staged_rtl.glob("*.sv") if p.name not in excluded)
+    define_flags = " ".join(f"-D{define}" for define in (defines or []))
     script = (
-        "read_slang -I {inc} -DSYNTHESIS {files}; hierarchy -top tinynpu_top; "
+        "read_slang -I {inc} -DSYNTHESIS {define_flags} {files}; hierarchy -top tinynpu_top; "
         "synth_xilinx -family xc7; stat\n"
-    ).format(inc=staged_rtl, files=" ".join(files))
+    ).format(inc=staged_rtl, define_flags=define_flags, files=" ".join(files))
     script_path.write_text(script)
 
 
@@ -171,7 +172,8 @@ def main() -> int:
     workdir.mkdir(parents=True, exist_ok=True)
 
     stage_rtl(staged, memory_mode=args.mode)
-    build_script(staged, script)
+    defines = ["TINYNPU_FPGA_BRAM"] if args.mode == "full-ram" else []
+    build_script(staged, script, defines=defines)
 
     if args.stage_only:
         print(f"staged_rtl={staged}")
