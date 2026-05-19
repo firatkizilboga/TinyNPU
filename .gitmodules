@@ -1,0 +1,3 @@
+[submodule "external/third_party/onnx2c"]
+	path = external/third_party/onnx2c
+	url = https://github.com/kraiskil/onnx2c
