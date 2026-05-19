@@ -31,58 +31,154 @@ module unified_buffer #(
 
 `ifdef TINYNPU_FPGA_BRAM
   // FPGA BRAM mode: replicate storage for 2R1W and split each 128-bit row into
-  // byte-wide RAM macros. This deliberately rejects sub-byte masks. INT4 packed
-  // writeback needs a staged read-modify-write path before it can be
-  // FPGA-realistic.
-  // TODO(int4-fpga): add an INT4 writeback packer that accumulates four
-  // nibbles per 16-bit lane in registers, then commits a full byte/halfword to
-  // UB. Do not reintroduce nibble write enables into the large FPGA memory.
+  // byte-wide RAM macros. Sub-byte INT4 writes are merged in a small staging
+  // CAM, then committed as full-byte writes so the large UB RAM never needs
+  // nibble write enables.
   localparam int UB_BYTES = `BUFFER_WIDTH / 8;
-  logic [UB_BYTES-1:0] input_byte_wr_en;
-  logic [UB_BYTES-1:0] weight_byte_wr_en;
+  localparam int PARTIAL_ENTRIES = 16;
+  localparam int PARTIAL_IDX_W = $clog2(PARTIAL_ENTRIES);
+
+  logic [UB_BYTES-1:0] byte_commit_wr_en;
+  logic [7:0]          byte_commit_wr_data[UB_BYTES-1:0];
   logic [7:0]          input_byte_rd_data [UB_BYTES-1:0];
   logic [7:0]          weight_byte_rd_data[UB_BYTES-1:0];
+
+  logic                         partial_valid[PARTIAL_ENTRIES-1:0];
+  logic [`ADDR_WIDTH-1:0]       partial_addr [PARTIAL_ENTRIES-1:0];
+  logic [`BUFFER_WIDTH-1:0]     partial_data [PARTIAL_ENTRIES-1:0];
+  logic [`BUFFER_WIDTH-1:0]     partial_mask [PARTIAL_ENTRIES-1:0];
+
+  logic                         wr_has_partial_mask;
+  logic                         partial_match_found;
+  logic                         partial_free_found;
+  logic [PARTIAL_IDX_W-1:0]     partial_match_idx;
+  logic [PARTIAL_IDX_W-1:0]     partial_free_idx;
+  logic [PARTIAL_IDX_W-1:0]     partial_update_idx;
+  logic [`BUFFER_WIDTH-1:0]     partial_selected_data;
+  logic [`BUFFER_WIDTH-1:0]     partial_selected_mask;
+  logic [`BUFFER_WIDTH-1:0]     partial_merged_data;
+  logic [`BUFFER_WIDTH-1:0]     partial_merged_mask;
+  logic [`BUFFER_WIDTH-1:0]     partial_next_data;
+  logic [`BUFFER_WIDTH-1:0]     partial_next_mask;
+  logic                         partial_update_needed;
+
+  always_comb begin
+    wr_has_partial_mask  = 1'b0;
+    partial_match_found  = 1'b0;
+    partial_free_found   = 1'b0;
+    partial_match_idx    = '0;
+    partial_free_idx     = '0;
+    partial_selected_data = '0;
+    partial_selected_mask = '0;
+
+    for (int b = 0; b < UB_BYTES; b++) begin
+      if (wr_mask[b*8 +: 8] != 8'h00 && wr_mask[b*8 +: 8] != 8'hFF) begin
+        wr_has_partial_mask = 1'b1;
+      end
+    end
+
+    for (int e = 0; e < PARTIAL_ENTRIES; e++) begin
+      if (partial_valid[e] && partial_addr[e] == wr_addr && !partial_match_found) begin
+        partial_match_found = 1'b1;
+        partial_match_idx = e[PARTIAL_IDX_W-1:0];
+      end
+      if (!partial_valid[e] && !partial_free_found) begin
+        partial_free_found = 1'b1;
+        partial_free_idx = e[PARTIAL_IDX_W-1:0];
+      end
+    end
+
+    partial_update_idx = partial_match_found ? partial_match_idx : partial_free_idx;
+    if (partial_match_found) begin
+      partial_selected_data = partial_data[partial_match_idx];
+      partial_selected_mask = partial_mask[partial_match_idx];
+    end
+
+    partial_merged_data = (partial_selected_data & ~wr_mask) | (wr_data & wr_mask);
+    partial_merged_mask = partial_selected_mask | wr_mask;
+    partial_next_mask = partial_merged_mask;
+
+    for (int b = 0; b < UB_BYTES; b++) begin
+      byte_commit_wr_en[b] = wr_en && (wr_mask[b*8 +: 8] != 8'h00);
+      byte_commit_wr_data[b] = partial_merged_data[b*8 +: 8];
+      if (wr_mask[b*8 +: 8] != 8'h00 && partial_merged_mask[b*8 +: 8] == 8'hFF) begin
+        partial_next_mask[b*8 +: 8] = 8'h00;
+      end
+    end
+
+    partial_next_data = partial_merged_data & partial_next_mask;
+    partial_update_needed = wr_en && (partial_match_found || wr_has_partial_mask);
+  end
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      for (int e = 0; e < PARTIAL_ENTRIES; e++) begin
+        partial_valid[e] <= 1'b0;
+        partial_addr[e]  <= '0;
+        partial_data[e]  <= '0;
+        partial_mask[e]  <= '0;
+      end
+    end else if (partial_update_needed) begin
+      if (!partial_match_found && !partial_free_found) begin
+`ifndef SYNTHESIS
+        $fatal(1, "unified_buffer INT4 partial-byte packer overflow");
+`endif
+      end else if (partial_next_mask == '0) begin
+        partial_valid[partial_update_idx] <= 1'b0;
+        partial_data[partial_update_idx]  <= '0;
+        partial_mask[partial_update_idx]  <= '0;
+      end else begin
+        partial_valid[partial_update_idx] <= 1'b1;
+        partial_addr[partial_update_idx]  <= wr_addr;
+        partial_data[partial_update_idx]  <= partial_next_data;
+        partial_mask[partial_update_idx]  <= partial_next_mask;
+      end
+    end
+  end
 
   generate
     genvar byte_idx;
     for (byte_idx = 0; byte_idx < UB_BYTES; byte_idx++) begin : g_byte_banks
-      assign input_byte_wr_en[byte_idx] = wr_en && (wr_mask[byte_idx*8 +: 8] == 8'hFF);
-      assign weight_byte_wr_en[byte_idx] = wr_en && (wr_mask[byte_idx*8 +: 8] == 8'hFF);
-
       tinynpu_byte_ram u_input_bank (
           .clk    (clk),
-          .wr_en  (input_byte_wr_en[byte_idx]),
+          .wr_en  (byte_commit_wr_en[byte_idx]),
           .wr_addr(wr_addr),
-          .wr_data(wr_data[byte_idx*8 +: 8]),
+          .wr_data(byte_commit_wr_data[byte_idx]),
           .rd_addr(input_addr),
           .rd_data(input_byte_rd_data[byte_idx])
       );
 
       tinynpu_byte_ram u_weight_bank (
           .clk    (clk),
-          .wr_en  (weight_byte_wr_en[byte_idx]),
+          .wr_en  (byte_commit_wr_en[byte_idx]),
           .wr_addr(wr_addr),
-          .wr_data(wr_data[byte_idx*8 +: 8]),
+          .wr_data(byte_commit_wr_data[byte_idx]),
           .rd_addr(weight_addr),
           .rd_data(weight_byte_rd_data[byte_idx])
       );
     end
   endgenerate
 
-  // Read logic - data and markers have same 1-cycle latency
+  // Byte RAM rd_data is already registered, so expose it directly to keep the
+  // same one-cycle read latency as the functional UB model.
+  always_comb begin
+    input_data  = '0;
+    weight_data = '0;
+    if (rst_n) begin
+      for (int b = 0; b < UB_BYTES; b++) begin
+        input_data[b*8 +: 8]  = input_byte_rd_data[b];
+        weight_data[b*8 +: 8] = weight_byte_rd_data[b];
+      end
+    end
+  end
+
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-      input_data       <= '0;
       input_first_out  <= 1'b0;
       input_last_out   <= 1'b0;
-      weight_data      <= '0;
       weight_first_out <= 1'b0;
       weight_last_out  <= 1'b0;
     end else begin
-      for (int b = 0; b < UB_BYTES; b++) begin
-        input_data[b*8 +: 8]  <= input_byte_rd_data[b];
-        weight_data[b*8 +: 8] <= weight_byte_rd_data[b];
-      end
       input_first_out  <= input_first_in;
       input_last_out   <= input_last_in;
       weight_first_out <= weight_first_in;

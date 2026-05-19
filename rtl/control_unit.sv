@@ -271,6 +271,9 @@ module control_unit #(
     logic        wb_valid_cycle;
     logic [$clog2(`ARRAY_SIZE)-1:0] cache_lane_idx;
     logic [`ADDR_WIDTH-1:0] mm_c_effective_base;
+    logic        packed_c_writeback;
+    logic [15:0] packed_c_group_base;
+    logic [15:0] packed_c_group_limit;
     xform_unit u_xform (
         .clk(clk),
         .rst_n(rst_n),
@@ -329,6 +332,24 @@ module control_unit #(
             wb_valid_cycle = (mm_out_precision == MODE_INT16) && (cycle_cnt == cache_lane_idx);
         end
         mm_c_effective_base = mm_c_base + mm_output_word_offset;
+
+        packed_c_writeback = (mm_writeback_mode == WB_MODE_NORMAL) &&
+                             (mm_output_layout == OUT_LAYOUT_C) &&
+                             (mm_out_precision != MODE_INT16);
+        unique case (mm_out_precision)
+            MODE_INT4: begin
+                packed_c_group_base  = {m_idx[15:2], 2'b00};
+                packed_c_group_limit = {m_idx[15:2], 2'b00} + 16'd4;
+            end
+            MODE_INT8: begin
+                packed_c_group_base  = {m_idx[15:1], 1'b0};
+                packed_c_group_limit = {m_idx[15:1], 1'b0} + 16'd2;
+            end
+            default: begin
+                packed_c_group_base  = m_idx;
+                packed_c_group_limit = m_idx + 16'd1;
+            end
+        endcase
     end
 
     always_comb begin
@@ -676,7 +697,21 @@ module control_unit #(
 
         if (cycle_cnt == (`ARRAY_SIZE - 1)) begin
           cycle_next = '0;
-          n_next = n_idx + 1;
+          if (packed_c_writeback) begin
+            if (((m_idx + 16'd1) < mm_m_total) && ((m_idx + 16'd1) < packed_c_group_limit)) begin
+              // Keep the same N tile while producing the next packed M lane.
+              m_next = m_idx + 16'd1;
+            end else if ((n_idx + 16'd1) < mm_n_total) begin
+              // Finish this packed M group across all N tiles before moving on.
+              m_next = packed_c_group_base;
+              n_next = n_idx + 16'd1;
+            end else begin
+              m_next = packed_c_group_limit;
+              n_next = '0;
+            end
+          end else begin
+            n_next = n_idx + 1;
+          end
           next_state = CTRL_EXEC_MATMUL;
         end else begin
           cycle_next = cycle_cnt + 1;
