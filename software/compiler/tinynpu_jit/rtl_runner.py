@@ -23,6 +23,7 @@ class RunnerConfig:
     dump_final_outputs: bool = True
     verbose_steps: bool = True
     force_mmio: bool = False
+    timed: bool = False
     banner: str | None = None
 
 
@@ -34,7 +35,7 @@ def render_runner_source(program_symbol: str, config: RunnerConfig | None = None
     cfg = config or RunnerConfig()
     run_call = (
         f"    return tinynpu_run_repeat(program, ip, op, NULL, 0u, {cfg.repeat_count}u);\n"
-        if cfg.repeat_count > 1
+        if cfg.timed or cfg.repeat_count > 1
         else "    return tinynpu_run(program, ip, op, NULL, 0u);\n"
     )
     banner = f'    puts("{cfg.banner}");\n' if cfg.banner else ""
@@ -101,13 +102,37 @@ def toolchain_prefix() -> Path:
     if preferred.exists():
         return preferred.parent / "riscv32-unknown-elf-"
     gcc = shutil.which("riscv32-unknown-elf-gcc")
-    if gcc is None:
-        raise FileNotFoundError("riscv32-unknown-elf-gcc not found in PATH")
-    return Path(gcc).resolve().parent / "riscv32-unknown-elf-"
+    if gcc is not None:
+        return Path(gcc).resolve().parent / "riscv32-unknown-elf-"
+    gcc = shutil.which("riscv64-unknown-elf-gcc")
+    if gcc is not None:
+        return Path(gcc).resolve().parent / "riscv64-unknown-elf-"
+    raise FileNotFoundError("riscv32-unknown-elf-gcc or riscv64-unknown-elf-gcc not found in PATH")
 
 
 def toolchain_root(prefix: Path) -> Path:
     return prefix.parent.parent
+
+
+def toolchain_include_lib_dirs(prefix: Path) -> tuple[Path, Path]:
+    root = toolchain_root(prefix)
+    target = prefix.name[:-1]
+    conventional_include = root / target / "include"
+    conventional_lib = root / target / "lib"
+    if conventional_include.exists() and conventional_lib.exists():
+        return conventional_include, conventional_lib
+
+    picolibc_root = Path("/usr/lib/picolibc") / target
+    picolibc_include = picolibc_root / "include"
+    picolibc_lib = picolibc_root / "lib" / TNPU_RISCV_MARCH / TNPU_RISCV_MABI
+    if picolibc_include.exists() and picolibc_lib.exists():
+        return picolibc_include, picolibc_lib
+    if TNPU_RISCV_MARCH == "rv32imfc" and TNPU_RISCV_MABI == "ilp32f":
+        ubuntu_lib = picolibc_root / "lib" / "rv32imafc" / "ilp32f"
+        if picolibc_include.exists() and ubuntu_lib.exists():
+            return picolibc_include, ubuntu_lib
+
+    raise FileNotFoundError(f"No C library include/lib directories found for {target}")
 
 
 def run_checked(
@@ -145,9 +170,7 @@ def build_v2_elf_and_hex(
     prefix = toolchain_prefix()
     gcc = f"{prefix}gcc"
     objcopy = f"{prefix}objcopy"
-    root = toolchain_root(prefix)
-    include_dir = root / "riscv32-unknown-elf" / "include"
-    lib_dir = root / "riscv32-unknown-elf" / "lib"
+    include_dir, lib_dir = toolchain_include_lib_dirs(prefix)
     elf_path = CUSTOM_DIR / f"{program_name}.elf"
     hex_path = CUSTOM_DIR / f"{program_name}.hex"
 
@@ -220,4 +243,3 @@ def run_vlt_npu(
 
 def _runner_source(program_symbol: str, config: RunnerConfig | None = None) -> str:
     return render_runner_source(program_symbol, config)
-

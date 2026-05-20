@@ -29,15 +29,32 @@ def run(cmd: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, cwd=cwd, text=True, capture_output=True, check=False)
 
 
-def npu_files(workdir: Path) -> tuple[list[str], list[Path], str]:
+def run_streaming(cmd: list[str], *, cwd: Path, log_path: Path) -> tuple[int, str]:
+    lines: list[str] = []
+    with log_path.open("w", buffering=1) as log:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            log.write(line)
+            lines.append(line)
+        return proc.wait(), "".join(lines)
+
+
+def npu_files(workdir: Path, *, top: str) -> tuple[list[str], list[Path], str]:
     sys.path.insert(0, str(ROOT / "scripts"))
     from synth_tinynpu_yosys import stage_rtl
 
     staged = workdir / "rtl_tinynpu_abstract_ram"
     stage_rtl(staged, memory_mode="abstract-ram")
-    excluded = {"ub_skewer_wrapper.sv"}
+    excluded = {"ub_skewer_wrapper.sv", "cv32e40p_tinynpu_synth_top.sv"}
     files = [str(p) for p in sorted(staged.glob("*.sv")) if p.name not in excluded]
-    return files, [staged], "tinynpu_top"
+    return files, [staged], top
 
 
 def parse_manifest(path: Path, *, design_rtl_dir: Path, include_fpu: bool) -> tuple[list[str], list[Path], str]:
@@ -67,6 +84,19 @@ def cpu_files(*, include_fpu: bool) -> tuple[list[str], list[Path], str]:
     return parse_manifest(manifest, design_rtl_dir=rtl, include_fpu=include_fpu)
 
 
+def cpu_npu_files(workdir: Path) -> tuple[list[str], list[Path], str]:
+    sys.path.insert(0, str(ROOT / "scripts"))
+    from synth_tinynpu_yosys import stage_rtl
+
+    staged = workdir / "rtl_cpu_npu_abstract_ram"
+    stage_rtl(staged, memory_mode="abstract-ram")
+
+    cpu, cpu_incdirs, _ = cpu_files(include_fpu=False)
+    excluded = {"ub_skewer_wrapper.sv"}
+    npu = [str(p) for p in sorted(staged.glob("*.sv")) if p.name not in excluded]
+    return cpu + npu, cpu_incdirs + [staged], "cv32e40p_tinynpu_synth_top"
+
+
 def write_yosys_script(
     path: Path,
     *,
@@ -78,22 +108,30 @@ def write_yosys_script(
     no_alumacc: bool,
     skip_abc: bool,
     coarse_only: bool,
+    defines: list[str],
+    flatten: bool,
+    abc_fast: bool,
+    write_netlist: Path | None,
 ) -> None:
     inc = " ".join(f"-I {p}" for p in incdirs)
+    define_flags = " ".join(f"-D{define}" for define in defines)
     file_list = " ".join(files)
-    synth_opts = f"-top {top} -flatten -noshare -noabc"
+    synth_opts = f"-top {top} -noshare -noabc"
+    if flatten:
+        synth_opts += " -flatten"
     if no_alumacc:
         synth_opts += " -noalumacc"
     if coarse_only:
         synth_opts += " -run begin:coarse"
     lines = [
-        f"read_slang {inc} -DSYNTHESIS {file_list}",
+        f"read_slang {inc} -DSYNTHESIS {define_flags} --top {top} {file_list}",
         f"hierarchy -check -top {top}",
         f"synth {synth_opts}",
         f"dfflibmap -liberty {liberty}",
     ]
     if not skip_abc and not coarse_only:
-        lines.append(f"abc -liberty {liberty} -D {delay_ps}")
+        fast = "-fast " if abc_fast else ""
+        lines.append(f"abc {fast}-liberty {liberty} -D {delay_ps}")
     lines.extend(
         [
             "clean",
@@ -102,6 +140,8 @@ def write_yosys_script(
     )
     if not skip_abc and not coarse_only:
         lines.append("sta")
+    if write_netlist is not None:
+        lines.append(f"write_verilog -noattr {write_netlist}")
     lines.append("")
     path.write_text("\n".join(lines))
 
@@ -121,14 +161,24 @@ def summarize(log: str) -> list[str]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Rough ASIC-style Yosys synthesis for TinyNPU/CV32E40P.")
-    ap.add_argument("target", choices=["npu", "cpu", "cpu-fpu"])
+    ap.add_argument("target", choices=["npu", "cpu", "cpu-fpu", "cpu-npu"])
     ap.add_argument("--workdir", default=str(ROOT / "runs" / "asic_synth"))
     ap.add_argument("--liberty", default="")
     ap.add_argument("--delay-ps", type=int, default=5000)
     ap.add_argument("--no-alumacc", action="store_true", help="Skip Yosys arithmetic-combining pass.")
     ap.add_argument("--skip-abc", action="store_true", help="Stop after generic synthesis and DFF mapping.")
     ap.add_argument("--coarse-only", action="store_true", help="Stop Yosys synth before fine arithmetic techmapping.")
+    ap.add_argument("--disable-xform", action="store_true", help="Compile NPU RTL with TINYNPU_DISABLE_XFORM for area/timing experiments.")
+    ap.add_argument("--abc-fast", action="store_true", help="Use ABC's faster, lower-quality mapping script.")
+    ap.add_argument(
+        "--npu-top",
+        default="tinynpu_top",
+        choices=["tinynpu_top", "ppu", "control_unit", "systolic_array", "ubss", "xform_unit"],
+        help="For target=npu, synthesize this module as top.",
+    )
+    ap.add_argument("--flatten", action="store_true", help="Flatten hierarchy during synth. Avoid this for memory-limited module-level runs.")
     ap.add_argument("--emit-only", action="store_true", help="Write the Yosys script but do not run it.")
+    ap.add_argument("--write-netlist", default="", help="Write the synthesized Verilog netlist to this path.")
     ap.add_argument("--yosys-bin", default=str(YOSYS))
     ap.add_argument("--slang-plugin", default=str(SLANG))
     args = ap.parse_args()
@@ -138,7 +188,9 @@ def main() -> int:
     liberty = Path(args.liberty) if args.liberty else ensure_default_liberty()
 
     if args.target == "npu":
-        files, incdirs, top = npu_files(workdir)
+        files, incdirs, top = npu_files(workdir, top=args.npu_top)
+    elif args.target == "cpu-npu":
+        files, incdirs, top = cpu_npu_files(workdir)
     elif args.target == "cpu-fpu":
         files, incdirs, top = cpu_files(include_fpu=True)
     else:
@@ -156,6 +208,10 @@ def main() -> int:
         no_alumacc=args.no_alumacc,
         skip_abc=args.skip_abc,
         coarse_only=args.coarse_only,
+        defines=["TINYNPU_DISABLE_XFORM"] if args.disable_xform else [],
+        flatten=args.flatten,
+        abc_fast=args.abc_fast,
+        write_netlist=Path(args.write_netlist) if args.write_netlist else None,
     )
     if args.emit_only:
         print(f"target={args.target}")
@@ -164,19 +220,17 @@ def main() -> int:
         print(f"files={len(files)}")
         return 0
 
-    proc = run([args.yosys_bin, "-Q", "-m", args.slang_plugin, str(script)], cwd=ROOT)
-    text = proc.stdout + proc.stderr
-    log_path.write_text(text)
+    returncode, text = run_streaming([args.yosys_bin, "-Q", "-m", args.slang_plugin, str(script)], cwd=ROOT, log_path=log_path)
 
     print(f"target={args.target}")
     print(f"script={script}")
     print(f"log={log_path}")
-    print(f"returncode={proc.returncode}")
+    print(f"returncode={returncode}")
     for line in summarize(text):
         print(line)
-    if proc.returncode != 0:
+    if returncode != 0:
         print(text[-4000:])
-    return proc.returncode
+    return returncode
 
 
 if __name__ == "__main__":

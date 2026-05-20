@@ -91,8 +91,12 @@ def _rope_ref(x: np.ndarray, *, positions: np.ndarray, head_dim: int, theta: flo
     return out
 
 
-def _score_scale(d_head: int, shape: tuple[int, int], *, act_scale: float) -> np.ndarray:
-    score_scale = np.float32((float(act_scale) * float(act_scale)) / np.sqrt(float(d_head)))
+def _score_scale(d_head: int, shape: tuple[int, int], *, act_scale: float, score_scale: float | None = None) -> np.ndarray:
+    score_scale = np.float32(
+        float(score_scale)
+        if score_scale is not None
+        else (float(act_scale) * float(act_scale)) / np.sqrt(float(d_head))
+    )
     return np.full(shape, score_scale, dtype=np.float32)
 
 
@@ -104,6 +108,72 @@ def _kv_head_for_q_head(q_head: int, *, n_heads: int, n_kv_heads: int) -> int:
 
 def _rope_uses_dq_fallback(d_head: int) -> bool:
     return int(d_head) % 16 != 0
+
+
+def _quant_layer(block: QLlamaBlock) -> dict[str, object] | None:
+    if block.quant_config is None:
+        return None
+    return dict(block.quant_config)
+
+
+def _qact(block: QLlamaBlock, name: str, default: float | None = None) -> float:
+    layer = _quant_layer(block)
+    if layer is None:
+        return float(block.config.act_scale if default is None else default)
+    scales = dict(layer.get("activation_scales", {}))
+    if name not in scales:
+        if default is not None:
+            return float(default)
+        raise KeyError(f"QLlama quant config is missing activation scale '{name}'.")
+    return float(scales[name])
+
+
+def _qscore_scale(block: QLlamaBlock, d_head: int) -> float:
+    layer = _quant_layer(block)
+    if layer is not None and "score" in dict(layer.get("matmuls", {})):
+        return 1.0
+    if layer is not None and "score_scale" in layer:
+        return float(layer["score_scale"])
+    return float((block.config.act_scale * block.config.act_scale) / np.sqrt(float(d_head)))
+
+
+def _qmatmul_entry(block: QLlamaBlock, name: str) -> dict[str, object] | None:
+    layer = _quant_layer(block)
+    if layer is None:
+        return None
+    matmuls = dict(layer.get("matmuls", {}))
+    if name not in matmuls:
+        return None
+    return dict(matmuls[name])
+
+
+def _qmatmul(block: QLlamaBlock, name: str, *, default_multiplier: int = 1, default_shift: int = 0) -> dict[str, int]:
+    entry = _qmatmul_entry(block, name)
+    if entry is None:
+        return {"multiplier": int(default_multiplier), "shift": int(default_shift)}
+    return {"multiplier": int(entry["multiplier"]), "shift": int(entry["shift"])}
+
+
+def _dtype_from_bits(bits: int) -> DType:
+    if int(bits) == 8:
+        return DType.INT8
+    if int(bits) == 16:
+        return DType.INT16
+    raise ValueError(f"unsupported QLlama tensor precision: {bits} bits")
+
+
+def _qmatmul_out_dtype(block: QLlamaBlock, name: str, *, default: DType = DType.INT16) -> DType:
+    entry = _qmatmul_entry(block, name)
+    if entry is None or "out_bits" not in entry:
+        return default
+    return _dtype_from_bits(int(entry["out_bits"]))
+
+
+def _qmatmul_output_scale(block: QLlamaBlock, name: str, *, default: float = 1.0) -> float:
+    entry = _qmatmul_entry(block, name)
+    if entry is None or "output_scale" not in entry:
+        return float(default)
+    return float(entry["output_scale"])
 
 
 @dataclass(frozen=True)
@@ -148,6 +218,7 @@ class QLlamaBlock:
     mlp_gate_proj_w: np.ndarray
     mlp_up_proj_w: np.ndarray
     mlp_down_proj_w: np.ndarray
+    quant_config: dict[str, object] | None = None
 
     @classmethod
     def random(cls, rng: np.random.Generator, config: QLlamaBlockConfig) -> QLlamaBlock:
@@ -290,29 +361,42 @@ def reference_prefill(
     k_weights = block.split_k_proj_weights()
     v_weights = block.split_v_proj_weights()
     positions = np.arange(prompt_len, dtype=np.int32)
+    rms1_scale = _qact(block, "rms1_out")
+    q_out_scale = _qact(block, "q_out")
+    k_out_scale = _qact(block, "k_out")
+    v_out_scale = _qact(block, "v_out")
+    rope_q_scale = _qact(block, "rope_q", q_out_scale)
+    rope_k_scale = _qact(block, "rope_k", k_out_scale)
+    attn_cat_scale = _qact(block, "attn_cat")
+    o_out_scale = _qact(block, "o_out")
+    rms2_scale = _qact(block, "rms2_out")
+    gate_out_scale = _qact(block, "gate_out")
+    up_out_scale = _qact(block, "up_out")
+    ffn_hidden_scale = _qact(block, "ffn_hidden")
+    down_out_scale = _qact(block, "down_out")
 
     x_norm1 = _rmsnorm(x_in, block.input_layernorm_w, block.config.rms_norm_eps)
-    x_norm1_q = golden.quantize(x_norm1, scale=act_scale, zero_point=0, out_dtype=DType.INT16)
+    x_norm1_q = golden.quantize(x_norm1, scale=rms1_scale, zero_point=0, out_dtype=DType.INT16)
 
     q_rope_heads: list[np.ndarray] = []
     k_rope_heads: list[np.ndarray] = []
     v_heads: list[np.ndarray] = []
     attn_heads: list[np.ndarray] = []
     rope_dq_fallback = enable_dq_xform and _rope_uses_dq_fallback(d_head)
-    score_scale = np.float32((float(act_scale) * float(act_scale)) / np.sqrt(float(d_head)))
+    score_scale = np.float32(_qscore_scale(block, d_head))
     for q_head in range(n_heads):
-        q_int = golden.matmul(x_norm1_q, q_weights[q_head], out_dtype=DType.INT16)
-        q_f = _dequantize_fp16_boundary(q_int, scale=act_scale) if rope_dq_fallback else golden.dequantize(q_int, scale=act_scale, zero_point=0)
+        q_int = golden.matmul(x_norm1_q, q_weights[q_head], out_dtype=DType.INT16, **_qmatmul(block, "q_proj"))
+        q_f = _dequantize_fp16_boundary(q_int, scale=q_out_scale) if rope_dq_fallback else golden.dequantize(q_int, scale=q_out_scale, zero_point=0)
         q_rope_f = _rope_ref(q_f, positions=positions, head_dim=d_head, theta=resolved_rope_theta)
-        q_rope_q = golden.quantize(q_rope_f, scale=act_scale, zero_point=0, out_dtype=DType.INT16)
+        q_rope_q = golden.quantize(q_rope_f, scale=rope_q_scale, zero_point=0, out_dtype=DType.INT16)
         q_rope_heads.append(q_rope_q)
 
     for kv_head in range(n_kv_heads):
-        k_int = golden.matmul(x_norm1_q, k_weights[kv_head], out_dtype=DType.INT16)
-        v_int = golden.matmul(x_norm1_q, v_weights[kv_head], out_dtype=DType.INT16)
-        k_f = _dequantize_fp16_boundary(k_int, scale=act_scale) if rope_dq_fallback else golden.dequantize(k_int, scale=act_scale, zero_point=0)
+        k_int = golden.matmul(x_norm1_q, k_weights[kv_head], out_dtype=DType.INT16, **_qmatmul(block, "k_proj"))
+        v_int = golden.matmul(x_norm1_q, v_weights[kv_head], out_dtype=DType.INT16, **_qmatmul(block, "v_proj"))
+        k_f = _dequantize_fp16_boundary(k_int, scale=k_out_scale) if rope_dq_fallback else golden.dequantize(k_int, scale=k_out_scale, zero_point=0)
         k_rope_f = _rope_ref(k_f, positions=positions, head_dim=d_head, theta=resolved_rope_theta)
-        k_rope_q = golden.quantize(k_rope_f, scale=act_scale, zero_point=0, out_dtype=DType.INT16)
+        k_rope_q = golden.quantize(k_rope_f, scale=rope_k_scale, zero_point=0, out_dtype=DType.INT16)
         k_rope_heads.append(k_rope_q)
         # V stays in projected INT16 space because it is not rotary-transformed.
         v_heads.append(v_int)
@@ -322,9 +406,15 @@ def reference_prefill(
         scores_int = golden.matmul(
             q_rope_heads[q_head],
             np.array(k_rope_heads[kv_head].T, dtype=np.int16, copy=True),
-            out_dtype=DType.INT16,
+            out_dtype=_qmatmul_out_dtype(block, "score"),
+            **_qmatmul(block, "score"),
         )
-        scores = _dequant_boundary(scores_int, scale=1.0, enable_dq_xform=enable_dq_xform, golden=golden)
+        scores = _dequant_boundary(
+            scores_int,
+            scale=_qmatmul_output_scale(block, "score"),
+            enable_dq_xform=enable_dq_xform and _qmatmul_out_dtype(block, "score") == DType.INT16,
+            golden=golden,
+        )
         scores = (scores * score_scale).astype(np.float32)
         masked = np.array(scores, copy=True)
         for row in range(prompt_len):
@@ -332,24 +422,24 @@ def reference_prefill(
                 masked[row, row + 1 :] = np.float32(-1.0e10)
         probs = softmax_f16_approx(masked, axis=-1)
         probs_q = _quantize_fp16_boundary(probs, scale=attn_scale)
-        attn = golden.matmul(probs_q, v_heads[kv_head], shift=8, out_dtype=DType.INT16)
+        attn = golden.matmul(probs_q, v_heads[kv_head], out_dtype=DType.INT16, **_qmatmul(block, "value", default_shift=8))
         attn_heads.append(attn)
 
     attn_cat = np.concatenate(attn_heads, axis=-1).astype(np.int16) if n_heads > 1 else np.array(attn_heads[0], copy=True)
-    o_int = golden.matmul(attn_cat, np.asarray(block.self_attn_o_proj_w, dtype=np.int16), out_dtype=DType.INT16)
-    o_f = _dequant_boundary(o_int, scale=act_scale, enable_dq_xform=enable_dq_xform, golden=golden)
+    o_int = golden.matmul(attn_cat, np.asarray(block.self_attn_o_proj_w, dtype=np.int16), out_dtype=DType.INT16, **_qmatmul(block, "o_proj"))
+    o_f = _dequant_boundary(o_int, scale=o_out_scale, enable_dq_xform=enable_dq_xform, golden=golden)
     resid1 = (x_in + o_f).astype(np.float32)
     x_norm2 = _rmsnorm(resid1, block.post_attention_layernorm_w, block.config.rms_norm_eps)
-    x_norm2_q = golden.quantize(x_norm2, scale=act_scale, zero_point=0, out_dtype=DType.INT16)
-    gate_int = golden.matmul(x_norm2_q, np.asarray(block.mlp_gate_proj_w, dtype=np.int16), out_dtype=DType.INT16)
-    up_int = golden.matmul(x_norm2_q, np.asarray(block.mlp_up_proj_w, dtype=np.int16), out_dtype=DType.INT16)
-    gate_f = _dequant_boundary(gate_int, scale=act_scale, enable_dq_xform=enable_dq_xform, golden=golden)
-    up_f = _dequant_boundary(up_int, scale=act_scale, enable_dq_xform=enable_dq_xform, golden=golden)
+    x_norm2_q = golden.quantize(x_norm2, scale=rms2_scale, zero_point=0, out_dtype=DType.INT16)
+    gate_int = golden.matmul(x_norm2_q, np.asarray(block.mlp_gate_proj_w, dtype=np.int16), out_dtype=DType.INT16, **_qmatmul(block, "gate_proj"))
+    up_int = golden.matmul(x_norm2_q, np.asarray(block.mlp_up_proj_w, dtype=np.int16), out_dtype=DType.INT16, **_qmatmul(block, "up_proj"))
+    gate_f = _dequant_boundary(gate_int, scale=gate_out_scale, enable_dq_xform=enable_dq_xform, golden=golden)
+    up_f = _dequant_boundary(up_int, scale=up_out_scale, enable_dq_xform=enable_dq_xform, golden=golden)
     gate_act = _silu(gate_f)
     ffn_hidden = (gate_act * up_f).astype(np.float32)
-    ffn_hidden_q = golden.quantize(ffn_hidden, scale=act_scale, zero_point=0, out_dtype=DType.INT16)
-    ffn_out_int = golden.matmul(ffn_hidden_q, np.asarray(block.mlp_down_proj_w, dtype=np.int16), out_dtype=DType.INT16)
-    ffn_out_f = _dequant_boundary(ffn_out_int, scale=act_scale, enable_dq_xform=enable_dq_xform, golden=golden)
+    ffn_hidden_q = golden.quantize(ffn_hidden, scale=ffn_hidden_scale, zero_point=0, out_dtype=DType.INT16)
+    ffn_out_int = golden.matmul(ffn_hidden_q, np.asarray(block.mlp_down_proj_w, dtype=np.int16), out_dtype=DType.INT16, **_qmatmul(block, "down_proj"))
+    ffn_out_f = _dequant_boundary(ffn_out_int, scale=down_out_scale, enable_dq_xform=enable_dq_xform, golden=golden)
     out = (resid1 + ffn_out_f).astype(np.float32)
     return {
         "x_norm1": x_norm1,
@@ -401,29 +491,42 @@ def reference_decode(
     q_weights = block.split_q_proj_weights()
     k_weights = block.split_k_proj_weights()
     v_weights = block.split_v_proj_weights()
+    rms1_scale = _qact(block, "rms1_out")
+    q_out_scale = _qact(block, "q_out")
+    k_out_scale = _qact(block, "k_out")
+    v_out_scale = _qact(block, "v_out")
+    rope_q_scale = _qact(block, "rope_q", q_out_scale)
+    rope_k_scale = _qact(block, "rope_k", k_out_scale)
+    attn_cat_scale = _qact(block, "attn_cat")
+    o_out_scale = _qact(block, "o_out")
+    rms2_scale = _qact(block, "rms2_out")
+    gate_out_scale = _qact(block, "gate_out")
+    up_out_scale = _qact(block, "up_out")
+    ffn_hidden_scale = _qact(block, "ffn_hidden")
+    down_out_scale = _qact(block, "down_out")
 
     x_norm1 = _rmsnorm(x_in, block.input_layernorm_w, block.config.rms_norm_eps)
-    x_norm1_q = golden.quantize(x_norm1, scale=act_scale, zero_point=0, out_dtype=DType.INT16)
+    x_norm1_q = golden.quantize(x_norm1, scale=rms1_scale, zero_point=0, out_dtype=DType.INT16)
 
     q_rope_heads: list[np.ndarray] = []
     k_cur_heads: list[np.ndarray] = []
     v_cur_heads: list[np.ndarray] = []
     attn_heads: list[np.ndarray] = []
     rope_dq_fallback = enable_dq_xform and _rope_uses_dq_fallback(d_head)
-    score_scale = np.float32((float(act_scale) * float(act_scale)) / np.sqrt(float(d_head)))
+    score_scale = np.float32(_qscore_scale(block, d_head))
     for q_head in range(n_heads):
-        q_int = golden.matmul(x_norm1_q, q_weights[q_head], out_dtype=DType.INT16)
-        q_f = _dequantize_fp16_boundary(q_int, scale=act_scale) if rope_dq_fallback else golden.dequantize(q_int, scale=act_scale, zero_point=0)
+        q_int = golden.matmul(x_norm1_q, q_weights[q_head], out_dtype=DType.INT16, **_qmatmul(block, "q_proj"))
+        q_f = _dequantize_fp16_boundary(q_int, scale=q_out_scale) if rope_dq_fallback else golden.dequantize(q_int, scale=q_out_scale, zero_point=0)
         q_rope_f = _rope_ref(q_f, positions=decode_pos, head_dim=d_head, theta=resolved_rope_theta)
-        q_rope_q = golden.quantize(q_rope_f, scale=act_scale, zero_point=0, out_dtype=DType.INT16)
+        q_rope_q = golden.quantize(q_rope_f, scale=rope_q_scale, zero_point=0, out_dtype=DType.INT16)
         q_rope_heads.append(q_rope_q)
 
     for kv_head in range(n_kv_heads):
-        k_int = golden.matmul(x_norm1_q, k_weights[kv_head], out_dtype=DType.INT16)
-        v_int = golden.matmul(x_norm1_q, v_weights[kv_head], out_dtype=DType.INT16)
-        k_f = _dequantize_fp16_boundary(k_int, scale=act_scale) if rope_dq_fallback else golden.dequantize(k_int, scale=act_scale, zero_point=0)
+        k_int = golden.matmul(x_norm1_q, k_weights[kv_head], out_dtype=DType.INT16, **_qmatmul(block, "k_proj"))
+        v_int = golden.matmul(x_norm1_q, v_weights[kv_head], out_dtype=DType.INT16, **_qmatmul(block, "v_proj"))
+        k_f = _dequantize_fp16_boundary(k_int, scale=k_out_scale) if rope_dq_fallback else golden.dequantize(k_int, scale=k_out_scale, zero_point=0)
         k_rope_f = _rope_ref(k_f, positions=decode_pos, head_dim=d_head, theta=resolved_rope_theta)
-        k_rope_q = golden.quantize(k_rope_f, scale=act_scale, zero_point=0, out_dtype=DType.INT16)
+        k_rope_q = golden.quantize(k_rope_f, scale=rope_k_scale, zero_point=0, out_dtype=DType.INT16)
         k_cur_heads.append(k_rope_q)
         # V stays in projected INT16 space because it is not rotary-transformed.
         v_cur_heads.append(v_int)
@@ -447,30 +550,36 @@ def reference_decode(
         scores_int = golden.matmul(
             q_rope_heads[q_head],
             np.array(k_full.T, dtype=np.int16, copy=True),
-            out_dtype=DType.INT16,
+            out_dtype=_qmatmul_out_dtype(block, "score"),
+            **_qmatmul(block, "score"),
         )
-        scores = _dequant_boundary(scores_int, scale=1.0, enable_dq_xform=enable_dq_xform, golden=golden)
+        scores = _dequant_boundary(
+            scores_int,
+            scale=_qmatmul_output_scale(block, "score"),
+            enable_dq_xform=enable_dq_xform and _qmatmul_out_dtype(block, "score") == DType.INT16,
+            golden=golden,
+        )
         scores = (scores * score_scale).astype(np.float32)
         probs = softmax_f16_approx(scores, axis=-1)
         probs_q = _quantize_fp16_boundary(probs, scale=attn_scale)
-        attn = golden.matmul(probs_q, v_full, shift=8, out_dtype=DType.INT16)
+        attn = golden.matmul(probs_q, v_full, out_dtype=DType.INT16, **_qmatmul(block, "value", default_shift=8))
         attn_heads.append(attn)
 
     attn_cat = np.concatenate(attn_heads, axis=-1).astype(np.int16) if n_heads > 1 else np.array(attn_heads[0], copy=True)
-    o_int = golden.matmul(attn_cat, np.asarray(block.self_attn_o_proj_w, dtype=np.int16), out_dtype=DType.INT16)
-    o_f = _dequant_boundary(o_int, scale=act_scale, enable_dq_xform=enable_dq_xform, golden=golden)
+    o_int = golden.matmul(attn_cat, np.asarray(block.self_attn_o_proj_w, dtype=np.int16), out_dtype=DType.INT16, **_qmatmul(block, "o_proj"))
+    o_f = _dequant_boundary(o_int, scale=o_out_scale, enable_dq_xform=enable_dq_xform, golden=golden)
     resid1 = (x_in + o_f).astype(np.float32)
     x_norm2 = _rmsnorm(resid1, block.post_attention_layernorm_w, block.config.rms_norm_eps)
-    x_norm2_q = golden.quantize(x_norm2, scale=act_scale, zero_point=0, out_dtype=DType.INT16)
-    gate_int = golden.matmul(x_norm2_q, np.asarray(block.mlp_gate_proj_w, dtype=np.int16), out_dtype=DType.INT16)
-    up_int = golden.matmul(x_norm2_q, np.asarray(block.mlp_up_proj_w, dtype=np.int16), out_dtype=DType.INT16)
-    gate_f = _dequant_boundary(gate_int, scale=act_scale, enable_dq_xform=enable_dq_xform, golden=golden)
-    up_f = _dequant_boundary(up_int, scale=act_scale, enable_dq_xform=enable_dq_xform, golden=golden)
+    x_norm2_q = golden.quantize(x_norm2, scale=rms2_scale, zero_point=0, out_dtype=DType.INT16)
+    gate_int = golden.matmul(x_norm2_q, np.asarray(block.mlp_gate_proj_w, dtype=np.int16), out_dtype=DType.INT16, **_qmatmul(block, "gate_proj"))
+    up_int = golden.matmul(x_norm2_q, np.asarray(block.mlp_up_proj_w, dtype=np.int16), out_dtype=DType.INT16, **_qmatmul(block, "up_proj"))
+    gate_f = _dequant_boundary(gate_int, scale=gate_out_scale, enable_dq_xform=enable_dq_xform, golden=golden)
+    up_f = _dequant_boundary(up_int, scale=up_out_scale, enable_dq_xform=enable_dq_xform, golden=golden)
     gate_act = _silu(gate_f)
     ffn_hidden = (gate_act * up_f).astype(np.float32)
-    ffn_hidden_q = golden.quantize(ffn_hidden, scale=act_scale, zero_point=0, out_dtype=DType.INT16)
-    ffn_out_int = golden.matmul(ffn_hidden_q, np.asarray(block.mlp_down_proj_w, dtype=np.int16), out_dtype=DType.INT16)
-    ffn_out_f = _dequant_boundary(ffn_out_int, scale=act_scale, enable_dq_xform=enable_dq_xform, golden=golden)
+    ffn_hidden_q = golden.quantize(ffn_hidden, scale=ffn_hidden_scale, zero_point=0, out_dtype=DType.INT16)
+    ffn_out_int = golden.matmul(ffn_hidden_q, np.asarray(block.mlp_down_proj_w, dtype=np.int16), out_dtype=DType.INT16, **_qmatmul(block, "down_proj"))
+    ffn_out_f = _dequant_boundary(ffn_out_int, scale=down_out_scale, enable_dq_xform=enable_dq_xform, golden=golden)
     out = (resid1 + ffn_out_f).astype(np.float32)
     return {
         "x_norm1": x_norm1,
@@ -592,6 +701,8 @@ def _add_prefill_head_runtime_tensors(
     n_kv_heads: int,
     prompt_len: int,
     act_scale: float,
+    score_scale: float | None = None,
+    score_dtype: DType = DType.INT16,
 ) -> None:
     token_names = [f"t{i}" for i in range(prompt_len)]
     for q_head in range(n_heads):
@@ -600,9 +711,9 @@ def _add_prefill_head_runtime_tensors(
         builder.add_tensor(TensorSpec(f"q_rope_f_h{q_head}", (prompt_len, d_head), DType.FLOAT32, TensorKind.INTERMEDIATE))
         builder.add_tensor(TensorSpec(f"q_rope_q_h{q_head}", (prompt_len, d_head), DType.INT16, TensorKind.INTERMEDIATE, metadata={"storage_role": "A"}))
         kv_head = _kv_head_for_q_head(q_head, n_heads=n_heads, n_kv_heads=n_kv_heads)
-        builder.add_tensor(TensorSpec(f"scores_h{q_head}", (prompt_len, prompt_len), DType.INT16, TensorKind.INTERMEDIATE))
+        builder.add_tensor(TensorSpec(f"scores_h{q_head}", (prompt_len, prompt_len), score_dtype, TensorKind.INTERMEDIATE))
         builder.add_tensor(TensorSpec(f"scores_f_h{q_head}", (prompt_len, prompt_len), DType.FLOAT32, TensorKind.INTERMEDIATE))
-        builder.add_tensor(TensorSpec(f"score_scale_h{q_head}", (prompt_len, prompt_len), DType.FLOAT32, TensorKind.CONSTANT, data=_score_scale(d_head, (prompt_len, prompt_len), act_scale=act_scale)))
+        builder.add_tensor(TensorSpec(f"score_scale_h{q_head}", (prompt_len, prompt_len), DType.FLOAT32, TensorKind.CONSTANT, data=_score_scale(d_head, (prompt_len, prompt_len), act_scale=act_scale, score_scale=score_scale)))
         builder.add_tensor(TensorSpec(f"scores_scaled_h{q_head}", (prompt_len, prompt_len), DType.FLOAT32, TensorKind.INTERMEDIATE))
         builder.add_tensor(TensorSpec(f"masked_scores_h{q_head}", (prompt_len, prompt_len), DType.FLOAT32, TensorKind.INTERMEDIATE))
         builder.add_tensor(TensorSpec(f"probs_h{q_head}", (prompt_len, prompt_len), DType.INT16, TensorKind.INTERMEDIATE))
@@ -639,7 +750,9 @@ def _add_decode_head_runtime_tensors(
     prompt_len: int,
     cache_len: int,
     act_scale: float,
+    score_scale: float | None = None,
     cache_token_names: list[str],
+    score_dtype: DType = DType.INT16,
 ) -> None:
     """Seed decode caches.
 
@@ -652,9 +765,9 @@ def _add_decode_head_runtime_tensors(
         builder.add_tensor(TensorSpec(f"q_f_h{q_head}", (1, d_head), DType.FLOAT32, TensorKind.INTERMEDIATE))
         builder.add_tensor(TensorSpec(f"q_rope_f_h{q_head}", (1, d_head), DType.FLOAT32, TensorKind.INTERMEDIATE))
         builder.add_tensor(TensorSpec(f"q_rope_q_h{q_head}", (1, d_head), DType.INT16, TensorKind.INTERMEDIATE, metadata={"storage_role": "A"}))
-        builder.add_tensor(TensorSpec(f"scores_h{q_head}", (1, cache_len), DType.INT16, TensorKind.INTERMEDIATE))
+        builder.add_tensor(TensorSpec(f"scores_h{q_head}", (1, cache_len), score_dtype, TensorKind.INTERMEDIATE))
         builder.add_tensor(TensorSpec(f"scores_f_h{q_head}", (1, cache_len), DType.FLOAT32, TensorKind.INTERMEDIATE))
-        builder.add_tensor(TensorSpec(f"score_scale_h{q_head}", (1, cache_len), DType.FLOAT32, TensorKind.CONSTANT, data=_score_scale(d_head, (1, cache_len), act_scale=act_scale)))
+        builder.add_tensor(TensorSpec(f"score_scale_h{q_head}", (1, cache_len), DType.FLOAT32, TensorKind.CONSTANT, data=_score_scale(d_head, (1, cache_len), act_scale=act_scale, score_scale=score_scale)))
         builder.add_tensor(TensorSpec(f"scores_scaled_h{q_head}", (1, cache_len), DType.FLOAT32, TensorKind.INTERMEDIATE))
         builder.add_tensor(TensorSpec(f"probs_h{q_head}", (1, cache_len), DType.INT16, TensorKind.INTERMEDIATE))
         builder.add_tensor(TensorSpec(f"probs_q_h{q_head}", (1, cache_len), DType.INT16, TensorKind.INTERMEDIATE, metadata={"storage_role": "A"}))
@@ -700,6 +813,7 @@ def _append_attention_post_score_steps(
     include_causal_mask: bool,
     past_kv_len: int = 0,
     enable_dq_xform: bool = False,
+    score_dequant_scale: float = 1.0,
 ) -> None:
     for q_head in range(n_heads):
         builder.host(
@@ -707,7 +821,7 @@ def _append_attention_post_score_steps(
             "dequantize",
             inputs=[f"scores_h{q_head}"],
             outputs=[f"scores_f_h{q_head}"],
-            attrs=_dq_attrs(1.0, enable_dq_xform=enable_dq_xform),
+            attrs=_dq_attrs(score_dequant_scale, enable_dq_xform=enable_dq_xform),
         )
         mul_attrs = {"lhs_encoding": "fp16_bits"} if enable_dq_xform else {}
         builder.host(
@@ -759,14 +873,26 @@ def _append_concat_alias_steps(builder: IRBuilder, *, n_heads: int) -> None:
     builder.host("alias_attn_cat_a", "alias", inputs=["attn_cat"], outputs=["attn_cat_a"])
 
 
-def _append_transformer_tail(builder: IRBuilder, *, act_scale: float, rms_norm_eps: float, enable_dq_xform: bool = False) -> None:
+def _append_transformer_tail(
+    builder: IRBuilder,
+    *,
+    block: QLlamaBlock,
+    rms_norm_eps: float,
+    enable_dq_xform: bool = False,
+) -> None:
+    o_out_scale = _qact(block, "o_out")
+    rms2_scale = _qact(block, "rms2_out")
+    gate_out_scale = _qact(block, "gate_out")
+    up_out_scale = _qact(block, "up_out")
+    ffn_hidden_scale = _qact(block, "ffn_hidden")
+    down_out_scale = _qact(block, "down_out")
     builder.segment(
         "seg_o_proj",
-        ops=[builder.matmul("op_o_proj", "attn_cat_a", "w_o", "o_int", in_dtype=DType.INT16, out_dtype=DType.INT16)],
+        ops=[builder.matmul("op_o_proj", "attn_cat_a", "w_o", "o_int", in_dtype=DType.INT16, out_dtype=DType.INT16, **_qmatmul(block, "o_proj"))],
         inputs=["attn_cat_a"],
         outputs=["o_int"],
     )
-    builder.host("dequant_o", "dequantize", inputs=["o_int"], outputs=["o_f"], attrs=_dq_attrs(act_scale, enable_dq_xform=enable_dq_xform))
+    builder.host("dequant_o", "dequantize", inputs=["o_int"], outputs=["o_f"], attrs=_dq_attrs(o_out_scale, enable_dq_xform=enable_dq_xform))
     residual1_attrs = {"rhs_encoding": "fp16_bits"} if enable_dq_xform else {}
     builder.host("residual1", "add", inputs=["x_in", "o_f"], outputs=["resid1"], attrs=residual1_attrs)
     builder.host("rmsnorm2", "rmsnorm", inputs=["resid1", "rms2_w"], outputs=["x_norm2"], attrs={"eps": rms_norm_eps})
@@ -775,19 +901,19 @@ def _append_transformer_tail(builder: IRBuilder, *, act_scale: float, rms_norm_e
         "quantize",
         inputs=["x_norm2"],
         outputs=["x_norm2_q"],
-        attrs={"scale": act_scale, "zero_point": 0, "dtype": DType.INT16},
+        attrs={"scale": rms2_scale, "zero_point": 0, "dtype": DType.INT16},
     )
     builder.segment(
         "seg_ffn_up",
         ops=[
-            builder.matmul("op_gate_proj", "x_norm2_q", "w_gate", "gate_int", in_dtype=DType.INT16, out_dtype=DType.INT16),
-            builder.matmul("op_up_proj", "x_norm2_q", "w_up", "up_int", in_dtype=DType.INT16, out_dtype=DType.INT16),
+            builder.matmul("op_gate_proj", "x_norm2_q", "w_gate", "gate_int", in_dtype=DType.INT16, out_dtype=DType.INT16, **_qmatmul(block, "gate_proj")),
+            builder.matmul("op_up_proj", "x_norm2_q", "w_up", "up_int", in_dtype=DType.INT16, out_dtype=DType.INT16, **_qmatmul(block, "up_proj")),
         ],
         inputs=["x_norm2_q"],
         outputs=["gate_int", "up_int"],
     )
-    builder.host("dequant_gate", "dequantize", inputs=["gate_int"], outputs=["gate_f"], attrs=_dq_attrs(act_scale, enable_dq_xform=enable_dq_xform))
-    builder.host("dequant_up", "dequantize", inputs=["up_int"], outputs=["up_f"], attrs=_dq_attrs(act_scale, enable_dq_xform=enable_dq_xform))
+    builder.host("dequant_gate", "dequantize", inputs=["gate_int"], outputs=["gate_f"], attrs=_dq_attrs(gate_out_scale, enable_dq_xform=enable_dq_xform))
+    builder.host("dequant_up", "dequantize", inputs=["up_int"], outputs=["up_f"], attrs=_dq_attrs(up_out_scale, enable_dq_xform=enable_dq_xform))
     silu_attrs = {"input_encoding": "fp16_bits"} if enable_dq_xform else {}
     ffn_mul_attrs = {"rhs_encoding": "fp16_bits"} if enable_dq_xform else {}
     builder.host("silu_gate", "silu", inputs=["gate_f"], outputs=["gate_act"], attrs=silu_attrs)
@@ -797,15 +923,15 @@ def _append_transformer_tail(builder: IRBuilder, *, act_scale: float, rms_norm_e
         "quantize",
         inputs=["ffn_hidden"],
         outputs=["ffn_hidden_q"],
-        attrs={"scale": act_scale, "zero_point": 0, "dtype": DType.INT16},
+        attrs={"scale": ffn_hidden_scale, "zero_point": 0, "dtype": DType.INT16},
     )
     builder.segment(
         "seg_ffn_down",
-        ops=[builder.matmul("op_down_proj", "ffn_hidden_q", "w_down", "ffn_out_int", in_dtype=DType.INT16, out_dtype=DType.INT16)],
+        ops=[builder.matmul("op_down_proj", "ffn_hidden_q", "w_down", "ffn_out_int", in_dtype=DType.INT16, out_dtype=DType.INT16, **_qmatmul(block, "down_proj"))],
         inputs=["ffn_hidden_q"],
         outputs=["ffn_out_int"],
     )
-    builder.host("dequant_ffn_out", "dequantize", inputs=["ffn_out_int"], outputs=["ffn_out_f"], attrs=_dq_attrs(act_scale, enable_dq_xform=enable_dq_xform))
+    builder.host("dequant_ffn_out", "dequantize", inputs=["ffn_out_int"], outputs=["ffn_out_f"], attrs=_dq_attrs(down_out_scale, enable_dq_xform=enable_dq_xform))
     residual2_attrs = {"rhs_encoding": "fp16_bits"} if enable_dq_xform else {}
     builder.host("residual2", "add", inputs=["resid1", "ffn_out_f"], outputs=["out"], attrs=residual2_attrs)
 
@@ -825,6 +951,8 @@ def build_prefill_artifact(
     rope_theta: float = 500000.0,
     rope_scaling: dict[str, object] | None = None,
     enable_dq_xform: bool = False,
+    expose_kv_cache_outputs: bool = False,
+    state: dict[str, object] | None = None,
 ):
     if d_model <= 0 or d_model % 8 != 0:
         raise ValueError("d_model must be a positive multiple of 8")
@@ -846,20 +974,21 @@ def build_prefill_artifact(
         raise ValueError("rope_theta must be positive")
     _require_supported_rope_scaling(rope_scaling)
 
-    state = build_shared_state(
-        d_model=d_model,
-        d_head=d_head,
-        n_heads=n_heads,
-        n_kv_heads=n_kv_heads,
-        ffn_hidden_dim=ffn_hidden_dim,
-        prompt_len=prompt_len,
-        seed=seed,
-        act_scale=act_scale,
-        attn_scale=attn_scale,
-        rms_norm_eps=rms_norm_eps,
-        rope_theta=rope_theta,
-        rope_scaling=rope_scaling,
-    )
+    if state is None:
+        state = build_shared_state(
+            d_model=d_model,
+            d_head=d_head,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            ffn_hidden_dim=ffn_hidden_dim,
+            prompt_len=prompt_len,
+            seed=seed,
+            act_scale=act_scale,
+            attn_scale=attn_scale,
+            rms_norm_eps=rms_norm_eps,
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
+        )
     block: QLlamaBlock = state["block"]
     act_scale = block.config.act_scale
     attn_scale = block.config.attn_scale
@@ -892,7 +1021,16 @@ def build_prefill_artifact(
         ),
     )
     _add_projection_tensors(b, block=block, d_model=d_model, d_head=d_head, n_heads=n_heads, n_kv_heads=n_kv_heads)
-    _add_prefill_head_runtime_tensors(b, d_head=d_head, n_heads=n_heads, n_kv_heads=n_kv_heads, prompt_len=prompt_len, act_scale=act_scale)
+    _add_prefill_head_runtime_tensors(
+        b,
+        d_head=d_head,
+        n_heads=n_heads,
+        n_kv_heads=n_kv_heads,
+        prompt_len=prompt_len,
+        act_scale=act_scale,
+        score_scale=_qscore_scale(block, d_head),
+        score_dtype=_qmatmul_out_dtype(block, "score"),
+    )
     _add_attention_concat_tensors(b, seq_len=prompt_len, d_head=d_head, n_heads=n_heads)
 
     b.host("rmsnorm1", "rmsnorm", inputs=["x_in", "rms1_w"], outputs=["x_norm1"], attrs={"eps": rms_norm_eps})
@@ -901,12 +1039,26 @@ def build_prefill_artifact(
         "quantize",
         inputs=["x_norm1"],
         outputs=["x_norm1_q"],
-        attrs={"scale": act_scale, "zero_point": 0, "dtype": DType.INT16},
+        attrs={"scale": _qact(block, "rms1_out"), "zero_point": 0, "dtype": DType.INT16},
     )
-    qkv_ops = [builder_op for q_head in range(n_heads) for builder_op in [b.matmul(f"op_q_h{q_head}", "x_norm1_q", f"w_q_h{q_head}", f"q_int_h{q_head}", in_dtype=DType.INT16, out_dtype=DType.INT16)]]
+    qkv_ops = [
+        builder_op
+        for q_head in range(n_heads)
+        for builder_op in [
+            b.matmul(
+                f"op_q_h{q_head}",
+                "x_norm1_q",
+                f"w_q_h{q_head}",
+                f"q_int_h{q_head}",
+                in_dtype=DType.INT16,
+                out_dtype=DType.INT16,
+                **_qmatmul(block, "q_proj"),
+            )
+        ]
+    ]
     for kv_head in range(n_kv_heads):
-        qkv_ops.append(b.matmul(f"op_k_h{kv_head}", "x_norm1_q", f"w_k_h{kv_head}", f"k_seq_h{kv_head}", in_dtype=DType.INT16, out_dtype=DType.INT16))
-        qkv_ops.append(b.matmul(f"op_v_h{kv_head}", "x_norm1_q", f"w_v_h{kv_head}", f"v_seq_h{kv_head}", in_dtype=DType.INT16, out_dtype=DType.INT16))
+        qkv_ops.append(b.matmul(f"op_k_h{kv_head}", "x_norm1_q", f"w_k_h{kv_head}", f"k_seq_h{kv_head}", in_dtype=DType.INT16, out_dtype=DType.INT16, **_qmatmul(block, "k_proj")))
+        qkv_ops.append(b.matmul(f"op_v_h{kv_head}", "x_norm1_q", f"w_v_h{kv_head}", f"v_seq_h{kv_head}", in_dtype=DType.INT16, out_dtype=DType.INT16, **_qmatmul(block, "v_proj")))
     b.segment(
         "seg_qkv",
         ops=qkv_ops,
@@ -914,10 +1066,11 @@ def build_prefill_artifact(
         outputs=[*(f"q_int_h{i}" for i in range(n_heads)), *(f"k_seq_h{i}" for i in range(n_kv_heads)), *(f"v_seq_h{i}" for i in range(n_kv_heads))],
     )
     rope_dq_fallback = enable_dq_xform and _rope_uses_dq_fallback(d_head)
-    qk_dq_attrs = _dq_fp16_attrs(act_scale) if rope_dq_fallback else {"scale": act_scale, "zero_point": 0}
+    qk_dq_attrs_q = _dq_fp16_attrs(_qact(block, "q_out")) if rope_dq_fallback else {"scale": _qact(block, "q_out"), "zero_point": 0}
+    qk_dq_attrs_k = _dq_fp16_attrs(_qact(block, "k_out")) if rope_dq_fallback else {"scale": _qact(block, "k_out"), "zero_point": 0}
     rope_input_attrs = {"input_encoding": "fp16_bits"} if rope_dq_fallback else {}
     for q_head in range(n_heads):
-        b.host(f"dequant_q_h{q_head}", "dequantize", inputs=[f"q_int_h{q_head}"], outputs=[f"q_f_h{q_head}"], attrs=qk_dq_attrs)
+        b.host(f"dequant_q_h{q_head}", "dequantize", inputs=[f"q_int_h{q_head}"], outputs=[f"q_f_h{q_head}"], attrs=qk_dq_attrs_q)
         b.host(
             f"rope_q_h{q_head}",
             "rope",
@@ -930,10 +1083,10 @@ def build_prefill_artifact(
             "quantize",
             inputs=[f"q_rope_f_h{q_head}"],
             outputs=[f"q_rope_q_h{q_head}"],
-            attrs={"scale": act_scale, "zero_point": 0, "dtype": DType.INT16},
+            attrs={"scale": _qact(block, "rope_q", _qact(block, "q_out")), "zero_point": 0, "dtype": DType.INT16},
         )
     for kv_head in range(n_kv_heads):
-        b.host(f"dequant_k_h{kv_head}", "dequantize", inputs=[f"k_seq_h{kv_head}"], outputs=[f"k_f_h{kv_head}"], attrs=qk_dq_attrs)
+        b.host(f"dequant_k_h{kv_head}", "dequantize", inputs=[f"k_seq_h{kv_head}"], outputs=[f"k_f_h{kv_head}"], attrs=qk_dq_attrs_k)
         b.host(
             f"rope_k_h{kv_head}",
             "rope",
@@ -946,7 +1099,7 @@ def build_prefill_artifact(
             "quantize",
             inputs=[f"k_rope_f_h{kv_head}"],
             outputs=[f"k_rope_q_h{kv_head}"],
-            attrs={"scale": act_scale, "zero_point": 0, "dtype": DType.INT16},
+            attrs={"scale": _qact(block, "rope_k", _qact(block, "k_out")), "zero_point": 0, "dtype": DType.INT16},
         )
         b.host(f"k_cache_scatter_matrix_h{kv_head}", "k_cache_scatter_matrix", inputs=[f"k_rope_q_h{kv_head}"], outputs=[f"prefill_k_cache_h{kv_head}"])
         b.host(f"v_cache_scatter_matrix_h{kv_head}", "v_cache_scatter_matrix", inputs=[f"v_seq_h{kv_head}"], outputs=[f"prefill_v_cache_h{kv_head}"])
@@ -959,7 +1112,8 @@ def build_prefill_artifact(
                 f"prefill_k_cache_h{_kv_head_for_q_head(q_head, n_heads=n_heads, n_kv_heads=n_kv_heads)}",
                 f"scores_h{q_head}",
                 in_dtype=DType.INT16,
-                out_dtype=DType.INT16,
+                out_dtype=_qmatmul_out_dtype(block, "score"),
+                **_qmatmul(block, "score"),
             )
             for q_head in range(n_heads)
         ],
@@ -969,7 +1123,15 @@ def build_prefill_artifact(
         ],
         outputs=[f"scores_h{i}" for i in range(n_heads)],
     )
-    _append_attention_post_score_steps(b, n_heads=n_heads, attn_scale=attn_scale, include_causal_mask=True, past_kv_len=0, enable_dq_xform=enable_dq_xform)
+    _append_attention_post_score_steps(
+        b,
+        n_heads=n_heads,
+        attn_scale=attn_scale,
+        include_causal_mask=True,
+        past_kv_len=0,
+        enable_dq_xform=enable_dq_xform and _qmatmul_out_dtype(block, "score") == DType.INT16,
+        score_dequant_scale=_qmatmul_output_scale(block, "score"),
+    )
     b.segment(
         "seg_value",
         ops=[
@@ -978,9 +1140,9 @@ def build_prefill_artifact(
                 f"probs_q_h{q_head}",
                 f"prefill_v_cache_h{_kv_head_for_q_head(q_head, n_heads=n_heads, n_kv_heads=n_kv_heads)}",
                 f"attn_h{q_head}",
-                shift=8,
                 in_dtype=DType.INT16,
                 out_dtype=DType.INT16,
+                **_qmatmul(block, "value", default_shift=8),
             )
             for q_head in range(n_heads)
         ],
@@ -991,11 +1153,25 @@ def build_prefill_artifact(
         outputs=[f"attn_h{i}" for i in range(n_heads)],
     )
     _append_concat_alias_steps(b, n_heads=n_heads)
-    _append_transformer_tail(b, act_scale=act_scale, rms_norm_eps=rms_norm_eps, enable_dq_xform=enable_dq_xform)
+    _append_transformer_tail(b, block=block, rms_norm_eps=rms_norm_eps, enable_dq_xform=enable_dq_xform)
 
-    plan = b.finalize(inputs=[], outputs=["out"])
+    outputs = ["out"]
+    expected = {"out": np.array(ref["out"], dtype=np.float32, copy=True)}
+    if expose_kv_cache_outputs:
+        for kv_head in range(n_kv_heads):
+            k_name = f"prefill_k_cache_h{kv_head}"
+            v_name = f"prefill_v_cache_h{kv_head}"
+            outputs.extend([k_name, v_name])
+            expected[k_name] = np.asarray(ref["k_heads"][kv_head], dtype=np.int16).T.copy()
+            expected[v_name] = np.asarray(ref["v_heads"][kv_head], dtype=np.int16).copy()
+
+    plan = b.finalize(inputs=[], outputs=outputs, metadata={"disable_rope_xform": True})
     plan.add_verification_step("out", "llama_prefill_out")
-    artifact = compile_plan(plan, {"out": np.array(ref["out"], dtype=np.float32, copy=True)})
+    if expose_kv_cache_outputs:
+        for kv_head in range(n_kv_heads):
+            plan.add_verification_step(f"prefill_k_cache_h{kv_head}", f"prefill_k_cache_h{kv_head}")
+            plan.add_verification_step(f"prefill_v_cache_h{kv_head}", f"prefill_v_cache_h{kv_head}")
+    artifact = compile_plan(plan, expected)
     return artifact, state, ref
 
 
@@ -1014,6 +1190,7 @@ def build_decode_artifact(
     rope_theta: float = 500000.0,
     rope_scaling: dict[str, object] | None = None,
     enable_dq_xform: bool = False,
+    state: dict[str, object] | None = None,
 ):
     if rms_norm_eps <= 0.0:
         raise ValueError("rms_norm_eps must be positive")
@@ -1021,20 +1198,21 @@ def build_decode_artifact(
         raise ValueError("rope_theta must be positive")
     _require_supported_rope_scaling(rope_scaling)
 
-    state = build_shared_state(
-        d_model=d_model,
-        d_head=d_head,
-        n_heads=n_heads,
-        n_kv_heads=n_kv_heads,
-        ffn_hidden_dim=ffn_hidden_dim,
-        prompt_len=prompt_len,
-        seed=seed,
-        act_scale=act_scale,
-        attn_scale=attn_scale,
-        rms_norm_eps=rms_norm_eps,
-        rope_theta=rope_theta,
-        rope_scaling=rope_scaling,
-    )
+    if state is None:
+        state = build_shared_state(
+            d_model=d_model,
+            d_head=d_head,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            ffn_hidden_dim=ffn_hidden_dim,
+            prompt_len=prompt_len,
+            seed=seed,
+            act_scale=act_scale,
+            attn_scale=attn_scale,
+            rms_norm_eps=rms_norm_eps,
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
+        )
     block: QLlamaBlock = state["block"]
     act_scale = block.config.act_scale
     attn_scale = block.config.attn_scale
@@ -1091,7 +1269,9 @@ def build_decode_artifact(
         prompt_len=prompt_len,
         cache_len=cache_len,
         act_scale=act_scale,
+        score_scale=_qscore_scale(block, d_head),
         cache_token_names=cache_token_names,
+        score_dtype=_qmatmul_out_dtype(block, "score"),
     )
     _add_attention_concat_tensors(b, seq_len=1, d_head=d_head, n_heads=n_heads)
 
@@ -1101,12 +1281,26 @@ def build_decode_artifact(
         "quantize",
         inputs=["x_norm1"],
         outputs=["x_norm1_q"],
-        attrs={"scale": act_scale, "zero_point": 0, "dtype": DType.INT16},
+        attrs={"scale": _qact(block, "rms1_out"), "zero_point": 0, "dtype": DType.INT16},
     )
-    qkv_ops = [builder_op for q_head in range(n_heads) for builder_op in [b.matmul(f"op_q_h{q_head}", "x_norm1_q", f"w_q_h{q_head}", f"q_int_h{q_head}", in_dtype=DType.INT16, out_dtype=DType.INT16)]]
+    qkv_ops = [
+        builder_op
+        for q_head in range(n_heads)
+        for builder_op in [
+            b.matmul(
+                f"op_q_h{q_head}",
+                "x_norm1_q",
+                f"w_q_h{q_head}",
+                f"q_int_h{q_head}",
+                in_dtype=DType.INT16,
+                out_dtype=DType.INT16,
+                **_qmatmul(block, "q_proj"),
+            )
+        ]
+    ]
     for kv_head in range(n_kv_heads):
-        qkv_ops.append(b.matmul(f"op_k_h{kv_head}", "x_norm1_q", f"w_k_h{kv_head}", f"k_cur_h{kv_head}", in_dtype=DType.INT16, out_dtype=DType.INT16))
-        qkv_ops.append(b.matmul(f"op_v_h{kv_head}", "x_norm1_q", f"w_v_h{kv_head}", f"v_cur_h{kv_head}", in_dtype=DType.INT16, out_dtype=DType.INT16))
+        qkv_ops.append(b.matmul(f"op_k_h{kv_head}", "x_norm1_q", f"w_k_h{kv_head}", f"k_cur_h{kv_head}", in_dtype=DType.INT16, out_dtype=DType.INT16, **_qmatmul(block, "k_proj")))
+        qkv_ops.append(b.matmul(f"op_v_h{kv_head}", "x_norm1_q", f"w_v_h{kv_head}", f"v_cur_h{kv_head}", in_dtype=DType.INT16, out_dtype=DType.INT16, **_qmatmul(block, "v_proj")))
     b.segment(
         "seg_qkv",
         ops=qkv_ops,
@@ -1114,10 +1308,11 @@ def build_decode_artifact(
         outputs=[*(f"q_int_h{i}" for i in range(n_heads)), *(f"k_cur_h{i}" for i in range(n_kv_heads)), *(f"v_cur_h{i}" for i in range(n_kv_heads))],
     )
     rope_dq_fallback = enable_dq_xform and _rope_uses_dq_fallback(d_head)
-    qk_dq_attrs = _dq_fp16_attrs(act_scale) if rope_dq_fallback else {"scale": act_scale, "zero_point": 0}
+    qk_dq_attrs_q = _dq_fp16_attrs(_qact(block, "q_out")) if rope_dq_fallback else {"scale": _qact(block, "q_out"), "zero_point": 0}
+    qk_dq_attrs_k = _dq_fp16_attrs(_qact(block, "k_out")) if rope_dq_fallback else {"scale": _qact(block, "k_out"), "zero_point": 0}
     rope_input_attrs = {"input_encoding": "fp16_bits"} if rope_dq_fallback else {}
     for q_head in range(n_heads):
-        b.host(f"dequant_q_h{q_head}", "dequantize", inputs=[f"q_int_h{q_head}"], outputs=[f"q_f_h{q_head}"], attrs=qk_dq_attrs)
+        b.host(f"dequant_q_h{q_head}", "dequantize", inputs=[f"q_int_h{q_head}"], outputs=[f"q_f_h{q_head}"], attrs=qk_dq_attrs_q)
         b.host(
             f"rope_q_h{q_head}",
             "rope",
@@ -1130,10 +1325,10 @@ def build_decode_artifact(
             "quantize",
             inputs=[f"q_rope_f_h{q_head}"],
             outputs=[f"q_rope_q_h{q_head}"],
-            attrs={"scale": act_scale, "zero_point": 0, "dtype": DType.INT16},
+            attrs={"scale": _qact(block, "rope_q", _qact(block, "q_out")), "zero_point": 0, "dtype": DType.INT16},
         )
     for kv_head in range(n_kv_heads):
-        b.host(f"dequant_k_h{kv_head}", "dequantize", inputs=[f"k_cur_h{kv_head}"], outputs=[f"k_f_h{kv_head}"], attrs=qk_dq_attrs)
+        b.host(f"dequant_k_h{kv_head}", "dequantize", inputs=[f"k_cur_h{kv_head}"], outputs=[f"k_f_h{kv_head}"], attrs=qk_dq_attrs_k)
         b.host(
             f"rope_k_h{kv_head}",
             "rope",
@@ -1146,7 +1341,7 @@ def build_decode_artifact(
             "quantize",
             inputs=[f"k_rope_f_h{kv_head}"],
             outputs=[f"k_rope_q_h{kv_head}"],
-            attrs={"scale": act_scale, "zero_point": 0, "dtype": DType.INT16},
+            attrs={"scale": _qact(block, "rope_k", _qact(block, "k_out")), "zero_point": 0, "dtype": DType.INT16},
         )
         b.host(
             f"k_append_h{kv_head}",
@@ -1171,14 +1366,22 @@ def build_decode_artifact(
                 f"k_cache_h{_kv_head_for_q_head(q_head, n_heads=n_heads, n_kv_heads=n_kv_heads)}",
                 f"scores_h{q_head}",
                 in_dtype=DType.INT16,
-                out_dtype=DType.INT16,
+                out_dtype=_qmatmul_out_dtype(block, "score"),
+                **_qmatmul(block, "score"),
             )
             for q_head in range(n_heads)
         ],
         inputs=[f"q_rope_q_h{i}" for i in range(n_heads)],
         outputs=[f"scores_h{i}" for i in range(n_heads)],
     )
-    _append_attention_post_score_steps(b, n_heads=n_heads, attn_scale=attn_scale, include_causal_mask=False, enable_dq_xform=enable_dq_xform)
+    _append_attention_post_score_steps(
+        b,
+        n_heads=n_heads,
+        attn_scale=attn_scale,
+        include_causal_mask=False,
+        enable_dq_xform=enable_dq_xform and _qmatmul_out_dtype(block, "score") == DType.INT16,
+        score_dequant_scale=_qmatmul_output_scale(block, "score"),
+    )
     b.segment(
         "seg_value",
         ops=[
@@ -1187,9 +1390,9 @@ def build_decode_artifact(
                 f"probs_q_h{q_head}",
                 f"v_cache_h{_kv_head_for_q_head(q_head, n_heads=n_heads, n_kv_heads=n_kv_heads)}",
                 f"attn_h{q_head}",
-                shift=8,
                 in_dtype=DType.INT16,
                 out_dtype=DType.INT16,
+                **_qmatmul(block, "value", default_shift=8),
             )
             for q_head in range(n_heads)
         ],
@@ -1197,9 +1400,9 @@ def build_decode_artifact(
         outputs=[f"attn_h{i}" for i in range(n_heads)],
     )
     _append_concat_alias_steps(b, n_heads=n_heads)
-    _append_transformer_tail(b, act_scale=act_scale, rms_norm_eps=rms_norm_eps, enable_dq_xform=enable_dq_xform)
+    _append_transformer_tail(b, block=block, rms_norm_eps=rms_norm_eps, enable_dq_xform=enable_dq_xform)
 
-    plan = b.finalize(inputs=[], outputs=["out"])
+    plan = b.finalize(inputs=[], outputs=["out"], metadata={"disable_rope_xform": True})
     plan.add_verification_step("out", "llama_decode_out")
     artifact = compile_plan(plan, {"out": np.array(decode_ref["out"], dtype=np.float32, copy=True)})
     return artifact, state, prefill_ref, decode_ref

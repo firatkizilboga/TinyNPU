@@ -9,6 +9,18 @@ import numpy as np
 from tinynpu.isa import PrecisionMode
 from tinynpu.packer import Packer
 
+# RTL PPU sigmoid supports INT16 qmax << (shift + 4) in a 48-bit activation
+# datapath. shift=29 is the largest safe fused-sigmoid value.
+MAX_FUSED_SIGMOID_SHIFT = 29
+
+
+def supports_fused_activation(activation: str | None, *, shift: int) -> bool:
+    kind = "none" if activation is None else str(activation)
+    if kind != "sigmoid":
+        return True
+    return int(shift) <= MAX_FUSED_SIGMOID_SHIFT
+
+
 # TODO(refactor): this file currently mixes tensor metadata with a very thin
 # low-level op set (`MatMulOp` + stringly-typed `HostOp`). The next migration
 # step should introduce a typed high-level op layer plus an IRBuilder that lowers

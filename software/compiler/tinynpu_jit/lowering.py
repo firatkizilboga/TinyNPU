@@ -16,6 +16,7 @@ from .ir import (
     TensorKind,
     VerifyTensor,
     make_rope_cs_tensor_spec,
+    supports_fused_activation,
     to_precision_mode,
 )
 from .memory_planner import (
@@ -24,7 +25,7 @@ from .memory_planner import (
     infer_roles,
     plan_program_memory,
 )
-from .runtime_approx import choose_xform_i16_f16_scale_params
+from .runtime_approx import choose_xform_i16_f16_scale_params, choose_xform_q_f16_i16_scale_params
 
 
 _NPU_DATA_DTYPES = {DType.INT4, DType.INT8, DType.INT16}
@@ -532,7 +533,8 @@ class SegmentCompiler:
     def compile(self, plan: ExecutionPlan, expected_tensors: dict[str, np.ndarray]) -> CompiledArtifact:
         _tmp = TinyNPUProgram(defines_path=self.defines_path)
         array_size = int(_tmp.hw.params.get("ARRAY_SIZE", 8))
-        rewrite_host_rope_patterns(plan)
+        if not bool(plan.metadata.get("disable_rope_xform", False)):
+            rewrite_host_rope_patterns(plan)
         rewrite_dequantize_fp16_xforms(plan)
         fold_input_quantize_into_input_contract(plan)
         prune_unused_tensors(plan)
@@ -543,7 +545,7 @@ class SegmentCompiler:
         # Read UB capacity from hardware config
         ub_capacity = int(_tmp.hw.params.get("BUFFER_DEPTH", 0))
         if ub_capacity <= 0:
-            ub_capacity = int(_tmp.hw.params.get("IM_BASE_ADDR", 0x8000))
+            ub_capacity = int(_tmp.hw.params.get("IM_BASE_ADDR", 0x9000))
 
         # Global memory plan: static weights get unique addresses, dynamic tensors
         # share a zone with within-segment liveness reuse.
@@ -625,6 +627,7 @@ class SegmentCompiler:
                                 and activation_step.inputs == step.outputs
                                 and next_step.kind == "dequantize"
                                 and next_step.inputs == activation_step.outputs
+                                and supports_fused_activation("sigmoid", shift=segment_op.shift)
                             ):
                                 segment_op.activation = "sigmoid"
                                 step.outputs[0] = activation_step.outputs[0]
@@ -648,6 +651,18 @@ class SegmentCompiler:
         return None
 
     def _annotate_output_layouts(self, plan: ExecutionPlan) -> None:
+        external_npu_uses: dict[str, set[str]] = defaultdict(set)
+        blocked_external_layouts: set[str] = set(plan.outputs)
+        for step in plan.steps:
+            if isinstance(step, VerifyTensor):
+                blocked_external_layouts.add(step.tensor_name)
+            elif isinstance(step, HostOp):
+                blocked_external_layouts.update(step.inputs)
+            elif isinstance(step, NpuSegment):
+                for op in step.ops:
+                    external_npu_uses[op.lhs].add("lhs")
+                    external_npu_uses[op.rhs].add("rhs")
+
         for step in plan.steps:
             if not isinstance(step, NpuSegment):
                 continue
@@ -667,7 +682,13 @@ class SegmentCompiler:
                         op.output_layout = "b"
                     else:
                         if op.out in step.outputs:
-                            op.output_layout = "c"
+                            uses = external_npu_uses.get(op.out, set())
+                            if op.out not in blocked_external_layouts and uses == {"lhs"}:
+                                op.output_layout = "a"
+                            elif op.out not in blocked_external_layouts and uses == {"rhs"}:
+                                op.output_layout = "b"
+                            else:
+                                op.output_layout = "c"
                         else:
                             later_uses: set[str] = set()
                             for later in step.ops[index + 1 :]:
@@ -703,6 +724,16 @@ class SegmentCompiler:
     ) -> SegmentArtifact:
         program = TinyNPUProgram(defines_path=self.defines_path)
         roles = infer_roles(segment)
+        quantize_by_output = {
+            step.outputs[0]: step
+            for step in plan.steps
+            if isinstance(step, HostOp)
+            and step.kind == "quantize"
+            and len(step.inputs) == 1
+            and len(step.outputs) == 1
+            and str(step.attrs.get("_npu_write_transform", "")) == "xform_q_f16_i16"
+            and int(step.attrs.get("zero_point", 0)) == 0
+        }
 
         referenced = set(segment.inputs + segment.outputs)
         for op in segment.ops:
@@ -761,7 +792,23 @@ class SegmentCompiler:
             precision = to_precision_mode(spec.dtype if spec.dtype in (DType.INT4, DType.INT8, DType.INT16) else DType.INT16)
             program.declare_data(name, data, precision=precision, role=role)
 
+        emitted_q_xforms: set[str] = set()
         for op in segment.ops:
+            for input_name in (op.lhs, op.rhs):
+                quantize_step = quantize_by_output.get(input_name)
+                if quantize_step is None or input_name in emitted_q_xforms:
+                    continue
+                multiplier, q_shift = choose_xform_q_f16_i16_scale_params(1.0 / float(quantize_step.attrs["scale"]))
+                quantize_step.attrs["_npu_write_xform_location"] = "segment"
+                quantize_step.attrs["_npu_write_xform_multiplier"] = int(multiplier)
+                quantize_step.attrs["_npu_write_xform_shift"] = int(q_shift)
+                program.xform_q_f16_i16(
+                    input_name,
+                    input_name,
+                    multiplier=int(multiplier),
+                    shift=int(q_shift),
+                )
+                emitted_q_xforms.add(input_name)
             activation = 0
             if op.activation == "relu":
                 activation = 1

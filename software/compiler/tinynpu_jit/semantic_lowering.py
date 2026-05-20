@@ -8,7 +8,7 @@ import numpy as np
 from .builder import IRBuilder
 from .golden import GoldenModel
 from .host_ops import execute_host_op
-from .ir import DType, HostOp, TensorKind, TensorSpec, normalize_shape
+from .ir import DType, HostOp, TensorKind, TensorSpec, normalize_shape, supports_fused_activation
 from .semantic_ir import (
     ActivationOp,
     AdaptiveAvgPool2dOp,
@@ -258,6 +258,8 @@ def execute_semantic_graph(graph: SemanticGraph, inputs: dict[str, np.ndarray]) 
             continue
         if isinstance(op, CompilerReadyLinearOp):
             output_name, activation, consumed = _maybe_fused_activation(graph, index)
+            if not supports_fused_activation(activation, shift=op.shift):
+                output_name, activation, consumed = op.outputs[0], None, 1
             weight_t = np.array(op.weight_int, copy=False).T
             lhs_value, original_shape, layout = _normalize_linear_input(env[op.inputs[0]], in_features=int(op.weight_int.shape[1]))
             matrix = golden.matmul(
@@ -275,6 +277,8 @@ def execute_semantic_graph(graph: SemanticGraph, inputs: dict[str, np.ndarray]) 
             continue
         if isinstance(op, CompilerReadyConv2dOp):
             output_name, activation, consumed = _maybe_fused_activation(graph, index)
+            if not supports_fused_activation(activation, shift=op.shift):
+                output_name, activation, consumed = op.outputs[0], None, 1
             image_hwc, original_shape, layout = _normalize_conv_input(env[op.inputs[0]], in_channels=op.in_channels)
             im2col_env = {op.inputs[0]: env[op.inputs[0]]}
             execute_host_op(
@@ -504,6 +508,8 @@ def lower_semantic_graph_to_plan(graph: SemanticGraph, materialized_values: dict
             continue
         if isinstance(op, CompilerReadyLinearOp):
             output_name, activation, consumed = _maybe_fused_activation(graph, index)
+            if not supports_fused_activation(activation, shift=op.shift):
+                output_name, activation, consumed = op.outputs[0], None, 1
             output_value = graph.values[output_name]
             weight_t_name = f"{op.name}_weight_t"
             weight_t = np.array(op.weight_int, copy=False).T.astype(np.int16)
@@ -599,6 +605,8 @@ def lower_semantic_graph_to_plan(graph: SemanticGraph, materialized_values: dict
             continue
         if isinstance(op, CompilerReadyConv2dOp):
             output_name, activation, consumed = _maybe_fused_activation(graph, index)
+            if not supports_fused_activation(activation, shift=op.shift):
+                output_name, activation, consumed = op.outputs[0], None, 1
             output_value = graph.values[output_name]
             cols_name = f"{op.name}_im2col"
             matmul_name = f"{op.name}_matmul"

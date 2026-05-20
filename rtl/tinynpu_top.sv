@@ -23,7 +23,6 @@ module tinynpu_top #(
     output logic [31:0]                 host_shared_rd_data,
     output logic                        host_shared_allow,
 
-    output logic [(`ARRAY_SIZE * `ARRAY_SIZE * `ACC_WIDTH)-1:0] results_flat,
     output logic result_valid,
     output logic all_done
 );
@@ -60,6 +59,8 @@ module tinynpu_top #(
     output_layout_t              ppu_output_layout;
     writeback_mode_t             ppu_writeback_mode;
     logic [$clog2(`ARRAY_SIZE)-1:0] ppu_cache_lane_idx;
+    logic                        ppu_busy;
+    logic                        ppu_done;
     logic                        sa_input_first, sa_input_last;
     logic                        sa_weight_first, sa_weight_last;
 
@@ -116,6 +117,8 @@ module tinynpu_top #(
         .ppu_output_layout(ppu_output_layout),
         .ppu_writeback_mode(ppu_writeback_mode),
         .ppu_cache_lane_idx(ppu_cache_lane_idx),
+        .ppu_busy       (ppu_busy),
+        .ppu_done       (ppu_done),
         .all_done_in    (all_done)
     );
 
@@ -163,7 +166,8 @@ module tinynpu_top #(
         .ppu_output_layout(ppu_output_layout),
         .ppu_writeback_mode(ppu_writeback_mode),
         .ppu_cache_lane_idx(ppu_cache_lane_idx),
-        .results_flat   (results_flat),
+        .ppu_busy       (ppu_busy),
+        .ppu_done       (ppu_done),
         .result_valid   (result_valid),
         .all_done       (all_done)
     );

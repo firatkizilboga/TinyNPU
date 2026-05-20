@@ -55,6 +55,8 @@ module control_unit #(
     output output_layout_t                 ppu_output_layout,
     output writeback_mode_t                ppu_writeback_mode,
     output logic [$clog2(`ARRAY_SIZE)-1:0] ppu_cache_lane_idx,
+    input  logic                           ppu_busy,
+    input  logic                           ppu_done,
 
     input logic all_done_in
 );
@@ -103,18 +105,19 @@ module control_unit #(
   logic [`ADDR_WIDTH-1:0] xform_src, xform_src_next;
   logic [`ADDR_WIDTH-1:0] xform_dest, xform_dest_next;
   logic [`ADDR_WIDTH-1:0] xform_count, xform_count_next;
-  logic xform_phase, xform_phase_next;
+  logic [2:0] xform_phase, xform_phase_next;
   xform_mode_t xform_mode, xform_mode_next;
   logic [15:0] xform_multiplier, xform_multiplier_next;
   logic [7:0] xform_shift, xform_shift_next;
 
-  // --- ROPE Buffer Registers (used by XFORM_MODE_ROPE_K16) ---
-  logic [`BUFFER_WIDTH-1:0] rope_k_lo_buf;    // K[0..half-1] latched from UB
-  logic [`BUFFER_WIDTH-1:0] rope_k_hi_buf;    // K[half..d-1] latched from UB
-  logic [`BUFFER_WIDTH-1:0] rope_cos_buf;     // cos table word latched from UB
-  logic [`BUFFER_WIDTH-1:0] rope_k_hi_rot_buf; // rotated K_hi latched for phase-5 write
-  logic [`BUFFER_WIDTH-1:0] rope_k_lo_rot_w;
-  logic [`BUFFER_WIDTH-1:0] rope_k_hi_rot_w;
+  // --- Registered XFORM unit ---
+  // Hardware XFORM is intentionally limited to word-local Q/DQ transforms.
+  // RoPE is a host/compiler responsibility because it needs cross-word pairing
+  // and trigonometric tables that do not fit the simple streaming datapath.
+  logic xform_unit_start;
+  logic xform_unit_done;
+  logic [`BUFFER_WIDTH-1:0] xform_unit_in_word;
+  logic [`BUFFER_WIDTH-1:0] xform_unit_out_word;
 
   // --- Internal Registers for MATMUL ---
   logic [`ADDR_WIDTH-1:0] mm_a_base, mm_b_base, mm_c_base, mm_bias_base;
@@ -133,8 +136,9 @@ module control_unit #(
   writeback_mode_t mm_writeback_mode;
   logic [15:0] m_idx, n_idx, k_idx;
 
-  // Flexible counter width for NxN support
-  logic [$clog2(`ARRAY_SIZE)-1:0] cycle_cnt, cycle_next;
+  // Flexible counter width for NxN support plus PPU pipeline drain wait.
+  localparam int CYCLE_CNT_WIDTH = $clog2(`ARRAY_SIZE + 16);
+  logic [CYCLE_CNT_WIDTH-1:0] cycle_cnt, cycle_next;
 
   logic [15:0] m_next, n_next, k_next;
   logic [PERF_COUNTER_WIDTH-1:0] perf_total_cycles;
@@ -171,7 +175,6 @@ module control_unit #(
       mm_writeback_mode <= WB_MODE_NORMAL;
       mm_b_read_mode <= B_READ_MODE_NORMAL;
       {m_idx, n_idx, k_idx, cycle_cnt} <= '0;
-      {rope_k_lo_buf, rope_k_hi_buf, rope_cos_buf, rope_k_hi_rot_buf} <= '0;
       perf_total_cycles <= '0;
       for (int perf_i = 0; perf_i < CTRL_STATE_COUNT; perf_i++) begin
         perf_state_cycles[perf_i] <= '0;
@@ -211,19 +214,6 @@ module control_unit #(
       xform_mode <= xform_mode_next;
       xform_multiplier <= xform_multiplier_next;
       xform_shift <= xform_shift_next;
-
-      // ROPE_K16: latch UB reads into rotation buffers each phase
-      // cycle_cnt here is the CURRENT phase. ub_rdata is the synchronous data
-      // fetched by the previous phase's address.
-      if (state == CTRL_EXEC_XFORM && xform_mode == XFORM_MODE_ROPE_K16) begin
-        case (cycle_cnt)
-          3'd1: rope_k_lo_buf <= ub_rdata; // phase 0 addressed K_lo; latch now
-          3'd2: rope_k_hi_buf <= ub_rdata; // phase 1 addressed K_hi
-          3'd3: rope_cos_buf  <= ub_rdata; // phase 2 addressed cos
-          3'd4: rope_k_hi_rot_buf <= rope_k_hi_rot_w; // sin in ub_rdata; latch K_hi_rot
-          default: ;
-        endcase
-      end
 
       // MATMUL Latch from Instruction Memory
       if (state == CTRL_DECODE && im_rdata[255:252] == ISA_OP_MATMUL) begin
@@ -281,239 +271,20 @@ module control_unit #(
     logic        wb_valid_cycle;
     logic [$clog2(`ARRAY_SIZE)-1:0] cache_lane_idx;
     logic [`ADDR_WIDTH-1:0] mm_c_effective_base;
-    logic [`BUFFER_WIDTH-1:0] xform_word_q_f16_i16;
-    logic [`BUFFER_WIDTH-1:0] xform_word_dq_i16_f16;
-
-    function automatic logic signed [63:0] round_shift_right_signed(
-        input logic signed [63:0] value,
-        input int unsigned shift
+    logic        packed_c_writeback;
+    logic [15:0] packed_c_group_base;
+    logic [15:0] packed_c_group_limit;
+    xform_unit u_xform (
+        .clk(clk),
+        .rst_n(rst_n),
+        .start(xform_unit_start),
+        .mode(xform_mode),
+        .in_word(xform_unit_in_word),
+        .multiplier(xform_multiplier),
+        .shift(xform_shift),
+        .done(xform_unit_done),
+        .out_word(xform_unit_out_word)
     );
-        logic signed [63:0] abs_value;
-        logic signed [63:0] rounded;
-        begin
-            if (shift == 0) begin
-                round_shift_right_signed = value;
-            end else if (shift >= 63) begin
-                round_shift_right_signed = '0;
-            end else if (value >= 0) begin
-                round_shift_right_signed = (value + (64'sd1 <<< (shift - 1))) >>> shift;
-            end else begin
-                abs_value = -value;
-                rounded = (abs_value + (64'sd1 <<< (shift - 1))) >>> shift;
-                round_shift_right_signed = -rounded;
-            end
-        end
-    endfunction
-
-    function automatic logic signed [15:0] clip_i16(
-        input logic signed [63:0] value
-    );
-        begin
-            if (value > 64'sd32767) begin
-                clip_i16 = 16'sh7fff;
-            end else if (value < -64'sd32768) begin
-                clip_i16 = 16'sh8000;
-            end else begin
-                clip_i16 = value[15:0];
-            end
-        end
-    endfunction
-
-    function automatic logic signed [15:0] quantize_lane_q_f16_i16(
-        input logic [15:0] fp16,
-        input logic [15:0] multiplier,
-        input logic [7:0] shift
-    );
-        logic sign;
-        logic [4:0] exp_bits;
-        logic [9:0] frac_bits;
-        logic signed [63:0] mant;
-        logic signed [63:0] scaled;
-        logic signed [63:0] qvalue;
-        int exp2;
-        int left_shift;
-        int right_shift;
-        begin
-            sign = fp16[15];
-            exp_bits = fp16[14:10];
-            frac_bits = fp16[9:0];
-            qvalue = 64'sd0;
-            if (multiplier == 16'd0) begin
-                quantize_lane_q_f16_i16 = 16'sd0;
-            end else if (exp_bits == 5'h1f) begin
-                quantize_lane_q_f16_i16 = sign ? -16'sd32768 : 16'sd32767;
-            end else if (exp_bits == 5'd0 && frac_bits == 10'd0) begin
-                quantize_lane_q_f16_i16 = 16'sd0;
-            end else begin
-                if (exp_bits == 5'd0) begin
-                    // subnormal: frac * 2^-24
-                    mant = $signed({2'b00, frac_bits});
-                    exp2 = -24;
-                end else begin
-                    // normal: (1024 + frac) * 2^(exp-25)
-                    mant = $signed({2'b01, frac_bits});
-                    exp2 = $signed({1'b0, exp_bits}) - 25;
-                end
-
-                scaled = mant * $signed({1'b0, multiplier});
-                if (exp2 >= $signed({1'b0, shift})) begin
-                    left_shift = exp2 - $signed({1'b0, shift});
-                    if (left_shift >= 47) begin
-                        qvalue = 64'sh7fffffffffffffff;
-                    end else begin
-                        qvalue = scaled <<< left_shift;
-                    end
-                end else begin
-                    right_shift = $signed({1'b0, shift}) - exp2;
-                    qvalue = round_shift_right_signed(scaled, right_shift);
-                end
-
-                if (sign) begin
-                    qvalue = -qvalue;
-                end
-                quantize_lane_q_f16_i16 = clip_i16(qvalue);
-            end
-        end
-    endfunction
-
-    function automatic int unsigned msb_index_u32(
-        input logic [31:0] value
-    );
-        begin
-            msb_index_u32 = 0;
-            for (int bit_idx = 31; bit_idx >= 0; bit_idx--) begin
-                if (value[bit_idx]) begin
-                    msb_index_u32 = bit_idx;
-                    break;
-                end
-            end
-        end
-    endfunction
-
-    function automatic logic [63:0] round_shift_right_unsigned64(
-        input logic [63:0] value,
-        input int unsigned shift
-    );
-        begin
-            if (shift == 0) begin
-                round_shift_right_unsigned64 = value;
-            end else if (shift >= 64) begin
-                round_shift_right_unsigned64 = '0;
-            end else begin
-                round_shift_right_unsigned64 = (value + (64'd1 << (shift - 1))) >> shift;
-            end
-        end
-    endfunction
-
-    function automatic logic [15:0] dequantize_lane_i16_f16(
-        input logic signed [15:0] value,
-        input logic [15:0] multiplier,
-        input logic [7:0] shift
-    );
-        logic sign;
-        logic [15:0] magnitude;
-        logic [31:0] product;
-        logic [63:0] rounded;
-        logic [10:0] significand;
-        int unsigned msb;
-        int signed exp_unbiased;
-        int signed exp_half;
-        int signed normal_shift;
-        int signed subnormal_shift;
-        begin
-            if (value == 16'sd0 || multiplier == 16'd0) begin
-                dequantize_lane_i16_f16 = 16'h0000;
-            end else begin
-                sign = value[15];
-                magnitude = sign ? ((~value[15:0]) + 16'd1) : value[15:0];
-                product = {16'd0, magnitude} * {16'd0, multiplier};
-                msb = msb_index_u32(product);
-                exp_unbiased = int'(msb) - int'(shift);
-                exp_half = exp_unbiased + 15;
-
-                if (exp_half >= 31) begin
-                    dequantize_lane_i16_f16 = {sign, 5'h1e, 10'h3ff};
-                end else if (exp_half <= 0) begin
-                    // FP16 subnormal: mantissa = round(product * 2^(24 - shift)).
-                    subnormal_shift = int'(shift) - 24;
-                    if (subnormal_shift <= 0) begin
-                        rounded = {32'd0, product} << (-subnormal_shift);
-                    end else begin
-                        rounded = round_shift_right_unsigned64({32'd0, product}, subnormal_shift);
-                    end
-                    if (rounded == 64'd0) begin
-                        dequantize_lane_i16_f16 = 16'h0000;
-                    end else if (rounded >= 64'd1024) begin
-                        dequantize_lane_i16_f16 = {sign, 5'd1, 10'd0};
-                    end else begin
-                        dequantize_lane_i16_f16 = {sign, 5'd0, rounded[9:0]};
-                    end
-                end else begin
-                    normal_shift = int'(msb) - 10;
-                    if (normal_shift >= 0) begin
-                        rounded = round_shift_right_unsigned64({32'd0, product}, normal_shift);
-                    end else begin
-                        rounded = {32'd0, product} << (-normal_shift);
-                    end
-                    if (rounded >= 64'd2048) begin
-                        exp_half = exp_half + 1;
-                        significand = 11'd1024;
-                    end else begin
-                        significand = rounded[10:0];
-                    end
-                    if (exp_half >= 31) begin
-                        dequantize_lane_i16_f16 = {sign, 5'h1e, 10'h3ff};
-                    end else begin
-                        dequantize_lane_i16_f16 = {sign, exp_half[4:0], significand[9:0]};
-                    end
-                end
-            end
-        end
-    endfunction
-
-    always_comb begin
-        xform_word_q_f16_i16 = ub_rdata;
-        xform_word_dq_i16_f16 = ub_rdata;
-        for (int lane = 0; lane < `ARRAY_SIZE; lane++) begin
-            xform_word_q_f16_i16[lane*16 +: 16] =
-                quantize_lane_q_f16_i16(
-                    ub_rdata[lane*16 +: 16],
-                    xform_multiplier,
-                    xform_shift
-                );
-        end
-        if (xform_mode == XFORM_MODE_DQ_I16_F16) begin
-            for (int lane = 0; lane < `ARRAY_SIZE; lane++) begin
-                xform_word_dq_i16_f16[lane*16 +: 16] =
-                    dequantize_lane_i16_f16(
-                        $signed(ub_rdata[lane*16 +: 16]),
-                        xform_multiplier,
-                        xform_shift
-                    );
-            end
-        end
-    end
-
-    // --- RoPE INT16 Q14 rotation combinational ---
-    // Valid during CTRL_EXEC_XFORM phase 4 (ub_rdata = sin word).
-    // rope_k_lo_rot_w[j] = clip_i16((K_lo[j]*cos[j] - K_hi[j]*sin[j] + 2^13) >> 14)
-    // rope_k_hi_rot_w[j] = clip_i16((K_hi[j]*cos[j] + K_lo[j]*sin[j] + 2^13) >> 14)
-    always_comb begin
-        rope_k_lo_rot_w = '0;
-        rope_k_hi_rot_w = '0;
-        for (int rj = 0; rj < `ARRAY_SIZE; rj++) begin
-            automatic logic signed [15:0] klo_v, khi_v, cos_v, sin_v;
-            automatic logic signed [31:0] lo_prod, hi_prod;
-            klo_v   = $signed(rope_k_lo_buf[rj*16 +: 16]);
-            khi_v   = $signed(rope_k_hi_buf[rj*16 +: 16]);
-            cos_v   = $signed(rope_cos_buf[rj*16 +: 16]);
-            sin_v   = $signed(ub_rdata[rj*16 +: 16]); // sin valid in phase 4
-            lo_prod = klo_v * cos_v - khi_v * sin_v;
-            hi_prod = khi_v * cos_v + klo_v * sin_v;
-            rope_k_lo_rot_w[rj*16 +: 16] = clip_i16($signed(lo_prod + 32'sd8192) >>> 14);
-            rope_k_hi_rot_w[rj*16 +: 16] = clip_i16($signed(hi_prod + 32'sd8192) >>> 14);
-        end
-    end
 
     always_comb begin
         unique case (mm_out_precision)
@@ -561,6 +332,24 @@ module control_unit #(
             wb_valid_cycle = (mm_out_precision == MODE_INT16) && (cycle_cnt == cache_lane_idx);
         end
         mm_c_effective_base = mm_c_base + mm_output_word_offset;
+
+        packed_c_writeback = (mm_writeback_mode == WB_MODE_NORMAL) &&
+                             (mm_output_layout == OUT_LAYOUT_C) &&
+                             (mm_out_precision != MODE_INT16);
+        unique case (mm_out_precision)
+            MODE_INT4: begin
+                packed_c_group_base  = {m_idx[15:2], 2'b00};
+                packed_c_group_limit = {m_idx[15:2], 2'b00} + 16'd4;
+            end
+            MODE_INT8: begin
+                packed_c_group_base  = {m_idx[15:1], 1'b0};
+                packed_c_group_limit = {m_idx[15:1], 1'b0} + 16'd2;
+            end
+            default: begin
+                packed_c_group_base  = m_idx;
+                packed_c_group_limit = m_idx + 16'd1;
+            end
+        endcase
     end
 
     always_comb begin
@@ -583,7 +372,7 @@ module control_unit #(
         sa_weight_first = 1'b0;
         sa_weight_last = 1'b0;
         ppu_capture_en = 1'b0;
-        ppu_cycle_idx = cycle_cnt;
+        ppu_cycle_idx = cycle_cnt[$clog2(`ARRAY_SIZE)-1:0];
         ppu_wb_en = 1'b0;
         ppu_bias_en = 1'b0;
         ppu_bias_clear = 1'b0;
@@ -599,6 +388,8 @@ module control_unit #(
         ppu_cache_lane_idx = cache_lane_idx;
         mmvr_wr_en = 1'b0;
         mmvr_out = '0;
+        xform_unit_start = 1'b0;
+        xform_unit_in_word = ub_rdata;
 
     move_src_next = move_src;
     move_dest_next = move_dest;
@@ -709,9 +500,7 @@ module control_unit #(
             xform_count_next = im_rdata[215:200];
             xform_multiplier_next = im_rdata[199:184];
             xform_shift_next = im_rdata[183:176];
-            xform_phase_next = 1'b0;
-            k_next = '0;      // pair index for ROPE_K16
-            cycle_next = '0;  // phase index for ROPE_K16
+            xform_phase_next = 3'd0;
             next_state = CTRL_EXEC_XFORM;
           end
           ISA_OP_MATMUL: begin
@@ -747,69 +536,39 @@ module control_unit #(
         status_out = `STATUS_BUSY;
         ub_req = 1'b1;
 
-        if (xform_mode == XFORM_MODE_ROPE_K16) begin
-          // 6-phase per K-pair: k_idx = pair index (0..half_count-1)
-          // xform_count = half_count, xform_multiplier = cs_base (cos/sin table addr)
-          // Both K and cos/sin use stride-8 (one valid word per ARRAY_SIZE-word tile).
-          // K stored as OUT_LAYOUT_C for m=1: valid word at src + n_tile*8 + 0.
-          // cos/sin stored as C-layout [1, d_head] with data[0, 0:half]=cos, data[0, half:d]=sin:
-          //   cos[k] at cs + k*8, sin[k] at cs + (k + half_count)*8
-          if (k_idx >= xform_count) begin
-            pc_next = pc + `INST_CHUNKS;
-            next_state = CTRL_FETCH;
-          end else begin
-            case (cycle_cnt)
-              3'd0: begin // read K_lo tile (stride-8)
-                ub_addr = xform_src + (k_idx << 3);
-                cycle_next = 3'd1;
-              end
-              3'd1: begin // K_lo in ub_rdata_reg; read K_hi tile
-                ub_addr = xform_src + ((k_idx + xform_count) << 3);
-                cycle_next = 3'd2;
-              end
-              3'd2: begin // K_hi in ub_rdata_reg; read cos word (stride-8)
-                ub_addr = xform_multiplier + (k_idx << 3);
-                cycle_next = 3'd3;
-              end
-              3'd3: begin // cos in ub_rdata_reg; read sin word (stride-8)
-                ub_addr = xform_multiplier + ((k_idx + xform_count) << 3);
-                cycle_next = 3'd4;
-              end
-              3'd4: begin // sin is now in ub_rdata_reg; write rotated K_lo (stride-8)
-                ub_addr = xform_dest + (k_idx << 3);
-                ub_wr_en = 1'b1;
-                ub_wdata = rope_k_lo_rot_w;
-                cycle_next = 3'd5;
-              end
-              3'd5: begin // write rotated K_hi (stride-8, pre-latched)
-                ub_addr = xform_dest + ((k_idx + xform_count) << 3);
-                ub_wr_en = 1'b1;
-                ub_wdata = rope_k_hi_rot_buf;
-                k_next = k_idx + 1;
-                cycle_next = 3'd0;
-              end
-              default: cycle_next = 3'd0;
-            endcase
-          end
-        end else if (xform_count == 0) begin
+`ifdef TINYNPU_DISABLE_XFORM
+        pc_next = pc + `INST_CHUNKS;
+        next_state = CTRL_FETCH;
+`else
+        if (xform_count == 0) begin
           pc_next = pc + `INST_CHUNKS;
           next_state = CTRL_FETCH;
-        end else if (xform_phase == 1'b0) begin
-          ub_addr = xform_src;
-          xform_phase_next = 1'b1;
         end else begin
-          ub_addr = xform_dest;
-          ub_wr_en = 1'b1;
-          unique case (xform_mode)
-            XFORM_MODE_Q_F16_I16: ub_wdata = xform_word_q_f16_i16;
-            XFORM_MODE_DQ_I16_F16: ub_wdata = xform_word_dq_i16_f16;
-            default: ub_wdata = ub_rdata_reg;
+          unique case (xform_phase)
+            3'd0: begin
+              ub_addr = xform_src;
+              xform_phase_next = 3'd1;
+            end
+            3'd1: begin
+              xform_unit_in_word = ub_rdata;
+              xform_unit_start = 1'b1;
+              xform_phase_next = 3'd2;
+            end
+            3'd2: begin
+              if (xform_unit_done) begin
+                ub_addr = xform_dest;
+                ub_wr_en = 1'b1;
+                ub_wdata = xform_unit_out_word;
+                xform_src_next = xform_src + 1;
+                xform_dest_next = xform_dest + 1;
+                xform_count_next = xform_count - 1;
+                xform_phase_next = 3'd0;
+              end
+            end
+            default: xform_phase_next = 3'd0;
           endcase
-          xform_src_next = xform_src + 1;
-          xform_dest_next = xform_dest + 1;
-          xform_count_next = xform_count - 1;
-          xform_phase_next = 1'b0;
         end
+`endif
       end
 
       CTRL_EXEC_MATMUL: begin
@@ -901,10 +660,10 @@ module control_unit #(
 
       CTRL_MM_DRAIN_SA: begin
         status_out = `STATUS_BUSY;
-        drain_enable = 1'b1;
-        ppu_capture_en = 1'b1;
+        drain_enable = (cycle_cnt < `ARRAY_SIZE);
+        ppu_capture_en = (cycle_cnt < `ARRAY_SIZE);
         
-        if (cycle_cnt == (`ARRAY_SIZE - 1)) begin
+        if (cycle_cnt >= `ARRAY_SIZE && ppu_done) begin
           cycle_next = '0;
           next_state = CTRL_MM_WRITEBACK;
         end else begin
@@ -938,7 +697,21 @@ module control_unit #(
 
         if (cycle_cnt == (`ARRAY_SIZE - 1)) begin
           cycle_next = '0;
-          n_next = n_idx + 1;
+          if (packed_c_writeback) begin
+            if (((m_idx + 16'd1) < mm_m_total) && ((m_idx + 16'd1) < packed_c_group_limit)) begin
+              // Keep the same N tile while producing the next packed M lane.
+              m_next = m_idx + 16'd1;
+            end else if ((n_idx + 16'd1) < mm_n_total) begin
+              // Finish this packed M group across all N tiles before moving on.
+              m_next = packed_c_group_base;
+              n_next = n_idx + 16'd1;
+            end else begin
+              m_next = packed_c_group_limit;
+              n_next = '0;
+            end
+          end else begin
+            n_next = n_idx + 1;
+          end
           next_state = CTRL_EXEC_MATMUL;
         end else begin
           cycle_next = cycle_cnt + 1;

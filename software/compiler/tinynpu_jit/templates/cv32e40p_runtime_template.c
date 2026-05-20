@@ -25,6 +25,9 @@
 #ifndef TINYNPU_SHARED_PACKED_READ_MMIO_FALLBACK
 #define TINYNPU_SHARED_PACKED_READ_MMIO_FALLBACK 0
 #endif
+#ifndef TINYNPU_SHARED_READBACK_MMIO
+#define TINYNPU_SHARED_READBACK_MMIO 1
+#endif
 
 enum {
     REG_STATUS = 0x00,
@@ -2590,6 +2593,10 @@ static int npu_read_mem_word_mmio(uint16_t addr, uint32_t chunks[TINY_BUFFER_WOR
 static int npu_read_mem_word(uint16_t addr, uint32_t chunks[TINY_BUFFER_WORDS_32], int precision)
 {
 #if TINYNPU_USE_SHARED_SRAM
+#if TINYNPU_SHARED_READBACK_MMIO
+    (void)precision;
+    return npu_read_mem_word_mmio(addr, chunks);
+#else
     if (g_tinynpu_force_mmio_transfers) {
         return npu_read_mem_word_mmio(addr, chunks);
     }
@@ -2602,6 +2609,7 @@ static int npu_read_mem_word(uint16_t addr, uint32_t chunks[TINY_BUFFER_WORDS_32
 #endif
     npu_shared_read_word(addr, chunks);
     return 0;
+#endif
 #else
     (void)precision;
     return npu_read_mem_word_mmio(addr, chunks);

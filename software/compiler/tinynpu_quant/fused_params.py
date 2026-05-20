@@ -14,11 +14,16 @@ class RescaleParams:
     relative_error: float
 
 
+# Matches rtl/ppu.sv: PPU_ACC_WIDTH=48, multiplier=16 bits,
+# PPU_PRODUCT_WIDTH=64, and the effective right shift is limited to 0..63.
+MAX_PPU_RESCALE_SHIFT = 63
+
+
 def synthesize_rescale(
     effective_scale: float,
     *,
     max_multiplier: int = 0xFFFF,
-    max_shift: int = 0xFF,
+    max_shift: int = MAX_PPU_RESCALE_SHIFT,
 ) -> RescaleParams:
     if effective_scale < 0:
         raise ValueError(f"effective_scale must be non-negative, got {effective_scale}.")

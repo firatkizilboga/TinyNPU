@@ -1,24 +1,18 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import numpy as np
 
 from run_cv32e40p_b_append_demo import (  # noqa: E402
-    CORE_DIR,
-    CUSTOM_DIR,
     GENERATED_DIR,
-    RUNTIME_DIR,
-    TNPU_RISCV_MABI,
-    TNPU_RISCV_MARCH,
+    RunnerConfig,
+    build_v2_elf_and_hex,
     _emit_i32_array,
     _emit_u32x4_image,
-    _run,
     _runner_source,
     _sanitize,
-    _toolchain_prefix,
-    _toolchain_root,
+    run_vlt_npu,
 )
 
 import sys
@@ -88,7 +82,7 @@ def _emit_program_source(program_name: str, program: TinyNPUProgram, expected: n
     decls.append(
         "static const TnpuImageLoad "
         f"{symbol}_im_preloads[1] = {{\n"
-        f'    {{.label = "preload.im_segment_000", .base_addr = 0x8000u, .image = {symbol}_im_image, .word_count = {len(im_words)}}}\n'
+        f'    {{.label = "preload.im_segment_000", .base_addr = 0x9000u, .image = {symbol}_im_image, .word_count = {len(im_words)}}}\n'
         "};"
     )
     decls.append(
@@ -100,7 +94,7 @@ def _emit_program_source(program_name: str, program: TinyNPUProgram, expected: n
     decls.append(
         "static const TnpuSegment "
         f"{symbol}_segments[1] = {{\n"
-        f'    {{.name = "segment_000", .im_start_addr = 0x8000u, .writes = NULL, .write_count = 0u, .reads = {symbol}_seg_reads, .read_count = 1u}}\n'
+        f'    {{.name = "segment_000", .im_start_addr = 0x9000u, .writes = NULL, .write_count = 0u, .reads = {symbol}_seg_reads, .read_count = 1u}}\n'
         "};"
     )
     decls.append(
@@ -168,70 +162,13 @@ def main() -> int:
     program_path.write_text(_emit_program_source(program_name, program, expected))
     runner_path.write_text(_runner_source(program_symbol))
 
-    prefix = _toolchain_prefix()
-    gcc = f"{prefix}gcc"
-    objcopy = f"{prefix}objcopy"
-    toolchain_root = _toolchain_root(prefix)
-    include_dir = toolchain_root / "riscv32-unknown-elf" / "include"
-    lib_dir = toolchain_root / "riscv32-unknown-elf" / "lib"
-    elf_path = CUSTOM_DIR / f"{program_name}.elf"
-    hex_path = CUSTOM_DIR / f"{program_name}.hex"
-
-    build_env = dict(os.environ)
-    build_env["CCACHE_DISABLE"] = "1"
-    build_env["TMPDIR"] = "/tmp"
-
-    _run(["make", "verilator-build-npu"], cwd=CORE_DIR, env=build_env)
-    _run(
-        [
-            gcc,
-            f"-march={TNPU_RISCV_MARCH}",
-            f"-mabi={TNPU_RISCV_MABI}",
-            "-o",
-            str(elf_path),
-            "-w",
-            "-O3",
-            "-g",
-            "-nostdlib",
-            "-DTINYNPU_USE_SHARED_SRAM=1",
-            "-DTNPU_RUNTIME_V2_DUMP_FINAL_OUTPUTS=1",
-            "-T",
-            "custom/link.ld",
-            "-static",
-            "-ffast-math",
-            "-fno-builtin-printf",
-            "-I.",
-            f"-I{include_dir}",
-            f"-I{RUNTIME_DIR}",
-            str(program_path),
-            str(runner_path),
-            str(CORE_DIR / "custom" / "crt0.S"),
-            str(CORE_DIR / "custom" / "syscalls.c"),
-            str(RUNTIME_DIR / "tinynpu_runtime_v2.c"),
-            "-L",
-            str(lib_dir),
-            "-lc",
-            "-lm",
-            "-lgcc",
-        ],
-        cwd=CORE_DIR,
-        env=build_env,
+    _, _, _, hex_path = build_v2_elf_and_hex(
+        program_name,
+        program_path.read_text(),
+        runner_config=RunnerConfig(dump_final_outputs=True, verbose_steps=True),
+        extra_cflags=["-ffast-math", "-fno-builtin-printf"],
     )
-    _run([objcopy, "-O", "verilog", str(elf_path), str(hex_path)], cwd=CORE_DIR, env=build_env)
-
-    sim_env = dict(build_env)
-    sim_env.setdefault("VERILATOR_MAX_TICKS", "3000000000")
-    sim = _run(
-        [
-            str(CORE_DIR / "obj_dir" / "cv32e40p_tb_vlt_npu"),
-            "+verilator+noassert",
-            f"+firmware={hex_path}",
-            "+maxcycles=2000000",
-        ],
-        cwd=CORE_DIR,
-        env=sim_env,
-        capture=True,
-    )
+    sim = run_vlt_npu(hex_path, maxcycles=2_000_000, noassert=True, timeout_s=240)
     print(sim.stdout, end="")
     if sim.stderr:
         print(sim.stderr, file=sys.stderr, end="")

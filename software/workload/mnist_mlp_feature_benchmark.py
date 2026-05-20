@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 import copy
+import gzip
 import json
 from pathlib import Path
+import struct
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
+from torch.utils.data import DataLoader, TensorDataset
+
+try:
+    from torchvision import datasets, transforms
+except ModuleNotFoundError:  # Server/minimal installs can run from raw IDX files.
+    datasets = None
+    transforms = None
 
 from software.compiler.tinynpu_jit import compile_module
 from software.compiler.tinynpu_quant import (
@@ -54,6 +61,14 @@ def get_flat_mnist_loaders(
     if task not in {TASK_MULTICLASS, TASK_IS_ZERO}:
         raise ValueError(f"Unsupported task {task!r}.")
 
+    if datasets is None or transforms is None:
+        train_ds = _load_flat_mnist_idx(data_dir, train=True, image_size=image_size, task=task)
+        test_ds = _load_flat_mnist_idx(data_dir, train=False, image_size=image_size, task=task)
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+        test_loader = DataLoader(test_ds, batch_size=256, shuffle=False)
+        test_loader_single = DataLoader(test_ds, batch_size=1, shuffle=False)
+        return train_loader, test_loader, test_loader_single, train_ds, test_ds
+
     target_transform = None
     if task == TASK_IS_ZERO:
         target_transform = lambda y: int(y == 0)
@@ -83,6 +98,39 @@ def get_flat_mnist_loaders(
     test_loader = DataLoader(test_ds, batch_size=256, shuffle=False)
     test_loader_single = DataLoader(test_ds, batch_size=1, shuffle=False)
     return train_loader, test_loader, test_loader_single, train_ds, test_ds
+
+
+def _read_idx_bytes(path: Path) -> bytes:
+    if path.exists():
+        return path.read_bytes()
+    gz_path = Path(str(path) + ".gz")
+    if gz_path.exists():
+        with gzip.open(gz_path, "rb") as handle:
+            return handle.read()
+    raise FileNotFoundError(f"Missing MNIST IDX file: {path}")
+
+
+def _load_flat_mnist_idx(data_dir: str, *, train: bool, image_size: int, task: str) -> TensorDataset:
+    raw_dir = Path(data_dir) / "MNIST" / "raw"
+    prefix = "train" if train else "t10k"
+    image_blob = _read_idx_bytes(raw_dir / f"{prefix}-images-idx3-ubyte")
+    label_blob = _read_idx_bytes(raw_dir / f"{prefix}-labels-idx1-ubyte")
+
+    magic, count, rows, cols = struct.unpack_from(">IIII", image_blob, 0)
+    label_magic, label_count = struct.unpack_from(">II", label_blob, 0)
+    if magic != 2051 or label_magic != 2049 or count != label_count:
+        raise ValueError("Invalid MNIST IDX files.")
+
+    images_u8 = torch.frombuffer(image_blob, dtype=torch.uint8, offset=16)
+    images = images_u8.reshape(count, 1, rows, cols).float() / 255.0
+    if image_size != rows or image_size != cols:
+        images = F.interpolate(images, size=(image_size, image_size), mode="bilinear", align_corners=False)
+    images = images.reshape(count, image_size * image_size)
+
+    labels = torch.frombuffer(label_blob, dtype=torch.uint8, offset=8).long()
+    if task == TASK_IS_ZERO:
+        labels = (labels == 0).long()
+    return TensorDataset(images, labels)
 
 
 def layer_configs_from_summary(summary: dict[str, object]) -> dict[str, LayerQuantConfig]:

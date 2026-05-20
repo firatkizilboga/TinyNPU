@@ -51,6 +51,8 @@ module control_top #(
     output output_layout_t                 ppu_output_layout,
     output writeback_mode_t                ppu_writeback_mode,
     output logic [$clog2(`ARRAY_SIZE)-1:0] ppu_cache_lane_idx,
+    input  logic                           ppu_busy,
+    input  logic                           ppu_done,
 
     // Sequencer Markers
     output logic                        sa_input_first,
@@ -164,6 +166,8 @@ module control_top #(
         .ppu_output_layout(ppu_output_layout),
         .ppu_writeback_mode(ppu_writeback_mode),
         .ppu_cache_lane_idx(ppu_cache_lane_idx),
+        .ppu_busy       (ppu_busy),
+        .ppu_done       (ppu_done),
         .all_done_in    (all_done_in)
     );
 

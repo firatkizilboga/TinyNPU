@@ -179,6 +179,28 @@ def _build_consumers(plan_steps: list[Any]) -> dict[str, list[Any]]:
     return consumers
 
 
+def _compatible_resident_handoff(producer_sym: dict[str, Any], consumer_sym: dict[str, Any], spec: TensorSpec) -> bool:
+    if spec.dtype != DType.INT16:
+        return False
+    if int(producer_sym["addr"]) != int(consumer_sym["addr"]):
+        return False
+    if int(producer_sym["word_count"]) != int(consumer_sym["word_count"]):
+        return False
+    if int(producer_sym["precision"]) != int(consumer_sym["precision"]):
+        return False
+
+    producer_role = str(producer_sym["role"])
+    consumer_role = str(consumer_sym["role"])
+    if producer_role == consumer_role:
+        return True
+
+    # Cross-role residency is not generally layout-compatible. RTL experiments
+    # showed C->A handoff can preserve a coarse final sigmoid result while still
+    # failing exact matmul checks, so keep those paths on explicit stage/readback
+    # until the compiler can request a real C->A transform or A-layout writeback.
+    return False
+
+
 def emit_cv32e40p_program_v2(
     artifact: CompiledArtifact,
     inputs: dict[str, np.ndarray],
@@ -193,7 +215,7 @@ def emit_cv32e40p_program_v2(
     hw = TinyNPUProgram(defines_path=defines_path).hw.params
     array_size = int(hw.get("ARRAY_SIZE", 8))
     buffer_width = int(hw.get("BUFFER_WIDTH", 128))
-    im_base_addr = int(hw.get("IM_BASE_ADDR", 0x8000))
+    im_base_addr = int(hw.get("IM_BASE_ADDR", 0x9000))
     if array_size != 8 or buffer_width != 128:
         raise NotImplementedError(
             f"Bare-metal runtime v2 currently assumes ARRAY_SIZE=8 and BUFFER_WIDTH=128 (got {array_size}, {buffer_width})."
@@ -398,6 +420,38 @@ def emit_cv32e40p_program_v2(
 
     segment_entries: list[str] = []
     segment_index: dict[str, int] = {}
+    npu_producer_by_output: dict[str, NpuSegment] = {}
+    for step in artifact.plan.steps:
+        if _is_step_instance(step, NpuSegment):
+            for output_name in step.outputs:
+                npu_producer_by_output[output_name] = step
+
+    resident_outputs: set[str] = set()
+    for tensor_name, producer_step in npu_producer_by_output.items():
+        if tensor_name in artifact.plan.outputs or tensor_name in expected_tensor_names:
+            continue
+        if tensor_name in absorbed_dequantize_by_input:
+            continue
+        uses = tensor_consumers.get(tensor_name, [])
+        non_verify_uses = [use for use in uses if not _is_step_instance(use, VerifyTensor)]
+        if not non_verify_uses or not all(_is_step_instance(use, NpuSegment) for use in non_verify_uses):
+            continue
+        producer_segment = artifact.segment_artifacts[producer_step.name]
+        producer_sym = producer_segment.symbol_table[tensor_name]
+        compatible = True
+        for use in non_verify_uses:
+            consumer_segment = artifact.segment_artifacts[use.name]
+            consumer_sym = consumer_segment.symbol_table.get(tensor_name)
+            if consumer_sym is None or not _compatible_resident_handoff(
+                producer_sym,
+                consumer_sym,
+                artifact.plan.tensors[tensor_name],
+            ):
+                compatible = False
+                break
+        if compatible:
+            resident_outputs.add(tensor_name)
+
     for step in artifact.plan.steps:
         if not _is_step_instance(step, NpuSegment):
             continue
@@ -411,6 +465,12 @@ def emit_cv32e40p_program_v2(
             if tensor_name in produced_inside:
                 continue
             sym = segment.symbol_table[tensor_name]
+            producer_step = npu_producer_by_output.get(tensor_name)
+            if producer_step is not None and tensor_name in resident_outputs:
+                producer_segment = artifact.segment_artifacts[producer_step.name]
+                producer_sym = producer_segment.symbol_table[tensor_name]
+                if _compatible_resident_handoff(producer_sym, sym, spec):
+                    continue
             write_tensor_name = tensor_name
             transform = "TNPU_WRITE_TRANSFORM_NONE"
             attrs_i32 = [0, 0]
@@ -434,12 +494,15 @@ def emit_cv32e40p_program_v2(
                     transform_policy == "xform_q_f16_i16"
                     and source_spec.dtype == DType.INT16
                     and int(sym["precision"]) == 2
-                    and str(sym["role"]) == "A"
+                    and str(sym["role"]) in {"A", "B"}
                     and int(producer.attrs.get("zero_point", 0)) == 0
                 ):
                     write_tensor_name = source_name
-                    transform = "TNPU_WRITE_XFORM_Q_F16_I16"
-                    attrs_f32[0] = 1.0 / float(producer.attrs["scale"])
+                    if str(producer.attrs.get("_npu_write_xform_location", "")) == "segment":
+                        transform = "TNPU_WRITE_TRANSFORM_NONE"
+                    else:
+                        transform = "TNPU_WRITE_XFORM_Q_F16_I16"
+                        attrs_f32[0] = 1.0 / float(producer.attrs["scale"])
                 elif (
                     not transform_policy
                     and source_spec.dtype == DType.FLOAT32
@@ -454,7 +517,7 @@ def emit_cv32e40p_program_v2(
                     not transform_policy
                     and source_spec.dtype == DType.INT16
                     and int(sym["precision"]) == 2
-                    and str(sym["role"]) == "A"
+                    and str(sym["role"]) in {"A", "B"}
                     and int(producer.attrs.get("zero_point", 0)) == 0
                 ):
                     source_producer = producer_by_output.get(source_name)
@@ -464,8 +527,11 @@ def emit_cv32e40p_program_v2(
                         or (source_producer is not None and str(source_producer.attrs.get("output_encoding", "")) == "fp16_bits")
                     ):
                         write_tensor_name = source_name
-                        transform = "TNPU_WRITE_XFORM_Q_F16_I16"
-                        attrs_f32[0] = 1.0 / float(producer.attrs["scale"])
+                        if str(producer.attrs.get("_npu_write_xform_location", "")) == "segment":
+                            transform = "TNPU_WRITE_TRANSFORM_NONE"
+                        else:
+                            transform = "TNPU_WRITE_XFORM_Q_F16_I16"
+                            attrs_f32[0] = 1.0 / float(producer.attrs["scale"])
             writes.append(
                 "    {"
                 f".tensor_idx = {tensor_index[write_tensor_name]}, .addr = 0x{int(sym['addr']):04x}u, "
@@ -495,6 +561,8 @@ def emit_cv32e40p_program_v2(
         reads: list[str] = []
         for output_name in step.outputs:
             sym = segment.symbol_table[output_name]
+            if output_name in resident_outputs:
+                continue
             read_tensor_name = output_name
             read_transform = "TNPU_READ_TRANSFORM_NONE"
             read_attrs_i32 = [0, 0]

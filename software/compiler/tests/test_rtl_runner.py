@@ -1,5 +1,6 @@
 import os
 import sys
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -43,3 +44,12 @@ def test_runtime_cflags_respect_runner_config():
 def test_sanitize_program_symbol_normalizes_c_identifier():
     assert sanitize_program_symbol("cv32e40p-demo/v2") == "cv32e40p_demo_v2"
 
+
+def test_runtime_v2_xform_write_uses_hardware_xform_path():
+    runtime_source = Path(__file__).parents[1] / "tinynpu_jit" / "tinynpu_runtime_v2.c"
+    source = runtime_source.read_text()
+    xform_branch = source.split("write->transform == TNPU_WRITE_XFORM_Q_F16_I16", 1)[1]
+    xform_branch = xform_branch.split("} else if (role == 'A'", 1)[0]
+
+    assert "tnpu_write_tensor_quantized_via_xform" in xform_branch
+    assert "tnpu_write_tensor_a_qf16_to_i16_fast" not in xform_branch

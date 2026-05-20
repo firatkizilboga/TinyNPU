@@ -313,7 +313,21 @@ class SimulatorExecutor:
                     else:
                         matches = np.array_equal(actual, expected)
                     if not matches:
-                        raise AssertionError(f"Verification failed for '{step.label}' ({step.tensor_name}).")
+                        actual_flat = np.asarray(actual).reshape(-1)
+                        expected_flat = np.asarray(expected).reshape(-1)
+                        diff_idx = np.flatnonzero(actual_flat != expected_flat)
+                        if diff_idx.size:
+                            preview = ", ".join(
+                                f"idx {int(idx)}: actual={actual_flat[int(idx)]!r} expected={expected_flat[int(idx)]!r}"
+                                for idx in diff_idx[:8]
+                            )
+                        else:
+                            delta = np.abs(actual_flat.astype(np.float64) - expected_flat.astype(np.float64))
+                            preview = f"max_abs_diff={float(delta.max(initial=0.0)):.6g}"
+                        raise AssertionError(
+                            f"Verification failed for '{step.label}' ({step.tensor_name}); "
+                            f"shape actual={actual.shape} expected={expected.shape}; {preview}"
+                        )
                     verified.append(step.label)
                     if debug:
                         debug_trace.append(
@@ -502,11 +516,14 @@ class SimulatorExecutor:
     ) -> tuple[np.ndarray, PrimitiveCounts]:
         role = symbol["role"]
         precision = PrecisionMode(symbol["precision"])
-        if role != "C":
+        if role == "C":
+            tensor = await self._read_role_c(dut, driver, spec.shape, symbol["addr"], precision)
+        elif role == "A":
+            tensor = await self._read_role_a(dut, driver, spec.shape, symbol["addr"], precision)
+        else:
             raise NotImplementedError(
-                f"Simulator readback currently supports only role C outputs, got role {role!r} for tensor {spec.name!r}."
+                f"Simulator readback currently supports only role A/C outputs, got role {role!r} for tensor {spec.name!r}."
             )
-        tensor = await self._read_role_c(dut, driver, spec.shape, symbol["addr"], precision)
         mmvr_bytes = (self.array_size * 16) // 8
         word_count = int(symbol["word_count"])
         counts = estimate_unpack_counts(spec.shape, word_count)
@@ -578,6 +595,31 @@ class SimulatorExecutor:
                                 val = (word >> (bit_idx * bits)) & mask
                                 if val & (1 << (bits - 1)):
                                     val -= (1 << bits)
+                                actual[row_idx, col_idx] = val
+        return actual
+
+    async def _read_role_a(self, dut: Any, driver: Any, shape: tuple[int, int], addr: int, precision: PrecisionMode) -> np.ndarray:
+        actual = np.zeros(shape, dtype=np.int32)
+        p = 1 << (2 - precision)
+        bits = 16 // p
+        mask = (1 << bits) - 1
+        m_tiles = (shape[0] + self.array_size - 1) // self.array_size
+        k_words = (shape[1] + p - 1) // p
+        k_tiles = (k_words + self.array_size - 1) // self.array_size
+        for mt in range(m_tiles):
+            for kt in range(k_tiles):
+                tile_addr = addr + (mt * k_tiles * self.array_size) + (kt * self.array_size)
+                for col_in_tile in range(self.array_size):
+                    vec = await driver.read_ub_vector(dut, tile_addr + col_in_tile, self.array_size)
+                    for row_in_tile in range(self.array_size):
+                        word = vec[row_in_tile]
+                        row_idx = mt * self.array_size + row_in_tile
+                        for bit_idx in range(p):
+                            col_idx = ((kt * self.array_size) + col_in_tile) * p + bit_idx
+                            if row_idx < shape[0] and col_idx < shape[1]:
+                                val = (word >> (bit_idx * bits)) & mask
+                                if val & (1 << (bits - 1)):
+                                    val -= 1 << bits
                                 actual[row_idx, col_idx] = val
         return actual
 

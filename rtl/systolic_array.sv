@@ -28,8 +28,6 @@ module systolic_array (
     
     // Output interface - Read accumulator results
     output logic signed [`ACC_WIDTH-1:0] results [`ARRAY_SIZE-1:0][`ARRAY_SIZE-1:0],
-    // Flattened output for Verilator/Verification access
-    output logic [(`ARRAY_SIZE * `ARRAY_SIZE * `ACC_WIDTH)-1:0] results_flat,
     output logic result_valid,
     
     // Marker outputs (expose for external control/debug)
@@ -37,20 +35,6 @@ module systolic_array (
     output logic computation_done,     // Pulses when last valid data enters array (row 3 col 0)
     output logic all_done              // Pulses when last valid data exits PE[3][3] (all computation complete)
 );
-
-    // ------------------------------------------------------------------------
-    // Flatten Output for Verification
-    // ------------------------------------------------------------------------
-    // Pack 2D array [Row][Col] into 1D vector
-    // Layout: Row0_Col0, Row0_Col1, ..., Row1_Col0, ...
-    generate
-        genvar fr, fc;
-        for (fr = 0; fr < `ARRAY_SIZE; fr++) begin : gen_flat_rows
-            for (fc = 0; fc < `ARRAY_SIZE; fc++) begin : gen_flat_cols
-                assign results_flat[((fr * `ARRAY_SIZE + fc) * `ACC_WIDTH) +: `ACC_WIDTH] = results[fr][fc];
-            end
-        end
-    endgenerate
 
     // ------------------------------------------------------------------------
     // PE Interconnection Wires
