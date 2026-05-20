@@ -8,7 +8,18 @@ import numpy as np
 
 from .golden import GoldenModel
 from .host_ops import execute_host_op
-from .ir import DType, ExecutionPlan, HostOp, MatMulOp, NpuSegment, TensorKind, TensorSpec, VerifyTensor, normalize_shape
+from .ir import (
+    DType,
+    ExecutionPlan,
+    HostOp,
+    MatMulOp,
+    NpuSegment,
+    TensorKind,
+    TensorSpec,
+    VerifyTensor,
+    normalize_shape,
+    supports_fused_activation,
+)
 from .quantization import synthesize_rescale
 
 # TODO(refactor): partition_fx_graph() is still a monolithic frontend that mixes
@@ -1190,7 +1201,12 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                 activation_kind = None
                 host_kind = None
             if activation_kind is not None and source is not None:
-                if current_ops and current_ops[-1].out == source and current_ops[-1].activation == "none":
+                if (
+                    current_ops
+                    and current_ops[-1].out == source
+                    and current_ops[-1].activation == "none"
+                    and supports_fused_activation(activation_kind, shift=current_ops[-1].shift)
+                ):
                     matmul_op = current_ops[-1]
                     if activation_kind == "h_gelu":
                         matmul_op.h_gelu_x_scale_shift = int(
@@ -1241,7 +1257,12 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
             else:
                 activation_kind = "sigmoid"
                 host_kind = "sigmoid"
-            if current_ops and current_ops[-1].out == source and current_ops[-1].activation == "none":
+            if (
+                current_ops
+                and current_ops[-1].out == source
+                and current_ops[-1].activation == "none"
+                and supports_fused_activation(activation_kind, shift=current_ops[-1].shift)
+            ):
                 matmul_op = current_ops[-1]
                 if activation_kind == "h_gelu":
                     matmul_op.h_gelu_x_scale_shift = int(

@@ -410,7 +410,7 @@ def emit_cv32e40p_c(
     hw = TinyNPUProgram(defines_path=defines_path).hw.params
     array_size = int(hw.get("ARRAY_SIZE", 8))
     buffer_width = int(hw.get("BUFFER_WIDTH", 128))
-    im_base_addr = int(hw.get("IM_BASE_ADDR", 0x8000))
+    im_base_addr = int(hw.get("IM_BASE_ADDR", 0x9000))
     if buffer_width != 128:
         raise NotImplementedError(f"Bare-metal emitter currently assumes 128-bit MMIO words, got {buffer_width}.")
     buffer_words_32 = buffer_width // 32

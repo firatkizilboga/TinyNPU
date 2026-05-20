@@ -10,6 +10,7 @@ module cv32e40p_tinynpu_synth_top (
     input  logic clk_i,
     input  logic rst_ni,
     input  logic fetch_enable_i,
+    input  logic [31:0] instr_rdata_i,
     output logic core_sleep_o,
     output logic npu_result_valid_o,
     output logic npu_all_done_o,
@@ -86,7 +87,7 @@ module cv32e40p_tinynpu_synth_top (
     endcase
   endfunction
 
-  cv32e40p_top #(
+  (* keep_hierarchy = "yes" *) cv32e40p_top #(
       .COREV_PULP      (0),
       .COREV_CLUSTER   (0),
       .FPU             (0),
@@ -111,7 +112,7 @@ module cv32e40p_tinynpu_synth_top (
       .instr_gnt_i   (instr_req),
       .instr_rvalid_i(instr_rvalid_q),
       .instr_addr_o  (instr_addr),
-      .instr_rdata_i (32'h0000_0013),
+      .instr_rdata_i (instr_rdata_i),
 
       .data_req_o   (data_req),
       .data_gnt_i   (data_req),
@@ -135,7 +136,7 @@ module cv32e40p_tinynpu_synth_top (
       .core_sleep_o  (core_sleep_o)
   );
 
-  tinynpu_top u_tinynpu (
+  (* keep_hierarchy = "yes", dont_touch = "yes" *) tinynpu_top u_tinynpu (
       .clk                (clk_i),
       .rst_n              (rst_ni),
       .host_addr          (npu_host_addr),

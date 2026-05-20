@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
 from tinynpu_jit import emit_cv32e40p_c, emit_cv32e40p_program_v2
 from tinynpu_jit.golden import GoldenModel
 from tinynpu_jit.host_ops import execute_host_op
+from tinynpu_jit.ir import supports_fused_activation
 from tinynpu_jit import (
     DType,
     describe_int16_k_cache_append,
@@ -294,11 +295,14 @@ def test_compile_plan_canonicalizes_runtime_input_to_fp16_xform():
     assert artifact.plan.tensors["x_f"].metadata.get("value_encoding") == "fp16_bits"
     assert quant.attrs.get("input_encoding") == "fp16_bits"
     assert quant.attrs.get("_npu_write_transform") == "xform_q_f16_i16"
+    assert quant.attrs.get("_npu_write_xform_location") == "segment"
+    xform_inst = int(artifact.segment_artifacts["seg0"].binary["im"][0])
+    assert ((xform_inst >> 252) & 0xF) == 0x4
+    assert ((xform_inst >> 248) & 0xF) == int(XformMode.Q_F16_I16)
 
     source = emit_cv32e40p_program_v2(artifact, {"x_f": x_f}, program_name="unit_test_v2_runtime_input_xform")
 
-    assert "TNPU_WRITE_XFORM_Q_F16_I16" in source
-    assert ".transform = TNPU_WRITE_XFORM_Q_F16_I16" in source
+    assert ".transform = TNPU_WRITE_TRANSFORM_NONE" in source
     assert "TNPU_HOST_QUANTIZE" not in source
     assert "TNPU_OP_SEGMENT" in source
     assert "TNPU_OP_VERIFY" in source
@@ -359,13 +363,55 @@ def test_emit_cv32e40p_program_v2_absorbs_f16_quantize_into_xform_write():
     plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=["scores"], outputs=["y"])
     plan.add_verification_step("y", "final_y")
     artifact = compile_plan(plan, {"y": y})
+    quant = next(step for step in artifact.plan.steps if isinstance(step, HostOp) and step.name == "quantize_probs")
+    assert quant.attrs.get("_npu_write_xform_location") == "segment"
+    xform_inst = int(artifact.segment_artifacts["seg0"].binary["im"][0])
+    assert ((xform_inst >> 252) & 0xF) == 0x4
+    assert ((xform_inst >> 248) & 0xF) == int(XformMode.Q_F16_I16)
 
     source = emit_cv32e40p_program_v2(artifact, {"scores": scores}, program_name="unit_test_v2_f16_quant_absorb")
 
-    assert "TNPU_WRITE_XFORM_Q_F16_I16" in source
-    assert ".transform = TNPU_WRITE_XFORM_Q_F16_I16" in source
+    assert ".transform = TNPU_WRITE_TRANSFORM_NONE" in source
     assert "TNPU_HOST_SOFTMAX_F16" in source
     assert "TNPU_HOST_QUANTIZE" not in source
+
+
+def test_compile_plan_emits_rhs_fp16_quantize_as_insegment_xform_q():
+    x = np.arange(1, 9, dtype=np.int16).reshape(1, 8)
+    w_f = np.eye(8, dtype=np.float32)
+    scale = 0.5
+    w_q = np.clip(np.rint(w_f / scale), -32768, 32767).astype(np.int16)
+    y = (x.astype(np.int32) @ w_q.astype(np.int32)).astype(np.int16)
+
+    tensors = {
+        "x": TensorSpec("x", x.shape, DType.INT16, TensorKind.INPUT),
+        "w_f": TensorSpec("w_f", w_f.shape, DType.FLOAT32, TensorKind.INPUT),
+        "w_q": TensorSpec("w_q", w_q.shape, DType.INT16, TensorKind.INTERMEDIATE),
+        "y": TensorSpec("y", y.shape, DType.INT16, TensorKind.OUTPUT, is_final_output=True),
+    }
+    steps = [
+        HostOp("quant_w", "quantize", inputs=["w_f"], outputs=["w_q"], attrs={"scale": scale, "zero_point": 0}),
+        NpuSegment("seg0", [MatMulOp("op0", "x", "w_q", "y")], inputs=["x", "w_q"], outputs=["y"]),
+    ]
+    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=["x", "w_f"], outputs=["y"])
+    plan.add_verification_step("y", "final_y")
+    artifact = compile_plan(plan, {"y": y})
+    quant = next(step for step in artifact.plan.steps if isinstance(step, HostOp) and step.name == "quant_w")
+
+    assert artifact.plan.tensors["w_f"].dtype == DType.INT16
+    assert artifact.plan.tensors["w_f"].metadata.get("value_encoding") == "fp16_bits"
+    assert quant.attrs.get("_npu_write_transform") == "xform_q_f16_i16"
+    assert quant.attrs.get("_npu_write_xform_location") == "segment"
+    assert artifact.segment_artifacts["seg0"].symbol_table["w_q"]["role"] == "B"
+    xform_inst = int(artifact.segment_artifacts["seg0"].binary["im"][0])
+    assert ((xform_inst >> 252) & 0xF) == 0x4
+    assert ((xform_inst >> 248) & 0xF) == int(XformMode.Q_F16_I16)
+
+    source = emit_cv32e40p_program_v2(artifact, {"x": x, "w_f": w_f}, program_name="unit_test_v2_rhs_xform_q")
+    assert "TNPU_HOST_QUANTIZE" not in source
+    assert "TNPU_WRITE_XFORM_Q_F16_I16" not in source
+    assert ".transform = TNPU_WRITE_TRANSFORM_NONE" in source
+    assert '.role = "B"' in source
 
 
 def test_compile_plan_canonicalizes_layernorm_boundary_to_fp16_xform():
@@ -403,9 +449,13 @@ def test_compile_plan_canonicalizes_layernorm_boundary_to_fp16_xform():
     assert layernorm.attrs.get("output_encoding") == "fp16_bits"
     assert quant.attrs.get("input_encoding") == "fp16_bits"
     assert quant.attrs.get("_npu_write_transform") == "xform_q_f16_i16"
+    assert quant.attrs.get("_npu_write_xform_location") == "segment"
+    xform_inst = int(artifact.segment_artifacts["seg0"].binary["im"][0])
+    assert ((xform_inst >> 252) & 0xF) == 0x4
+    assert ((xform_inst >> 248) & 0xF) == int(XformMode.Q_F16_I16)
 
     source = emit_cv32e40p_program_v2(artifact, {"x_f": x_f}, program_name="unit_test_v2_ln_xform")
-    assert "TNPU_WRITE_XFORM_Q_F16_I16" in source
+    assert ".transform = TNPU_WRITE_TRANSFORM_NONE" in source
 
 
 def test_emit_cv32e40p_program_v2_absorbs_dequantize_into_segment_read():
@@ -490,6 +540,11 @@ def test_compile_plan_fuses_explicit_dequantize_fp16_to_xform():
     shift = (xform_inst >> 176) & 0xFF
     assert multiplier > 0
     assert multiplier / float(1 << shift) == scale
+
+    source = emit_cv32e40p_program_v2(artifact, {"x": x}, program_name="unit_test_v2_final_dq_f16")
+    assert "TNPU_HOST_DEQUANTIZE" not in source
+    assert "TNPU_READ_DEQUANTIZE_INT16_TO_FLOAT32" not in source
+    assert ".transform = TNPU_READ_TRANSFORM_NONE" in source
 
 
 def test_compile_plan_rejects_float32_npu_weight_constant():
@@ -651,6 +706,79 @@ def test_compile_plan_fuses_layout_restore_sigmoid_dequantize_tail():
     assert restore.outputs == ["sigm"]
     dequant = next(step for step in artifact.plan.steps if isinstance(step, HostOp) and step.kind == "dequantize")
     assert dequant.inputs == ["sigm"]
+
+
+def test_fused_sigmoid_shift_contract_matches_ppu():
+    assert supports_fused_activation("sigmoid", shift=29)
+    assert not supports_fused_activation("sigmoid", shift=30)
+    assert supports_fused_activation("h_gelu", shift=30)
+    assert supports_fused_activation(None, shift=30)
+
+
+def test_emit_v2_keeps_npu_intermediate_resident_between_segments():
+    x = np.arange(1, 65, dtype=np.int16).reshape(1, 64)
+    w1 = np.eye(64, dtype=np.int16)
+    w2 = np.ones((64, 1), dtype=np.int16)
+    y = (x.astype(np.int32) @ w1.astype(np.int32) @ w2.astype(np.int32)).astype(np.int16)
+
+    tensors = {
+        "x": TensorSpec("x", x.shape, DType.INT16, TensorKind.INPUT, metadata={"storage_role": "A"}),
+        "w1": TensorSpec("w1", w1.shape, DType.INT16, TensorKind.CONSTANT, data=w1),
+        "h": TensorSpec("h", (1, 64), DType.INT16, TensorKind.INTERMEDIATE, metadata={"storage_role": "A"}),
+        "w2": TensorSpec("w2", w2.shape, DType.INT16, TensorKind.CONSTANT, data=w2),
+        "y": TensorSpec("y", y.shape, DType.INT16, TensorKind.OUTPUT, is_final_output=True),
+    }
+    steps = [
+        NpuSegment("fc1", [MatMulOp("op_fc1", "x", "w1", "h")], inputs=["x", "w1"], outputs=["h"]),
+        NpuSegment("fc2", [MatMulOp("op_fc2", "h", "w2", "y")], inputs=["h", "w2"], outputs=["y"]),
+    ]
+    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=["x"], outputs=["y"])
+    artifact = compile_plan(plan, {"y": y})
+    source = emit_cv32e40p_program_v2(artifact, {"x": x}, program_name="resident_handoff_unit")
+
+    assert (
+        '.name = "fc1", .im_start_addr = 0x9000u, '
+        ".writes = resident_handoff_unit_seg_fc1_writes, .write_count = 1u, "
+        ".reads = NULL, .read_count = 0u"
+    ) in source
+    assert (
+        '.name = "fc2", .im_start_addr = 0x9004u, '
+        ".writes = NULL, .write_count = 0u, "
+        ".reads = resident_handoff_unit_seg_fc2_reads, .read_count = 1u"
+    ) in source
+
+
+def test_emit_v2_keeps_single_tile_intermediate_resident_with_matching_layout():
+    x = np.arange(1, 9, dtype=np.int16).reshape(1, 8)
+    w1 = np.eye(8, dtype=np.int16)
+    w2 = np.arange(1, 9, dtype=np.int16).reshape(8, 1)
+    y = (x.astype(np.int32) @ w1.astype(np.int32) @ w2.astype(np.int32)).astype(np.int16)
+
+    tensors = {
+        "x": TensorSpec("x", x.shape, DType.INT16, TensorKind.INPUT, metadata={"storage_role": "A"}),
+        "w1": TensorSpec("w1", w1.shape, DType.INT16, TensorKind.CONSTANT, data=w1),
+        "h": TensorSpec("h", (1, 8), DType.INT16, TensorKind.INTERMEDIATE, metadata={"storage_role": "A"}),
+        "w2": TensorSpec("w2", w2.shape, DType.INT16, TensorKind.CONSTANT, data=w2),
+        "y": TensorSpec("y", y.shape, DType.INT16, TensorKind.OUTPUT, is_final_output=True),
+    }
+    steps = [
+        NpuSegment("fc1", [MatMulOp("op_fc1", "x", "w1", "h")], inputs=["x", "w1"], outputs=["h"]),
+        NpuSegment("fc2", [MatMulOp("op_fc2", "h", "w2", "y")], inputs=["h", "w2"], outputs=["y"]),
+    ]
+    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=["x"], outputs=["y"])
+    artifact = compile_plan(plan, {"y": y})
+    source = emit_cv32e40p_program_v2(artifact, {"x": x}, program_name="resident_single_tile_unit")
+
+    assert (
+        '.name = "fc1", .im_start_addr = 0x9000u, '
+        ".writes = resident_single_tile_unit_seg_fc1_writes, .write_count = 1u, "
+        ".reads = NULL, .read_count = 0u"
+    ) in source
+    assert (
+        '.name = "fc2", .im_start_addr = 0x9004u, '
+        ".writes = NULL, .write_count = 0u, "
+        ".reads = resident_single_tile_unit_seg_fc2_reads, .read_count = 1u"
+    ) in source
 
 
 def test_compile_plan_marks_rhs_chaining_output_as_b_layout():
@@ -1647,8 +1775,8 @@ def test_qgpt2_quantized_reference_float_gap_budget():
 
     assert float(x_norm1_diff.max()) == pytest.approx(0.0009417533874511719, abs=1.0e-9)
     assert float(x_norm1_diff.mean()) == pytest.approx(0.00014864235708955675, abs=1.0e-12)
-    assert float(out_diff.max()) == pytest.approx(91.71892547607422, abs=1.0e-6)
-    assert float(out_diff.mean()) == pytest.approx(17.648956298828125, abs=1.0e-6)
+    assert float(out_diff.max()) == pytest.approx(91.71893310546875, abs=1.0e-6)
+    assert float(out_diff.mean()) == pytest.approx(17.64895248413086, abs=1.0e-6)
 
 
 def test_gpt2_two_block_prefill_decode_reuse_matches_full_sequence():
@@ -1957,7 +2085,7 @@ def test_qllama_decode_emits_absolute_cache_scatter_addresses():
     source = emit_cv32e40p_c(artifact, {}, program_name="unit_test_qllama_decode_scatter")
 
     assert "static const int k_append_h0_scatter_addrs[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};" in source
-    assert "static const int v_append_h0_scatter_addrs[2] = {71, 79};" in source
+    assert "static const int v_append_h0_scatter_addrs[2] = {23, 31};" in source
     assert "static const int v_append_h0_scatter_addrs[2] = {7, 15};" not in source
 
 

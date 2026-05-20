@@ -59,13 +59,12 @@ module ubss #(
     input  output_layout_t                 ppu_output_layout,
     input  writeback_mode_t                ppu_writeback_mode,
     input  logic [$clog2(`ARRAY_SIZE)-1:0] ppu_cache_lane_idx,
+    output logic                           ppu_busy,
+    output logic                           ppu_done,
 
     // ------------------------------------------------------------------------
     // Outputs
     // ------------------------------------------------------------------------
-    // TODO(remove-results-flat): delete this verification-only accumulator dump
-    // once direct cocotb tests stop depending on the flattened array.
-    output logic [(`ARRAY_SIZE * `ARRAY_SIZE * `ACC_WIDTH)-1:0] results_flat,
     output logic                     result_valid,
     output logic                     all_done
 );
@@ -281,7 +280,6 @@ module ubss #(
         .drain_enable(drain_enable),
         .acc_clear(acc_clear),
         .results(sa_results),
-        .results_flat(results_flat),
         .result_valid(result_valid),
         .computation_started(), .computation_done(), .all_done(all_done)
     );
@@ -318,6 +316,8 @@ module ubss #(
         .cache_lane_idx(ppu_cache_lane_idx),
         .bias_in(cu_rdata),
         .acc_in(bottom_row_acc),
+        .busy(ppu_busy),
+        .done(ppu_done),
         .ub_wdata(ppu_wdata)
     );
 

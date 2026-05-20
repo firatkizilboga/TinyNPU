@@ -57,6 +57,23 @@ def di_sigmoid(x_in: int, *, m_i: int, k_i: int, p_out: int = 8, alpha_smooth: i
     return _int_div_prob(numer, denom, p_out=p_out)
 
 
+def ppu_hard_sigmoid(x_in: int, *, shift: int, p_out: int) -> int:
+    if p_out <= 0:
+        raise ValueError(f"p_out must be positive, got {p_out}.")
+    if shift < 0:
+        raise ValueError(f"shift must be non-negative, got {shift}.")
+    bound = 8 << int(shift) if int(shift) <= 29 else 0
+    qmax = (1 << (int(p_out) - 1)) - 1
+    if bound <= 0 or qmax <= 0 or x_in <= -bound:
+        numer = 0
+    elif x_in >= bound:
+        numer = qmax << (int(shift) + 4)
+    else:
+        numer = (int(x_in) + bound) * qmax
+    numer += 1 << (int(shift) + 3)
+    return int(numer >> (int(shift) + 4))
+
+
 def _round_shift_signed(value: int, shift: int) -> int:
     if shift <= 0:
         return int(value)
@@ -295,7 +312,7 @@ class GoldenModel:
         elif activation == "sigmoid":
             p_out = 4 if out_dtype == DType.INT4 else 8 if out_dtype == DType.INT8 else 16
             clamped = int(np.clip(value, -32768, 32767))
-            return int(self.di_sigmoid(clamped, m_i=int(multiplier), k_i=int(shift), p_out=p_out))
+            return int(ppu_hard_sigmoid(clamped, shift=int(shift), p_out=p_out))
         elif activation == "h_gelu":
             clamped = int(np.clip(value, -32768, 32767))
             value = self.h_gelu(clamped, x_scale_shift=int(h_gelu_x_scale_shift))

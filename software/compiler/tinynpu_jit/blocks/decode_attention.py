@@ -341,7 +341,7 @@ def _build_decode_artifact(
                 k_rope_verify_name = k_rope_q_name
                 k_rope_verify_expected = k_rope_q.copy()
 
-            b.intermediate(k_rope_q_name, k_val.shape, DType.INT16)
+            b.intermediate(k_rope_q_name, k_val.shape, DType.INT16, metadata={"storage_role": "C"})
             b.intermediate(k_proj_name, k_val.shape, DType.INT16)
             b.intermediate(k_proj_f_name, k_val.shape, DType.FLOAT32)
             b.intermediate(k_rope_f_name, k_val.shape, DType.FLOAT32)

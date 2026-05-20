@@ -50,7 +50,7 @@ def _ppu_rescale(acc, *, multiplier=1, shift=0, bias=0):
 
 def _ppu_sigmoid(value, *, shift, precision=2):
     p_out = 4 if precision == 0 else 8 if precision == 1 else 16
-    bound = 8 << int(shift) if shift < 28 else 0
+    bound = 8 << int(shift) if shift <= 29 else 0
     qmax = (1 << (p_out - 1)) - 1
     if bound <= 0 or qmax <= 0 or value <= -bound:
         numer = 0

@@ -45,7 +45,7 @@ module ppu (
   // Keeping this narrow avoids a full 8-bit dynamic barrel shifter in the
   // activation path without changing any generated model configuration.
   localparam int PPU_HGELU_SHIFT_WIDTH = 4;
-  localparam int PPU_SIGMOID_SHIFT_WIDTH = 5;
+  localparam int PPU_SIGMOID_SHIFT_WIDTH = 6;
   localparam logic signed [PPU_ACC_WIDTH-1:0] PPU_ACC_MAX = {1'b0, {(PPU_ACC_WIDTH - 1) {1'b1}}};
   localparam logic signed [PPU_ACC_WIDTH-1:0] PPU_ACC_MIN = {1'b1, {(PPU_ACC_WIDTH - 1) {1'b0}}};
   localparam logic [PPU_SHIFT_WIDTH-1:0] PPU_SHIFT_MAX = PPU_SHIFT_WIDTH'(PPU_PRODUCT_WIDTH - 1);
@@ -321,7 +321,9 @@ module ppu (
         row_we_s0 <= `ARRAY_SIZE'(1) << ((`ARRAY_SIZE - 1) - ppu_cycle_idx);
         shift_s0 <= ppu_effective_shift(shift);
         sigmoid_shift_s0 <= ppu_effective_sigmoid_shift(shift);
-        sigmoid_shift_valid_s0 <= (shift < 8'd28);
+        // INT16 sigmoid uses qmax << (shift + 4). With a 48-bit activation
+        // datapath, shift=29 is the largest value that still fits.
+        sigmoid_shift_valid_s0 <= (shift <= 8'd29);
         activation_s0 <= activation;
         h_gelu_x_scale_shift_s0 <= ppu_effective_h_gelu_shift(h_gelu_x_scale_shift);
         precision_s0 <= precision;

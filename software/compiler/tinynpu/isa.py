@@ -47,6 +47,10 @@ class XformMode(IntEnum):
 # dynamic shifter in the activation path and are not part of the hardware ABI.
 MAX_H_GELU_X_SCALE_SHIFT = 15
 
+# Matches rtl/ppu.sv PPU_PRODUCT_WIDTH - 1. Larger values would be clamped by
+# the PPU, so reject them at the ABI boundary instead of silently changing math.
+MAX_MATMUL_RESCALE_SHIFT = 63
+
 
 def _validate_h_gelu_x_scale_shift(value):
     value = int(value)
@@ -54,6 +58,16 @@ def _validate_h_gelu_x_scale_shift(value):
         raise ValueError(
             f"h_gelu_x_scale_shift={value} is outside the supported hardware range "
             f"0..{MAX_H_GELU_X_SCALE_SHIFT}."
+        )
+    return value
+
+
+def _validate_matmul_rescale_shift(value):
+    value = int(value)
+    if value < 0 or value > MAX_MATMUL_RESCALE_SHIFT:
+        raise ValueError(
+            f"shift={value} is outside the supported matmul rescale range "
+            f"0..{MAX_MATMUL_RESCALE_SHIFT}."
         )
     return value
 
@@ -86,7 +100,7 @@ class MatMul(Instruction):
         self.b = b
         self.c = c
         self.bias = bias
-        self.shift = shift
+        self.shift = _validate_matmul_rescale_shift(shift)
         self.multiplier = multiplier
         self.activation = activation
         self.in_prec = in_prec
@@ -236,6 +250,7 @@ def pack_matmul(
     b_read_mode=BReadMode.NORMAL,
 ):
     h_gelu_x_scale_shift = _validate_h_gelu_x_scale_shift(h_gelu_x_scale_shift)
+    shift = _validate_matmul_rescale_shift(shift)
     instr = 0
     instr |= (opcode & 0xF) << 252
     instr |= (writeback_mode & 0xF) << 248

@@ -21,8 +21,8 @@ from tinynpu_jit.rtl_runner import (  # noqa: E402
     TNPU_RISCV_MARCH,
     run_checked,
     run_vlt_npu,
+    toolchain_include_lib_dirs,
     toolchain_prefix,
-    toolchain_root,
 )
 
 
@@ -37,9 +37,7 @@ def _build_c_elf_and_hex(program_name: str, source: str) -> tuple[Path, Path, Pa
     prefix = toolchain_prefix()
     gcc = f"{prefix}gcc"
     objcopy = f"{prefix}objcopy"
-    root = toolchain_root(prefix)
-    include_dir = root / "riscv32-unknown-elf" / "include"
-    lib_dir = root / "riscv32-unknown-elf" / "lib"
+    include_dir, lib_dir = toolchain_include_lib_dirs(prefix)
     elf_path = CUSTOM_DIR / f"{program_name}.elf"
     hex_path = CUSTOM_DIR / f"{program_name}.hex"
 

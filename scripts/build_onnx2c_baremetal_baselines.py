@@ -73,31 +73,32 @@ def _deterministic_input() -> np.ndarray:
     return values
 
 
-def _deterministic_mlp_input() -> np.ndarray:
-    values = np.zeros((1, 64), dtype=np.float32)
-    for i in range(64):
+def _deterministic_mlp_input(hidden_dim: int = 64) -> np.ndarray:
+    values = np.zeros((1, hidden_dim), dtype=np.float32)
+    for i in range(hidden_dim):
         values[0, i] = ((i * 5 + 3) % 19) / 18.0
     return values
 
 
-def _write_mlp_onnx(model_path: Path) -> None:
+def _write_mlp_onnx(model_path: Path, hidden_dim: int = 64) -> None:
     import onnx
     from onnx import TensorProto, helper, numpy_helper
 
-    input_x = helper.make_tensor_value_info("input_x", TensorProto.FLOAT, [1, 64])
+    h = int(hidden_dim)
+    input_x = helper.make_tensor_value_info("input_x", TensorProto.FLOAT, [1, h])
     output_y = helper.make_tensor_value_info("output_y", TensorProto.FLOAT, [1, 1])
 
     def w(shape: tuple[int, ...], mod: int, scale: float, offset: int) -> np.ndarray:
         return _deterministic_weight(shape, mod=mod, scale=scale, offset=offset).astype(np.float32)
 
     initializers = [
-        numpy_helper.from_array(w((64, 64), 23, 0.0075, 0).T, "fc1_w_t"),
-        numpy_helper.from_array(w((1, 64), 19, 0.0020, 0), "fc1_b"),
-        numpy_helper.from_array(w((64, 64), 29, 0.0065, 101).T, "fc2_w_t"),
-        numpy_helper.from_array(w((1, 64), 19, 0.0020, 101), "fc2_b"),
-        numpy_helper.from_array(w((64, 64), 31, 0.0060, 211).T, "fc3_w_t"),
-        numpy_helper.from_array(w((1, 64), 19, 0.0020, 211), "fc3_b"),
-        numpy_helper.from_array(w((1, 64), 17, 0.0100, 307).T, "fc4_w_t"),
+        numpy_helper.from_array(w((h, h), 23, 0.0075, 0).T, "fc1_w_t"),
+        numpy_helper.from_array(w((1, h), 19, 0.0020, 0), "fc1_b"),
+        numpy_helper.from_array(w((h, h), 29, 0.0065, 101).T, "fc2_w_t"),
+        numpy_helper.from_array(w((1, h), 19, 0.0020, 101), "fc2_b"),
+        numpy_helper.from_array(w((h, h), 31, 0.0060, 211).T, "fc3_w_t"),
+        numpy_helper.from_array(w((1, h), 19, 0.0020, 211), "fc3_b"),
+        numpy_helper.from_array(w((1, h), 17, 0.0100, 307).T, "fc4_w_t"),
         numpy_helper.from_array(np.array([[-0.05]], dtype=np.float32), "fc4_b"),
     ]
     nodes = [
@@ -121,20 +122,21 @@ def _write_mlp_onnx(model_path: Path) -> None:
     onnx.save(model, model_path)
 
 
-def _write_conv_onnx(model_path: Path) -> None:
+def _write_conv_onnx(model_path: Path, conv_channels: int = 16) -> None:
     import onnx
     from onnx import TensorProto, helper, numpy_helper
 
+    ch = int(conv_channels)
     input_x = helper.make_tensor_value_info("input_x", TensorProto.FLOAT, [1, 1, 8, 8])
     output_y = helper.make_tensor_value_info("output_y", TensorProto.FLOAT, [1, 1, 1, 1])
     initializers = [
-        numpy_helper.from_array(_deterministic_weight((16, 1, 3, 3), mod=23, scale=0.020, offset=0), "conv1_w"),
-        numpy_helper.from_array(_deterministic_weight((16,), mod=19, scale=0.002, offset=0), "conv1_b"),
-        numpy_helper.from_array(_deterministic_weight((16, 16, 3, 3), mod=29, scale=0.006, offset=101), "conv2_w"),
-        numpy_helper.from_array(_deterministic_weight((16,), mod=19, scale=0.002, offset=101), "conv2_b"),
-        numpy_helper.from_array(_deterministic_weight((16, 16, 3, 3), mod=31, scale=0.006, offset=211), "conv3_w"),
-        numpy_helper.from_array(_deterministic_weight((16,), mod=19, scale=0.002, offset=211), "conv3_b"),
-        numpy_helper.from_array(_deterministic_weight((1, 16, 2, 2), mod=17, scale=0.012, offset=307), "conv4_w"),
+        numpy_helper.from_array(_deterministic_weight((ch, 1, 3, 3), mod=23, scale=0.020, offset=0), "conv1_w"),
+        numpy_helper.from_array(_deterministic_weight((ch,), mod=19, scale=0.002, offset=0), "conv1_b"),
+        numpy_helper.from_array(_deterministic_weight((ch, ch, 3, 3), mod=29, scale=0.006, offset=101), "conv2_w"),
+        numpy_helper.from_array(_deterministic_weight((ch,), mod=19, scale=0.002, offset=101), "conv2_b"),
+        numpy_helper.from_array(_deterministic_weight((ch, ch, 3, 3), mod=31, scale=0.006, offset=211), "conv3_w"),
+        numpy_helper.from_array(_deterministic_weight((ch,), mod=19, scale=0.002, offset=211), "conv3_b"),
+        numpy_helper.from_array(_deterministic_weight((1, ch, 2, 2), mod=17, scale=0.012, offset=307), "conv4_w"),
         numpy_helper.from_array(np.array([-0.05], dtype=np.float32), "conv4_b"),
     ]
     nodes = [
@@ -330,20 +332,48 @@ def _write_tiny_lm_onnx(model_path: Path, prompt_len: int = 9) -> None:
     onnx.save(model, model_path)
 
 
-def _onnx_generator_source(model: str, output_path: Path, *, prompt_len: int) -> str:
+def _onnx_generator_source(
+    model: str,
+    output_path: Path,
+    *,
+    prompt_len: int,
+    mlp_hidden: int,
+    conv_channels: int,
+) -> str:
     script_path = Path(__file__).resolve()
-    extra = f", prompt_len={int(prompt_len)}" if model == "tiny_lm" else ""
+    extra = ""
+    if model == "tiny_lm":
+        extra = f", prompt_len={int(prompt_len)}"
+    elif model == "mlp":
+        extra = f", hidden_dim={int(mlp_hidden)}"
+    elif model == "conv":
+        extra = f", conv_channels={int(conv_channels)}"
     return f"""import runpy
 ns = runpy.run_path({str(script_path)!r})
 ns['_write_{model}_onnx']({str(output_path)!r}{extra})
 """
 
 
-def _generate_onnx(model: str, model_path: Path, *, prompt_len: int) -> None:
+def _generate_onnx(
+    model: str,
+    model_path: Path,
+    *,
+    prompt_len: int,
+    mlp_hidden: int,
+    conv_channels: int,
+) -> None:
     if not ONNX_PYTHON.exists():
         raise FileNotFoundError(f"{ONNX_PYTHON} not found; create it and install onnx/numpy first")
     generator = GENERATED_DIR / f"third_party_onnx2c_{model}_make_onnx.py"
-    generator.write_text(_onnx_generator_source(model, model_path, prompt_len=prompt_len))
+    generator.write_text(
+        _onnx_generator_source(
+            model,
+            model_path,
+            prompt_len=prompt_len,
+            mlp_hidden=mlp_hidden,
+            conv_channels=conv_channels,
+        )
+    )
     run_checked([str(ONNX_PYTHON), str(generator)], cwd=REPO_ROOT)
 
 
@@ -416,8 +446,8 @@ int main(void)
 """
 
 
-def _render_mlp_wrapper(generated_c_name: str, signature: str) -> str:
-    input_x = _deterministic_mlp_input()
+def _render_mlp_wrapper(generated_c_name: str, signature: str, *, hidden_dim: int) -> str:
+    input_x = _deterministic_mlp_input(hidden_dim)
     return f"""// Bare-metal MLP baseline generated by third-party onnx2c.
 // onnx2c: https://github.com/kraiskil/onnx2c
 // Generated model source: {generated_c_name}
@@ -449,7 +479,7 @@ static float output_y[1][1];
 
 int main(void)
 {{
-    const float (*input_x)[64] = (const float (*)[64])input_x_flat;
+    const float (*input_x)[{int(hidden_dim)}] = (const float (*)[{int(hidden_dim)}])input_x_flat;
     reset_timer();
     uint32_t t0 = read_mcycle32();
     onnx2c_mlp(input_x, output_y);
@@ -583,7 +613,15 @@ def build_elf_and_hex(program_name: str, wrapper_source: str, generated_model_c:
     return wrapper_path, elf_path, hex_path
 
 
-def build_model(model: str, program_name: str, *, prompt: str, prompt_len: int) -> tuple[Path, Path, Path, Path, Path]:
+def build_model(
+    model: str,
+    program_name: str,
+    *,
+    prompt: str,
+    prompt_len: int,
+    mlp_hidden: int,
+    conv_channels: int,
+) -> tuple[Path, Path, Path, Path, Path]:
     GENERATED_DIR.mkdir(exist_ok=True)
     onnx_path = GENERATED_DIR / f"{program_name}.onnx"
     generated_c = GENERATED_DIR / f"{program_name}_onnx2c_model.c"
@@ -593,11 +631,17 @@ def build_model(model: str, program_name: str, *, prompt: str, prompt_len: int) 
         func_name = "onnx2c_conv4"
     else:
         func_name = "onnx2c_tiny_lm"
-    _generate_onnx(model, onnx_path, prompt_len=prompt_len)
+    _generate_onnx(
+        model,
+        onnx_path,
+        prompt_len=prompt_len,
+        mlp_hidden=mlp_hidden,
+        conv_channels=conv_channels,
+    )
     _generate_c_from_onnx(onnx_path, generated_c, func_name=func_name)
     signature = _read_entry_signature(generated_c, func_name)
     if model == "mlp":
-        wrapper = _render_mlp_wrapper(generated_c.name, signature)
+        wrapper = _render_mlp_wrapper(generated_c.name, signature, hidden_dim=mlp_hidden)
     elif model == "conv":
         wrapper = _render_conv_wrapper(generated_c.name, signature)
     elif model == "tiny_lm":
@@ -614,6 +658,8 @@ def main() -> int:
     parser.add_argument("--program-name", default=None)
     parser.add_argument("--prompt", default="there was a little girl named lily .")
     parser.add_argument("--prompt-len", type=int, default=9)
+    parser.add_argument("--mlp-hidden", type=int, default=64)
+    parser.add_argument("--conv-channels", type=int, default=16)
     parser.add_argument("--run-rtl", action="store_true")
     parser.add_argument("--maxcycles", type=int, default=40_000_000)
     parser.add_argument("--verilator-max-ticks", type=int, default=40_000_000_000)
@@ -631,6 +677,8 @@ def main() -> int:
         program_name,
         prompt=args.prompt,
         prompt_len=args.prompt_len,
+        mlp_hidden=args.mlp_hidden,
+        conv_channels=args.conv_channels,
     )
     print(f"onnx={onnx_path}")
     print(f"generated_c={generated_c}")

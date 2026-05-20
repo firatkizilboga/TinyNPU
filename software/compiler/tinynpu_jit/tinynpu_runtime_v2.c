@@ -363,6 +363,12 @@ static int16_t tnpu_quantize_fp16_lane_to_i16(uint16_t fp16, uint16_t multiplier
     return tnpu_clip_i16(qvalue);
 }
 
+static void tnpu_write_tensor_a_fast(
+    const TinyTensor *tensor,
+    uint16_t base_addr,
+    int precision,
+    uint16_t word_count);
+
 static void tnpu_write_tensor_a_qf16_to_i16_fast(
     const TinyTensor *tensor,
     uint16_t base_addr,
@@ -401,9 +407,10 @@ static void tnpu_write_tensor_a_qf16_to_i16_fast(
     }
 }
 
-static void tnpu_write_tensor_a_quantized_via_xform(
+static void tnpu_write_tensor_quantized_via_xform(
     const TinyTensor *tensor,
     uint16_t base_addr,
+    const char *role,
     int word_count,
     float inv_scale)
 {
@@ -411,7 +418,16 @@ static void tnpu_write_tensor_a_quantized_via_xform(
     uint8_t shift;
     runtime_assert(inv_scale > 0.0f, "xform quantized write expects positive inv_scale");
     runtime_assert(word_count <= 0xFFFF, "xform quantized write expects <= 65535 words");
-    tnpu_write_tensor_a_f16bits_from_float(tensor, base_addr, word_count);
+    if (tensor->dtype != TINY_DTYPE_FLOAT32 && tensor->value_encoding == TINY_VALUE_ENCODING_FP16_BITS) {
+        if (tnpu_role_code(role, 'A') == 'A') {
+            tnpu_write_tensor_a_fast(tensor, base_addr, 2, (uint16_t)word_count);
+        } else {
+            write_tensor_to_npu(tensor, base_addr, role, 2, word_count);
+        }
+    } else {
+        runtime_assert(tnpu_role_code(role, 'A') == 'A', "float32 xform write currently supports only role A");
+        tnpu_write_tensor_a_f16bits_from_float(tensor, base_addr, word_count);
+    }
     tnpu_choose_xform_scale_params(inv_scale, &multiplier, &shift);
     tnpu_run_xform_q_f16_i16(base_addr, base_addr, (uint16_t)word_count, multiplier, shift);
 }
@@ -847,16 +863,22 @@ static int tnpu_execute_segment(TinyTensor *runtime_tensors, const TnpuSegment *
         } else if (write->transform == TNPU_WRITE_XFORM_Q_F16_I16) {
             uint16_t multiplier;
             uint8_t shift;
-            if (role != 'A' || (int)write->precision != 2) {
-                printf("runtime v2: xform write only supports role A INT16\n");
+            if ((role != 'A' && role != 'B') || (int)write->precision != 2) {
+                printf("runtime v2: xform write only supports role A/B INT16\n");
                 return 1;
             }
             if (write->attrs_i32[0] != 0) {
                 printf("runtime v2: xform write currently requires zero_point=0\n");
                 return 1;
             }
-            tnpu_choose_xform_scale_params(write->attrs_f32[0], &multiplier, &shift);
-            tnpu_write_tensor_a_qf16_to_i16_fast(tensor, write->addr, write->word_count, multiplier, shift);
+            (void)multiplier;
+            (void)shift;
+            tnpu_write_tensor_quantized_via_xform(
+                tensor,
+                write->addr,
+                tnpu_role_or_default(write->role, "A"),
+                (int)write->word_count,
+                write->attrs_f32[0]);
         } else if (role == 'A' && (int)write->precision == 2) {
             tnpu_write_tensor_a_fast(tensor, write->addr, (int)write->precision, write->word_count);
         } else {

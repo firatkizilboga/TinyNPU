@@ -19,6 +19,10 @@ if str(COMPILER_ROOT) not in sys.path:
     sys.path.insert(0, str(COMPILER_ROOT))
 
 from software.compiler.tinynpu_jit import write_cv32e40p_program_v2  # noqa: E402
+from software.compiler.tinynpu_jit.rtl_runner import (  # noqa: E402
+    toolchain_include_lib_dirs as _toolchain_include_lib_dirs,
+    toolchain_prefix as _shared_toolchain_prefix,
+)
 from software.workload.jit_multitile_matmul import (  # noqa: E402
     JitMatmulBenchmarkCase,
     build_configured_matmul_artifact,
@@ -83,20 +87,7 @@ int main(void)
 
 
 def _toolchain_prefix() -> Path:
-    prefix_override = os.environ.get("TINYNPU_RISCV_PREFIX")
-    if prefix_override:
-        prefix = Path(prefix_override)
-        gcc = prefix.parent / (prefix.name + "gcc")
-        if not gcc.exists():
-            raise FileNotFoundError(f"{gcc} not found for TINYNPU_RISCV_PREFIX")
-        return prefix
-    preferred = Path("/opt/riscv-ilp32f/bin/riscv32-unknown-elf-gcc")
-    if preferred.exists():
-        return preferred.parent / "riscv32-unknown-elf-"
-    gcc = shutil.which("riscv32-unknown-elf-gcc")
-    if gcc is None:
-        raise FileNotFoundError("riscv32-unknown-elf-gcc not found in PATH")
-    return Path(gcc).resolve().parent / "riscv32-unknown-elf-"
+    return _shared_toolchain_prefix()
 
 
 def _toolchain_root(prefix: Path) -> Path:
@@ -133,9 +124,7 @@ def _emit_case_sources(case: JitMatmulBenchmarkCase, repeat_count: int) -> tuple
 def _compile_case(program_name: str, program_path: Path, runner_path: Path, prefix: Path) -> Path:
     gcc = f"{prefix}gcc"
     objcopy = f"{prefix}objcopy"
-    toolchain_root = _toolchain_root(prefix)
-    include_dir = toolchain_root / "riscv32-unknown-elf" / "include"
-    lib_dir = toolchain_root / "riscv32-unknown-elf" / "lib"
+    include_dir, lib_dir = _toolchain_include_lib_dirs(prefix)
     elf_path = CUSTOM_DIR / f"{program_name}.elf"
     hex_path = CUSTOM_DIR / f"{program_name}.hex"
     compile_cmd = [
