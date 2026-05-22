@@ -28,7 +28,7 @@ digraph TinyNPUCompilerStack {
         arrowsize=0.8
     ];
 
-    Model [label="PyTorch / QAT Model", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
+    Model [label="PyTorch / quantized model", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
     Quant [label="tinynpu_quant\ncompiler-ready conversion", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
     FX [label="FX tracing\ncompile_module()", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
 
@@ -84,7 +84,7 @@ digraph TinyNPUCompilerStack {
 
     { rank=same; HostExec; SimExec; }
 
-    Model -> Quant [label="optional QAT conversion"];
+    Model -> Quant [label="PTQ / optional QAT conversion"];
     Quant -> FX [label="compiler-ready module"];
     Model -> FX [label="direct quantized module path"];
 
