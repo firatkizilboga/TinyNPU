@@ -493,6 +493,29 @@ Figure~\ref{fig:runtime-state} shows this firmware loop. For accelerator segment
 
 Verification is built into this same path. Compiler-owned expected tensors can be checked during execution, and the runtime can record RTL cycle counts for accelerator run windows separately from software-side overhead.
 
+\subsection{GPT- and Llama-Like Blocks}
+The transformer experiments use reduced-dimensional blocks that preserve the execution structure of GPT-style and Llama-style decoder layers without claiming full pretrained-model compatibility. They are useful because they exercise the parts of the stack that simple MLP and convolution tests do not: normalization, attention score formation, softmax, key/value cache handling, residual connections, and feed-forward sublayers.
+
+The Llama-like block uses RMSNorm, grouped-query attention, RoPE on Q/K, an attention output projection, and a SwiGLU feed-forward tail. Dense projections are lowered to INT16 NPU matmuls: Q/K/V projection, QK score matmul, probability-times-value matmul, attention output projection, gate/up projections, and down projection. The CPU handles the non-matrix pieces: RMSNorm, RoPE, softmax, residual adds, SiLU, elementwise feed-forward multiplication, and the quantize/dequantize boundaries around those operations. Prefill materializes the key/value cache for the prompt. Decode reuses that cache, appends the new K/V entries, and attends over the prompt plus the decode token.
+
+The GPT-2-like block uses LayerNorm, causal self-attention, an attention output projection, residual connections, and a two-layer feed-forward network. Its NPU work is the same class of dense matmul work: Q/K/V projections, score and value matmuls, output projection, and feed-forward projections. The CPU handles LayerNorm, softmax, residual adds, and the non-matrix attention bookkeeping. The reported GPT-2-like experiment chains two blocks back-to-back and includes prefill, decode, and cache reuse so that the runtime is forced to carry intermediate state across more than one block.
+
+\begin{table}[H]
+    \centering
+    \footnotesize
+    \caption{Transformer-like block lowering boundary. The blocks are reduced-size structural tests, not full pretrained GPT-2 or Llama models.}
+    \label{tab:transformer-lowering}
+    \begin{tabularx}{\textwidth}{|l|>{\raggedright\arraybackslash}X|>{\raggedright\arraybackslash}X|}
+        \hline
+        \textbf{Block} & \textbf{NPU work} & \textbf{CPU/runtime work} \\
+        \hline
+        Llama-like & INT16 Q/K/V projections, attention score matmul, probability-times-value matmul, attention output projection, gate/up projections, down projection & RMSNorm, RoPE, softmax, residual adds, SiLU and elementwise feed-forward multiply, K/V cache scatter/append, quantize/dequantize boundaries \\
+        \hline
+        GPT-2-like & INT16 Q/K/V projections, attention score matmul, probability-times-value matmul, attention output projection, feed-forward projections & LayerNorm, causal mask and softmax, residual adds, cache reuse across prefill and decode, quantize/dequantize boundaries \\
+        \hline
+    \end{tabularx}
+\end{table}
+
 \subsection{Scope Boundaries}
 The system targets a narrow but concrete contract. The mixed-precision helper produces compiler-ready configurations rather than solving the global bit-allocation problem. The compiler supports a bounded operator set and routes remaining work through host steps. The evaluation focuses on trained MNIST-derived models, controlled kernel benchmarks, and small transformer-like blocks, which is enough to study the interaction between architecture, compilation, and runtime without overstating workload coverage.
 
@@ -610,7 +633,7 @@ The same RTL contains an INT16-to-FP16 dequantization mode, but the public full-
 
 \subsection{Transformer-Like Block Scaling}
 
-Small transformer-like blocks are included to test the compiler/runtime boundary for attention-style workloads. They are not presented as a full language-model throughput claim. The useful question is whether the hybrid path begins to win as dimensions grow and fixed launch/host costs are amortized over more matrix work.
+Small transformer-like blocks are included to test the compiler/runtime boundary for attention-style workloads. They are not presented as a full language-model throughput claim. The useful question is whether the hybrid path begins to win as dimensions grow and fixed launch/host costs are amortized over more matrix work. In Table~\ref{tab:transformer-scaling}, \(d\) is hidden size, \(h\) is per-head width, \(n_h\) is the number of query heads, \(n_{kv}\) is the number of key/value heads, \(f\) is feed-forward hidden size, and \(T\) is prompt/cache length.
 
 \begin{table}[H]
     \centering
@@ -622,20 +645,20 @@ Small transformer-like blocks are included to test the compiler/runtime boundary
         \hline
         \textbf{Workload} & \textbf{CPU cycles} & \textbf{CPU+NPU hot cycles} & \textbf{CPU+NPU cold cycles} & \textbf{Hot wall speedup} \\
         \hline
-        QLlama decode d32 & 224,719 & 172,789 & 187,030 & \(0.89\times\) \\
+        Llama-like decode \(d=32,h=8,n_h=4,n_{kv}=2,f=32,T=8\) & 224,719 & 172,789 & 187,030 & \(0.89\times\) \\
         \hline
-        QLlama decode d48 & 426,993 & 241,336 & 271,712 & \(1.21\times\) \\
+        Llama-like decode \(d=48,h=8,n_h=6,n_{kv}=3,f=48,T=8\) & 426,993 & 241,336 & 271,712 & \(1.21\times\) \\
         \hline
-        QLlama decode d64 & 668,974 & 277,909 & 330,045 & \(1.65\times\) \\
+        Llama-like decode \(d=64,h=16,n_h=4,n_{kv}=2,f=64,T=8\) & 668,974 & 277,909 & 330,045 & \(1.65\times\) \\
         \hline
-        GPT2 two-block d16 & 729,486 & 498,500 & 522,997 & \(1.00\times\) \\
+        GPT-2-like two-block \(d=16,h=16,n_h=1,f=16,T=4\) & 729,486 & 498,500 & 522,997 & \(1.00\times\) \\
         \hline
-        GPT2 two-block d24 & 1,333,079 & 709,199 & 757,888 & \(1.29\times\) \\
+        GPT-2-like two-block \(d=24,h=24,n_h=1,f=24,T=4\) & 1,333,079 & 709,199 & 757,888 & \(1.29\times\) \\
         \hline
     \end{tabular}}
 \end{table}
 
-The trend is consistent with the trained-model results. Very small decode shapes are not a good fit because the host operations and segment overhead consume too much of the total time. As the hidden dimension grows from d32 to d64, QLlama decode moves from slower-than-CPU wall time to \(1.65\times\) hot wall-clock speedup. GPT2-shaped two-block runs show the same direction but with a smaller margin at the tested sizes.
+The trend is consistent with the trained-model results. Very small decode shapes are not a good fit because the host operations and segment overhead consume too much of the total time. As the hidden dimension grows from \(d=32\) to \(d=64\), the Llama-like decode experiment moves from slower-than-CPU wall time to \(1.65\times\) hot wall-clock speedup. GPT-2-like two-block runs show the same direction but with a smaller margin at the tested sizes.
 
 \subsection{Bottlenecks and Interpretation}
 The bottleneck ranking is different for each class of workload. Matrix-native MLPs are dominated by whether weights and instruction images are resident. Convolutions are dominated by the remaining host-side \texttt{im2col} boundary. Transformer-like blocks are dominated by host operations, segment overhead, and whether the matrix dimensions are large enough to amortize fixed launch costs.
