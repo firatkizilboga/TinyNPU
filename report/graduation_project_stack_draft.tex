@@ -281,27 +281,21 @@ When the integration provides it, the same UB and IM storage can also be exposed
     \label{fig:hardware-architecture}
 \end{figure}
 
-Figure~\ref{fig:hardware-architecture} shows the top-level organization. The compute path is a matrix path: the unified buffer feeds activation and weight streamers, the streamers feed the systolic array, and drained accumulators pass through the PPU before returning to the buffer. The XFORM unit is shown separately because it handles explicit FP16/INT16 boundary conversions rather than participating in the main systolic feed loop.
+Figure~\ref{fig:hardware-architecture} shows the top-level organization. The compute path is a matrix path: the unified buffer feeds activation and weight streamers, the streamers feed the systolic array, and drained accumulators pass through the PPU before returning to the buffer. The XFORM unit is placed next to the unified buffer because it is a memory-side boundary converter: it reads packed words from UB, converts between FP16 and INT16 representations, and writes the result back to UB.
 
 \subsubsection{Unified Buffer and Physical Roles}
 
 The unified buffer is the central staging memory of the datapath. Architecturally it provides one activation-side read path, one weight-side read path, and a masked write path for packed output updates. This organization keeps both feed directions active at the same time and leaves room for a banked implementation rather than forcing one monolithic memory block.
 
-Within that buffer, the names A, B, C, and BIAS refer to physical roles in the datapath. A is the left-fed operand: its tiles are packed so that each unified-buffer row can launch one horizontal activation vector into the array boundary. B is the top-fed operand: its tiles are packed for the vertical weight stream. C is the writeback region: it stores quantized output tiles in the packed format chosen by the output precision. BIAS is a separate region consumed only by the PPU. These names therefore describe how data is stored and consumed by the hardware pipeline, not whether a tensor was logically an activation, a weight, or an intermediate result in the original model.
+Within that buffer, the names A, B, C, and BIAS refer to physical roles in the datapath. A is the left-fed operand: its tiles are packed so that each unified-buffer row can launch one horizontal activation vector into the array boundary. B is the top-fed operand: its tiles are packed for the vertical weight stream. C is the normal output layout: it stores quantized output tiles for host readback, final model outputs, verification, and any result that does not need to be consumed immediately as the next A-side operand. BIAS is a separate region consumed only by the PPU. These names therefore describe how data is stored and consumed by the hardware pipeline, not whether a tensor was logically an activation, a weight, or an intermediate result in the original model.
 
-The physical layouts are intentionally different. A layout is feed-oriented: each unified-buffer word represents one activation-side feed step, with one 16-bit lane per array row and one, two, or four packed \(K\)-elements per lane for INT16, INT8, or INT4. B layout is similar on the weight side, with each word representing one top-fed step into the array columns. C layout is writeback-oriented instead: it stores output tiles compactly by output column, and at lower precision it packs several logical results into subword slots. That is why a tensor written back in C format is not automatically ready for the next layer's A stream. The writeback order that is convenient for storing results is different from the feed order that the left-side streamer expects.
+The physical layouts are intentionally different. A layout is feed-oriented: each unified-buffer word represents one activation-side feed step, with one 16-bit lane per array row and one, two, or four packed \(K\)-elements per lane for INT16, INT8, or INT4. B layout is similar on the weight side, with each word representing one top-fed step into the array columns. C layout is writeback-oriented instead: it stores output tiles compactly by output column, and at lower precision it packs several logical results into subword slots. C is still useful as the default result layout, but it is not automatically a good input layout for the next layer. When a result must feed another NPU matmul without host layout repair, the compiler selects an A-compatible writeback layout instead.
 
 \subsubsection{Systolic Array and Skewers}
 
 The array is output-stationary: packed activation words enter from the left edge and move one PE to the right per cycle, packed weight words enter from the top edge and move one PE downward per cycle, and each PE keeps its output accumulator stationary for the full reduction along the $K$ dimension. Only after the last $K$ contribution has been consumed does the array switch into drain mode and shift those accumulated results downward into the post-processing unit. This choice fits the dominant tiled-GEMM workload well because it keeps the reduction local to the PE and avoids repeatedly moving partial sums through the buffer system during the $K$ loop.
 
 The streamer logic between the unified buffer and the array provides the timing skew that makes the systolic wavefront legal. On the activation side, row \(i\) is delayed before it enters the left edge; on the weight side, column \(j\) is delayed before it enters the top edge. The values themselves do not change. What changes is when they enter the array. That timing offset creates the diagonal wavefront expected by the schedule, so the activation and weight pieces that belong together meet at the correct PE in the correct cycle. A tile therefore executes in three phases: feed the packed $K$-steps into the array, allow the wavefront to fill across the remaining diagonals, and then drain the stationary accumulators.
-
-\subsubsection{Convolution Lowering Boundary}
-
-The current RTL does not contain a convolution-specific gather datapath. Convolution is lowered through the compiler/runtime boundary as \texttt{im2col} followed by ordinary matrix multiplication. This keeps the hardware contract small and makes the systolic array responsible only for the dense linear algebra it can execute directly. The cost is that convolution programs pay host-side window materialization and layout traffic before the NPU segment can run.
-
-This boundary is important for interpreting the measurements. A convolution speedup in this report is not evidence for a dedicated convolution engine. It is evidence for accelerating the matrix multiplication after the compiler has converted the convolution window walk into a matrix-shaped operand. The remaining \texttt{im2col} cost is part of the reported end-to-end runtime.
 
 \subsubsection{Processing Element}
 
@@ -444,7 +438,8 @@ The current evaluated path uses post-training quantization for trained MNIST-der
     \footnotesize
     \caption{Trained MNIST \texttt{is\_zero} accuracy after post-training quantization. Balanced accuracy uses an equal zero/nonzero test split; full-test accuracy uses the original MNIST test distribution.}
     \label{tab:trained-ptq-accuracy}
-    \begin{tabularx}{\textwidth}{|l|c|c|c|c|c|}
+    \resizebox{\textwidth}{!}{%
+    \begin{tabular}{|l|c|c|c|c|c|}
         \hline
         \textbf{Model} & \textbf{FP32 balanced} & \textbf{FP32 full} & \textbf{INT16 PTQ} & \textbf{INT8 PTQ} & \textbf{INT4 PTQ} \\
         \hline
@@ -452,7 +447,7 @@ The current evaluated path uses post-training quantization for trained MNIST-der
         \hline
         MLP h256 & 98.57\% & 98.33\% & 98.57\% & 98.57\% & 98.37\% \\
         \hline
-    \end{tabularx}
+    \end{tabular}}
 \end{table}
 
 \begin{figure}[H]
@@ -474,7 +469,7 @@ The compiler converts model structure into a mixed execution structure. Rather t
     \label{fig:compiler-stack}
 \end{figure}
 
-Figure~\ref{fig:compiler-stack} summarizes the software flow. A model enters either directly as a supported quantized PyTorch module or through a compiler-ready conversion path built around \texttt{tinynpu\_quant}. The frontend traces the model, partitions it into a mixed execution plan, validates host operations, and lowers each accelerator segment through the memory planner and \texttt{SegmentCompiler}. The resulting \texttt{CompiledArtifact} contains the execution plan, per-segment IM/UB binaries, expected tensors for verification, and the memory-layout information required by the runtime.
+Figure~\ref{fig:compiler-stack} summarizes the software flow. A model enters either directly as a supported quantized PyTorch module or through a compiler-ready conversion path built around \texttt{tinynpu\_quant}. The frontend traces the model, partitions it into a mixed execution plan, validates host operations, and lowers each accelerator segment through the memory planner and \texttt{SegmentCompiler}. The code generator then emits two pieces of C: a program file containing NPU instructions and buffer images, and a runner file that calls \texttt{runtime\_v2.c} with the required inputs, execution steps, and verification data.
 
 Packing is part of the compiler contract as well. The backend uses role-specific physical layouts for activation-side tensors, weight-side tensors, output buffers, and bias payloads. These are physical storage forms rather than semantic tensor meanings, but they are essential because legal execution depends on matching memory layout to the real feed directions and writeback format of the NPU. A useful correction came late in the project: internal NPU outputs can no longer be treated as if ordinary C-style writeback were automatically consumable by a following A-side input. The compiler now annotates the required physical output layout explicitly, and the emitted instruction stream carries that selection into the RTL writeback path.
 
@@ -483,18 +478,18 @@ The important compiler policy is not the cycle-by-cycle tile schedule but where 
 Memory planning makes those execution boundaries explicit in the buffer layout. The unified buffer is divided into a static zone and a dynamic zone: weights and biases receive globally assigned packed addresses that can be shared across segments, while activations and outputs are placed in a per-segment dynamic region with liveness-based reuse. The planner also treats layout as a real physical requirement. If a tensor must be emitted in an A-compatible layout for an internal chained consumer, that requirement is carried explicitly instead of being inferred informally.
 
 \subsection{Runtime and Verification}
-The runtime executes the compiled artifact as a mixed host-accelerator loop. For each step in the execution plan, it either launches an accelerator segment, executes an explicit host operation, or checks a verification tensor. Host-side work is therefore visible both in the plan and in the benchmark accounting.
+The deployed runtime is the C file \texttt{runtime\_v2.c} linked into the generated CV32E40P firmware. It executes the compiled plan as a mixed CPU/NPU loop. For each step, it either launches an NPU segment, executes a required CPU fallback operation, or checks an expected tensor. CPU work is therefore visible both in the plan and in the benchmark accounting.
 
-The runtime also owns repeated-run behavior. It can preserve reusable state such as static unified-buffer contents and preloaded instruction-memory images across runs.
+\texttt{runtime\_v2.c} also owns repeated-run behavior. It can preserve reusable state such as static unified-buffer contents and preloaded instruction-memory images across runs.
 
 \begin{figure}[H]
     \centering
     \includegraphics[width=0.9\textwidth,height=0.58\textheight,keepaspectratio]{diagrams/runtime_state_graphviz.pdf}
-    \caption{Host-side runtime flow for executing a compiled TinyNPU artifact.}
+    \caption{\texttt{runtime\_v2.c} flow for executing a compiled TinyNPU artifact.}
     \label{fig:runtime-state}
 \end{figure}
 
-Figure~\ref{fig:runtime-state} shows the same loop from the host-side orchestration perspective. For accelerator segments, the runtime packs logical tensors into the physical layouts expected by the datapath, stages vectors into the unified buffer, launches execution, waits for completion, and reads the results back into logical tensors. With output-layout support, the host-side runtime no longer has to repair certain internal layout mismatches itself: when the compiler marks a chained tensor as needing A-format storage, the hardware segment writes it back in that form directly.
+Figure~\ref{fig:runtime-state} shows this firmware loop. For accelerator segments, \texttt{runtime\_v2.c} packs logical tensors into the physical layouts expected by the datapath, stages data into the unified buffer and instruction memory, starts the NPU, waits for completion, and reads the outputs back. With output-layout support, the runtime no longer has to repair certain internal layout mismatches itself: when the compiler marks a chained tensor as needing A-format storage, the hardware segment writes it back in that form directly.
 
 Verification is built into this same path. Compiler-owned expected tensors can be checked during execution, and the runtime can record RTL cycle counts for accelerator run windows separately from software-side overhead.
 

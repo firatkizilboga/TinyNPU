@@ -55,10 +55,12 @@ digraph TinyNPUArchitecture {
         fontsize=20;
 
         UB [label="Unified Buffer", fillcolor="#efe8ff", color="#8b74bd", fontcolor="#2c2236", width=2.2, height=1.1];
+        XFORM [label="XFORM Unit\nFP16/INT16 boundary", fillcolor="#fff4cc", color="#c49a3a", fontcolor="#3b2d0f", width=2.4, height=1.1];
         InStream [label="Input\nStreamer", shape=parallelogram, skew=0.4, fillcolor="#e7f6ec", color="#4f9a6c", fontcolor="#1f3328", width=2.0, height=1.1];
         WtStream [label="Weight\nStreamer", shape=parallelogram, skew=0.4, fillcolor="#e7f6ec", color="#4f9a6c", fontcolor="#1f3328", width=2.0, height=1.1];
         SA [label="N x N\nSystolic\nArray", shape=box, width=2.1, height=2.1, fixedsize=true, fillcolor="#e7f6ec", color="#4f9a6c", fontcolor="#1f3328"];
 
+        UB -> XFORM [dir=both, label="quantize /\ndequantize"];
         UB -> InStream:w [label="A words"];
         UB -> WtStream:w [label="weights"];
         InStream -> SA:w [label="horizontal feed"];
@@ -66,12 +68,11 @@ digraph TinyNPUArchitecture {
     }
 
     PPU [label="Post-Processing Unit\n+ Layout Reformatter", fillcolor="#ffe8db", color="#d18a66", fontcolor="#40261d", width=2.6, height=1.2];
-    XFORM [label="XFORM Unit\nFP16/INT16 boundary", fillcolor="#fff4cc", color="#c49a3a", fontcolor="#3b2d0f", width=2.4, height=1.1];
 
     { rank=min; Runtime; }
     { rank=same; Runtime; RuntimeMMIOSpacer; MMIO; }
-    { rank=same; IM; UB; }
-    { rank=same; SA; PPU; XFORM; }
+    { rank=same; IM; UB; XFORM; }
+    { rank=same; SA; PPU; }
 
     Runtime:e -> MMIO:s [minlen=2, label="host commands"];
     MMIO:s -> Runtime:w [minlen=2, label="status / data"];
@@ -80,7 +81,6 @@ digraph TinyNPUArchitecture {
     SA -> PPU [label="drain / capture", minlen=1];
     UB -> PPU [constraint=false, style=dashed, label="bias", fontcolor="#6e6e6e", color="#7a7a7a"];
     PPU -> UB [constraint=false, label="layout-aware writeback\ntranspose / repack"];
-    UB -> XFORM [constraint=false, dir=both, label="quantize / dequantize"];
 
     Runtime -> RuntimeMMIOSpacer [style=invis, minlen=2];
     RuntimeMMIOSpacer -> MMIO [style=invis, minlen=2];

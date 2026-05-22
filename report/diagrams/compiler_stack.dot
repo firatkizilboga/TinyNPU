@@ -60,15 +60,15 @@ digraph TinyNPUCompilerStack {
 
         Planner [label="Memory planner\nroles + layouts", fillcolor="#E7F6EC", color="#4F9A6C", fontcolor="#1f3328"];
         Compiler [label="SegmentCompiler\noutput_layout selection", fillcolor="#E7F6EC", color="#4F9A6C", fontcolor="#1f3328"];
-        Program [label="baremetal emitter\ngenerate runtime descriptors", fillcolor="#E7F6EC", color="#4F9A6C", fontcolor="#1f3328", width=2.4];
-        Segment [label="generated program C\nIM image + UB image + op table", fillcolor="#E7F6EC", color="#4F9A6C", fontcolor="#1f3328", width=2.5];
-        Runner [label="generated *_runner.c\ninput/output binding", fillcolor="#E7F6EC", color="#4F9A6C", fontcolor="#1f3328"];
+        Program [label="code generator\nemit instructions + data", fillcolor="#E7F6EC", color="#4F9A6C", fontcolor="#1f3328", width=2.4];
+        Segment [label="program C\ninstructions + buffer images", fillcolor="#E7F6EC", color="#4F9A6C", fontcolor="#1f3328", width=2.5];
+        Runner [label="runner C\ncalls runtime_v2.c", fillcolor="#E7F6EC", color="#4F9A6C", fontcolor="#1f3328"];
     }
 
-    Artifact [label="Runtime package\nprogram C + runner C + expected tensors", fillcolor="#EFE8FF", color="#8B74BD", fontcolor="#2C2236", width=2.6];
+    Artifact [label="Generated C package\nprogram + runner + checks", fillcolor="#EFE8FF", color="#8B74BD", fontcolor="#2C2236", width=2.6];
 
     subgraph cluster_runtime {
-        label="Execution Backends";
+        label="Execution";
         color="#D18A66";
         penwidth=2.0;
         style="rounded,dashed";
@@ -76,13 +76,10 @@ digraph TinyNPUCompilerStack {
         fontcolor="#8F4F32";
         fontsize=16;
 
-        HostExec [label="shared runtime library\nexecutor", fillcolor="#FFE8DB", color="#D18A66", fontcolor="#40261d", width=2.2];
-        SimExec [label="CV32 firmware + Verilator\nshared-SRAM default\nMMIO fallback", fillcolor="#FFE8DB", color="#D18A66", fontcolor="#40261d", width=2.4];
+        SimExec [label="CV32E40P firmware\nruns runtime_v2.c\nunder Verilator", fillcolor="#FFE8DB", color="#D18A66", fontcolor="#40261d", width=2.4];
     }
 
-    Result [label="ExecutionResult\noutputs + verification + benchmark", fillcolor="#FFF7D9", color="#C9A227", fontcolor="#4A3A00", width=2.2];
-
-    { rank=same; HostExec; SimExec; }
+    Result [label="Outputs + checks\ncycle counts", fillcolor="#FFF7D9", color="#C9A227", fontcolor="#4A3A00", width=2.2];
 
     Model -> Quant [label="PTQ / optional QAT conversion"];
     Quant -> FX [label="compiler-ready module"];
@@ -96,15 +93,14 @@ digraph TinyNPUCompilerStack {
     Validate -> Planner [label="validated plan"];
     Planner -> Compiler [label="segment layouts"];
     Plan -> Compiler [label="NPU segments"];
-    Compiler -> Program [label="declare data / emit ISA"];
-    Program -> Segment [label="static program data"];
-    Program -> Runner [label="runtime step table use"];
+    Compiler -> Program [label="lower to C"];
+    Program -> Segment [label="program image"];
+    Program -> Runner [label="execution steps"];
     Segment -> Artifact [label="generated source"];
     Runner -> Artifact [label="generated source"];
     Expected -> Artifact [label="verification reference"];
     Planner -> Artifact [label="global memory report"];
 
-    Artifact -> HostExec [label="link runtime + generated program"];
-    HostExec -> SimExec [label="build firmware image"];
+    Artifact -> SimExec [label="compile firmware"];
     SimExec -> Result [label="execute + verify + perf counters"];
 }
