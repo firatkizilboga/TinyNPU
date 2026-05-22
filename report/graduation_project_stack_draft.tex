@@ -585,7 +585,8 @@ Table~\ref{tab:wall-clock-models} compares trained MNIST-derived MLP and convolu
     \footnotesize
     \caption{Current trained-model wall-clock comparison. CPU/ONNX uses 57.1 MHz; CPU+NPU uses the current 39.17 MHz integrated timing estimate.}
     \label{tab:wall-clock-models}
-    \begin{tabularx}{\textwidth}{|l|r|r|r|r|r|}
+    \resizebox{\textwidth}{!}{%
+    \begin{tabular}{|l|r|r|r|r|r|}
         \hline
         \textbf{Workload} & \textbf{CPU/ONNX cycles} & \textbf{CPU+NPU cycles} & \textbf{CPU wall} & \textbf{CPU+NPU wall} & \textbf{Wall speedup} \\
         \hline
@@ -601,7 +602,7 @@ Table~\ref{tab:wall-clock-models} compares trained MNIST-derived MLP and convolu
         \hline
         MLP h256 warm & 1,662,361 & 45,987 & 29,113.2 us & 1,174.0 us & \(24.80\times\) \\
         \hline
-    \end{tabularx}
+    \end{tabular}}
 \end{table}
 
 The MLP case shows the best current behavior because it is matrix-native and benefits from resident execution. The warm MLP result reaches \(24.80\times\) wall-clock speedup even after applying the lower CPU+NPU timing estimate. The convolution case also improves with scale, but it remains more sensitive to host work because the current compiler lowers convolution through \texttt{im2col}. The wide32 convolution reaches \(3.27\times\) warm wall-clock speedup, while the smaller 16-channel case is only \(1.57\times\) warm.
@@ -621,7 +622,8 @@ Small transformer-like blocks are included to test the compiler/runtime boundary
     \footnotesize
     \caption{Small transformer-like runtime comparison. CPU+NPU wall speedups use the 57.1 MHz CPU-only and 39.17 MHz CPU+NPU timing assumptions.}
     \label{tab:transformer-scaling}
-    \begin{tabularx}{\textwidth}{|l|r|r|r|r|}
+    \resizebox{\textwidth}{!}{%
+    \begin{tabular}{|l|r|r|r|r|}
         \hline
         \textbf{Workload} & \textbf{CPU cycles} & \textbf{CPU+NPU hot cycles} & \textbf{CPU+NPU cold cycles} & \textbf{Hot wall speedup} \\
         \hline
@@ -635,7 +637,7 @@ Small transformer-like blocks are included to test the compiler/runtime boundary
         \hline
         GPT2 two-block d24 & 1,333,079 & 709,199 & 757,888 & \(1.29\times\) \\
         \hline
-    \end{tabularx}
+    \end{tabular}}
 \end{table}
 
 The trend is consistent with the trained-model results. Very small decode shapes are not a good fit because the host operations and segment overhead consume too much of the total time. As the hidden dimension grows from d32 to d64, QLlama decode moves from slower-than-CPU wall time to \(1.65\times\) hot wall-clock speedup. GPT2-shaped two-block runs show the same direction but with a smaller margin at the tested sizes.
