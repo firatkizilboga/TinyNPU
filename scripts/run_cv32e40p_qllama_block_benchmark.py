@@ -169,7 +169,6 @@ def _run_variant(
     repeat_count: int,
     cpu_only: bool,
     npu_emitter: str,
-    runtime_xform: str,
     maxcycles: int,
     verilator_max_ticks: int,
     timeout_s: int,
@@ -189,8 +188,6 @@ def _run_variant(
             artifact,
             {},
             program_name=program_name,
-            runtime_xform_policy="none" if runtime_xform == "off" else ("all" if runtime_xform == "on" else runtime_xform),
-            fuse_xforms=runtime_xform != "off",
         )
         _, _, _, hex_path = build_v2_elf_and_hex(
             program_name,
@@ -274,12 +271,6 @@ def main() -> int:
         default="v2",
         help="Emitter used for NPU variant. CPU-only baseline always uses the legacy CPU emitter.",
     )
-    parser.add_argument(
-        "--runtime-xform",
-        choices=["on", "off", "q-only", "dq-only"],
-        default="q-only",
-        help="For Runtime V2 NPU emission, choose which Q/DQ boundaries use XFORM.",
-    )
     args = parser.parse_args()
 
     if args.variant in {"both", "cpu"} or args.npu_emitter == "legacy":
@@ -312,7 +303,6 @@ def main() -> int:
                 repeat_count=args.repeat_count,
                 cpu_only=False,
                 npu_emitter=args.npu_emitter,
-                runtime_xform=args.runtime_xform,
                 maxcycles=maxcycles,
                 verilator_max_ticks=args.verilator_max_ticks,
                 timeout_s=args.timeout_s,
@@ -328,7 +318,6 @@ def main() -> int:
                 repeat_count=args.repeat_count,
                 cpu_only=True,
                 npu_emitter=args.npu_emitter,
-                runtime_xform=args.runtime_xform,
                 maxcycles=maxcycles,
                 verilator_max_ticks=args.verilator_max_ticks,
                 timeout_s=args.timeout_s,

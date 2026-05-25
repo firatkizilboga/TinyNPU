@@ -45,11 +45,15 @@ def test_sanitize_program_symbol_normalizes_c_identifier():
     assert sanitize_program_symbol("cv32e40p-demo/v2") == "cv32e40p_demo_v2"
 
 
-def test_runtime_v2_xform_write_uses_hardware_xform_path():
+def test_runtime_v2_has_no_hardware_xform_qdq_path():
     runtime_source = Path(__file__).parents[1] / "tinynpu_jit" / "tinynpu_runtime_v2.c"
+    runtime_header = Path(__file__).parents[1] / "tinynpu_jit" / "tinynpu_runtime_v2.h"
     source = runtime_source.read_text()
-    xform_branch = source.split("write->transform == TNPU_WRITE_XFORM_Q_F32_I16", 1)[1]
-    xform_branch = xform_branch.split("} else if (role == 'A'", 1)[0]
+    header = runtime_header.read_text()
 
-    assert "tnpu_write_tensor_quantized_via_xform" in xform_branch
-    assert "tnpu_write_tensor_a_qf16_to_i16_fast" not in xform_branch
+    assert "TNPU_WRITE_XFORM_Q_F32_I16" not in source
+    assert "TNPU_READ_XFORM_DQ_I16_F32" not in source
+    assert "TNPU_WRITE_XFORM_Q_F32_I16" not in header
+    assert "TNPU_READ_XFORM_DQ_I16_F32" not in header
+    assert "tnpu_write_tensor_quantized_via_xform" not in source
+    assert "tnpu_write_tensor_a_qf16_to_i16_fast" not in source

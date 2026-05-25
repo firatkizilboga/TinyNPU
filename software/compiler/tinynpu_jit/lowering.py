@@ -25,9 +25,6 @@ from .memory_planner import (
     infer_roles,
     plan_program_memory,
 )
-from .runtime_approx import choose_xform_i16_f16_scale_params, choose_xform_q_f16_i16_scale_params
-
-
 _NPU_DATA_DTYPES = {DType.INT4, DType.INT8, DType.INT16}
 _NPU_BIAS_DTYPES = {DType.INT16, DType.INT32}
 _FP16_BOUNDARY_HOST_KINDS = {"layernorm", "gelu"}
@@ -365,11 +362,7 @@ def canonicalize_npu_boundary_policy(plan: ExecutionPlan) -> None:
             # contract only has direct absorbed/XFORM ingress support for INT16.
             continue
 
-        source_producer = producer_by_output.get(source_name)
-        transform = "quantize_f32_i16"
-        if source_spec.dtype == DType.FLOAT32 and int(step.attrs.get("zero_point", 0)) == 0:
-            transform = "xform_q_f32_i16"
-        step.attrs["_npu_write_transform"] = transform
+        step.attrs["_npu_write_transform"] = "quantize_f32_i16"
 
     for step in plan.steps:
         if not isinstance(step, HostOp):
@@ -389,11 +382,7 @@ def canonicalize_npu_boundary_policy(plan: ExecutionPlan) -> None:
             and output_spec.dtype == DType.FLOAT32
             and str(step.attrs.get("output_encoding", "")) != "fp16_bits"
         ):
-            step.attrs["_npu_read_transform"] = (
-                "xform_dq_i16_f32"
-                if int(step.attrs.get("zero_point", 0)) == 0
-                else "dequantize_int16_to_float32"
-            )
+            step.attrs["_npu_read_transform"] = "dequantize_int16_to_float32"
 
 
 def validate_npu_boundary_policy(plan: ExecutionPlan) -> None:
@@ -442,79 +431,23 @@ def validate_npu_boundary_policy(plan: ExecutionPlan) -> None:
             if plan.tensors[output_name].dtype != DType.INT16:
                 continue
             transform = str(step.attrs.get("_npu_write_transform", ""))
-            if transform not in {"quantize_f32_i16", "xform_q_f32_i16"}:
+            if transform != "quantize_f32_i16":
                 raise ValueError(
                     f"NPU boundary quantize '{step.name}' is missing canonical boundary transform metadata."
                 )
         elif isinstance(step, HostOp) and step.kind == "dequantize":
             transform = step.attrs.get("_npu_read_transform")
-            if transform is not None and transform not in {
-                "dequantize_int16_to_float32",
-                "xform_dq_i16_f32",
-            }:
+            if transform is not None and transform != "dequantize_int16_to_float32":
                 raise ValueError(f"Unsupported NPU read transform on '{step.name}': {transform!r}.")
 
 
 def rewrite_dequantize_fp16_xforms(plan: ExecutionPlan) -> None:
-    """Fuse explicit INT16->FP16-bit dequantize requests into producer segments.
+    """Retired hardware FP16 dequantize rewrite.
 
-    This pass only handles the safe in-place case: a segment output is consumed by
-    one dequantize op, zero-point is 0, and the requested output encoding is
-    FP16 bits.  The quantized integer value is not preserved.
+    Keep this function as a no-op while older call sites are being migrated. All
+    dequantize boundaries now remain explicit software/runtime host operations.
     """
-    consumers = _build_tensor_consumers(plan.steps)
-    segment_producers = _build_segment_producer_by_output(plan)
-    new_steps: list[HostOp | NpuSegment | VerifyTensor] = []
-
-    for step in plan.steps:
-        if (
-            not isinstance(step, HostOp)
-            or step.kind != "dequantize"
-            or len(step.inputs) != 1
-            or len(step.outputs) != 1
-            or str(step.attrs.get("output_encoding", "")) != "fp16_bits"
-        ):
-            new_steps.append(step)
-            continue
-
-        source_name = step.inputs[0]
-        output_name = step.outputs[0]
-        source_spec = plan.tensors[source_name]
-        output_spec = plan.tensors[output_name]
-        non_verify_uses = [use for use in consumers.get(source_name, []) if not isinstance(use, VerifyTensor)]
-        producer = segment_producers.get(source_name)
-        if (
-            producer is None
-            or len(non_verify_uses) != 1
-            or non_verify_uses[0] is not step
-            or source_spec.dtype != DType.INT16
-            or int(step.attrs.get("zero_point", 0)) != 0
-            or tuple(source_spec.shape) != tuple(output_spec.shape)
-        ):
-            new_steps.append(step)
-            continue
-
-        segment, op = producer
-        if op.rope_xforms():
-            new_steps.append(step)
-            continue
-
-        multiplier, shift = choose_xform_i16_f16_scale_params(float(step.attrs["scale"]))
-        op.out = output_name
-        op.dequantize_to_fp16 = True
-        op.dequantize_multiplier = int(multiplier)
-        op.dequantize_shift = int(shift)
-        _replace_segment_output(segment, source_name, output_name)
-        output_spec.dtype = DType.INT16
-        output_spec.metadata["value_encoding"] = "fp16_bits"
-        output_spec.metadata["dequantization"] = {
-            "scale": float(step.attrs["scale"]),
-            "zero_point": 0,
-            "multiplier": int(multiplier),
-            "shift": int(shift),
-        }
-
-    plan.steps = new_steps
+    return
 
 
 class SegmentCompiler:
@@ -524,8 +457,8 @@ class SegmentCompiler:
     def compile(self, plan: ExecutionPlan, expected_tensors: dict[str, np.ndarray]) -> CompiledArtifact:
         _tmp = TinyNPUProgram(defines_path=self.defines_path)
         array_size = int(_tmp.hw.params.get("ARRAY_SIZE", 8))
-        # Hardware RoPE and FP16 transport XFORM rewrites are retired. RoPE is
-        # lowered as a host op; active XFORM ingress/egress is FP32<->INT16.
+        # Hardware XFORM rewrites are retired. RoPE and Q/DQ boundaries stay as
+        # explicit software/runtime host operations around NPU segments.
         fold_input_quantize_into_input_contract(plan)
         prune_unused_tensors(plan)
         canonicalize_npu_boundary_policy(plan)
@@ -714,17 +647,6 @@ class SegmentCompiler:
     ) -> SegmentArtifact:
         program = TinyNPUProgram(defines_path=self.defines_path)
         roles = infer_roles(segment)
-        quantize_by_output = {
-            step.outputs[0]: step
-            for step in plan.steps
-            if isinstance(step, HostOp)
-            and step.kind == "quantize"
-            and len(step.inputs) == 1
-            and len(step.outputs) == 1
-            and str(step.attrs.get("_npu_write_transform", "")) == "xform_q_f16_i16"
-            and int(step.attrs.get("zero_point", 0)) == 0
-        }
-
         referenced = set(segment.inputs + segment.outputs)
         for op in segment.ops:
             referenced.add(op.lhs)
@@ -782,23 +704,7 @@ class SegmentCompiler:
             precision = to_precision_mode(spec.dtype if spec.dtype in (DType.INT4, DType.INT8, DType.INT16) else DType.INT16)
             program.declare_data(name, data, precision=precision, role=role)
 
-        emitted_q_xforms: set[str] = set()
         for op in segment.ops:
-            for input_name in (op.lhs, op.rhs):
-                quantize_step = quantize_by_output.get(input_name)
-                if quantize_step is None or input_name in emitted_q_xforms:
-                    continue
-                multiplier, q_shift = choose_xform_q_f16_i16_scale_params(1.0 / float(quantize_step.attrs["scale"]))
-                quantize_step.attrs["_npu_write_xform_location"] = "segment"
-                quantize_step.attrs["_npu_write_xform_multiplier"] = int(multiplier)
-                quantize_step.attrs["_npu_write_xform_shift"] = int(q_shift)
-                program.xform_q_f16_i16(
-                    input_name,
-                    input_name,
-                    multiplier=int(multiplier),
-                    shift=int(q_shift),
-                )
-                emitted_q_xforms.add(input_name)
             activation = 0
             if op.activation == "relu":
                 activation = 1
@@ -840,12 +746,7 @@ class SegmentCompiler:
             if op.rope_xforms():
                 raise ValueError("Hardware RoPE XFORM has been removed; lower RoPE as a CPU host op.")
             if op.dequantize_to_fp16:
-                program.xform_dq_i16_f16(
-                    op.out,
-                    op.out,
-                    multiplier=int(op.dequantize_multiplier),
-                    shift=int(op.dequantize_shift),
-                )
+                raise ValueError("Hardware FP16 dequantize XFORM has been removed; lower dequantize as a host op.")
 
         # Pre-assign globally planned addresses before compile() runs so that
         # program.compile() respects the planner layout instead of bump-allocating.

@@ -97,13 +97,11 @@ typedef struct {
 typedef enum {
     TNPU_WRITE_TRANSFORM_NONE = 0,
     TNPU_WRITE_QUANTIZE_F32_TO_INT16 = 1,
-    TNPU_WRITE_XFORM_Q_F32_I16 = 2,
 } TnpuTensorWriteTransform;
 
 typedef enum {
     TNPU_READ_TRANSFORM_NONE = 0,
     TNPU_READ_DEQUANTIZE_INT16_TO_FLOAT32 = 1,
-    TNPU_READ_XFORM_DQ_I16_F32 = 2,
 } TnpuTensorReadTransform;
 
 typedef struct {

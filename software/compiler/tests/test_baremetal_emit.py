@@ -257,7 +257,7 @@ def test_emit_cv32e40p_program_v2_structured_program():
     assert "TNPU_OP_PRELOAD_UB" in source
 
 
-def test_compile_plan_canonicalizes_runtime_input_to_fp32_xform_write():
+def test_compile_plan_canonicalizes_runtime_input_to_fp32_quantized_write():
     x_f = np.array(
         [
             [1.0, -2.0, 3.0, -4.0, 0.5, -0.5, 2.5, -1.5],
@@ -292,18 +292,18 @@ def test_compile_plan_canonicalizes_runtime_input_to_fp32_xform_write():
     quant = next(step for step in artifact.plan.steps if isinstance(step, HostOp) and step.name == "quant_x")
 
     assert artifact.plan.tensors["x_f"].dtype == DType.FLOAT32
-    assert quant.attrs.get("_npu_write_transform") == "xform_q_f32_i16"
+    assert quant.attrs.get("_npu_write_transform") == "quantize_f32_i16"
     assert quant.attrs.get("_npu_write_xform_location") is None
 
-    source = emit_cv32e40p_program_v2(artifact, {"x_f": x_f}, program_name="unit_test_v2_runtime_input_xform")
+    source = emit_cv32e40p_program_v2(artifact, {"x_f": x_f}, program_name="unit_test_v2_runtime_input_quant")
 
-    assert ".transform = TNPU_WRITE_XFORM_Q_F32_I16" in source
+    assert ".transform = TNPU_WRITE_QUANTIZE_F32_TO_INT16" in source
     assert "TNPU_HOST_QUANTIZE" not in source
     assert "TNPU_OP_SEGMENT" in source
     assert "TNPU_OP_VERIFY" in source
 
 
-def test_emit_cv32e40p_program_v2_uses_xform_quantize_for_generic_fp32_host_output():
+def test_emit_cv32e40p_program_v2_uses_software_quantize_for_generic_fp32_host_output():
     x_f = np.arange(64, dtype=np.float32).reshape(8, 8) / 16.0
     bias_f = np.ones((8, 8), dtype=np.float32)
     x_sum = x_f + bias_f
@@ -329,11 +329,11 @@ def test_emit_cv32e40p_program_v2_uses_xform_quantize_for_generic_fp32_host_outp
     artifact = compile_plan(plan, {"y": y})
     quant = next(step for step in artifact.plan.steps if isinstance(step, HostOp) and step.name == "quant_x")
 
-    assert quant.attrs.get("_npu_write_transform") == "xform_q_f32_i16"
+    assert quant.attrs.get("_npu_write_transform") == "quantize_f32_i16"
 
     source = emit_cv32e40p_program_v2(artifact, {"x_f": x_f}, program_name="unit_test_v2_float_quant_fallback")
-    assert "TNPU_WRITE_XFORM_Q_F32_I16" in source
-    assert ".transform = TNPU_WRITE_XFORM_Q_F32_I16" in source
+    assert "TNPU_WRITE_XFORM_Q_F32_I16" not in source
+    assert ".transform = TNPU_WRITE_QUANTIZE_F32_TO_INT16" in source
     assert "TNPU_HOST_QUANTIZE" not in source
 
 
@@ -392,18 +392,18 @@ def test_compile_plan_keeps_rhs_fp32_quantize_on_host():
     quant = next(step for step in artifact.plan.steps if isinstance(step, HostOp) and step.name == "quant_w")
 
     assert artifact.plan.tensors["w_f"].dtype == DType.FLOAT32
-    assert quant.attrs.get("_npu_write_transform") == "xform_q_f32_i16"
+    assert quant.attrs.get("_npu_write_transform") == "quantize_f32_i16"
     assert quant.attrs.get("_npu_write_xform_location") is None
     assert artifact.segment_artifacts["seg0"].symbol_table["w_q"]["role"] == "B"
 
-    source = emit_cv32e40p_program_v2(artifact, {"x": x, "w_f": w_f}, program_name="unit_test_v2_rhs_xform_q")
+    source = emit_cv32e40p_program_v2(artifact, {"x": x, "w_f": w_f}, program_name="unit_test_v2_rhs_quant")
     assert "TNPU_HOST_QUANTIZE" in source
     assert "TNPU_WRITE_XFORM_Q_F32_I16" not in source
     assert ".transform = TNPU_WRITE_TRANSFORM_NONE" in source
     assert '.role = "B"' in source
 
 
-def test_compile_plan_canonicalizes_layernorm_boundary_to_fp32_xform():
+def test_compile_plan_canonicalizes_layernorm_boundary_to_fp32_quantize():
     x_f = np.arange(64, dtype=np.float32).reshape(8, 8) / 16.0
     ln_wb = np.concatenate(
         [
@@ -437,11 +437,11 @@ def test_compile_plan_canonicalizes_layernorm_boundary_to_fp32_xform():
 
     assert layernorm.attrs.get("output_encoding") is None
     assert quant.attrs.get("input_encoding") is None
-    assert quant.attrs.get("_npu_write_transform") == "xform_q_f32_i16"
+    assert quant.attrs.get("_npu_write_transform") == "quantize_f32_i16"
     assert quant.attrs.get("_npu_write_xform_location") is None
 
-    source = emit_cv32e40p_program_v2(artifact, {"x_f": x_f}, program_name="unit_test_v2_ln_xform")
-    assert ".transform = TNPU_WRITE_XFORM_Q_F32_I16" in source
+    source = emit_cv32e40p_program_v2(artifact, {"x_f": x_f}, program_name="unit_test_v2_ln_quant")
+    assert ".transform = TNPU_WRITE_QUANTIZE_F32_TO_INT16" in source
 
 
 def test_emit_cv32e40p_program_v2_absorbs_dequantize_into_segment_read():
@@ -479,8 +479,8 @@ def test_emit_cv32e40p_program_v2_absorbs_dequantize_into_segment_read():
 
     source = emit_cv32e40p_program_v2(artifact, {"x_q": x_q}, program_name="unit_test_v2_dequant_absorb")
 
-    assert "TNPU_READ_XFORM_DQ_I16_F32" in source
-    assert ".transform = TNPU_READ_XFORM_DQ_I16_F32" in source
+    assert "TNPU_READ_XFORM_DQ_I16_F32" not in source
+    assert ".transform = TNPU_READ_DEQUANTIZE_INT16_TO_FLOAT32" in source
     assert "TNPU_HOST_DEQUANTIZE" not in source
 
 

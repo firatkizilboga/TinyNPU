@@ -203,56 +203,6 @@ def _compatible_resident_handoff(producer_sym: dict[str, Any], consumer_sym: dic
 
 
 _ISA_OP_HALT = 0x1
-_ISA_OP_XFORM = 0x4
-_XFORM_MODE_Q_F32_I16 = 0x1
-_XFORM_MODE_DQ_I16_F32 = 0x2
-_XFORM_SCRATCH_UB_ADDR = 0x7000
-
-
-def _choose_xform_scale_params(inv_scale: float) -> tuple[int, int]:
-    best_err = float("inf")
-    best_mult = 1
-    best_shift = 0
-    if inv_scale >= 1.0:
-        rounded = int(inv_scale + 0.5)
-        if float(rounded) == float(inv_scale) and rounded <= 0xFFFF:
-            return rounded, 0
-    for shift in range(16):
-        scaled = float(inv_scale) * float(1 << shift)
-        if scaled > 65535.0:
-            break
-        mult = int(scaled + 0.5)
-        if mult == 0:
-            mult = 1
-        approx = float(mult) / float(1 << shift)
-        err = abs(approx - float(inv_scale))
-        if err < best_err or (err == best_err and shift > best_shift):
-            best_err = err
-            best_mult = mult
-            best_shift = shift
-    if best_err == float("inf"):
-        return 0xFFFF, 0
-    return best_mult, best_shift
-
-
-def _pack_xform_instruction(
-    *,
-    mode: int,
-    src_addr: int,
-    dst_addr: int,
-    count: int,
-    multiplier: int,
-    shift: int,
-) -> int:
-    instr = 0
-    instr |= (_ISA_OP_XFORM & 0xF) << 252
-    instr |= (mode & 0xF) << 248
-    instr |= (src_addr & 0xFFFF) << 232
-    instr |= (dst_addr & 0xFFFF) << 216
-    instr |= (count & 0xFFFF) << 200
-    instr |= (multiplier & 0xFFFF) << 184
-    instr |= (shift & 0xFF) << 176
-    return instr
 
 
 def _split_im_words(instructions: list[int], *, buffer_width: int, chunks_per_inst: int) -> list[int]:
@@ -265,27 +215,13 @@ def _split_im_words(instructions: list[int], *, buffer_width: int, chunks_per_in
     return chunks
 
 
-def _runtime_xform_enabled(policy: str, kind: str) -> bool:
-    if policy == "all":
-        return True
-    if policy == "q-only" and kind == "q":
-        return True
-    if policy == "dq-only" and kind == "dq":
-        return True
-    return False
-
-
 def emit_cv32e40p_program_v2(
     artifact: CompiledArtifact,
     inputs: dict[str, np.ndarray],
     *,
     program_name: str = "tinynpu_program_v2",
     defines_path: str | None = None,
-    runtime_xform_policy: str = "all",
-    fuse_xforms: bool = False,
 ) -> str:
-    if runtime_xform_policy not in {"none", "all", "q-only", "dq-only"}:
-        raise ValueError(f"Unsupported runtime_xform_policy={runtime_xform_policy!r}.")
     for name in artifact.plan.inputs:
         if name not in inputs:
             raise KeyError(f"Missing runtime input '{name}' for bare-metal v2 emission.")
@@ -447,7 +383,7 @@ def emit_cv32e40p_program_v2(
         if not all(_is_step_instance(use, NpuSegment) for use in non_verify_uses):
             continue
         transform_policy = str(step.attrs.get("_npu_write_transform", ""))
-        if transform_policy in {"quantize_f32_i16", "xform_q_f32_i16"}:
+        if transform_policy == "quantize_f32_i16":
             if source_spec.dtype != DType.FLOAT32:
                 continue
             if not all(
@@ -525,9 +461,6 @@ def emit_cv32e40p_program_v2(
         segment = artifact.segment_artifacts[step.name]
         produced_inside = {op.out for op in step.ops}
         writes: list[str] = []
-        prepend_xforms: list[int] = []
-        append_xforms: list[int] = []
-        scratch_cursor = _XFORM_SCRATCH_UB_ADDR
         for tensor_name in step.inputs:
             spec = artifact.plan.tensors[tensor_name]
             if spec.kind == TensorKind.CONSTANT:
@@ -560,35 +493,6 @@ def emit_cv32e40p_program_v2(
                     transform = "TNPU_WRITE_QUANTIZE_F32_TO_INT16"
                     attrs_i32[0] = int(producer.attrs.get("zero_point", 0))
                     attrs_f32[0] = 1.0 / float(producer.attrs["scale"])
-                elif (
-                    transform_policy == "xform_q_f32_i16"
-                    and source_spec.dtype == DType.FLOAT32
-                    and int(sym["precision"]) == 2
-                    and str(sym["role"]) == "A"
-                    and int(producer.attrs.get("zero_point", 0)) == 0
-                ):
-                    write_tensor_name = source_name
-                    attrs_f32[0] = 1.0 / float(producer.attrs["scale"])
-                    if _runtime_xform_enabled(runtime_xform_policy, "q"):
-                        transform = "TNPU_WRITE_XFORM_Q_F32_I16"
-                        if fuse_xforms:
-                            multiplier, shift = _choose_xform_scale_params(attrs_f32[0])
-                            scratch_addr = scratch_cursor
-                            scratch_cursor += int(sym["word_count"]) * 2
-                            attrs_i32[1] = scratch_addr
-                            prepend_xforms.append(
-                                _pack_xform_instruction(
-                                    mode=_XFORM_MODE_Q_F32_I16,
-                                    src_addr=scratch_addr,
-                                    dst_addr=int(sym["addr"]),
-                                    count=int(sym["word_count"]),
-                                    multiplier=multiplier,
-                                    shift=shift,
-                                )
-                            )
-                    else:
-                        transform = "TNPU_WRITE_QUANTIZE_F32_TO_INT16"
-                        attrs_i32[0] = int(producer.attrs.get("zero_point", 0))
                 elif (
                     not transform_policy
                     and source_spec.dtype == DType.FLOAT32
@@ -654,28 +558,10 @@ def emit_cv32e40p_program_v2(
             if dequant_step is not None:
                 read_tensor_name = dequant_step.outputs[0]
                 transform_policy = str(dequant_step.attrs.get("_npu_read_transform", ""))
-                if transform_policy in {"", "dequantize_int16_to_float32", "xform_dq_i16_f32"}:
+                if transform_policy in {"", "dequantize_int16_to_float32"}:
                     read_attrs_i32[0] = int(dequant_step.attrs.get("zero_point", 0))
                     read_attrs_f32[0] = float(dequant_step.attrs["scale"])
-                    if transform_policy == "xform_dq_i16_f32" and _runtime_xform_enabled(runtime_xform_policy, "dq"):
-                        read_transform = "TNPU_READ_XFORM_DQ_I16_F32"
-                        if fuse_xforms:
-                            multiplier, shift = _choose_xform_scale_params(read_attrs_f32[0])
-                            scratch_addr = scratch_cursor
-                            scratch_cursor += int(sym["word_count"]) * 2
-                            read_attrs_i32[1] = scratch_addr
-                            append_xforms.append(
-                                _pack_xform_instruction(
-                                    mode=_XFORM_MODE_DQ_I16_F32,
-                                    src_addr=int(sym["addr"]),
-                                    dst_addr=scratch_addr,
-                                    count=int(sym["word_count"]),
-                                    multiplier=multiplier,
-                                    shift=shift,
-                                )
-                            )
-                    else:
-                        read_transform = "TNPU_READ_DEQUANTIZE_INT16_TO_FLOAT32"
+                    read_transform = "TNPU_READ_DEQUANTIZE_INT16_TO_FLOAT32"
                     absorbed_dequantize_step_names.add(dequant_step.name)
             reads.append(
                 "    {"
@@ -691,7 +577,7 @@ def emit_cv32e40p_program_v2(
         if base_instructions and ((base_instructions[-1] >> 252) & 0xF) == _ISA_OP_HALT:
             halt_instruction = base_instructions[-1]
             base_instructions = base_instructions[:-1]
-        fused_instructions = prepend_xforms + base_instructions + append_xforms + [halt_instruction]
+        fused_instructions = base_instructions + [halt_instruction]
         flattened_chunks = _split_im_words(
             fused_instructions,
             buffer_width=buffer_width,
