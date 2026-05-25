@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -11,6 +12,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT / "software" / "compiler") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "software" / "compiler"))
 
+from tinynpu_jit import RunnerConfig, build_v2_elf_and_hex, emit_cv32e40p_program_v2  # noqa: E402
 from tinynpu_jit.baremetal_emit import emit_cv32e40p_c  # noqa: E402
 from tinynpu_jit.blocks import build_llama_decode_artifact, build_llama_prefill_artifact  # noqa: E402
 from tinynpu_jit.rtl_runner import (  # noqa: E402
@@ -85,6 +87,22 @@ def _parse_metrics(stdout: str) -> dict[str, int]:
     if any(name.startswith("repeat.") for name in metrics):
         return metrics
 
+    if "cold.body" in metrics or "cold.e2e" in metrics:
+        preload_total = metrics.get("preload.total", 0)
+        cold_body = metrics.get("cold.body")
+        cold_total = metrics.get("cold.e2e")
+        if cold_body is None and cold_total is not None:
+            cold_body = max(0, cold_total - preload_total)
+        if cold_total is None and cold_body is not None:
+            cold_total = preload_total + cold_body
+        if cold_body is not None:
+            metrics["repeat.segment.npu.total"] = cold_body
+            metrics["repeat.program.npu.hot.avg"] = metrics.get("warm.avg.body", cold_body)
+        if cold_total is not None:
+            metrics["repeat.preload.total"] = preload_total
+            metrics["repeat.program.npu.cold.total"] = cold_total
+        return metrics
+
     preload_total = sum(value for name, value in metrics.items() if name.startswith("preload."))
     host_total = sum(value for name, value in metrics.items() if name.startswith("hostop."))
     segment_cpu_total = sum(
@@ -150,29 +168,65 @@ def _run_variant(
     program_name: str,
     repeat_count: int,
     cpu_only: bool,
+    npu_emitter: str,
+    runtime_xform: str,
     maxcycles: int,
     verilator_max_ticks: int,
     timeout_s: int,
     dump_stdout: bool,
 ) -> tuple[dict[str, int], str]:
-    source = emit_cv32e40p_c(
-        artifact,
-        {},
-        program_name=program_name,
-        repeat_count=repeat_count,
-        cpu_only_baseline=cpu_only,
-    )
-    _, _, hex_path = _build_c_elf_and_hex(program_name, source)
-    proc = run_vlt_npu(
-        hex_path,
-        maxcycles=maxcycles,
-        verilator_max_ticks=verilator_max_ticks,
-        timeout_s=timeout_s,
-        noassert=True,
-    )
-    stdout = proc.stdout
+    if cpu_only or npu_emitter == "legacy":
+        source = emit_cv32e40p_c(
+            artifact,
+            {},
+            program_name=program_name,
+            repeat_count=repeat_count,
+            cpu_only_baseline=cpu_only,
+        )
+        _, _, hex_path = _build_c_elf_and_hex(program_name, source)
+    else:
+        source = emit_cv32e40p_program_v2(
+            artifact,
+            {},
+            program_name=program_name,
+            runtime_xform_policy="none" if runtime_xform == "off" else ("all" if runtime_xform == "on" else runtime_xform),
+            fuse_xforms=runtime_xform != "off",
+        )
+        _, _, _, hex_path = build_v2_elf_and_hex(
+            program_name,
+            source,
+            runner_config=RunnerConfig(
+                repeat_count=repeat_count,
+                dump_final_outputs=True,
+                verbose_steps=True,
+                timed=repeat_count > 1,
+                banner=f"QLlama {program_name}",
+            ),
+            extra_cflags=["-ffast-math", "-fno-builtin-printf"],
+        )
+    try:
+        proc = run_vlt_npu(
+            hex_path,
+            maxcycles=maxcycles,
+            verilator_max_ticks=verilator_max_ticks,
+            timeout_s=timeout_s,
+            noassert=True,
+        )
+        stdout = proc.stdout
+        stderr = proc.stderr
+    except subprocess.CalledProcessError as exc:
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or ""
+        if dump_stdout and stdout:
+            print(stdout)
+        if stderr:
+            print(stderr, file=sys.stderr, end="")
+        tail = "\n".join(stdout.splitlines()[-40:])
+        raise RuntimeError(f"{program_name} RTL run failed with exit code {exc.returncode}\n{tail}") from exc
     if dump_stdout:
         print(stdout)
+    if stderr:
+        print(stderr, file=sys.stderr, end="")
     return _parse_metrics(stdout), stdout
 
 
@@ -214,12 +268,25 @@ def main() -> int:
     parser.add_argument("--verilator-max-ticks", type=int, default=30_000_000_000)
     parser.add_argument("--timeout-s", type=int, default=300)
     parser.add_argument("--dump-stdout", action="store_true")
+    parser.add_argument(
+        "--npu-emitter",
+        choices=["v2", "legacy"],
+        default="v2",
+        help="Emitter used for NPU variant. CPU-only baseline always uses the legacy CPU emitter.",
+    )
+    parser.add_argument(
+        "--runtime-xform",
+        choices=["on", "off", "q-only", "dq-only"],
+        default="q-only",
+        help="For Runtime V2 NPU emission, choose which Q/DQ boundaries use XFORM.",
+    )
     args = parser.parse_args()
 
-    build_env = dict(os.environ)
-    build_env["CCACHE_DISABLE"] = "1"
-    build_env["TMPDIR"] = "/tmp"
-    run_checked(["make", "verilator-build-npu"], cwd=CORE_DIR, env=build_env)
+    if args.variant in {"both", "cpu"} or args.npu_emitter == "legacy":
+        build_env = dict(os.environ)
+        build_env["CCACHE_DISABLE"] = "1"
+        build_env["TMPDIR"] = "/tmp"
+        run_checked(["make", "verilator-build-npu"], cwd=CORE_DIR, env=build_env)
 
     modes = ["prefill", "decode"] if args.mode == "both" else [args.mode]
     for mode in modes:
@@ -244,6 +311,8 @@ def main() -> int:
                 program_name=f"cv32e40p_qllama_{mode}_npu_d{args.d_model}_h{args.d_head}_nh{args.n_heads}_nkv{args.n_kv_heads}_f{args.ffn_hidden_dim}_t{args.prompt_len}_s{args.seed}_r{args.repeat_count}",
                 repeat_count=args.repeat_count,
                 cpu_only=False,
+                npu_emitter=args.npu_emitter,
+                runtime_xform=args.runtime_xform,
                 maxcycles=maxcycles,
                 verilator_max_ticks=args.verilator_max_ticks,
                 timeout_s=args.timeout_s,
@@ -258,6 +327,8 @@ def main() -> int:
                 program_name=f"cv32e40p_qllama_{mode}_cpu_d{args.d_model}_h{args.d_head}_nh{args.n_heads}_nkv{args.n_kv_heads}_f{args.ffn_hidden_dim}_t{args.prompt_len}_s{args.seed}_r{args.repeat_count}",
                 repeat_count=args.repeat_count,
                 cpu_only=True,
+                npu_emitter=args.npu_emitter,
+                runtime_xform=args.runtime_xform,
                 maxcycles=maxcycles,
                 verilator_max_ticks=args.verilator_max_ticks,
                 timeout_s=args.timeout_s,

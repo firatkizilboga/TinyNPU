@@ -31,8 +31,8 @@ DOORBELL_ADDR = REG_MMVR + (BUFFER_WIDTH // 8) - 1
 
 OP_HALT = 0x1
 OP_XFORM = 0x4
-XFORM_MODE_Q_F16_I16 = 0x1
-XFORM_MODE_DQ_I16_F16 = 0x2
+XFORM_MODE_Q_F32_I16 = 0x1
+XFORM_MODE_DQ_I16_F32 = 0x2
 
 
 async def _reset(dut):
@@ -68,11 +68,11 @@ def _pack_xform(mode, src, dest, count, multiplier, shift):
 
 
 def _pack_xform_q(src, dest, count, multiplier, shift):
-    return _pack_xform(XFORM_MODE_Q_F16_I16, src, dest, count, multiplier, shift)
+    return _pack_xform(XFORM_MODE_Q_F32_I16, src, dest, count, multiplier, shift)
 
 
 def _pack_xform_dq(src, dest, count, multiplier, shift):
-    return _pack_xform(XFORM_MODE_DQ_I16_F16, src, dest, count, multiplier, shift)
+    return _pack_xform(XFORM_MODE_DQ_I16_F32, src, dest, count, multiplier, shift)
 
 
 def _pack_i16_word(values):
@@ -98,6 +98,22 @@ def _unpack_u16_word(lanes):
     for idx, lane in enumerate(lanes):
         word |= (int(lane) & 0xFFFF_FFFF) << (idx * 32)
     return [(word >> (idx * 16)) & 0xFFFF for idx in range(8)]
+
+
+def _pack_f32_word(values):
+    word = 0
+    bits = np.asarray(values, dtype=np.float32).view(np.uint32)
+    for idx, value in enumerate(bits):
+        word |= int(value) << (idx * 32)
+    return word
+
+
+def _unpack_f32_words(low_lanes, high_lanes):
+    bits = []
+    for lanes in (low_lanes, high_lanes):
+        for lane in lanes:
+            bits.append(int(lane) & 0xFFFF_FFFF)
+    return np.asarray(bits, dtype=np.uint32).view(np.float32)
 
 
 async def _shared_write_word(dut, addr, lanes):
@@ -154,7 +170,7 @@ async def _run_until_halt(dut):
 
 
 @cocotb.test()
-async def test_xform_q_f16_i16_one_word(dut):
+async def test_xform_q_f32_i16_one_word(dut):
     await _reset(dut)
 
     src_addr = 0
@@ -162,12 +178,14 @@ async def test_xform_q_f16_i16_one_word(dut):
     multiplier = 16
     shift = 0
     values_f32 = np.array([1.0, -2.0, 3.5, -4.25, 0.5, -0.5, 2.5, -1.5], dtype=np.float32)
-    values_f16 = values_f32.astype(np.float16)
-    expected = np.clip(np.rint(values_f16.astype(np.float32) * multiplier), -32768, 32767).astype(np.int16).tolist()
-    src_word = _pack_i16_word(values_f16.view(np.uint16).astype(np.int32).tolist())
-    src_lanes = [(src_word >> (lane * 32)) & 0xFFFF_FFFF for lane in range(LANES_PER_WORD)]
+    expected = np.clip(np.rint(values_f32 * multiplier), -32768, 32767).astype(np.int16).tolist()
+    src_word_lo = _pack_f32_word(values_f32[:4])
+    src_word_hi = _pack_f32_word(values_f32[4:])
+    src_lanes_lo = [(src_word_lo >> (lane * 32)) & 0xFFFF_FFFF for lane in range(LANES_PER_WORD)]
+    src_lanes_hi = [(src_word_hi >> (lane * 32)) & 0xFFFF_FFFF for lane in range(LANES_PER_WORD)]
 
-    await _shared_write_word(dut, src_addr, src_lanes)
+    await _shared_write_word(dut, src_addr, src_lanes_lo)
+    await _shared_write_word(dut, src_addr + 1, src_lanes_hi)
     await _load_instruction_shared(dut, 0, _pack_xform_q(src_addr, dest_addr, 1, multiplier, shift))
     await _load_instruction_shared(dut, 1, _pack_halt())
     await _run_until_halt(dut)
@@ -177,7 +195,7 @@ async def test_xform_q_f16_i16_one_word(dut):
 
 
 @cocotb.test()
-async def test_xform_dq_i16_f16_one_word(dut):
+async def test_xform_dq_i16_f32_one_word(dut):
     await _reset(dut)
 
     src_addr = 0
@@ -185,7 +203,7 @@ async def test_xform_dq_i16_f16_one_word(dut):
     multiplier = 16
     shift = 4
     values_i16 = np.array([1, -2, 3, -4, 8, -16, 32, -64], dtype=np.int16)
-    expected = values_i16.astype(np.float16).view(np.uint16).astype(np.int32).tolist()
+    expected = values_i16.astype(np.float32)
     src_word = _pack_i16_word(values_i16.tolist())
     src_lanes = [(src_word >> (lane * 32)) & 0xFFFF_FFFF for lane in range(LANES_PER_WORD)]
 
@@ -194,5 +212,5 @@ async def test_xform_dq_i16_f16_one_word(dut):
     await _load_instruction_shared(dut, 1, _pack_halt())
     await _run_until_halt(dut)
 
-    got = _unpack_u16_word(await _shared_read_word(dut, dest_addr))
-    assert got == expected, f"XFORM DQ mismatch: got {got}, expected {expected}"
+    got = _unpack_f32_words(await _shared_read_word(dut, dest_addr), await _shared_read_word(dut, dest_addr + 1))
+    np.testing.assert_array_equal(got, expected)

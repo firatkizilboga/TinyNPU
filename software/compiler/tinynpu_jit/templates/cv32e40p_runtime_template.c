@@ -266,9 +266,16 @@ static void tensor_set_i32(TinyTensor *tensor, int linear, int32_t value)
     tensor_i32(tensor)[linear] = value;
 }
 
+static uint16_t host_float32_to_fp16_bits(float value);
+
 static void tensor_set_float(TinyTensor *tensor, int linear, float value)
 {
-    tensor_f32(tensor)[linear] = value;
+    if (tensor->dtype == TINY_DTYPE_FLOAT32) {
+        tensor_f32(tensor)[linear] = value;
+        return;
+    }
+    runtime_assert(tensor->value_encoding == TINY_VALUE_ENCODING_FP16_BITS, "float write requires float32 or fp16-bit tensor");
+    tensor_i32(tensor)[linear] = (int16_t)host_float32_to_fp16_bits(value);
 }
 
 static int32_t clip_for_dtype(int64_t value, TinyDType dtype)
@@ -390,7 +397,7 @@ static void host_sigmoid(TinyTensor *dst, const TinyTensor *src)
 
 static void host_silu(TinyTensor *dst, const TinyTensor *src)
 {
-    runtime_assert(dst->dtype == TINY_DTYPE_FLOAT32, "silu expects float output");
+    runtime_assert(tensor_is_float_compatible(dst), "silu expects float-compatible output");
     runtime_assert(dst->elem_count == src->elem_count, "silu size mismatch");
     for (int i = 0; i < src->elem_count; ++i) {
         float value = tensor_get_float(src, i);
@@ -726,6 +733,16 @@ static void host_dequantize(TinyTensor *dst, const TinyTensor *src, float scale,
     }
 }
 
+static void host_fp16bits_to_float32_tensor(TinyTensor *dst, const TinyTensor *src)
+{
+    runtime_assert(dst->dtype == TINY_DTYPE_FLOAT32, "fp16_to_float32 output must be float");
+    runtime_assert(src->value_encoding == TINY_VALUE_ENCODING_FP16_BITS, "fp16_to_float32 input must be fp16-bit encoded");
+    runtime_assert(dst->elem_count == src->elem_count, "fp16_to_float32 size mismatch");
+    for (int i = 0; i < src->elem_count; ++i) {
+        tensor_set_float(dst, i, tensor_get_float(src, i));
+    }
+}
+
 static void host_requantize(TinyTensor *dst, const TinyTensor *src, float scale, int zero_point)
 {
     runtime_assert(dst->dtype != TINY_DTYPE_FLOAT32, "requantize output must be integer");
@@ -1010,7 +1027,7 @@ static void host_mean(
 static void host_rmsnorm(TinyTensor *dst, const TinyTensor *src, const TinyTensor *weight, float eps)
 {
     runtime_assert(eps > 0.0f, "rmsnorm eps must be positive");
-    runtime_assert(dst->dtype == TINY_DTYPE_FLOAT32, "rmsnorm output must be float");
+    runtime_assert(tensor_is_float_compatible(dst), "rmsnorm output must be float-compatible");
     runtime_assert(src->rank >= 1, "rmsnorm expects rank >= 1");
     runtime_assert(dst->elem_count == src->elem_count, "rmsnorm size mismatch");
 
@@ -1083,7 +1100,7 @@ static void host_mul(TinyTensor *dst, const TinyTensor *lhs, const TinyTensor *r
     int lhs_idx[4] = {0, 0, 0, 0};
     int rhs_idx[4] = {0, 0, 0, 0};
 
-    runtime_assert(dst->dtype == TINY_DTYPE_FLOAT32, "mul expects float output");
+    runtime_assert(tensor_is_float_compatible(dst), "mul expects float-compatible output");
     runtime_assert(tensor_is_float_compatible(lhs) && tensor_is_float_compatible(rhs), "mul expects float-compatible inputs");
     for (int linear = 0; linear < dst->elem_count; ++linear) {
         tensor_unravel(dst, linear, out_idx);
@@ -1656,7 +1673,7 @@ static void host_rope_precomputed(
     const int *inv_freq_bits,
     int inv_freq_len)
 {
-    runtime_assert(dst->dtype == TINY_DTYPE_FLOAT32, "rope output must be float");
+    runtime_assert(tensor_is_float_compatible(dst), "rope output must be float-compatible");
     runtime_assert(src->rank >= 2, "rope expects rank >= 2");
     runtime_assert(head_dim > 0 && (head_dim % 2) == 0, "rope head_dim must be positive and even");
     runtime_assert(src->shape[src->rank - 1] == head_dim, "rope last dimension mismatch");
@@ -1678,7 +1695,6 @@ static void host_rope_precomputed(
         seq_len = src->shape[src->rank - 2];
     }
 
-    float *dst_data = tensor_f32(dst);
     for (int outer_idx = 0; outer_idx < outer; ++outer_idx) {
         for (int seq_idx = 0; seq_idx < seq_len; ++seq_idx) {
             const int logical_pos = position + seq_idx;
@@ -1690,8 +1706,8 @@ static void host_rope_precomputed(
                 const float s = sinf(angle);
                 const float first = tensor_get_float(src, base + i);
                 const float second = tensor_get_float(src, base + half + i);
-                dst_data[base + i] = first * c - second * s;
-                dst_data[base + half + i] = second * c + first * s;
+                tensor_set_float(dst, base + i, first * c - second * s);
+                tensor_set_float(dst, base + half + i, second * c + first * s);
             }
         }
     }
@@ -1913,7 +1929,7 @@ static void host_materialize_v_cache_view(TinyTensor *dst, const TinyTensor *bas
 
 static void host_rope(TinyTensor *dst, const TinyTensor *src, int head_dim, int position, float theta)
 {
-    runtime_assert(dst->dtype == TINY_DTYPE_FLOAT32, "rope output must be float");
+    runtime_assert(tensor_is_float_compatible(dst), "rope output must be float-compatible");
     runtime_assert(src->rank >= 2, "rope expects rank >= 2");
     runtime_assert(theta > 0.0f, "rope theta must be positive");
     runtime_assert(head_dim > 0 && (head_dim % 2) == 0, "rope head_dim must be positive and even");
@@ -1933,7 +1949,6 @@ static void host_rope(TinyTensor *dst, const TinyTensor *src, int head_dim, int 
         seq_len = src->shape[src->rank - 2];
     }
 
-    float *dst_data = tensor_f32(dst);
     if (host_rope_cache_prepare(head_dim, theta, position + seq_len - 1)) {
         for (int outer_idx = 0; outer_idx < outer; ++outer_idx) {
             for (int seq_idx = 0; seq_idx < seq_len; ++seq_idx) {
@@ -1946,8 +1961,8 @@ static void host_rope(TinyTensor *dst, const TinyTensor *src, int head_dim, int 
                     float s = sin_row[i];
                     float first = tensor_get_float(src, base + i);
                     float second = tensor_get_float(src, base + half + i);
-                    dst_data[base + i] = first * c - second * s;
-                    dst_data[base + half + i] = second * c + first * s;
+                    tensor_set_float(dst, base + i, first * c - second * s);
+                    tensor_set_float(dst, base + half + i, second * c + first * s);
                 }
             }
         }
@@ -1984,8 +1999,8 @@ static void host_rope(TinyTensor *dst, const TinyTensor *src, int head_dim, int 
                     float s = cur_sin[i];
                     float first = tensor_get_float(src, base + i);
                     float second = tensor_get_float(src, base + half + i);
-                    dst_data[base + i] = first * c - second * s;
-                    dst_data[base + half + i] = second * c + first * s;
+                    tensor_set_float(dst, base + i, first * c - second * s);
+                    tensor_set_float(dst, base + half + i, second * c + first * s);
                 }
                 if (seq_idx + 1 < seq_len) {
                     for (int i = 0; i < half; ++i) {

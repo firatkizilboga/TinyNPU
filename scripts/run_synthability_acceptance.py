@@ -57,8 +57,8 @@ def _static_rtl_guards() -> tuple[bool, str]:
         if "results_flat" in text:
             failures.append(f"{path.relative_to(ROOT)} still exposes results_flat")
 
-    if "XFORM_MODE_ROPE_K16" not in (ROOT / "rtl" / "defines.sv").read_text():
-        failures.append("defines.sv no longer declares XFORM_MODE_ROPE_K16; update acceptance policy")
+    if "XFORM_MODE_ROPE_K16" in (ROOT / "rtl" / "defines.sv").read_text():
+        failures.append("defines.sv still declares retired hardware RoPE XFORM mode")
 
     if failures:
         return False, "\n".join(failures)
@@ -107,7 +107,7 @@ def _checks(*, include_integration: bool, include_qllama: bool) -> list[Check]:
             timeout_s=300,
         ),
         Check(
-            "xform_q_f16_i16_shared",
+            "xform_qdq_f32_i16_shared",
             [
                 "make",
                 "-f",

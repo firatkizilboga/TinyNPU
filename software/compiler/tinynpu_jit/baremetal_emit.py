@@ -183,6 +183,41 @@ def _lookup_cache_base_addr(artifact: CompiledArtifact, base_name: str) -> int:
     return _lookup_tensor_addr(artifact, base_name)
 
 
+def _build_step_consumers(artifact: CompiledArtifact) -> dict[str, list[HostOp | NpuSegment | VerifyTensor]]:
+    consumers: dict[str, list[HostOp | NpuSegment | VerifyTensor]] = {}
+    for step in artifact.plan.steps:
+        if isinstance(step, HostOp):
+            for name in step.inputs:
+                consumers.setdefault(name, []).append(step)
+        elif isinstance(step, NpuSegment):
+            for name in step.inputs:
+                consumers.setdefault(name, []).append(step)
+            for op in step.ops:
+                for name in (op.lhs, op.rhs, op.bias):
+                    if name is not None:
+                        consumers.setdefault(name, []).append(step)
+        elif isinstance(step, VerifyTensor):
+            consumers.setdefault(step.tensor_name, []).append(step)
+    return consumers
+
+
+def _xform_quant_sources(artifact: CompiledArtifact) -> dict[str, str]:
+    consumers = _build_step_consumers(artifact)
+    sources: dict[str, str] = {}
+    for step in artifact.plan.steps:
+        if (
+            isinstance(step, HostOp)
+            and step.kind == "quantize"
+            and len(step.inputs) == 1
+            and len(step.outputs) == 1
+            and str(step.attrs.get("_npu_write_transform", "")) == "xform_q_f16_i16"
+        ):
+            non_verify_uses = [use for use in consumers.get(step.outputs[0], []) if not isinstance(use, VerifyTensor)]
+            if non_verify_uses and all(isinstance(use, NpuSegment) for use in non_verify_uses):
+                sources[step.outputs[0]] = step.inputs[0]
+    return sources
+
+
 def _emit_host_step_attrs(
     step: HostOp,
     artifact: CompiledArtifact,
@@ -234,6 +269,8 @@ def _emit_host_step_attrs(
         scale = float(step.attrs["scale"])
         zero_point = int(step.attrs.get("zero_point", 0))
         lines.append(f"    host_dequantize({out_ref}, {in_ref}, {_format_scalar(scale, dtype=DType.FLOAT32)}, {zero_point});")
+    elif step.kind == "fp16_to_float32":
+        lines.append(f"    host_fp16bits_to_float32_tensor({out_ref}, {in_ref});")
     elif step.kind == "requantize":
         scale = float(step.attrs["scale"])
         zero_point = int(step.attrs.get("zero_point", 0))
@@ -395,6 +432,7 @@ def emit_cv32e40p_c(
     verify_cpu_baseline: bool = False,
     repeat_count: int = 1,
     cpu_only_baseline: bool = False,
+    suppress_final_output_dump: bool = False,
 ) -> str:
     if verify_cpu_baseline and not emit_cpu_baseline:
         raise ValueError("verify_cpu_baseline requires emit_cpu_baseline=True.")
@@ -510,6 +548,7 @@ def emit_cv32e40p_c(
             next_im_addr += len(flattened_chunks)
 
     body_lines: list[str] = []
+    xform_quant_source_by_output = _xform_quant_sources(artifact)
 
     def _cpu_only_materialize_lines(tensor_name: str | None) -> list[str]:
         if tensor_name is None:
@@ -551,6 +590,8 @@ def emit_cv32e40p_c(
 
     for step in artifact.plan.steps:
         if isinstance(step, HostOp):
+            if step.outputs and step.outputs[0] in xform_quant_source_by_output:
+                continue
             attr_decls, lines = _emit_host_step_attrs(step, artifact, cpu_only_baseline=cpu_only_baseline)
             decls.extend(attr_decls)
             for input_name in step.inputs:
@@ -632,9 +673,10 @@ def emit_cv32e40p_c(
                 if tensor_name in produced_inside:
                     continue
                 symbol = segment.symbol_table[tensor_name]
+                source_tensor_name = xform_quant_source_by_output.get(tensor_name, tensor_name)
                 body_lines.append(
                     "    write_tensor_to_npu("
-                    f"{_emit_tensor_reference(tensor_name)}, 0x{int(symbol['addr']):04x}u, "
+                    f"{_emit_tensor_reference(source_tensor_name)}, 0x{int(symbol['addr']):04x}u, "
                     f"\"{symbol['role']}\", {int(symbol['precision'])}, {int(symbol['word_count'])});"
                 )
             for symbol_name, symbol in sorted(segment.symbol_table.items()):
@@ -784,9 +826,10 @@ def emit_cv32e40p_c(
     else:
         main_lines.extend(body_lines)
 
-    main_lines.append('    printf("Final outputs:\\n");')
-    for output_name in artifact.plan.outputs:
-        main_lines.append(f"    print_tensor({_emit_tensor_reference(output_name)});")
+    if not suppress_final_output_dump:
+        main_lines.append('    printf("Final outputs:\\n");')
+        for output_name in artifact.plan.outputs:
+            main_lines.append(f"    print_tensor({_emit_tensor_reference(output_name)});")
     main_lines.extend(verify_lines)
     if artifact.plan.outputs:
         main_lines.append('    printf("All outputs matched expected tensors\\n");')

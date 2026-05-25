@@ -6,10 +6,12 @@ module xform_unit (
     input  logic start,
     input  xform_mode_t mode,
     input  logic [`BUFFER_WIDTH-1:0] in_word,
+    input  logic [`BUFFER_WIDTH-1:0] in_word_hi,
     input  logic [15:0] multiplier,
     input  logic [7:0] shift,
     output logic done,
-    output logic [`BUFFER_WIDTH-1:0] out_word
+    output logic [`BUFFER_WIDTH-1:0] out_word,
+    output logic [`BUFFER_WIDTH-1:0] out_word_hi
 );
     localparam int XFORM_LANES_PER_CYCLE = 2;
     localparam int XFORM_GROUP_COUNT =
@@ -21,6 +23,7 @@ module xform_unit (
     logic [XFORM_GROUP_WIDTH-1:0] group_idx;
     xform_mode_t mode_reg;
     logic [`BUFFER_WIDTH-1:0] in_word_reg;
+    logic [`BUFFER_WIDTH-1:0] in_word_hi_reg;
     logic [15:0] multiplier_reg;
     logic [7:0] shift_reg;
 
@@ -57,53 +60,55 @@ module xform_unit (
         end
     endfunction
 
-    function automatic logic signed [15:0] quantize_lane_q_f16_i16(
-        input logic [15:0] fp16,
+    function automatic logic signed [15:0] quantize_lane_q_f32_i16(
+        input logic [31:0] fp32,
         input logic [15:0] lane_multiplier,
         input logic [7:0] lane_shift
     );
         logic sign;
-        logic [4:0] exp_bits;
-        logic [9:0] frac_bits;
+        logic [7:0] exp_bits;
+        logic [22:0] frac_bits;
         logic signed [63:0] mant;
         logic signed [63:0] scaled;
         logic signed [63:0] qvalue;
         int exp2;
+        int shift_i;
         int left_shift;
         int right_shift;
         begin
-            sign = fp16[15];
-            exp_bits = fp16[14:10];
-            frac_bits = fp16[9:0];
+            sign = fp32[31];
+            exp_bits = fp32[30:23];
+            frac_bits = fp32[22:0];
+            shift_i = int'(lane_shift);
             qvalue = 64'sd0;
             if (lane_multiplier == 16'd0) begin
-                quantize_lane_q_f16_i16 = 16'sd0;
-            end else if (exp_bits == 5'h1f) begin
-                quantize_lane_q_f16_i16 = sign ? -16'sd32768 : 16'sd32767;
-            end else if (exp_bits == 5'd0 && frac_bits == 10'd0) begin
-                quantize_lane_q_f16_i16 = 16'sd0;
+                quantize_lane_q_f32_i16 = 16'sd0;
+            end else if (exp_bits == 8'hff) begin
+                quantize_lane_q_f32_i16 = sign ? -16'sd32768 : 16'sd32767;
+            end else if (exp_bits == 8'd0 && frac_bits == 23'd0) begin
+                quantize_lane_q_f32_i16 = 16'sd0;
             end else begin
-                if (exp_bits == 5'd0) begin
-                    mant = $signed({2'b00, frac_bits});
-                    exp2 = -24;
+                if (exp_bits == 8'd0) begin
+                    mant = $signed({41'd0, frac_bits});
+                    exp2 = -149;
                 end else begin
-                    mant = $signed({2'b01, frac_bits});
-                    exp2 = $signed({1'b0, exp_bits}) - 25;
+                    mant = $signed({40'd0, 1'b1, frac_bits});
+                    exp2 = int'(exp_bits) - 150;
                 end
 
                 scaled = mant * $signed({1'b0, lane_multiplier});
-                if (exp2 >= $signed({1'b0, lane_shift})) begin
-                    left_shift = exp2 - $signed({1'b0, lane_shift});
-                    qvalue = (left_shift >= 47) ? 64'sh7fffffffffffffff : (scaled <<< left_shift);
+                if (exp2 >= shift_i) begin
+                    left_shift = exp2 - shift_i;
+                    qvalue = (left_shift >= 24) ? 64'sh7fffffffffffffff : (scaled <<< left_shift);
                 end else begin
-                    right_shift = $signed({1'b0, lane_shift}) - exp2;
+                    right_shift = shift_i - exp2;
                     qvalue = round_shift_right_signed(scaled, right_shift);
                 end
 
                 if (sign) begin
                     qvalue = -qvalue;
                 end
-                quantize_lane_q_f16_i16 = clip_i16(qvalue);
+                quantize_lane_q_f32_i16 = clip_i16(qvalue);
             end
         end
     endfunction
@@ -135,7 +140,7 @@ module xform_unit (
         end
     endfunction
 
-    function automatic logic [15:0] dequantize_lane_i16_f16(
+    function automatic logic [31:0] dequantize_lane_i16_f32(
         input logic signed [15:0] value,
         input logic [15:0] lane_multiplier,
         input logic [7:0] lane_shift
@@ -144,56 +149,56 @@ module xform_unit (
         logic [15:0] magnitude;
         logic [31:0] product;
         logic [31:0] rounded;
-        logic [10:0] significand;
+        logic [22:0] fraction;
         int unsigned msb;
         int signed exp_unbiased;
-        int signed exp_half;
+        int signed exp_float;
         int signed normal_shift;
         int signed subnormal_shift;
         begin
             if (value == 16'sd0 || lane_multiplier == 16'd0) begin
-                dequantize_lane_i16_f16 = 16'h0000;
+                dequantize_lane_i16_f32 = 32'h0000_0000;
             end else begin
                 sign = value[15];
                 magnitude = sign ? ((~value[15:0]) + 16'd1) : value[15:0];
                 product = {16'd0, magnitude} * {16'd0, lane_multiplier};
                 msb = msb_index_u32(product);
                 exp_unbiased = int'(msb) - int'(lane_shift);
-                exp_half = exp_unbiased + 15;
+                exp_float = exp_unbiased + 127;
 
-                if (exp_half >= 31) begin
-                    dequantize_lane_i16_f16 = {sign, 5'h1e, 10'h3ff};
-                end else if (exp_half <= 0) begin
-                    subnormal_shift = int'(lane_shift) - 24;
+                if (exp_float >= 255) begin
+                    dequantize_lane_i16_f32 = {sign, 8'hfe, 23'h7fffff};
+                end else if (exp_float <= 0) begin
+                    subnormal_shift = int'(lane_shift) - 149;
                     if (subnormal_shift <= 0) begin
                         rounded = ((-subnormal_shift) >= 32) ? 32'hffff_ffff : (product << (-subnormal_shift));
                     end else begin
                         rounded = round_shift_right_unsigned32(product, subnormal_shift);
                     end
                     if (rounded == 32'd0) begin
-                        dequantize_lane_i16_f16 = 16'h0000;
-                    end else if (rounded >= 32'd1024) begin
-                        dequantize_lane_i16_f16 = {sign, 5'd1, 10'd0};
+                        dequantize_lane_i16_f32 = 32'h0000_0000;
+                    end else if (rounded >= 32'h0080_0000) begin
+                        dequantize_lane_i16_f32 = {sign, 8'd1, 23'd0};
                     end else begin
-                        dequantize_lane_i16_f16 = {sign, 5'd0, rounded[9:0]};
+                        dequantize_lane_i16_f32 = {sign, 8'd0, rounded[22:0]};
                     end
                 end else begin
-                    normal_shift = int'(msb) - 10;
+                    normal_shift = int'(msb) - 23;
                     if (normal_shift >= 0) begin
                         rounded = round_shift_right_unsigned32(product, normal_shift);
                     end else begin
                         rounded = product << (-normal_shift);
                     end
-                    if (rounded >= 32'd2048) begin
-                        exp_half = exp_half + 1;
-                        significand = 11'd1024;
+                    if (rounded >= 32'd16777216) begin
+                        exp_float = exp_float + 1;
+                        fraction = 23'd0;
                     end else begin
-                        significand = rounded[10:0];
+                        fraction = rounded[22:0];
                     end
-                    if (exp_half >= 31) begin
-                        dequantize_lane_i16_f16 = {sign, 5'h1e, 10'h3ff};
+                    if (exp_float >= 255) begin
+                        dequantize_lane_i16_f32 = {sign, 8'hfe, 23'h7fffff};
                     end else begin
-                        dequantize_lane_i16_f16 = {sign, exp_half[4:0], significand[9:0]};
+                        dequantize_lane_i16_f32 = {sign, exp_float[7:0], fraction};
                     end
                 end
             end
@@ -207,9 +212,11 @@ module xform_unit (
             group_idx <= '0;
             mode_reg <= XFORM_MODE_NONE;
             in_word_reg <= '0;
+            in_word_hi_reg <= '0;
             multiplier_reg <= '0;
             shift_reg <= '0;
             out_word <= '0;
+            out_word_hi <= '0;
         end else begin
             done <= 1'b0;
             if (start && !busy) begin
@@ -217,28 +224,38 @@ module xform_unit (
                 group_idx <= '0;
                 mode_reg <= mode;
                 in_word_reg <= in_word;
+                in_word_hi_reg <= in_word_hi;
                 multiplier_reg <= multiplier;
                 shift_reg <= shift;
                 out_word <= in_word;
+                out_word_hi <= in_word_hi;
             end else if (busy) begin
                 for (int lane_offset = 0; lane_offset < XFORM_LANES_PER_CYCLE; lane_offset++) begin
                     int lane;
                     lane = int'(group_idx) * XFORM_LANES_PER_CYCLE + lane_offset;
                     if (lane < `ARRAY_SIZE) begin
                         unique case (mode_reg)
-                            XFORM_MODE_Q_F16_I16: begin
-                                out_word[lane*16 +: 16] <= quantize_lane_q_f16_i16(
-                                    in_word_reg[lane*16 +: 16],
+                            XFORM_MODE_Q_F32_I16: begin
+                                out_word[lane*16 +: 16] <= quantize_lane_q_f32_i16(
+                                    lane < 4 ? in_word_reg[lane*32 +: 32] : in_word_hi_reg[(lane-4)*32 +: 32],
                                     multiplier_reg,
                                     shift_reg
                                 );
                             end
-                            XFORM_MODE_DQ_I16_F16: begin
-                                out_word[lane*16 +: 16] <= dequantize_lane_i16_f16(
-                                    $signed(in_word_reg[lane*16 +: 16]),
-                                    multiplier_reg,
-                                    shift_reg
-                                );
+                            XFORM_MODE_DQ_I16_F32: begin
+                                if (lane < 4) begin
+                                    out_word[lane*32 +: 32] <= dequantize_lane_i16_f32(
+                                        $signed(in_word_reg[lane*16 +: 16]),
+                                        multiplier_reg,
+                                        shift_reg
+                                    );
+                                end else begin
+                                    out_word_hi[(lane-4)*32 +: 32] <= dequantize_lane_i16_f32(
+                                        $signed(in_word_reg[lane*16 +: 16]),
+                                        multiplier_reg,
+                                        shift_reg
+                                    );
+                                end
                             end
                             default: ;
                         endcase

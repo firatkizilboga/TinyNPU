@@ -60,10 +60,39 @@ def _dq_attrs(scale: float, *, enable_dq_xform: bool) -> dict[str, object]:
     return _dq_fp16_attrs(scale) if enable_dq_xform else {"scale": float(scale), "zero_point": 0}
 
 
+def _fp16_host_dtype(enable_xform: bool) -> DType:
+    return DType.INT16 if enable_xform else DType.FLOAT32
+
+
+def _fp16_host_metadata(enable_xform: bool) -> dict[str, object]:
+    return {"value_encoding": "fp16_bits"} if enable_xform else {}
+
+
+def _fp16_host_attrs(enable_xform: bool) -> dict[str, object]:
+    return {"output_encoding": "fp16_bits"} if enable_xform else {}
+
+
+def _quant_attrs(scale: float, *, enable_xform: bool) -> dict[str, object]:
+    attrs: dict[str, object] = {"scale": float(scale), "zero_point": 0, "dtype": DType.INT16}
+    if enable_xform:
+        attrs["input_encoding"] = "fp16_bits"
+    return attrs
+
+
 def _dequant_boundary(source: np.ndarray, *, scale: float, enable_dq_xform: bool, golden: GoldenModel) -> np.ndarray:
     if enable_dq_xform:
         return _dequantize_fp16_boundary(source, scale=scale)
     return golden.dequantize(source, scale=scale, zero_point=0)
+
+
+def _quant_boundary(source: np.ndarray, *, scale: float, enable_xform: bool, golden: GoldenModel) -> np.ndarray:
+    if enable_xform:
+        return _quantize_fp16_boundary(source, scale=scale)
+    return golden.quantize(source, scale=scale, zero_point=0, out_dtype=DType.INT16)
+
+
+def _fp16_roundtrip(source: np.ndarray) -> np.ndarray:
+    return np.asarray(source, dtype=np.float32).astype(np.float16).astype(np.float32)
 
 
 def _rope_ref(x: np.ndarray, *, positions: np.ndarray, head_dim: int, theta: float) -> np.ndarray:
@@ -376,19 +405,19 @@ def reference_prefill(
     down_out_scale = _qact(block, "down_out")
 
     x_norm1 = _rmsnorm(x_in, block.input_layernorm_w, block.config.rms_norm_eps)
-    x_norm1_q = golden.quantize(x_norm1, scale=rms1_scale, zero_point=0, out_dtype=DType.INT16)
+    x_norm1_q = _quant_boundary(x_norm1, scale=rms1_scale, enable_xform=enable_dq_xform, golden=golden)
 
     q_rope_heads: list[np.ndarray] = []
     k_rope_heads: list[np.ndarray] = []
     v_heads: list[np.ndarray] = []
     attn_heads: list[np.ndarray] = []
-    rope_dq_fallback = enable_dq_xform and _rope_uses_dq_fallback(d_head)
+    rope_dq_fallback = enable_dq_xform
     score_scale = np.float32(_qscore_scale(block, d_head))
     for q_head in range(n_heads):
         q_int = golden.matmul(x_norm1_q, q_weights[q_head], out_dtype=DType.INT16, **_qmatmul(block, "q_proj"))
         q_f = _dequantize_fp16_boundary(q_int, scale=q_out_scale) if rope_dq_fallback else golden.dequantize(q_int, scale=q_out_scale, zero_point=0)
         q_rope_f = _rope_ref(q_f, positions=positions, head_dim=d_head, theta=resolved_rope_theta)
-        q_rope_q = golden.quantize(q_rope_f, scale=rope_q_scale, zero_point=0, out_dtype=DType.INT16)
+        q_rope_q = _quant_boundary(q_rope_f, scale=rope_q_scale, enable_xform=enable_dq_xform, golden=golden)
         q_rope_heads.append(q_rope_q)
 
     for kv_head in range(n_kv_heads):
@@ -396,7 +425,11 @@ def reference_prefill(
         v_int = golden.matmul(x_norm1_q, v_weights[kv_head], out_dtype=DType.INT16, **_qmatmul(block, "v_proj"))
         k_f = _dequantize_fp16_boundary(k_int, scale=k_out_scale) if rope_dq_fallback else golden.dequantize(k_int, scale=k_out_scale, zero_point=0)
         k_rope_f = _rope_ref(k_f, positions=positions, head_dim=d_head, theta=resolved_rope_theta)
-        k_rope_q = golden.quantize(k_rope_f, scale=rope_k_scale, zero_point=0, out_dtype=DType.INT16)
+        # K-cache writes are still scatter writes, not contiguous XFORM writes.
+        # Match the runtime path: RoPE emits FP16 bits, then host scalar quantizes
+        # those rounded values before scattering into the transposed K cache.
+        k_rope_source = _fp16_roundtrip(k_rope_f) if enable_dq_xform else k_rope_f
+        k_rope_q = golden.quantize(k_rope_source, scale=rope_k_scale, zero_point=0, out_dtype=DType.INT16)
         k_rope_heads.append(k_rope_q)
         # V stays in projected INT16 space because it is not rotary-transformed.
         v_heads.append(v_int)
@@ -430,14 +463,18 @@ def reference_prefill(
     o_f = _dequant_boundary(o_int, scale=o_out_scale, enable_dq_xform=enable_dq_xform, golden=golden)
     resid1 = (x_in + o_f).astype(np.float32)
     x_norm2 = _rmsnorm(resid1, block.post_attention_layernorm_w, block.config.rms_norm_eps)
-    x_norm2_q = golden.quantize(x_norm2, scale=rms2_scale, zero_point=0, out_dtype=DType.INT16)
+    x_norm2_q = _quant_boundary(x_norm2, scale=rms2_scale, enable_xform=enable_dq_xform, golden=golden)
     gate_int = golden.matmul(x_norm2_q, np.asarray(block.mlp_gate_proj_w, dtype=np.int16), out_dtype=DType.INT16, **_qmatmul(block, "gate_proj"))
     up_int = golden.matmul(x_norm2_q, np.asarray(block.mlp_up_proj_w, dtype=np.int16), out_dtype=DType.INT16, **_qmatmul(block, "up_proj"))
     gate_f = _dequant_boundary(gate_int, scale=gate_out_scale, enable_dq_xform=enable_dq_xform, golden=golden)
     up_f = _dequant_boundary(up_int, scale=up_out_scale, enable_dq_xform=enable_dq_xform, golden=golden)
     gate_act = _silu(gate_f)
+    if enable_dq_xform:
+        gate_act = _fp16_roundtrip(gate_act)
     ffn_hidden = (gate_act * up_f).astype(np.float32)
-    ffn_hidden_q = golden.quantize(ffn_hidden, scale=ffn_hidden_scale, zero_point=0, out_dtype=DType.INT16)
+    if enable_dq_xform:
+        ffn_hidden = _fp16_roundtrip(ffn_hidden)
+    ffn_hidden_q = _quant_boundary(ffn_hidden, scale=ffn_hidden_scale, enable_xform=enable_dq_xform, golden=golden)
     ffn_out_int = golden.matmul(ffn_hidden_q, np.asarray(block.mlp_down_proj_w, dtype=np.int16), out_dtype=DType.INT16, **_qmatmul(block, "down_proj"))
     ffn_out_f = _dequant_boundary(ffn_out_int, scale=down_out_scale, enable_dq_xform=enable_dq_xform, golden=golden)
     out = (resid1 + ffn_out_f).astype(np.float32)
@@ -506,19 +543,19 @@ def reference_decode(
     down_out_scale = _qact(block, "down_out")
 
     x_norm1 = _rmsnorm(x_in, block.input_layernorm_w, block.config.rms_norm_eps)
-    x_norm1_q = golden.quantize(x_norm1, scale=rms1_scale, zero_point=0, out_dtype=DType.INT16)
+    x_norm1_q = _quant_boundary(x_norm1, scale=rms1_scale, enable_xform=enable_dq_xform, golden=golden)
 
     q_rope_heads: list[np.ndarray] = []
     k_cur_heads: list[np.ndarray] = []
     v_cur_heads: list[np.ndarray] = []
     attn_heads: list[np.ndarray] = []
-    rope_dq_fallback = enable_dq_xform and _rope_uses_dq_fallback(d_head)
+    rope_dq_fallback = enable_dq_xform
     score_scale = np.float32(_qscore_scale(block, d_head))
     for q_head in range(n_heads):
         q_int = golden.matmul(x_norm1_q, q_weights[q_head], out_dtype=DType.INT16, **_qmatmul(block, "q_proj"))
         q_f = _dequantize_fp16_boundary(q_int, scale=q_out_scale) if rope_dq_fallback else golden.dequantize(q_int, scale=q_out_scale, zero_point=0)
         q_rope_f = _rope_ref(q_f, positions=decode_pos, head_dim=d_head, theta=resolved_rope_theta)
-        q_rope_q = golden.quantize(q_rope_f, scale=rope_q_scale, zero_point=0, out_dtype=DType.INT16)
+        q_rope_q = _quant_boundary(q_rope_f, scale=rope_q_scale, enable_xform=enable_dq_xform, golden=golden)
         q_rope_heads.append(q_rope_q)
 
     for kv_head in range(n_kv_heads):
@@ -526,7 +563,11 @@ def reference_decode(
         v_int = golden.matmul(x_norm1_q, v_weights[kv_head], out_dtype=DType.INT16, **_qmatmul(block, "v_proj"))
         k_f = _dequantize_fp16_boundary(k_int, scale=k_out_scale) if rope_dq_fallback else golden.dequantize(k_int, scale=k_out_scale, zero_point=0)
         k_rope_f = _rope_ref(k_f, positions=decode_pos, head_dim=d_head, theta=resolved_rope_theta)
-        k_rope_q = golden.quantize(k_rope_f, scale=rope_k_scale, zero_point=0, out_dtype=DType.INT16)
+        # K-cache writes are still scatter writes, not contiguous XFORM writes.
+        # Match the runtime path: RoPE emits FP16 bits, then host scalar quantizes
+        # those rounded values before scattering into the transposed K cache.
+        k_rope_source = _fp16_roundtrip(k_rope_f) if enable_dq_xform else k_rope_f
+        k_rope_q = golden.quantize(k_rope_source, scale=rope_k_scale, zero_point=0, out_dtype=DType.INT16)
         k_cur_heads.append(k_rope_q)
         # V stays in projected INT16 space because it is not rotary-transformed.
         v_cur_heads.append(v_int)
@@ -570,14 +611,18 @@ def reference_decode(
     o_f = _dequant_boundary(o_int, scale=o_out_scale, enable_dq_xform=enable_dq_xform, golden=golden)
     resid1 = (x_in + o_f).astype(np.float32)
     x_norm2 = _rmsnorm(resid1, block.post_attention_layernorm_w, block.config.rms_norm_eps)
-    x_norm2_q = golden.quantize(x_norm2, scale=rms2_scale, zero_point=0, out_dtype=DType.INT16)
+    x_norm2_q = _quant_boundary(x_norm2, scale=rms2_scale, enable_xform=enable_dq_xform, golden=golden)
     gate_int = golden.matmul(x_norm2_q, np.asarray(block.mlp_gate_proj_w, dtype=np.int16), out_dtype=DType.INT16, **_qmatmul(block, "gate_proj"))
     up_int = golden.matmul(x_norm2_q, np.asarray(block.mlp_up_proj_w, dtype=np.int16), out_dtype=DType.INT16, **_qmatmul(block, "up_proj"))
     gate_f = _dequant_boundary(gate_int, scale=gate_out_scale, enable_dq_xform=enable_dq_xform, golden=golden)
     up_f = _dequant_boundary(up_int, scale=up_out_scale, enable_dq_xform=enable_dq_xform, golden=golden)
     gate_act = _silu(gate_f)
+    if enable_dq_xform:
+        gate_act = _fp16_roundtrip(gate_act)
     ffn_hidden = (gate_act * up_f).astype(np.float32)
-    ffn_hidden_q = golden.quantize(ffn_hidden, scale=ffn_hidden_scale, zero_point=0, out_dtype=DType.INT16)
+    if enable_dq_xform:
+        ffn_hidden = _fp16_roundtrip(ffn_hidden)
+    ffn_hidden_q = _quant_boundary(ffn_hidden, scale=ffn_hidden_scale, enable_xform=enable_dq_xform, golden=golden)
     ffn_out_int = golden.matmul(ffn_hidden_q, np.asarray(block.mlp_down_proj_w, dtype=np.int16), out_dtype=DType.INT16, **_qmatmul(block, "down_proj"))
     ffn_out_f = _dequant_boundary(ffn_out_int, scale=down_out_scale, enable_dq_xform=enable_dq_xform, golden=golden)
     out = (resid1 + ffn_out_f).astype(np.float32)
@@ -640,7 +685,10 @@ def _common_io_tensors(
     seq_len: int,
     act_scale: float,
     out_name: str = "out",
+    enable_dq_xform: bool = False,
 ) -> dict[str, TensorSpec]:
+    fp_dtype = _fp16_host_dtype(enable_dq_xform)
+    fp_meta = _fp16_host_metadata(enable_dq_xform)
     return {
         "x_in": TensorSpec("x_in", (seq_len, d_model), DType.FLOAT32, TensorKind.CONSTANT, data=np.array(x_in, dtype=np.float32, copy=True)),
         "rms1_w": TensorSpec("rms1_w", (d_model,), DType.FLOAT32, TensorKind.CONSTANT, data=np.array(block.input_layernorm_w, dtype=np.float32, copy=True)),
@@ -649,21 +697,21 @@ def _common_io_tensors(
         "w_gate": TensorSpec("w_gate", (d_model, ffn_hidden_dim), DType.INT16, TensorKind.CONSTANT, data=np.array(block.mlp_gate_proj_w, dtype=np.int16, copy=True)),
         "w_up": TensorSpec("w_up", (d_model, ffn_hidden_dim), DType.INT16, TensorKind.CONSTANT, data=np.array(block.mlp_up_proj_w, dtype=np.int16, copy=True)),
         "w_down": TensorSpec("w_down", (ffn_hidden_dim, d_model), DType.INT16, TensorKind.CONSTANT, data=np.array(block.mlp_down_proj_w, dtype=np.int16, copy=True)),
-        "x_norm1": TensorSpec("x_norm1", (seq_len, d_model), DType.FLOAT32, TensorKind.INTERMEDIATE),
+        "x_norm1": TensorSpec("x_norm1", (seq_len, d_model), fp_dtype, TensorKind.INTERMEDIATE, metadata=dict(fp_meta)),
         "x_norm1_q": TensorSpec("x_norm1_q", (seq_len, d_model), DType.INT16, TensorKind.INTERMEDIATE, metadata={"storage_role": "A"}),
         "attn_cat": TensorSpec("attn_cat", (seq_len, attn_dim), DType.INT16, TensorKind.INTERMEDIATE),
         "attn_cat_a": TensorSpec("attn_cat_a", (seq_len, attn_dim), DType.INT16, TensorKind.INTERMEDIATE, metadata={"storage_role": "A"}),
         "o_int": TensorSpec("o_int", (seq_len, d_model), DType.INT16, TensorKind.INTERMEDIATE),
         "o_f": TensorSpec("o_f", (seq_len, d_model), DType.FLOAT32, TensorKind.INTERMEDIATE),
         "resid1": TensorSpec("resid1", (seq_len, d_model), DType.FLOAT32, TensorKind.INTERMEDIATE),
-        "x_norm2": TensorSpec("x_norm2", (seq_len, d_model), DType.FLOAT32, TensorKind.INTERMEDIATE),
+        "x_norm2": TensorSpec("x_norm2", (seq_len, d_model), fp_dtype, TensorKind.INTERMEDIATE, metadata=dict(fp_meta)),
         "x_norm2_q": TensorSpec("x_norm2_q", (seq_len, d_model), DType.INT16, TensorKind.INTERMEDIATE, metadata={"storage_role": "A"}),
         "gate_int": TensorSpec("gate_int", (seq_len, ffn_hidden_dim), DType.INT16, TensorKind.INTERMEDIATE),
         "up_int": TensorSpec("up_int", (seq_len, ffn_hidden_dim), DType.INT16, TensorKind.INTERMEDIATE),
         "gate_f": TensorSpec("gate_f", (seq_len, ffn_hidden_dim), DType.FLOAT32, TensorKind.INTERMEDIATE),
         "up_f": TensorSpec("up_f", (seq_len, ffn_hidden_dim), DType.FLOAT32, TensorKind.INTERMEDIATE),
-        "gate_act": TensorSpec("gate_act", (seq_len, ffn_hidden_dim), DType.FLOAT32, TensorKind.INTERMEDIATE),
-        "ffn_hidden": TensorSpec("ffn_hidden", (seq_len, ffn_hidden_dim), DType.FLOAT32, TensorKind.INTERMEDIATE),
+        "gate_act": TensorSpec("gate_act", (seq_len, ffn_hidden_dim), fp_dtype, TensorKind.INTERMEDIATE, metadata=dict(fp_meta)),
+        "ffn_hidden": TensorSpec("ffn_hidden", (seq_len, ffn_hidden_dim), fp_dtype, TensorKind.INTERMEDIATE, metadata=dict(fp_meta)),
         "ffn_hidden_q": TensorSpec("ffn_hidden_q", (seq_len, ffn_hidden_dim), DType.INT16, TensorKind.INTERMEDIATE, metadata={"storage_role": "A"}),
         "ffn_out_int": TensorSpec("ffn_out_int", (seq_len, d_model), DType.INT16, TensorKind.INTERMEDIATE),
         "ffn_out_f": TensorSpec("ffn_out_f", (seq_len, d_model), DType.FLOAT32, TensorKind.INTERMEDIATE),
@@ -703,12 +751,15 @@ def _add_prefill_head_runtime_tensors(
     act_scale: float,
     score_scale: float | None = None,
     score_dtype: DType = DType.INT16,
+    enable_dq_xform: bool = False,
 ) -> None:
+    fp_dtype = _fp16_host_dtype(enable_dq_xform)
+    fp_meta = _fp16_host_metadata(enable_dq_xform)
     token_names = [f"t{i}" for i in range(prompt_len)]
     for q_head in range(n_heads):
         builder.add_tensor(TensorSpec(f"q_int_h{q_head}", (prompt_len, d_head), DType.INT16, TensorKind.INTERMEDIATE))
         builder.add_tensor(TensorSpec(f"q_f_h{q_head}", (prompt_len, d_head), DType.FLOAT32, TensorKind.INTERMEDIATE))
-        builder.add_tensor(TensorSpec(f"q_rope_f_h{q_head}", (prompt_len, d_head), DType.FLOAT32, TensorKind.INTERMEDIATE))
+        builder.add_tensor(TensorSpec(f"q_rope_f_h{q_head}", (prompt_len, d_head), fp_dtype, TensorKind.INTERMEDIATE, metadata=dict(fp_meta)))
         builder.add_tensor(TensorSpec(f"q_rope_q_h{q_head}", (prompt_len, d_head), DType.INT16, TensorKind.INTERMEDIATE, metadata={"storage_role": "A"}))
         kv_head = _kv_head_for_q_head(q_head, n_heads=n_heads, n_kv_heads=n_kv_heads)
         builder.add_tensor(TensorSpec(f"scores_h{q_head}", (prompt_len, prompt_len), score_dtype, TensorKind.INTERMEDIATE))
@@ -736,7 +787,7 @@ def _add_prefill_head_runtime_tensors(
         builder.add_tensor(TensorSpec(f"k_seq_h{kv_head}", (prompt_len, d_head), DType.INT16, TensorKind.INTERMEDIATE))
         builder.add_tensor(TensorSpec(f"v_seq_h{kv_head}", (prompt_len, d_head), DType.INT16, TensorKind.INTERMEDIATE))
         builder.add_tensor(TensorSpec(f"k_f_h{kv_head}", (prompt_len, d_head), DType.FLOAT32, TensorKind.INTERMEDIATE))
-        builder.add_tensor(TensorSpec(f"k_rope_f_h{kv_head}", (prompt_len, d_head), DType.FLOAT32, TensorKind.INTERMEDIATE))
+        builder.add_tensor(TensorSpec(f"k_rope_f_h{kv_head}", (prompt_len, d_head), fp_dtype, TensorKind.INTERMEDIATE, metadata=dict(fp_meta)))
         builder.add_tensor(TensorSpec(f"k_rope_q_h{kv_head}", (prompt_len, d_head), DType.INT16, TensorKind.INTERMEDIATE))
 
 
@@ -753,6 +804,7 @@ def _add_decode_head_runtime_tensors(
     score_scale: float | None = None,
     cache_token_names: list[str],
     score_dtype: DType = DType.INT16,
+    enable_dq_xform: bool = False,
 ) -> None:
     """Seed decode caches.
 
@@ -760,10 +812,12 @@ def _add_decode_head_runtime_tensors(
     `(cache_len, d_head)`. The K transpose is owned by the scatter helpers and
     by this decode seeding path.
     """
+    fp_dtype = _fp16_host_dtype(enable_dq_xform)
+    fp_meta = _fp16_host_metadata(enable_dq_xform)
     for q_head in range(n_heads):
         builder.add_tensor(TensorSpec(f"q_int_h{q_head}", (1, d_head), DType.INT16, TensorKind.INTERMEDIATE))
         builder.add_tensor(TensorSpec(f"q_f_h{q_head}", (1, d_head), DType.FLOAT32, TensorKind.INTERMEDIATE))
-        builder.add_tensor(TensorSpec(f"q_rope_f_h{q_head}", (1, d_head), DType.FLOAT32, TensorKind.INTERMEDIATE))
+        builder.add_tensor(TensorSpec(f"q_rope_f_h{q_head}", (1, d_head), fp_dtype, TensorKind.INTERMEDIATE, metadata=dict(fp_meta)))
         builder.add_tensor(TensorSpec(f"q_rope_q_h{q_head}", (1, d_head), DType.INT16, TensorKind.INTERMEDIATE, metadata={"storage_role": "A"}))
         builder.add_tensor(TensorSpec(f"scores_h{q_head}", (1, cache_len), score_dtype, TensorKind.INTERMEDIATE))
         builder.add_tensor(TensorSpec(f"scores_f_h{q_head}", (1, cache_len), DType.FLOAT32, TensorKind.INTERMEDIATE))
@@ -796,7 +850,7 @@ def _add_decode_head_runtime_tensors(
         builder.add_tensor(TensorSpec(f"k_cur_h{kv_head}", (1, d_head), DType.INT16, TensorKind.INTERMEDIATE))
         builder.add_tensor(TensorSpec(f"v_cur_h{kv_head}", (1, d_head), DType.INT16, TensorKind.INTERMEDIATE))
         builder.add_tensor(TensorSpec(f"k_f_h{kv_head}", (1, d_head), DType.FLOAT32, TensorKind.INTERMEDIATE))
-        builder.add_tensor(TensorSpec(f"k_rope_f_h{kv_head}", (1, d_head), DType.FLOAT32, TensorKind.INTERMEDIATE))
+        builder.add_tensor(TensorSpec(f"k_rope_f_h{kv_head}", (1, d_head), fp_dtype, TensorKind.INTERMEDIATE, metadata=dict(fp_meta)))
         builder.add_tensor(TensorSpec(f"k_rope_q_h{kv_head}", (1, d_head), DType.INT16, TensorKind.INTERMEDIATE))
 
 
@@ -895,13 +949,13 @@ def _append_transformer_tail(
     builder.host("dequant_o", "dequantize", inputs=["o_int"], outputs=["o_f"], attrs=_dq_attrs(o_out_scale, enable_dq_xform=enable_dq_xform))
     residual1_attrs = {"rhs_encoding": "fp16_bits"} if enable_dq_xform else {}
     builder.host("residual1", "add", inputs=["x_in", "o_f"], outputs=["resid1"], attrs=residual1_attrs)
-    builder.host("rmsnorm2", "rmsnorm", inputs=["resid1", "rms2_w"], outputs=["x_norm2"], attrs={"eps": rms_norm_eps})
+    builder.host("rmsnorm2", "rmsnorm", inputs=["resid1", "rms2_w"], outputs=["x_norm2"], attrs={"eps": rms_norm_eps, **_fp16_host_attrs(enable_dq_xform)})
     builder.host(
         "quant_x_norm2",
         "quantize",
         inputs=["x_norm2"],
         outputs=["x_norm2_q"],
-        attrs={"scale": rms2_scale, "zero_point": 0, "dtype": DType.INT16},
+        attrs=_quant_attrs(rms2_scale, enable_xform=enable_dq_xform),
     )
     builder.segment(
         "seg_ffn_up",
@@ -914,8 +968,10 @@ def _append_transformer_tail(
     )
     builder.host("dequant_gate", "dequantize", inputs=["gate_int"], outputs=["gate_f"], attrs=_dq_attrs(gate_out_scale, enable_dq_xform=enable_dq_xform))
     builder.host("dequant_up", "dequantize", inputs=["up_int"], outputs=["up_f"], attrs=_dq_attrs(up_out_scale, enable_dq_xform=enable_dq_xform))
-    silu_attrs = {"input_encoding": "fp16_bits"} if enable_dq_xform else {}
-    ffn_mul_attrs = {"rhs_encoding": "fp16_bits"} if enable_dq_xform else {}
+    silu_attrs = {"input_encoding": "fp16_bits", **_fp16_host_attrs(enable_dq_xform)} if enable_dq_xform else {}
+    ffn_mul_attrs = {"lhs_encoding": "fp16_bits", "rhs_encoding": "fp16_bits"} if enable_dq_xform else {}
+    if enable_dq_xform:
+        ffn_mul_attrs["output_encoding"] = "fp16_bits"
     builder.host("silu_gate", "silu", inputs=["gate_f"], outputs=["gate_act"], attrs=silu_attrs)
     builder.host("ffn_mul", "mul", inputs=["gate_act", "up_f"], outputs=["ffn_hidden"], attrs=ffn_mul_attrs)
     builder.host(
@@ -923,7 +979,7 @@ def _append_transformer_tail(
         "quantize",
         inputs=["ffn_hidden"],
         outputs=["ffn_hidden_q"],
-        attrs={"scale": ffn_hidden_scale, "zero_point": 0, "dtype": DType.INT16},
+        attrs=_quant_attrs(ffn_hidden_scale, enable_xform=enable_dq_xform),
     )
     builder.segment(
         "seg_ffn_down",
@@ -1018,6 +1074,7 @@ def build_prefill_artifact(
             attn_dim=attn_dim,
             seq_len=prompt_len,
             act_scale=act_scale,
+            enable_dq_xform=enable_dq_xform,
         ),
     )
     _add_projection_tensors(b, block=block, d_model=d_model, d_head=d_head, n_heads=n_heads, n_kv_heads=n_kv_heads)
@@ -1030,16 +1087,17 @@ def build_prefill_artifact(
         act_scale=act_scale,
         score_scale=_qscore_scale(block, d_head),
         score_dtype=_qmatmul_out_dtype(block, "score"),
+        enable_dq_xform=enable_dq_xform,
     )
     _add_attention_concat_tensors(b, seq_len=prompt_len, d_head=d_head, n_heads=n_heads)
 
-    b.host("rmsnorm1", "rmsnorm", inputs=["x_in", "rms1_w"], outputs=["x_norm1"], attrs={"eps": rms_norm_eps})
+    b.host("rmsnorm1", "rmsnorm", inputs=["x_in", "rms1_w"], outputs=["x_norm1"], attrs={"eps": rms_norm_eps, **_fp16_host_attrs(enable_dq_xform)})
     b.host(
         "quant_x_norm1",
         "quantize",
         inputs=["x_norm1"],
         outputs=["x_norm1_q"],
-        attrs={"scale": _qact(block, "rms1_out"), "zero_point": 0, "dtype": DType.INT16},
+        attrs=_quant_attrs(_qact(block, "rms1_out"), enable_xform=enable_dq_xform),
     )
     qkv_ops = [
         builder_op
@@ -1065,10 +1123,10 @@ def build_prefill_artifact(
         inputs=["x_norm1_q"],
         outputs=[*(f"q_int_h{i}" for i in range(n_heads)), *(f"k_seq_h{i}" for i in range(n_kv_heads)), *(f"v_seq_h{i}" for i in range(n_kv_heads))],
     )
-    rope_dq_fallback = enable_dq_xform and _rope_uses_dq_fallback(d_head)
+    rope_dq_fallback = enable_dq_xform
     qk_dq_attrs_q = _dq_fp16_attrs(_qact(block, "q_out")) if rope_dq_fallback else {"scale": _qact(block, "q_out"), "zero_point": 0}
     qk_dq_attrs_k = _dq_fp16_attrs(_qact(block, "k_out")) if rope_dq_fallback else {"scale": _qact(block, "k_out"), "zero_point": 0}
-    rope_input_attrs = {"input_encoding": "fp16_bits"} if rope_dq_fallback else {}
+    rope_input_attrs = {"input_encoding": "fp16_bits", **_fp16_host_attrs(enable_dq_xform)} if rope_dq_fallback else {}
     for q_head in range(n_heads):
         b.host(f"dequant_q_h{q_head}", "dequantize", inputs=[f"q_int_h{q_head}"], outputs=[f"q_f_h{q_head}"], attrs=qk_dq_attrs_q)
         b.host(
@@ -1083,7 +1141,7 @@ def build_prefill_artifact(
             "quantize",
             inputs=[f"q_rope_f_h{q_head}"],
             outputs=[f"q_rope_q_h{q_head}"],
-            attrs={"scale": _qact(block, "rope_q", _qact(block, "q_out")), "zero_point": 0, "dtype": DType.INT16},
+            attrs=_quant_attrs(_qact(block, "rope_q", _qact(block, "q_out")), enable_xform=enable_dq_xform),
         )
     for kv_head in range(n_kv_heads):
         b.host(f"dequant_k_h{kv_head}", "dequantize", inputs=[f"k_seq_h{kv_head}"], outputs=[f"k_f_h{kv_head}"], attrs=qk_dq_attrs_k)
@@ -1099,7 +1157,7 @@ def build_prefill_artifact(
             "quantize",
             inputs=[f"k_rope_f_h{kv_head}"],
             outputs=[f"k_rope_q_h{kv_head}"],
-            attrs={"scale": _qact(block, "rope_k", _qact(block, "k_out")), "zero_point": 0, "dtype": DType.INT16},
+            attrs=_quant_attrs(_qact(block, "rope_k", _qact(block, "k_out")), enable_xform=enable_dq_xform),
         )
         b.host(f"k_cache_scatter_matrix_h{kv_head}", "k_cache_scatter_matrix", inputs=[f"k_rope_q_h{kv_head}"], outputs=[f"prefill_k_cache_h{kv_head}"])
         b.host(f"v_cache_scatter_matrix_h{kv_head}", "v_cache_scatter_matrix", inputs=[f"v_seq_h{kv_head}"], outputs=[f"prefill_v_cache_h{kv_head}"])
@@ -1257,6 +1315,7 @@ def build_decode_artifact(
             attn_dim=attn_dim,
             seq_len=1,
             act_scale=act_scale,
+            enable_dq_xform=enable_dq_xform,
         ),
     )
     _add_projection_tensors(b, block=block, d_model=d_model, d_head=d_head, n_heads=n_heads, n_kv_heads=n_kv_heads)
@@ -1272,16 +1331,17 @@ def build_decode_artifact(
         score_scale=_qscore_scale(block, d_head),
         cache_token_names=cache_token_names,
         score_dtype=_qmatmul_out_dtype(block, "score"),
+        enable_dq_xform=enable_dq_xform,
     )
     _add_attention_concat_tensors(b, seq_len=1, d_head=d_head, n_heads=n_heads)
 
-    b.host("rmsnorm1", "rmsnorm", inputs=["x_in", "rms1_w"], outputs=["x_norm1"], attrs={"eps": rms_norm_eps})
+    b.host("rmsnorm1", "rmsnorm", inputs=["x_in", "rms1_w"], outputs=["x_norm1"], attrs={"eps": rms_norm_eps, **_fp16_host_attrs(enable_dq_xform)})
     b.host(
         "quant_x_norm1",
         "quantize",
         inputs=["x_norm1"],
         outputs=["x_norm1_q"],
-        attrs={"scale": _qact(block, "rms1_out"), "zero_point": 0, "dtype": DType.INT16},
+        attrs=_quant_attrs(_qact(block, "rms1_out"), enable_xform=enable_dq_xform),
     )
     qkv_ops = [
         builder_op
@@ -1300,17 +1360,21 @@ def build_decode_artifact(
     ]
     for kv_head in range(n_kv_heads):
         qkv_ops.append(b.matmul(f"op_k_h{kv_head}", "x_norm1_q", f"w_k_h{kv_head}", f"k_cur_h{kv_head}", in_dtype=DType.INT16, out_dtype=DType.INT16, **_qmatmul(block, "k_proj")))
-        qkv_ops.append(b.matmul(f"op_v_h{kv_head}", "x_norm1_q", f"w_v_h{kv_head}", f"v_cur_h{kv_head}", in_dtype=DType.INT16, out_dtype=DType.INT16, **_qmatmul(block, "v_proj")))
+        qkv_ops.append(b.matmul(f"op_v_h{kv_head}", "x_norm1_q", f"w_v_h{kv_head}", f"v_cache_h{kv_head}_{decode_token_name}", in_dtype=DType.INT16, out_dtype=DType.INT16, **_qmatmul(block, "v_proj")))
     b.segment(
         "seg_qkv",
         ops=qkv_ops,
         inputs=["x_norm1_q"],
-        outputs=[*(f"q_int_h{i}" for i in range(n_heads)), *(f"k_cur_h{i}" for i in range(n_kv_heads)), *(f"v_cur_h{i}" for i in range(n_kv_heads))],
+        outputs=[
+            *(f"q_int_h{i}" for i in range(n_heads)),
+            *(f"k_cur_h{i}" for i in range(n_kv_heads)),
+            *(f"v_cache_h{i}_{decode_token_name}" for i in range(n_kv_heads)),
+        ],
     )
-    rope_dq_fallback = enable_dq_xform and _rope_uses_dq_fallback(d_head)
+    rope_dq_fallback = enable_dq_xform
     qk_dq_attrs_q = _dq_fp16_attrs(_qact(block, "q_out")) if rope_dq_fallback else {"scale": _qact(block, "q_out"), "zero_point": 0}
     qk_dq_attrs_k = _dq_fp16_attrs(_qact(block, "k_out")) if rope_dq_fallback else {"scale": _qact(block, "k_out"), "zero_point": 0}
-    rope_input_attrs = {"input_encoding": "fp16_bits"} if rope_dq_fallback else {}
+    rope_input_attrs = {"input_encoding": "fp16_bits", **_fp16_host_attrs(enable_dq_xform)} if rope_dq_fallback else {}
     for q_head in range(n_heads):
         b.host(f"dequant_q_h{q_head}", "dequantize", inputs=[f"q_int_h{q_head}"], outputs=[f"q_f_h{q_head}"], attrs=qk_dq_attrs_q)
         b.host(
@@ -1325,7 +1389,7 @@ def build_decode_artifact(
             "quantize",
             inputs=[f"q_rope_f_h{q_head}"],
             outputs=[f"q_rope_q_h{q_head}"],
-            attrs={"scale": _qact(block, "rope_q", _qact(block, "q_out")), "zero_point": 0, "dtype": DType.INT16},
+            attrs=_quant_attrs(_qact(block, "rope_q", _qact(block, "q_out")), enable_xform=enable_dq_xform),
         )
     for kv_head in range(n_kv_heads):
         b.host(f"dequant_k_h{kv_head}", "dequantize", inputs=[f"k_cur_h{kv_head}"], outputs=[f"k_f_h{kv_head}"], attrs=qk_dq_attrs_k)
@@ -1341,7 +1405,7 @@ def build_decode_artifact(
             "quantize",
             inputs=[f"k_rope_f_h{kv_head}"],
             outputs=[f"k_rope_q_h{kv_head}"],
-            attrs={"scale": _qact(block, "rope_k", _qact(block, "k_out")), "zero_point": 0, "dtype": DType.INT16},
+            attrs=_quant_attrs(_qact(block, "rope_k", _qact(block, "k_out")), enable_xform=enable_dq_xform),
         )
         b.host(
             f"k_append_h{kv_head}",
@@ -1349,13 +1413,6 @@ def build_decode_artifact(
             inputs=[f"k_rope_q_h{kv_head}", f"k_cache_h{kv_head}"],
             outputs=[f"k_cache_h{kv_head}_{decode_token_name}"],
             attrs={"token_index": prompt_len, "k_cache_base": f"k_cache_h{kv_head}"},
-        )
-        b.host(
-            f"v_append_h{kv_head}",
-            "v_cache_scatter_write",
-            inputs=[f"v_cur_h{kv_head}", f"v_cache_h{kv_head}"],
-            outputs=[f"v_cache_h{kv_head}_{decode_token_name}"],
-            attrs={"token_index": prompt_len, "v_cache_base": f"v_cache_h{kv_head}"},
         )
     b.segment(
         "seg_score",

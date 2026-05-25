@@ -63,9 +63,8 @@ typedef enum logic [3:0] {
 
 typedef enum logic [3:0] {
     XFORM_MODE_NONE      = 4'b0000,
-    XFORM_MODE_Q_F16_I16 = 4'b0001,
-    XFORM_MODE_DQ_I16_F16 = 4'b0010,
-    XFORM_MODE_ROPE_K16  = 4'b0011   // RoPE rotation: INT16 Q14 in-place, half_count pairs
+    XFORM_MODE_Q_F32_I16 = 4'b0001,
+    XFORM_MODE_DQ_I16_F32 = 4'b0010
 } xform_mode_t;
 
 // Instruction register field definitions

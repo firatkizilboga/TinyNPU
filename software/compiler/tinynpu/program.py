@@ -248,7 +248,7 @@ class TinyNPUProgram:
         if dest_name not in self.symbols: self.symbols[dest_name] = Symbol(dest_name, src.shape, src.precision, role=src.storage_role)
         self.instructions.append(Move(src_name, dest_name))
 
-    def xform_q_f16_i16(self, src_name, dest_name=None, multiplier=1, shift=0):
+    def xform_q_f32_i16(self, src_name, dest_name=None, multiplier=1, shift=0):
         if src_name not in self.symbols:
             raise ValueError(f"Source symbol '{src_name}' not found.")
         src = self.symbols[src_name]
@@ -260,29 +260,35 @@ class TinyNPUProgram:
             Xform(
                 src_name,
                 dest_name,
-                mode=XformMode.Q_F16_I16,
+                mode=XformMode.Q_F32_I16,
+                multiplier=multiplier,
+                shift=shift,
+            )
+        )
+
+    def xform_q_f16_i16(self, src_name, dest_name=None, multiplier=1, shift=0):
+        return self.xform_q_f32_i16(src_name, dest_name, multiplier, shift)
+
+    def xform_dq_i16_f32(self, src_name, dest_name=None, multiplier=1, shift=0):
+        if src_name not in self.symbols:
+            raise ValueError(f"Source symbol '{src_name}' not found.")
+        src = self.symbols[src_name]
+        if dest_name is None:
+            dest_name = src_name
+        if dest_name not in self.symbols:
+            self.symbols[dest_name] = Symbol(dest_name, src.shape, PrecisionMode.INT16, role=src.storage_role)
+        self.instructions.append(
+            Xform(
+                src_name,
+                dest_name,
+                mode=XformMode.DQ_I16_F32,
                 multiplier=multiplier,
                 shift=shift,
             )
         )
 
     def xform_dq_i16_f16(self, src_name, dest_name=None, multiplier=1, shift=0):
-        if src_name not in self.symbols:
-            raise ValueError(f"Source symbol '{src_name}' not found.")
-        src = self.symbols[src_name]
-        if dest_name is None:
-            dest_name = src_name
-        if dest_name not in self.symbols:
-            self.symbols[dest_name] = Symbol(dest_name, src.shape, PrecisionMode.INT16, role=src.storage_role)
-        self.instructions.append(
-            Xform(
-                src_name,
-                dest_name,
-                mode=XformMode.DQ_I16_F16,
-                multiplier=multiplier,
-                shift=shift,
-            )
-        )
+        return self.xform_dq_i16_f32(src_name, dest_name, multiplier, shift)
 
     def xform_rope_k16(self, k_name, cs_name, dest_name=None, row_index=0):
         """Apply RoPE in-place on a K tensor stored as INT16 Q14.
@@ -293,6 +299,7 @@ class TinyNPUProgram:
         dest_name: output symbol (defaults to k_name for in-place rotation).
         row_index: row inside k_name to rotate. Prefill emits one XFORM per row.
         """
+        raise NotImplementedError("Hardware RoPE XFORM has been removed; lower RoPE as a CPU host op.")
         if k_name not in self.symbols:
             raise ValueError(f"Symbol '{k_name}' not found.")
         if cs_name not in self.symbols:
@@ -350,6 +357,7 @@ class TinyNPUProgram:
             if isinstance(instr, Move):
                 instr.count = self.symbols[instr.src].word_count
             if isinstance(instr, XformRopeK16):
+                raise NotImplementedError("Hardware RoPE XFORM has been removed; lower RoPE as a CPU host op.")
                 src_sym = self.symbols[instr.src]
                 dst_sym = self.symbols[instr.dest]
                 if src_sym.precision != PrecisionMode.INT16 or dst_sym.precision != PrecisionMode.INT16:

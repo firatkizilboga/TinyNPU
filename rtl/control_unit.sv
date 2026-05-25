@@ -117,7 +117,10 @@ module control_unit #(
   logic xform_unit_start;
   logic xform_unit_done;
   logic [`BUFFER_WIDTH-1:0] xform_unit_in_word;
+  logic [`BUFFER_WIDTH-1:0] xform_unit_in_word_hi;
   logic [`BUFFER_WIDTH-1:0] xform_unit_out_word;
+  logic [`BUFFER_WIDTH-1:0] xform_unit_out_word_hi;
+  logic [`BUFFER_WIDTH-1:0] xform_tmp_word, xform_tmp_word_next;
 
   // --- Internal Registers for MATMUL ---
   logic [`ADDR_WIDTH-1:0] mm_a_base, mm_b_base, mm_c_base, mm_bias_base;
@@ -169,6 +172,7 @@ module control_unit #(
       xform_mode <= XFORM_MODE_NONE;
       xform_multiplier <= '0;
       xform_shift <= '0;
+      xform_tmp_word <= '0;
       {mm_a_base, mm_b_base, mm_c_base, mm_bias_base, mm_output_word_offset, mm_b_word_offset, mm_m_total, mm_k_total, mm_n_total} <= '0;
       {mm_shift, mm_multiplier, mm_activation, mm_h_gelu_x_scale_shift, mm_in_precision, mm_out_precision, mm_write_offset} <= '0;
       mm_output_layout <= OUT_LAYOUT_C;
@@ -214,6 +218,7 @@ module control_unit #(
       xform_mode <= xform_mode_next;
       xform_multiplier <= xform_multiplier_next;
       xform_shift <= xform_shift_next;
+      xform_tmp_word <= xform_tmp_word_next;
 
       // MATMUL Latch from Instruction Memory
       if (state == CTRL_DECODE && im_rdata[255:252] == ISA_OP_MATMUL) begin
@@ -280,10 +285,12 @@ module control_unit #(
         .start(xform_unit_start),
         .mode(xform_mode),
         .in_word(xform_unit_in_word),
+        .in_word_hi(xform_unit_in_word_hi),
         .multiplier(xform_multiplier),
         .shift(xform_shift),
         .done(xform_unit_done),
-        .out_word(xform_unit_out_word)
+        .out_word(xform_unit_out_word),
+        .out_word_hi(xform_unit_out_word_hi)
     );
 
     always_comb begin
@@ -390,6 +397,7 @@ module control_unit #(
         mmvr_out = '0;
         xform_unit_start = 1'b0;
         xform_unit_in_word = ub_rdata;
+        xform_unit_in_word_hi = '0;
 
     move_src_next = move_src;
     move_dest_next = move_dest;
@@ -402,6 +410,7 @@ module control_unit #(
     xform_mode_next = xform_mode;
     xform_multiplier_next = xform_multiplier;
     xform_shift_next = xform_shift;
+    xform_tmp_word_next = xform_tmp_word;
     m_next = m_idx;
     n_next = n_idx;
     k_next = k_idx;
@@ -544,29 +553,70 @@ module control_unit #(
           pc_next = pc + `INST_CHUNKS;
           next_state = CTRL_FETCH;
         end else begin
-          unique case (xform_phase)
-            3'd0: begin
-              ub_addr = xform_src;
-              xform_phase_next = 3'd1;
-            end
-            3'd1: begin
-              xform_unit_in_word = ub_rdata;
-              xform_unit_start = 1'b1;
-              xform_phase_next = 3'd2;
-            end
-            3'd2: begin
-              if (xform_unit_done) begin
-                ub_addr = xform_dest;
+          if (xform_mode == XFORM_MODE_Q_F32_I16) begin
+            unique case (xform_phase)
+              3'd0: begin
+                ub_addr = xform_src;
+                xform_phase_next = 3'd1;
+              end
+              3'd1: begin
+                xform_tmp_word_next = ub_rdata;
+                ub_addr = xform_src + 1;
+                xform_phase_next = 3'd2;
+              end
+              3'd2: begin
+                xform_unit_in_word = xform_tmp_word;
+                xform_unit_in_word_hi = ub_rdata;
+                xform_unit_start = 1'b1;
+                xform_phase_next = 3'd3;
+              end
+              3'd3: begin
+                if (xform_unit_done) begin
+                  ub_addr = xform_dest;
+                  ub_wr_en = 1'b1;
+                  ub_wdata = xform_unit_out_word;
+                  xform_src_next = xform_src + 2;
+                  xform_dest_next = xform_dest + 1;
+                  xform_count_next = xform_count - 1;
+                  xform_phase_next = 3'd0;
+                end
+              end
+              default: xform_phase_next = 3'd0;
+            endcase
+          end else if (xform_mode == XFORM_MODE_DQ_I16_F32) begin
+            unique case (xform_phase)
+              3'd0: begin
+                ub_addr = xform_src;
+                xform_phase_next = 3'd1;
+              end
+              3'd1: begin
+                xform_unit_in_word = ub_rdata;
+                xform_unit_start = 1'b1;
+                xform_phase_next = 3'd2;
+              end
+              3'd2: begin
+                if (xform_unit_done) begin
+                  ub_addr = xform_dest;
+                  ub_wr_en = 1'b1;
+                  ub_wdata = xform_unit_out_word;
+                  xform_phase_next = 3'd3;
+                end
+              end
+              3'd3: begin
+                ub_addr = xform_dest + 1;
                 ub_wr_en = 1'b1;
-                ub_wdata = xform_unit_out_word;
+                ub_wdata = xform_unit_out_word_hi;
                 xform_src_next = xform_src + 1;
-                xform_dest_next = xform_dest + 1;
+                xform_dest_next = xform_dest + 2;
                 xform_count_next = xform_count - 1;
                 xform_phase_next = 3'd0;
               end
-            end
-            default: xform_phase_next = 3'd0;
-          endcase
+              default: xform_phase_next = 3'd0;
+            endcase
+          end else begin
+            pc_next = pc + `INST_CHUNKS;
+            next_state = CTRL_FETCH;
+          end
         end
 `endif
       end

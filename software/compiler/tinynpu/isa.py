@@ -38,9 +38,8 @@ class BReadMode(IntEnum):
 
 class XformMode(IntEnum):
     NONE = 0
-    Q_F16_I16 = 1
-    DQ_I16_F16 = 2
-    ROPE_K16 = 3  # RoPE rotation: INT16 Q14, in-place over K in UB
+    Q_F32_I16 = 1
+    DQ_I16_F32 = 2
 
 
 # Matches rtl/ppu.sv PPU_HGELU_SHIFT_WIDTH. Larger values need a wider
@@ -172,7 +171,7 @@ class Halt(Instruction):
 
 
 class Xform(Instruction):
-    def __init__(self, src, dest, mode=XformMode.Q_F16_I16, multiplier=1, shift=0):
+    def __init__(self, src, dest, mode=XformMode.Q_F32_I16, multiplier=1, shift=0):
         self.src = src
         self.dest = dest
         self.mode = mode
@@ -195,14 +194,10 @@ class Xform(Instruction):
 
 
 class XformRopeK16(Instruction):
-    """RoPE rotation XFORM for INT16 Q14 K vectors stored in UB.
+    """Retired hardware RoPE transform placeholder.
 
-    Instruction field mapping (reuses the XFORM encoding):
-      [251:248] = XFORM_MODE_ROPE_K16 (3)
-      [247:232] = src_addr   (K base address in UB)
-      [231:216] = dest_addr  (output K address, may equal src for in-place)
-      [215:200] = half_count (= total_k_words // 2; number of lo/hi word pairs)
-      [199:184] = cs_addr    (base address of cos/sin table: cos[0..half-1] then sin[0..half-1])
+    Kept only so older serialized/programmatic callers fail with a clear error
+    instead of encoding an unsupported XFORM mode.
     """
     def __init__(self, src, dest, cs_addr, row_index=0):
         self.src = src        # symbol name of K tensor
@@ -214,17 +209,7 @@ class XformRopeK16(Instruction):
         self.dest_word_offset = 0
 
     def encode(self, symbol_to_addr):
-        src_addr = symbol_to_addr[self.src] + self.src_word_offset
-        dest_addr = symbol_to_addr[self.dest] + self.dest_word_offset
-        cs_base = symbol_to_addr[self.cs_addr]
-        instr = 0
-        instr |= (Opcode.XFORM & 0xF) << 252
-        instr |= (XformMode.ROPE_K16 & 0xF) << 248
-        instr |= (src_addr & 0xFFFF) << 232
-        instr |= (dest_addr & 0xFFFF) << 216
-        instr |= (self.half_count & 0xFFFF) << 200
-        instr |= (cs_base & 0xFFFF) << 184
-        return instr
+        raise NotImplementedError("Hardware RoPE XFORM has been removed; lower RoPE as a CPU host op.")
 
 # --- Legacy Functions for compatibility if needed ---
 def pack_matmul(

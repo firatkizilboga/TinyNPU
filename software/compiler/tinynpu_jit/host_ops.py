@@ -548,6 +548,13 @@ def _input_as_float32(step: HostOp, values: dict[str, np.ndarray], index: int) -
     return raw.astype(np.float32)
 
 
+def _encode_output(step: HostOp, value: np.ndarray) -> np.ndarray:
+    out = np.asarray(value, dtype=np.float32)
+    if str(step.attrs.get("output_encoding", "")) == "fp16_bits":
+        return out.astype(np.float16).view(np.uint16).astype(np.int16)
+    return out.astype(np.float32)
+
+
 def _host_exp_approx_scalar(x: float) -> float:
     exp_neg_int = (
         1.0,
@@ -631,11 +638,28 @@ def _softmax_f16_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple
 def _quantize_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
     source = values[step.inputs[0]]
     if str(step.attrs.get("input_encoding", "")) == "fp16_bits":
-        if str(step.attrs.get("_npu_write_transform", "")) == "xform_q_f16_i16":
+        if (
+            int(step.attrs.get("zero_point", 0)) == 0
+            and _dtype_attr(step.attrs.get("dtype", DType.INT8)) == DType.INT16
+        ):
+            values[step.outputs[0]] = _quantize_fp16_bits_to_i16_xform(
+                np.asarray(source),
+                scale=float(step.attrs["scale"]),
+            )
+            return
+        if str(step.attrs.get("_npu_write_transform", "")) in {"xform_q_f16_i16", "xform_q_f32_i16"}:
             if int(step.attrs.get("zero_point", 0)) != 0:
-                raise ValueError("xform_q_f16_i16 quantize does not support non-zero zero_point.")
+                raise ValueError("xform quantize does not support non-zero zero_point.")
             if _dtype_attr(step.attrs.get("dtype", DType.INT8)) != DType.INT16:
-                raise ValueError("xform_q_f16_i16 quantize only supports INT16 output.")
+                raise ValueError("xform quantize only supports INT16 output.")
+            if str(step.attrs.get("_npu_write_transform", "")) == "xform_q_f32_i16":
+                values[step.outputs[0]] = golden.quantize(
+                    source,
+                    scale=float(step.attrs["scale"]),
+                    zero_point=0,
+                    out_dtype=DType.INT16,
+                )
+                return
             values[step.outputs[0]] = _quantize_fp16_bits_to_i16_xform(
                 np.asarray(source),
                 scale=float(step.attrs["scale"]),
@@ -689,6 +713,15 @@ def _dequantize_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[
         writes=elems,
         branches=elems,
     )
+
+
+def _fp16_to_float32_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
+    values[step.outputs[0]] = _fp16_bits_to_float32_array(values[step.inputs[0]])
+
+
+def _fp16_to_float32_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
+    elems = int(np.asarray(values[step.inputs[0]]).size)
+    return "host_intrinsic", _counts(reads=elems, writes=elems)
 
 
 def _sigmoid_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
@@ -792,7 +825,7 @@ def _v_cache_scatter_matrix_benchmark(step: HostOp, values: dict[str, np.ndarray
 
 def _silu_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
     source = _input_as_float32(step, values, 0)
-    values[step.outputs[0]] = _silu_runtime_approx(source)
+    values[step.outputs[0]] = _encode_output(step, _silu_runtime_approx(source))
 
 
 def _silu_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
@@ -966,7 +999,7 @@ def _rmsnorm_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenMod
     x = _input_as_float32(step, values, 0)
     weight = _input_as_float32(step, values, 1).reshape(-1)
     eps = np.float32(step.attrs.get("eps", 1.0e-6))
-    values[step.outputs[0]] = _rmsnorm_runtime_approx(x, weight, float(eps))
+    values[step.outputs[0]] = _encode_output(step, _rmsnorm_runtime_approx(x, weight, float(eps)))
 
 
 def _rmsnorm_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
@@ -1022,7 +1055,7 @@ def _layernorm_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[s
 def _mul_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
     lhs = _input_as_float32(step, values, 0)
     rhs = _input_as_float32(step, values, 1)
-    values[step.outputs[0]] = (lhs * rhs).astype(np.float32)
+    values[step.outputs[0]] = _encode_output(step, lhs * rhs)
 
 
 def _mul_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
@@ -1146,7 +1179,7 @@ def _rope_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel)
     second = x[..., half:head_dim]
     out[..., :half] = first * cos - second * sin
     out[..., half:head_dim] = second * cos + first * sin
-    values[step.outputs[0]] = out.astype(np.float32)
+    values[step.outputs[0]] = _encode_output(step, out)
 
 
 def _rope_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[str, Any]:
@@ -1251,6 +1284,7 @@ for _spec in (
         semantic_validator=_validate_im2col,
     ),
     HostOpSpec("gelu", _gelu_eval, _gelu_benchmark),
+    HostOpSpec("fp16_to_float32", _fp16_to_float32_eval, _fp16_to_float32_benchmark),
     HostOpSpec(
         "k_cache_scatter_write",
         _k_cache_scatter_write_eval,

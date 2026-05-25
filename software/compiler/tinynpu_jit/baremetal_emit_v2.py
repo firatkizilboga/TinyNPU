@@ -63,6 +63,7 @@ _HOST_KIND_ENUM = {
     "concat_lastdim2": "TNPU_HOST_CONCAT_LASTDIM2",
     "linear": "TNPU_HOST_LINEAR",
     "conv2d": "TNPU_HOST_CONV2D",
+    "fp16_to_float32": "TNPU_HOST_FP16_TO_FLOAT32",
 }
 
 
@@ -201,13 +202,90 @@ def _compatible_resident_handoff(producer_sym: dict[str, Any], consumer_sym: dic
     return False
 
 
+_ISA_OP_HALT = 0x1
+_ISA_OP_XFORM = 0x4
+_XFORM_MODE_Q_F32_I16 = 0x1
+_XFORM_MODE_DQ_I16_F32 = 0x2
+_XFORM_SCRATCH_UB_ADDR = 0x7000
+
+
+def _choose_xform_scale_params(inv_scale: float) -> tuple[int, int]:
+    best_err = float("inf")
+    best_mult = 1
+    best_shift = 0
+    if inv_scale >= 1.0:
+        rounded = int(inv_scale + 0.5)
+        if float(rounded) == float(inv_scale) and rounded <= 0xFFFF:
+            return rounded, 0
+    for shift in range(16):
+        scaled = float(inv_scale) * float(1 << shift)
+        if scaled > 65535.0:
+            break
+        mult = int(scaled + 0.5)
+        if mult == 0:
+            mult = 1
+        approx = float(mult) / float(1 << shift)
+        err = abs(approx - float(inv_scale))
+        if err < best_err or (err == best_err and shift > best_shift):
+            best_err = err
+            best_mult = mult
+            best_shift = shift
+    if best_err == float("inf"):
+        return 0xFFFF, 0
+    return best_mult, best_shift
+
+
+def _pack_xform_instruction(
+    *,
+    mode: int,
+    src_addr: int,
+    dst_addr: int,
+    count: int,
+    multiplier: int,
+    shift: int,
+) -> int:
+    instr = 0
+    instr |= (_ISA_OP_XFORM & 0xF) << 252
+    instr |= (mode & 0xF) << 248
+    instr |= (src_addr & 0xFFFF) << 232
+    instr |= (dst_addr & 0xFFFF) << 216
+    instr |= (count & 0xFFFF) << 200
+    instr |= (multiplier & 0xFFFF) << 184
+    instr |= (shift & 0xFF) << 176
+    return instr
+
+
+def _split_im_words(instructions: list[int], *, buffer_width: int, chunks_per_inst: int) -> list[int]:
+    chunks: list[int] = []
+    mask = (1 << buffer_width) - 1
+    for inst in instructions:
+        inst_int = int(inst)
+        for chunk_idx in range(chunks_per_inst):
+            chunks.append((inst_int >> (chunk_idx * buffer_width)) & mask)
+    return chunks
+
+
+def _runtime_xform_enabled(policy: str, kind: str) -> bool:
+    if policy == "all":
+        return True
+    if policy == "q-only" and kind == "q":
+        return True
+    if policy == "dq-only" and kind == "dq":
+        return True
+    return False
+
+
 def emit_cv32e40p_program_v2(
     artifact: CompiledArtifact,
     inputs: dict[str, np.ndarray],
     *,
     program_name: str = "tinynpu_program_v2",
     defines_path: str | None = None,
+    runtime_xform_policy: str = "all",
+    fuse_xforms: bool = False,
 ) -> str:
+    if runtime_xform_policy not in {"none", "all", "q-only", "dq-only"}:
+        raise ValueError(f"Unsupported runtime_xform_policy={runtime_xform_policy!r}.")
     for name in artifact.plan.inputs:
         if name not in inputs:
             raise KeyError(f"Missing runtime input '{name}' for bare-metal v2 emission.")
@@ -347,32 +425,6 @@ def emit_cv32e40p_program_v2(
     segment_im_start: dict[str, int] = {}
     im_preloads: list[str] = []
     next_im_addr = im_base_addr
-    for step in artifact.plan.steps:
-        if not _is_step_instance(step, NpuSegment):
-            continue
-        segment = artifact.segment_artifacts[step.name]
-        flattened_chunks: list[int] = []
-        for inst in segment.binary["im"]:
-            inst_int = int(inst)
-            for chunk_idx in range(im_chunks_per_inst):
-                chunk = (inst_int >> (chunk_idx * buffer_width)) & ((1 << buffer_width) - 1)
-                flattened_chunks.append(int(chunk))
-        image_name = f"{symbol}_im_{_sanitize(step.name)}"
-        decls.append(_emit_u32x4_image(image_name, flattened_chunks))
-        segment_im_start[step.name] = next_im_addr
-        im_preloads.append(
-            "    {"
-            f'.label = "preload.im_{_sanitize(step.name)}", '
-            f".base_addr = 0x{next_im_addr:04x}u, .image = {image_name}, .word_count = {len(flattened_chunks)}"
-            "}"
-        )
-        next_im_addr += len(flattened_chunks)
-    if im_preloads:
-        decls.append(
-            f"static const TnpuImageLoad {symbol}_im_preloads[{len(im_preloads)}] = {{\n"
-            + ",\n".join(im_preloads)
-            + "\n};"
-        )
 
     tensor_consumers = _build_consumers(artifact.plan.steps)
     producer_by_output: dict[str, HostOp] = {}
@@ -385,11 +437,26 @@ def emit_cv32e40p_program_v2(
     for output_name, step in producer_by_output.items():
         if step.kind != "quantize":
             continue
+        if len(step.inputs) != 1:
+            continue
+        source_spec = artifact.plan.tensors[step.inputs[0]]
         uses = tensor_consumers.get(output_name, [])
         non_verify_uses = [use for use in uses if not _is_step_instance(use, VerifyTensor)]
         if not non_verify_uses:
             continue
         if not all(_is_step_instance(use, NpuSegment) for use in non_verify_uses):
+            continue
+        transform_policy = str(step.attrs.get("_npu_write_transform", ""))
+        if transform_policy in {"quantize_f32_i16", "xform_q_f32_i16"}:
+            if source_spec.dtype != DType.FLOAT32:
+                continue
+            if not all(
+                artifact.segment_artifacts[use.name].symbol_table.get(output_name, {}).get("role") == "A"
+                for use in non_verify_uses
+                if _is_step_instance(use, NpuSegment)
+            ):
+                continue
+        else:
             continue
         absorbed_quantize_outputs.add(output_name)
 
@@ -458,6 +525,9 @@ def emit_cv32e40p_program_v2(
         segment = artifact.segment_artifacts[step.name]
         produced_inside = {op.out for op in step.ops}
         writes: list[str] = []
+        prepend_xforms: list[int] = []
+        append_xforms: list[int] = []
+        scratch_cursor = _XFORM_SCRATCH_UB_ADDR
         for tensor_name in step.inputs:
             spec = artifact.plan.tensors[tensor_name]
             if spec.kind == TensorKind.CONSTANT:
@@ -491,18 +561,34 @@ def emit_cv32e40p_program_v2(
                     attrs_i32[0] = int(producer.attrs.get("zero_point", 0))
                     attrs_f32[0] = 1.0 / float(producer.attrs["scale"])
                 elif (
-                    transform_policy == "xform_q_f16_i16"
-                    and source_spec.dtype == DType.INT16
+                    transform_policy == "xform_q_f32_i16"
+                    and source_spec.dtype == DType.FLOAT32
                     and int(sym["precision"]) == 2
-                    and str(sym["role"]) in {"A", "B"}
+                    and str(sym["role"]) == "A"
                     and int(producer.attrs.get("zero_point", 0)) == 0
                 ):
                     write_tensor_name = source_name
-                    if str(producer.attrs.get("_npu_write_xform_location", "")) == "segment":
-                        transform = "TNPU_WRITE_TRANSFORM_NONE"
+                    attrs_f32[0] = 1.0 / float(producer.attrs["scale"])
+                    if _runtime_xform_enabled(runtime_xform_policy, "q"):
+                        transform = "TNPU_WRITE_XFORM_Q_F32_I16"
+                        if fuse_xforms:
+                            multiplier, shift = _choose_xform_scale_params(attrs_f32[0])
+                            scratch_addr = scratch_cursor
+                            scratch_cursor += int(sym["word_count"]) * 2
+                            attrs_i32[1] = scratch_addr
+                            prepend_xforms.append(
+                                _pack_xform_instruction(
+                                    mode=_XFORM_MODE_Q_F32_I16,
+                                    src_addr=scratch_addr,
+                                    dst_addr=int(sym["addr"]),
+                                    count=int(sym["word_count"]),
+                                    multiplier=multiplier,
+                                    shift=shift,
+                                )
+                            )
                     else:
-                        transform = "TNPU_WRITE_XFORM_Q_F16_I16"
-                        attrs_f32[0] = 1.0 / float(producer.attrs["scale"])
+                        transform = "TNPU_WRITE_QUANTIZE_F32_TO_INT16"
+                        attrs_i32[0] = int(producer.attrs.get("zero_point", 0))
                 elif (
                     not transform_policy
                     and source_spec.dtype == DType.FLOAT32
@@ -529,9 +615,6 @@ def emit_cv32e40p_program_v2(
                         write_tensor_name = source_name
                         if str(producer.attrs.get("_npu_write_xform_location", "")) == "segment":
                             transform = "TNPU_WRITE_TRANSFORM_NONE"
-                        else:
-                            transform = "TNPU_WRITE_XFORM_Q_F16_I16"
-                            attrs_f32[0] = 1.0 / float(producer.attrs["scale"])
             writes.append(
                 "    {"
                 f".tensor_idx = {tensor_index[write_tensor_name]}, .addr = 0x{int(sym['addr']):04x}u, "
@@ -571,10 +654,28 @@ def emit_cv32e40p_program_v2(
             if dequant_step is not None:
                 read_tensor_name = dequant_step.outputs[0]
                 transform_policy = str(dequant_step.attrs.get("_npu_read_transform", ""))
-                if transform_policy in {"", "dequantize_int16_to_float32"}:
-                    read_transform = "TNPU_READ_DEQUANTIZE_INT16_TO_FLOAT32"
+                if transform_policy in {"", "dequantize_int16_to_float32", "xform_dq_i16_f32"}:
                     read_attrs_i32[0] = int(dequant_step.attrs.get("zero_point", 0))
                     read_attrs_f32[0] = float(dequant_step.attrs["scale"])
+                    if transform_policy == "xform_dq_i16_f32" and _runtime_xform_enabled(runtime_xform_policy, "dq"):
+                        read_transform = "TNPU_READ_XFORM_DQ_I16_F32"
+                        if fuse_xforms:
+                            multiplier, shift = _choose_xform_scale_params(read_attrs_f32[0])
+                            scratch_addr = scratch_cursor
+                            scratch_cursor += int(sym["word_count"]) * 2
+                            read_attrs_i32[1] = scratch_addr
+                            append_xforms.append(
+                                _pack_xform_instruction(
+                                    mode=_XFORM_MODE_DQ_I16_F32,
+                                    src_addr=int(sym["addr"]),
+                                    dst_addr=scratch_addr,
+                                    count=int(sym["word_count"]),
+                                    multiplier=multiplier,
+                                    shift=shift,
+                                )
+                            )
+                    else:
+                        read_transform = "TNPU_READ_DEQUANTIZE_INT16_TO_FLOAT32"
                     absorbed_dequantize_step_names.add(dequant_step.name)
             reads.append(
                 "    {"
@@ -585,6 +686,27 @@ def emit_cv32e40p_program_v2(
                 f".role = \"{sym['role']}\""
                 "}"
             )
+        base_instructions = [int(inst) for inst in segment.binary["im"]]
+        halt_instruction = (_ISA_OP_HALT & 0xF) << 252
+        if base_instructions and ((base_instructions[-1] >> 252) & 0xF) == _ISA_OP_HALT:
+            halt_instruction = base_instructions[-1]
+            base_instructions = base_instructions[:-1]
+        fused_instructions = prepend_xforms + base_instructions + append_xforms + [halt_instruction]
+        flattened_chunks = _split_im_words(
+            fused_instructions,
+            buffer_width=buffer_width,
+            chunks_per_inst=im_chunks_per_inst,
+        )
+        image_name = f"{symbol}_im_{_sanitize(step.name)}"
+        decls.append(_emit_u32x4_image(image_name, flattened_chunks))
+        segment_im_start[step.name] = next_im_addr
+        im_preloads.append(
+            "    {"
+            f'.label = "preload.im_{_sanitize(step.name)}", '
+            f".base_addr = 0x{next_im_addr:04x}u, .image = {image_name}, .word_count = {len(flattened_chunks)}"
+            "}"
+        )
+        next_im_addr += len(flattened_chunks)
         writes_name = f"{symbol}_seg_{_sanitize(step.name)}_writes"
         reads_name = f"{symbol}_seg_{_sanitize(step.name)}_reads"
         if writes:
@@ -607,6 +729,12 @@ def emit_cv32e40p_program_v2(
             "}"
         )
         segment_index[step.name] = len(segment_entries) - 1
+    if im_preloads:
+        decls.append(
+            f"static const TnpuImageLoad {symbol}_im_preloads[{len(im_preloads)}] = {{\n"
+            + ",\n".join(im_preloads)
+            + "\n};"
+        )
     if segment_entries:
         decls.append(
             f"static const TnpuSegment {symbol}_segments[{len(segment_entries)}] = {{\n"

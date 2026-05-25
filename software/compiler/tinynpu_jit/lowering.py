@@ -151,6 +151,13 @@ def _can_lower_rope_pattern(
     target_spec = plan.tensors[quant.outputs[0]]
     if source_spec.shape != target_spec.shape or target_spec.dtype != DType.INT16:
         return False
+    source_role = str(source_spec.metadata.get("storage_role", "C")).upper()
+    target_role = str(target_spec.metadata.get("storage_role", "C")).upper()
+    if source_role != "C" or target_role != "C":
+        # XFORM_ROPE_K16 is a C-layout transform. A/B-layout tensors have
+        # packed addressing semantics that the current XFORM instruction does
+        # not own, so keep those chains in the host path.
+        return False
 
     deq_scale = float(dequant.attrs.get("scale", 1.0))
     quant_scale = float(quant.attrs.get("scale", 1.0))
@@ -359,32 +366,9 @@ def canonicalize_npu_boundary_policy(plan: ExecutionPlan) -> None:
             continue
 
         source_producer = producer_by_output.get(source_name)
-        if (
-            source_spec.dtype == DType.FLOAT32
-            and source_spec.kind == TensorKind.INPUT
-        ):
-            source_spec.dtype = DType.INT16
-            source_spec.metadata["value_encoding"] = "fp16_bits"
-            step.attrs["input_encoding"] = "fp16_bits"
-        elif (
-            source_spec.dtype == DType.FLOAT32
-            and source_producer is not None
-            and source_producer.kind in _FP16_BOUNDARY_HOST_KINDS
-        ):
-            source_producer.attrs["output_encoding"] = "fp16_bits"
-            step.attrs["input_encoding"] = "fp16_bits"
-            source_spec.dtype = DType.INT16
-            source_spec.metadata["value_encoding"] = "fp16_bits"
-
         transform = "quantize_f32_i16"
-        if source_spec.dtype == DType.INT16:
-            if (
-                str(step.attrs.get("input_encoding", "")) == "fp16_bits"
-                or str(source_spec.metadata.get("value_encoding", "")) == "fp16_bits"
-                or (source_producer is not None and source_producer.kind == "softmax_f16")
-                or (source_producer is not None and str(source_producer.attrs.get("output_encoding", "")) == "fp16_bits")
-            ):
-                transform = "xform_q_f16_i16"
+        if source_spec.dtype == DType.FLOAT32 and int(step.attrs.get("zero_point", 0)) == 0:
+            transform = "xform_q_f32_i16"
         step.attrs["_npu_write_transform"] = transform
 
     for step in plan.steps:
@@ -405,7 +389,11 @@ def canonicalize_npu_boundary_policy(plan: ExecutionPlan) -> None:
             and output_spec.dtype == DType.FLOAT32
             and str(step.attrs.get("output_encoding", "")) != "fp16_bits"
         ):
-            step.attrs["_npu_read_transform"] = "dequantize_int16_to_float32"
+            step.attrs["_npu_read_transform"] = (
+                "xform_dq_i16_f32"
+                if int(step.attrs.get("zero_point", 0)) == 0
+                else "dequantize_int16_to_float32"
+            )
 
 
 def validate_npu_boundary_policy(plan: ExecutionPlan) -> None:
@@ -454,13 +442,16 @@ def validate_npu_boundary_policy(plan: ExecutionPlan) -> None:
             if plan.tensors[output_name].dtype != DType.INT16:
                 continue
             transform = str(step.attrs.get("_npu_write_transform", ""))
-            if transform not in {"quantize_f32_i16", "xform_q_f16_i16"}:
+            if transform not in {"quantize_f32_i16", "xform_q_f32_i16"}:
                 raise ValueError(
                     f"NPU boundary quantize '{step.name}' is missing canonical boundary transform metadata."
                 )
         elif isinstance(step, HostOp) and step.kind == "dequantize":
             transform = step.attrs.get("_npu_read_transform")
-            if transform is not None and transform != "dequantize_int16_to_float32":
+            if transform is not None and transform not in {
+                "dequantize_int16_to_float32",
+                "xform_dq_i16_f32",
+            }:
                 raise ValueError(f"Unsupported NPU read transform on '{step.name}': {transform!r}.")
 
 
@@ -533,9 +524,8 @@ class SegmentCompiler:
     def compile(self, plan: ExecutionPlan, expected_tensors: dict[str, np.ndarray]) -> CompiledArtifact:
         _tmp = TinyNPUProgram(defines_path=self.defines_path)
         array_size = int(_tmp.hw.params.get("ARRAY_SIZE", 8))
-        if not bool(plan.metadata.get("disable_rope_xform", False)):
-            rewrite_host_rope_patterns(plan)
-        rewrite_dequantize_fp16_xforms(plan)
+        # Hardware RoPE and FP16 transport XFORM rewrites are retired. RoPE is
+        # lowered as a host op; active XFORM ingress/egress is FP32<->INT16.
         fold_input_quantize_into_input_contract(plan)
         prune_unused_tensors(plan)
         canonicalize_npu_boundary_policy(plan)
@@ -847,8 +837,8 @@ class SegmentCompiler:
                 b_word_offset=int(op.b_word_offset),
                 b_read_mode=b_read_mode,
             )
-            for rope_cs_name, row_index in op.rope_xforms():
-                program.xform_rope_k16(op.out, rope_cs_name, row_index=row_index)
+            if op.rope_xforms():
+                raise ValueError("Hardware RoPE XFORM has been removed; lower RoPE as a CPU host op.")
             if op.dequantize_to_fp16:
                 program.xform_dq_i16_f16(
                     op.out,
