@@ -168,12 +168,11 @@ def main() -> int:
     ap.add_argument("--no-alumacc", action="store_true", help="Skip Yosys arithmetic-combining pass.")
     ap.add_argument("--skip-abc", action="store_true", help="Stop after generic synthesis and DFF mapping.")
     ap.add_argument("--coarse-only", action="store_true", help="Stop Yosys synth before fine arithmetic techmapping.")
-    ap.add_argument("--disable-xform", action="store_true", help="Compile NPU RTL with TINYNPU_DISABLE_XFORM for area/timing experiments.")
     ap.add_argument("--abc-fast", action="store_true", help="Use ABC's faster, lower-quality mapping script.")
     ap.add_argument(
         "--npu-top",
         default="tinynpu_top",
-        choices=["tinynpu_top", "ppu", "control_unit", "systolic_array", "ubss", "xform_unit"],
+        choices=["tinynpu_top", "ppu", "control_unit", "systolic_array", "ubss"],
         help="For target=npu, synthesize this module as top.",
     )
     ap.add_argument("--flatten", action="store_true", help="Flatten hierarchy during synth. Avoid this for memory-limited module-level runs.")
@@ -208,7 +207,7 @@ def main() -> int:
         no_alumacc=args.no_alumacc,
         skip_abc=args.skip_abc,
         coarse_only=args.coarse_only,
-        defines=["TINYNPU_DISABLE_XFORM"] if args.disable_xform else [],
+        defines=[],
         flatten=args.flatten,
         abc_fast=args.abc_fast,
         write_netlist=Path(args.write_netlist) if args.write_netlist else None,

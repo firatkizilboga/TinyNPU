@@ -61,12 +61,6 @@ typedef enum logic [3:0] {
     B_READ_MODE_K_CACHE_INT16    = 4'b0001
 } b_read_mode_t;
 
-typedef enum logic [3:0] {
-    XFORM_MODE_NONE      = 4'b0000,
-    XFORM_MODE_Q_F32_I16 = 4'b0001,
-    XFORM_MODE_DQ_I16_F32 = 4'b0010
-} xform_mode_t;
-
 // Instruction register field definitions
 typedef struct packed {
     precision_mode_t mode;        // [15:14] Bit-width mode
@@ -141,8 +135,7 @@ typedef enum logic [3:0] {
     ISA_OP_NOP    = 4'h0,
     ISA_OP_HALT   = 4'h1,
     ISA_OP_MATMUL = 4'h2,      // Super Instruction (Includes Quant Config)
-    ISA_OP_MOVE   = 4'h3,      // Internal DMA
-    ISA_OP_XFORM  = 4'h4       // Internal transform (e.g., FP16<->INT16)
+    ISA_OP_MOVE   = 4'h3       // Internal DMA
 } opcode_t;
 
 `endif // DEFINES_SV

@@ -2,7 +2,7 @@ import numpy as np
 import os
 import re
 import json
-from .isa import Opcode, HostCmd, PrecisionMode, MatMul, Move, Halt, Xform, XformRopeK16, XformMode, OutputLayout, WritebackMode, BReadMode, generate_host_messages
+from .isa import Opcode, HostCmd, PrecisionMode, MatMul, Move, Halt, XformRopeK16, OutputLayout, WritebackMode, BReadMode, generate_host_messages
 from .packer import Packer
 from .memory import MemoryManager
 
@@ -249,43 +249,13 @@ class TinyNPUProgram:
         self.instructions.append(Move(src_name, dest_name))
 
     def xform_q_f32_i16(self, src_name, dest_name=None, multiplier=1, shift=0):
-        if src_name not in self.symbols:
-            raise ValueError(f"Source symbol '{src_name}' not found.")
-        src = self.symbols[src_name]
-        if dest_name is None:
-            dest_name = src_name
-        if dest_name not in self.symbols:
-            self.symbols[dest_name] = Symbol(dest_name, src.shape, PrecisionMode.INT16, role=src.storage_role)
-        self.instructions.append(
-            Xform(
-                src_name,
-                dest_name,
-                mode=XformMode.Q_F32_I16,
-                multiplier=multiplier,
-                shift=shift,
-            )
-        )
+        raise NotImplementedError("Hardware XFORM has been removed; lower quantize as a software/runtime host op.")
 
     def xform_q_f16_i16(self, src_name, dest_name=None, multiplier=1, shift=0):
         return self.xform_q_f32_i16(src_name, dest_name, multiplier, shift)
 
     def xform_dq_i16_f32(self, src_name, dest_name=None, multiplier=1, shift=0):
-        if src_name not in self.symbols:
-            raise ValueError(f"Source symbol '{src_name}' not found.")
-        src = self.symbols[src_name]
-        if dest_name is None:
-            dest_name = src_name
-        if dest_name not in self.symbols:
-            self.symbols[dest_name] = Symbol(dest_name, src.shape, PrecisionMode.INT16, role=src.storage_role)
-        self.instructions.append(
-            Xform(
-                src_name,
-                dest_name,
-                mode=XformMode.DQ_I16_F32,
-                multiplier=multiplier,
-                shift=shift,
-            )
-        )
+        raise NotImplementedError("Hardware XFORM has been removed; lower dequantize as a software/runtime host op.")
 
     def xform_dq_i16_f16(self, src_name, dest_name=None, multiplier=1, shift=0):
         return self.xform_dq_i16_f32(src_name, dest_name, multiplier, shift)
@@ -385,15 +355,6 @@ class TinyNPUProgram:
                 instr.half_count = n_tiles // 2
                 instr.src_word_offset = row_offset
                 instr.dest_word_offset = row_offset
-            elif isinstance(instr, Xform):
-                src_words = self.symbols[instr.src].word_count
-                dst_words = self.symbols[instr.dest].word_count
-                if src_words != dst_words:
-                    raise ValueError(
-                        f"XFORM source/dest word counts must match (got {src_words} vs {dst_words}) "
-                        f"for {instr.src}->{instr.dest}."
-                    )
-                instr.count = src_words
         symbol_to_addr = {name: sym.addr for name, sym in self.symbols.items()}
         # Build UB image indexed by address so pre-assigned (non-sequential) addresses work.
         total_ub_words = max((sym.addr + sym.word_count for sym in self.symbols.values() if not sym.is_view), default=0)

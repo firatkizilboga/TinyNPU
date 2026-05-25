@@ -5,7 +5,6 @@ class Opcode(IntEnum):
     HALT = 0x1
     MATMUL = 0x2
     MOVE = 0x3
-    XFORM = 0x4
 
 class PrecisionMode(IntEnum):
     INT4 = 0
@@ -34,12 +33,6 @@ class WritebackMode(IntEnum):
 class BReadMode(IntEnum):
     NORMAL = 0
     K_CACHE_INT16 = 1
-
-
-class XformMode(IntEnum):
-    NONE = 0
-    Q_F32_I16 = 1
-    DQ_I16_F32 = 2
 
 
 # Matches rtl/ppu.sv PPU_HGELU_SHIFT_WIDTH. Larger values need a wider
@@ -170,29 +163,6 @@ class Halt(Instruction):
         return instr
 
 
-class Xform(Instruction):
-    def __init__(self, src, dest, mode=XformMode.Q_F32_I16, multiplier=1, shift=0):
-        self.src = src
-        self.dest = dest
-        self.mode = mode
-        self.multiplier = multiplier
-        self.shift = shift
-        self.count = 0  # Words count, inferred by compiler
-
-    def encode(self, symbol_to_addr):
-        src_addr = symbol_to_addr[self.src]
-        dest_addr = symbol_to_addr[self.dest]
-        instr = 0
-        instr |= (Opcode.XFORM & 0xF) << 252
-        instr |= (self.mode & 0xF) << 248
-        instr |= (src_addr & 0xFFFF) << 232
-        instr |= (dest_addr & 0xFFFF) << 216
-        instr |= (self.count & 0xFFFF) << 200
-        instr |= (self.multiplier & 0xFFFF) << 184
-        instr |= (self.shift & 0xFF) << 176
-        return instr
-
-
 class XformRopeK16(Instruction):
     """Retired hardware RoPE transform placeholder.
 
@@ -272,17 +242,6 @@ def pack_simple(opcode):
     instr |= (opcode & 0xF) << 252
     return instr
 
-
-def pack_xform(opcode, mode, src, dest, count, multiplier=1, shift=0):
-    instr = 0
-    instr |= (opcode & 0xF) << 252
-    instr |= (mode & 0xF) << 248
-    instr |= (src & 0xFFFF) << 232
-    instr |= (dest & 0xFFFF) << 216
-    instr |= (count & 0xFFFF) << 200
-    instr |= (multiplier & 0xFFFF) << 184
-    instr |= (shift & 0xFF) << 176
-    return instr
 
 # --- MMIO Helpers ---
 class MMIOReg(IntEnum):

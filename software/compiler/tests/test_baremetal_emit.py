@@ -33,7 +33,7 @@ from tinynpu_jit import (
     run_host_emulation,
 )
 from tinynpu import TinyNPUProgram
-from tinynpu.isa import BReadMode, OutputLayout, PrecisionMode, WritebackMode, XformMode
+from tinynpu.isa import BReadMode, OutputLayout, PrecisionMode, WritebackMode
 from run_cv32e40p_decode_attention_jit_demo import (
     build_artifact_legacy as build_decode_attention_artifact_legacy,
     build_artifact_via_builder as build_decode_attention_artifact_via_builder,
@@ -484,107 +484,6 @@ def test_emit_cv32e40p_program_v2_absorbs_dequantize_into_segment_read():
     assert "TNPU_HOST_DEQUANTIZE" not in source
 
 
-@pytest.mark.skip(reason="FP16-bit XFORM-DQ was replaced by FP32 boundary XFORM-DQ.")
-def test_compile_plan_fuses_explicit_dequantize_fp16_to_xform():
-    x = np.eye(8, dtype=np.int16)
-    w = np.eye(8, dtype=np.int16)
-    scale = 0.25
-    expected = _fp16_bits((x.astype(np.float32) @ w.astype(np.float32)) * np.float32(scale))
-    tensors = {
-        "x": TensorSpec("x", x.shape, DType.INT16, TensorKind.INPUT),
-        "w": TensorSpec("w", w.shape, DType.INT16, TensorKind.CONSTANT, data=w),
-        "y_q": TensorSpec("y_q", x.shape, DType.INT16, TensorKind.INTERMEDIATE),
-        "y_f16": TensorSpec("y_f16", x.shape, DType.INT16, TensorKind.OUTPUT, is_final_output=True),
-    }
-    steps = [
-        NpuSegment("seg0", [MatMulOp("op0", "x", "w", "y_q")], inputs=["x", "w"], outputs=["y_q"]),
-        HostOp(
-            "dq_y",
-            "dequantize",
-            inputs=["y_q"],
-            outputs=["y_f16"],
-            attrs={"scale": scale, "zero_point": 0, "output_encoding": "fp16_bits"},
-        ),
-        VerifyTensor("y_f16", "y_f16", is_final_output=True),
-    ]
-    artifact = compile_plan(
-        ExecutionPlan(tensors=tensors, steps=steps, inputs=["x"], outputs=["y_f16"]),
-        {"y_f16": expected},
-    )
-
-    segment = artifact.plan.steps[0]
-    assert isinstance(segment, NpuSegment)
-    assert segment.outputs == ["y_f16"]
-    assert segment.ops[0].out == "y_f16"
-    assert segment.ops[0].dequantize_to_fp16
-    assert not any(isinstance(step, HostOp) and step.name == "dq_y" for step in artifact.plan.steps)
-
-    im = artifact.segment_artifacts["seg0"].binary["im"]
-    xform_inst = int(im[1])
-    assert ((xform_inst >> 252) & 0xF) == 0x4
-    assert ((xform_inst >> 248) & 0xF) == int(XformMode.DQ_I16_F16)
-    multiplier = (xform_inst >> 184) & 0xFFFF
-    shift = (xform_inst >> 176) & 0xFF
-    assert multiplier > 0
-    assert multiplier / float(1 << shift) == scale
-
-    source = emit_cv32e40p_program_v2(artifact, {"x": x}, program_name="unit_test_v2_final_dq_f16")
-    assert "TNPU_HOST_DEQUANTIZE" not in source
-    assert "TNPU_READ_DEQUANTIZE_INT16_TO_FLOAT32" not in source
-    assert ".transform = TNPU_READ_TRANSFORM_NONE" in source
-
-
-@pytest.mark.skip(reason="FP16-bit XFORM-DQ was replaced by FP32 boundary XFORM-DQ.")
-def test_compile_plan_can_materialize_xform_dequantized_fp16_bits_to_float32():
-    x = np.eye(8, dtype=np.int16)
-    w = np.eye(8, dtype=np.int16)
-    scale = 0.25
-    expected = ((x.astype(np.float32) @ w.astype(np.float32)) * np.float32(scale)).astype(np.float16).astype(np.float32)
-    tensors = {
-        "x": TensorSpec("x", x.shape, DType.INT16, TensorKind.INPUT),
-        "w": TensorSpec("w", w.shape, DType.INT16, TensorKind.CONSTANT, data=w),
-        "y_q": TensorSpec("y_q", x.shape, DType.INT16, TensorKind.INTERMEDIATE),
-        "y_f16": TensorSpec(
-            "y_f16",
-            x.shape,
-            DType.INT16,
-            TensorKind.INTERMEDIATE,
-            metadata={"value_encoding": "fp16_bits"},
-        ),
-        "y_f": TensorSpec("y_f", x.shape, DType.FLOAT32, TensorKind.OUTPUT, is_final_output=True),
-    }
-    steps = [
-        NpuSegment("seg0", [MatMulOp("op0", "x", "w", "y_q")], inputs=["x", "w"], outputs=["y_q"]),
-        HostOp(
-            "dq_y",
-            "dequantize",
-            inputs=["y_q"],
-            outputs=["y_f16"],
-            attrs={"scale": scale, "zero_point": 0, "output_encoding": "fp16_bits"},
-        ),
-        HostOp("materialize_y", "fp16_to_float32", inputs=["y_f16"], outputs=["y_f"]),
-        VerifyTensor("y_f", "y_f", is_final_output=True),
-    ]
-    artifact = compile_plan(
-        ExecutionPlan(tensors=tensors, steps=steps, inputs=["x"], outputs=["y_f"]),
-        {"y_f": expected},
-    )
-
-    segment = artifact.plan.steps[0]
-    assert isinstance(segment, NpuSegment)
-    assert segment.outputs == ["y_f16"]
-    assert segment.ops[0].out == "y_f16"
-    assert segment.ops[0].dequantize_to_fp16
-
-    source = emit_cv32e40p_c(artifact, {"x": x}, program_name="unit_test_fp16_transport_materialize")
-    assert "host_fp16bits_to_float32_tensor(&y_f, &y_f16);" in source
-    assert "host_dequantize(&y_f16" not in source
-
-    source_v2 = emit_cv32e40p_program_v2(artifact, {"x": x}, program_name="unit_test_v2_fp16_transport_materialize")
-    assert "TNPU_HOST_FP16_TO_FLOAT32" in source_v2
-    assert "TNPU_HOST_DEQUANTIZE" not in source_v2
-
-
 def test_compile_plan_rejects_float32_npu_weight_constant():
     x = np.eye(8, dtype=np.int16)
     w_f = np.eye(8, dtype=np.float32)
@@ -970,59 +869,32 @@ def test_tinynpu_program_encodes_k_cache_append_mode_in_matmul_instruction():
     assert ((inst >> 184) & 0xFFFF) == 17
 
 
-def test_tinynpu_program_encodes_xform_q_f32_i16_instruction():
+def test_tinynpu_program_rejects_xform_q_f32_i16_instruction():
     program = TinyNPUProgram()
     src = np.zeros((8, 8), dtype=np.int16)
     dst = np.zeros((8, 8), dtype=np.int16)
     program.declare_data("src_f32", src, precision=PrecisionMode.INT16, role="A")
     program.declare_data("dst_i16", dst, precision=PrecisionMode.INT16, role="A")
-    program.xform_q_f32_i16("src_f32", "dst_i16", multiplier=123, shift=7)
-    program.halt()
-    binary = program.compile()
-
-    inst = int(binary["im"][0])
-    assert ((inst >> 252) & 0xF) == 0x4
-    assert ((inst >> 248) & 0xF) == int(XformMode.Q_F32_I16)
-    assert ((inst >> 200) & 0xFFFF) == 8
-    assert ((inst >> 184) & 0xFFFF) == 123
-    assert ((inst >> 176) & 0xFF) == 7
+    with pytest.raises(NotImplementedError, match="Hardware XFORM has been removed"):
+        program.xform_q_f32_i16("src_f32", "dst_i16", multiplier=123, shift=7)
 
 
-def test_tinynpu_program_encodes_xform_q_f32_i16_inplace_instruction():
+def test_tinynpu_program_rejects_xform_q_f32_i16_inplace_instruction():
     program = TinyNPUProgram()
     src = np.zeros((8, 8), dtype=np.int16)
     program.declare_data("src_f32", src, precision=PrecisionMode.INT16, role="A")
-    program.xform_q_f32_i16("src_f32", multiplier=16, shift=1)
-    program.halt()
-    binary = program.compile()
-
-    inst = int(binary["im"][0])
-    src_addr = (inst >> 232) & 0xFFFF
-    dst_addr = (inst >> 216) & 0xFFFF
-    assert ((inst >> 252) & 0xF) == 0x4
-    assert ((inst >> 248) & 0xF) == int(XformMode.Q_F32_I16)
-    assert src_addr == dst_addr
-    assert ((inst >> 200) & 0xFFFF) == 8
-    assert ((inst >> 184) & 0xFFFF) == 16
-    assert ((inst >> 176) & 0xFF) == 1
+    with pytest.raises(NotImplementedError, match="Hardware XFORM has been removed"):
+        program.xform_q_f32_i16("src_f32", multiplier=16, shift=1)
 
 
-def test_tinynpu_program_encodes_xform_dq_i16_f32_instruction():
+def test_tinynpu_program_rejects_xform_dq_i16_f32_instruction():
     program = TinyNPUProgram()
     src = np.zeros((8, 8), dtype=np.int16)
     dst = np.zeros((8, 8), dtype=np.int16)
     program.declare_data("src_i16", src, precision=PrecisionMode.INT16, role="C")
     program.declare_data("dst_f32", dst, precision=PrecisionMode.INT16, role="C")
-    program.xform_dq_i16_f32("src_i16", "dst_f32", multiplier=3, shift=5)
-    program.halt()
-    binary = program.compile()
-
-    inst = int(binary["im"][0])
-    assert ((inst >> 252) & 0xF) == 0x4
-    assert ((inst >> 248) & 0xF) == int(XformMode.DQ_I16_F32)
-    assert ((inst >> 200) & 0xFFFF) == 8
-    assert ((inst >> 184) & 0xFFFF) == 3
-    assert ((inst >> 176) & 0xFF) == 5
+    with pytest.raises(NotImplementedError, match="Hardware XFORM has been removed"):
+        program.xform_dq_i16_f32("src_i16", "dst_f32", multiplier=3, shift=5)
 
 
 def test_compile_plan_preserves_output_word_offset_in_segment_binary():
@@ -2047,66 +1919,6 @@ def test_qllama_prefill_host_emulation_matches_reference_trace():
     np.testing.assert_allclose(result.tensors["out"], ref["out"], atol=1.0e-5, rtol=1.0e-5)
 
 
-@pytest.mark.skip(reason="FP16-bit QLlama XFORM path was replaced by FP32 boundary XFORM.")
-def test_qllama_prefill_lowers_dequant_boundaries_to_fp16_xform():
-    artifact, _, _ = build_llama_prefill_artifact(
-        d_model=8,
-        d_head=8,
-        n_heads=1,
-        n_kv_heads=1,
-        ffn_hidden_dim=8,
-        prompt_len=8,
-        seed=0,
-        enable_dq_xform=True,
-    )
-
-    assert [step.name for step in artifact.plan.steps if isinstance(step, HostOp) and step.kind == "dequantize"] == []
-    encoded_outputs = {"q_f_h0", "k_f_h0", "scores_f_h0", "o_f", "gate_f", "up_f", "ffn_out_f"}
-    lowered_outputs = {
-        op.out
-        for step in artifact.plan.steps
-        if isinstance(step, NpuSegment)
-        for op in step.ops
-        if op.dequantize_to_fp16
-    }
-    assert encoded_outputs <= lowered_outputs
-    for name in encoded_outputs:
-        assert artifact.plan.tensors[name].dtype == DType.INT16
-        assert artifact.plan.tensors[name].metadata.get("value_encoding") == "fp16_bits"
-    xform_quant_outputs = {
-        step.outputs[0]
-        for step in artifact.plan.steps
-        if isinstance(step, HostOp)
-        and step.kind == "quantize"
-        and step.attrs.get("_npu_write_transform") == "xform_q_f16_i16"
-    }
-    assert {"x_norm1_q", "q_rope_q_h0", "probs_q_h0", "x_norm2_q", "ffn_hidden_q"} <= xform_quant_outputs
-
-
-@pytest.mark.skip(reason="FP16-bit QLlama XFORM path was replaced by FP32 boundary XFORM.")
-def test_qllama_xform_quant_boundaries_are_not_scalar_quantized_before_stage():
-    artifact, _, _, _ = build_llama_decode_artifact(
-        d_model=8,
-        d_head=8,
-        n_heads=1,
-        n_kv_heads=1,
-        ffn_hidden_dim=8,
-        prompt_len=8,
-        seed=0,
-        enable_dq_xform=True,
-    )
-
-    source = emit_cv32e40p_c(artifact, {}, program_name="unit_test_qllama_decode_xform_q_stage")
-
-    assert "host_quantize_fp16bits(&x_norm1_q, &x_norm1" not in source
-    assert 'write_tensor_to_npu(&x_norm1, ' in source
-    assert "host_quantize_fp16bits(&q_rope_q_h0, &q_rope_f_h0" not in source
-    assert 'write_tensor_to_npu(&q_rope_f_h0, ' in source
-    assert "host_quantize_fp16bits(&ffn_hidden_q, &ffn_hidden" not in source
-    assert 'write_tensor_to_npu(&ffn_hidden, ' in source
-    assert "host_quantize_fp16bits(&k_rope_q_h0, &k_rope_f_h0" in source
-
-
 def test_qllama_decode_host_emulation_matches_reference_trace_and_cache_seed():
     artifact, _, prefill_ref, decode_ref = build_llama_decode_artifact(
         d_model=16,
@@ -2965,223 +2777,3 @@ def test_rope_cos_sin_table_values():
         assert int(table[i]) == expected_cos, f"cos mismatch at i={i}"
         assert int(table[half + i]) == expected_sin, f"sin mismatch at i={i}"
 
-
-@pytest.mark.skip(reason="Hardware RoPE XFORM was removed; RoPE is a host op.")
-def test_npu_program_xform_rope_k16_isa_encoding():
-    """TinyNPUProgram.xform_rope_k16 produces a XFORM ROPE_K16 instruction."""
-    from tinynpu.isa import XformMode, Opcode
-
-    d_head = 16
-    k_data = np.ones((1, d_head), dtype=np.int16) * 100
-    cs_data = make_rope_cos_sin_table_q14(d_head, position=3).reshape(1, d_head)
-
-    prog = TinyNPUProgram()
-    prog.declare_data("k", k_data, role="C")
-    prog.declare_data("cs", cs_data, role="C")
-    prog.xform_rope_k16("k", "cs")
-    prog.halt()
-    binary = prog.compile()
-
-    # The XFORM ROPE_K16 instruction should be the first instruction.
-    instr = binary["im"][0]
-    opcode = (instr >> 252) & 0xF
-    mode = (instr >> 248) & 0xF
-    assert opcode == int(Opcode.XFORM), f"expected XFORM opcode, got {opcode}"
-    assert mode == int(XformMode.ROPE_K16), f"expected ROPE_K16 mode, got {mode}"
-
-    # half_count should be d_head / 16 = 1 for d_head=16
-    half_count = (instr >> 200) & 0xFFFF
-    assert half_count == d_head // 16, f"half_count={half_count}, expected {d_head // 16}"
-
-
-@pytest.mark.skip(reason="Hardware RoPE XFORM was removed; RoPE is a host op.")
-def test_npu_program_xform_rope_k16_row_offset_encoding():
-    """Row-wise prefill RoPE XFORMs encode row-specific C-layout offsets."""
-    from tinynpu.isa import XformMode, Opcode
-
-    d_head = 16
-    row_index = 3
-    k_data = np.ones((8, d_head), dtype=np.int16) * 100
-    cs_data = make_rope_cos_sin_table_q14(d_head, position=row_index).reshape(1, d_head)
-
-    prog = TinyNPUProgram()
-    prog.declare_data("k", k_data, role="C")
-    prog.declare_data("cs", cs_data, role="C")
-    prog.xform_rope_k16("k", "cs", row_index=row_index)
-    prog.halt()
-    binary = prog.compile()
-
-    instr = binary["im"][0]
-    assert ((instr >> 252) & 0xF) == int(Opcode.XFORM)
-    assert ((instr >> 248) & 0xF) == int(XformMode.ROPE_K16)
-    encoded_src = (instr >> 232) & 0xFFFF
-    encoded_dest = (instr >> 216) & 0xFFFF
-    assert encoded_src == prog.symbols["k"].addr + row_index
-    assert encoded_dest == prog.symbols["k"].addr + row_index
-
-
-@pytest.mark.skip(reason="Hardware RoPE XFORM was removed; RoPE is a host op.")
-def test_npu_segment_with_rope_cs_python_simulation():
-    """End-to-end test: matmul producing K, then XFORM ROPE_K16, using host emulation."""
-    d_head = 16
-    d_model = 8  # small for test speed
-    rng = np.random.default_rng(42)
-
-    x = rng.integers(-4, 5, size=(1, d_model), dtype=np.int16)
-    w_k = rng.integers(-4, 5, size=(d_model, d_head), dtype=np.int16)
-    position = 3
-    theta = 10000.0
-
-    # Expected: K = x @ w_k, then ROPE
-    k_ref = np.clip(x.astype(np.int32) @ w_k.astype(np.int32), -32768, 32767).astype(np.int16)
-    cs_ref = make_rope_cos_sin_table_q14(d_head, position, theta)
-    k_rope_ref = _rope_rotate_half_q14(k_ref, cs_ref)
-
-    cs_tensor_spec = make_rope_cs_tensor_spec("k_rope_cs", d_head, position, theta)
-
-    tensors = {
-        "x": TensorSpec("x", x.shape, DType.INT16, TensorKind.CONSTANT, data=x),
-        "w_k": TensorSpec("w_k", w_k.shape, DType.INT16, TensorKind.CONSTANT, data=w_k),
-        "k_out": TensorSpec("k_out", (1, d_head), DType.INT16, TensorKind.OUTPUT, is_final_output=True),
-        "k_rope_cs": cs_tensor_spec,
-    }
-
-    seg = NpuSegment(
-        "seg_k",
-        [MatMulOp("op_k", "x", "w_k", "k_out", in_dtype=DType.INT16, out_dtype=DType.INT16,
-                  rope_cs_name="k_rope_cs")],
-        inputs=["x", "w_k"],
-        outputs=["k_out"],
-    )
-    plan = ExecutionPlan(tensors=tensors, steps=[seg], inputs=["x"], outputs=["k_out"])
-    plan.add_verification_step("k_out", "k_out")
-    artifact = compile_plan(plan, {"k_out": k_rope_ref})
-
-    seg_artifact = artifact.segment_artifacts["seg_k"]
-    k_addr = int(seg_artifact.symbol_table["k_out"]["addr"])
-    cs_addr = int(seg_artifact.symbol_table["k_rope_cs"]["addr"])
-    w_addr = int(seg_artifact.symbol_table["w_k"]["addr"])
-
-    assert cs_addr != w_addr, "RoPE cos/sin table must not alias the weight tensor in UB"
-    assert cs_addr != k_addr, "RoPE cos/sin table must not alias the K output tensor in UB"
-
-    result = run_host_emulation(artifact, {"x": x})
-    k_sim = np.asarray(result.tensors["k_out"]).astype(np.int16).reshape(-1)
-
-    # Allow ±1 rounding tolerance due to Q14 integer arithmetic
-    diff = np.abs(k_sim.astype(np.int32) - k_rope_ref.astype(np.int32))
-    assert diff.max() <= 1, (
-        f"ROPE result mismatch: max diff={diff.max()}\n"
-        f"  sim:      {k_sim}\n"
-        f"  expected: {k_rope_ref}"
-    )
-
-
-@pytest.mark.skip(reason="Hardware RoPE XFORM was removed; RoPE chains stay on host.")
-def test_compile_plan_rewrites_host_rope_chain_to_xform():
-    d_model = 8
-    d_head = 16
-    position = 3
-    theta = 10000.0
-    rng = np.random.default_rng(7)
-
-    x = rng.integers(-4, 5, size=(1, d_model), dtype=np.int16)
-    w_q = rng.integers(-4, 5, size=(d_model, d_head), dtype=np.int16)
-
-    q_ref = np.clip(x.astype(np.int32) @ w_q.astype(np.int32), -32768, 32767).astype(np.int16)
-    cs_ref = make_rope_cos_sin_table_q14(d_head, position, theta)
-    q_rope_ref = _rope_rotate_half_q14(q_ref, cs_ref)
-
-    tensors = {
-        "x": TensorSpec("x", x.shape, DType.INT16, TensorKind.INPUT),
-        "w_q": TensorSpec("w_q", w_q.shape, DType.INT16, TensorKind.CONSTANT, data=w_q),
-        "q_int": TensorSpec("q_int", (1, d_head), DType.INT16, TensorKind.INTERMEDIATE),
-        "q_f": TensorSpec("q_f", (1, d_head), DType.FLOAT32, TensorKind.INTERMEDIATE),
-        "q_rope_f": TensorSpec("q_rope_f", (1, d_head), DType.FLOAT32, TensorKind.INTERMEDIATE),
-        "q_rope_q": TensorSpec("q_rope_q", (1, d_head), DType.INT16, TensorKind.OUTPUT, is_final_output=True),
-    }
-    steps = [
-        NpuSegment("seg_q", [MatMulOp("op_q", "x", "w_q", "q_int")], inputs=["x", "w_q"], outputs=["q_int"]),
-        HostOp("dequant_q", "dequantize", inputs=["q_int"], outputs=["q_f"], attrs={"scale": 1.0 / 32.0, "zero_point": 0}),
-        HostOp("rope_q", "rope", inputs=["q_f"], outputs=["q_rope_f"], attrs={"head_dim": d_head, "position": position, "theta": theta}),
-        HostOp(
-            "quant_q_rope",
-            "quantize",
-            inputs=["q_rope_f"],
-            outputs=["q_rope_q"],
-            attrs={"scale": 1.0 / 32.0, "zero_point": 0, "dtype": DType.INT16},
-        ),
-    ]
-    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=["x"], outputs=["q_rope_q"])
-    plan.add_verification_step("q_rope_q", "q_rope_q")
-
-    artifact = compile_plan(plan, {"q_rope_q": q_rope_ref})
-
-    seg = artifact.segment_artifacts["seg_q"]
-    assert artifact.plan.steps[0].ops[0].out == "q_rope_q"
-    assert artifact.plan.steps[0].ops[0].rope_cs_name == "q_rope_q__rope_cs"
-    assert "q_rope_q__rope_cs" in artifact.plan.tensors
-    assert all(not (isinstance(step, HostOp) and step.name in {"dequant_q", "rope_q", "quant_q_rope"}) for step in artifact.plan.steps)
-    assert "q_rope_q__rope_cs" in seg.symbol_table
-
-    result = run_host_emulation(artifact, {"x": x}, verification=VerificationMode.OFF)
-    assert "q_rope_q" in result.tensors
-    diff = np.abs(np.asarray(result.tensors["q_rope_q"]).astype(np.int32).reshape(-1) - q_rope_ref.astype(np.int32).reshape(-1))
-    assert diff.max() <= 1
-
-
-@pytest.mark.skip(reason="Hardware RoPE XFORM was removed; RoPE chains stay on host.")
-def test_compile_plan_rewrites_prefill_rope_chain_to_row_xforms():
-    d_model = 8
-    d_head = 16
-    seq_len = 8
-    position = 2
-    theta = 10000.0
-    rng = np.random.default_rng(11)
-
-    x = rng.integers(-4, 5, size=(seq_len, d_model), dtype=np.int16)
-    w_q = rng.integers(-4, 5, size=(d_model, d_head), dtype=np.int16)
-
-    q_ref = np.clip(x.astype(np.int32) @ w_q.astype(np.int32), -32768, 32767).astype(np.int16)
-    q_rope_ref = np.zeros_like(q_ref)
-    for row in range(seq_len):
-        cs_ref = make_rope_cos_sin_table_q14(d_head, position + row, theta)
-        q_rope_ref[row] = _rope_rotate_half_q14(q_ref[row : row + 1], cs_ref)
-
-    tensors = {
-        "x": TensorSpec("x", x.shape, DType.INT16, TensorKind.INPUT),
-        "w_q": TensorSpec("w_q", w_q.shape, DType.INT16, TensorKind.CONSTANT, data=w_q),
-        "q_int": TensorSpec("q_int", (seq_len, d_head), DType.INT16, TensorKind.INTERMEDIATE),
-        "q_f": TensorSpec("q_f", (seq_len, d_head), DType.FLOAT32, TensorKind.INTERMEDIATE),
-        "q_rope_f": TensorSpec("q_rope_f", (seq_len, d_head), DType.FLOAT32, TensorKind.INTERMEDIATE),
-        "q_rope_q": TensorSpec("q_rope_q", (seq_len, d_head), DType.INT16, TensorKind.OUTPUT, is_final_output=True),
-    }
-    steps = [
-        NpuSegment("seg_q", [MatMulOp("op_q", "x", "w_q", "q_int")], inputs=["x", "w_q"], outputs=["q_int"]),
-        HostOp("dequant_q", "dequantize", inputs=["q_int"], outputs=["q_f"], attrs={"scale": 1.0 / 32.0, "zero_point": 0}),
-        HostOp("rope_q", "rope", inputs=["q_f"], outputs=["q_rope_f"], attrs={"head_dim": d_head, "position": position, "theta": theta}),
-        HostOp(
-            "quant_q_rope",
-            "quantize",
-            inputs=["q_rope_f"],
-            outputs=["q_rope_q"],
-            attrs={"scale": 1.0 / 32.0, "zero_point": 0, "dtype": DType.INT16},
-        ),
-    ]
-    plan = ExecutionPlan(tensors=tensors, steps=steps, inputs=["x"], outputs=["q_rope_q"])
-    plan.add_verification_step("q_rope_q", "q_rope_q")
-
-    artifact = compile_plan(plan, {"q_rope_q": q_rope_ref})
-
-    op = artifact.plan.steps[0].ops[0]
-    expected_cs_names = [f"q_rope_q__rope_cs_r{row}" for row in range(seq_len)]
-    assert op.out == "q_rope_q"
-    assert op.rope_cs_name is None
-    assert op.rope_cs_names == expected_cs_names
-    assert op.rope_row_indices == list(range(seq_len))
-    assert all(name in artifact.plan.tensors for name in expected_cs_names)
-    assert all(not (isinstance(step, HostOp) and step.name in {"dequant_q", "rope_q", "quant_q_rope"}) for step in artifact.plan.steps)
-
-    result = run_host_emulation(artifact, {"x": x}, verification=VerificationMode.OFF)
-    diff = np.abs(np.asarray(result.tensors["q_rope_q"]).astype(np.int32) - q_rope_ref.astype(np.int32))
-    assert diff.max() <= 1

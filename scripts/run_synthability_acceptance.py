@@ -57,8 +57,9 @@ def _static_rtl_guards() -> tuple[bool, str]:
         if "results_flat" in text:
             failures.append(f"{path.relative_to(ROOT)} still exposes results_flat")
 
-    if "XFORM_MODE_ROPE_K16" in (ROOT / "rtl" / "defines.sv").read_text():
-        failures.append("defines.sv still declares retired hardware RoPE XFORM mode")
+    defines_text = (ROOT / "rtl" / "defines.sv").read_text()
+    if "XFORM_MODE" in defines_text or "ISA_OP_XFORM" in defines_text:
+        failures.append("defines.sv still declares retired hardware XFORM support")
 
     if failures:
         return False, "\n".join(failures)
@@ -101,19 +102,6 @@ def _checks(*, include_integration: bool, include_qllama: bool) -> list[Check]:
                 "SIM_BUILD=sim_build_accept_multitile",
                 "TOPLEVEL=tinynpu_top",
                 "MODULE=test_jit_multitile_matmul",
-                "CCACHE_DISABLE=1",
-            ],
-            cwd=cocotb,
-            timeout_s=300,
-        ),
-        Check(
-            "xform_qdq_f32_i16_shared",
-            [
-                "make",
-                "-f",
-                "Makefile.npu",
-                "SIM_BUILD=sim_build_accept_xform",
-                "MODULE=test_xform_shared",
                 "CCACHE_DISABLE=1",
             ],
             cwd=cocotb,
