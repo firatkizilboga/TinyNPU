@@ -42,6 +42,15 @@ module unified_buffer #(
   logic [7:0]          byte_commit_wr_data[UB_BYTES-1:0];
   logic [7:0]          input_byte_rd_data [UB_BYTES-1:0];
   logic [7:0]          weight_byte_rd_data[UB_BYTES-1:0];
+  logic [`BUFFER_WIDTH-1:0] byte_commit_mask;
+  logic [`BUFFER_WIDTH-1:0] byte_commit_word;
+  logic [`BUFFER_WIDTH-1:0] input_data_raw;
+  logic [`BUFFER_WIDTH-1:0] weight_data_raw;
+
+  logic                         wr_req_valid;
+  logic [`BUFFER_WIDTH-1:0]     wr_req_mask;
+  logic [  `ADDR_WIDTH-1:0]     wr_req_addr;
+  logic [`BUFFER_WIDTH-1:0]     wr_req_data;
 
   logic                         partial_valid[PARTIAL_ENTRIES-1:0];
   logic [`ADDR_WIDTH-1:0]       partial_addr [PARTIAL_ENTRIES-1:0];
@@ -72,13 +81,13 @@ module unified_buffer #(
     partial_selected_mask = '0;
 
     for (int b = 0; b < UB_BYTES; b++) begin
-      if (wr_mask[b*8 +: 8] != 8'h00 && wr_mask[b*8 +: 8] != 8'hFF) begin
+      if (wr_req_mask[b*8 +: 8] != 8'h00 && wr_req_mask[b*8 +: 8] != 8'hFF) begin
         wr_has_partial_mask = 1'b1;
       end
     end
 
     for (int e = 0; e < PARTIAL_ENTRIES; e++) begin
-      if (partial_valid[e] && partial_addr[e] == wr_addr && !partial_match_found) begin
+      if (partial_valid[e] && partial_addr[e] == wr_req_addr && !partial_match_found) begin
         partial_match_found = 1'b1;
         partial_match_idx = e[PARTIAL_IDX_W-1:0];
       end
@@ -94,44 +103,61 @@ module unified_buffer #(
       partial_selected_mask = partial_mask[partial_match_idx];
     end
 
-    partial_merged_data = (partial_selected_data & ~wr_mask) | (wr_data & wr_mask);
-    partial_merged_mask = partial_selected_mask | wr_mask;
+    partial_merged_data = (partial_selected_data & ~wr_req_mask) | (wr_req_data & wr_req_mask);
+    partial_merged_mask = partial_selected_mask | wr_req_mask;
     partial_next_mask = partial_merged_mask;
+    byte_commit_mask = '0;
+    byte_commit_word = '0;
 
     for (int b = 0; b < UB_BYTES; b++) begin
-      byte_commit_wr_en[b] = wr_en && (wr_mask[b*8 +: 8] != 8'h00);
+      byte_commit_wr_en[b] = wr_req_valid && (wr_req_mask[b*8 +: 8] != 8'h00);
       byte_commit_wr_data[b] = partial_merged_data[b*8 +: 8];
-      if (wr_mask[b*8 +: 8] != 8'h00 && partial_merged_mask[b*8 +: 8] == 8'hFF) begin
+      if (byte_commit_wr_en[b]) begin
+        byte_commit_mask[b*8 +: 8] = 8'hFF;
+        byte_commit_word[b*8 +: 8] = byte_commit_wr_data[b];
+      end
+      if (wr_req_mask[b*8 +: 8] != 8'h00 && partial_merged_mask[b*8 +: 8] == 8'hFF) begin
         partial_next_mask[b*8 +: 8] = 8'h00;
       end
     end
 
     partial_next_data = partial_merged_data & partial_next_mask;
-    partial_update_needed = wr_en && (partial_match_found || wr_has_partial_mask);
+    partial_update_needed = wr_req_valid && (partial_match_found || wr_has_partial_mask);
   end
 
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
+      wr_req_valid <= 1'b0;
+      wr_req_addr  <= '0;
+      wr_req_data  <= '0;
+      wr_req_mask  <= '0;
       for (int e = 0; e < PARTIAL_ENTRIES; e++) begin
         partial_valid[e] <= 1'b0;
         partial_addr[e]  <= '0;
         partial_data[e]  <= '0;
         partial_mask[e]  <= '0;
       end
-    end else if (partial_update_needed) begin
-      if (!partial_match_found && !partial_free_found) begin
+    end else begin
+      wr_req_valid <= wr_en;
+      wr_req_addr  <= wr_addr;
+      wr_req_data  <= wr_data;
+      wr_req_mask  <= wr_mask;
+
+      if (partial_update_needed) begin
+        if (!partial_match_found && !partial_free_found) begin
 `ifndef SYNTHESIS
-        $fatal(1, "unified_buffer INT4 partial-byte packer overflow");
+          $fatal(1, "unified_buffer INT4 partial-byte packer overflow");
 `endif
-      end else if (partial_next_mask == '0) begin
-        partial_valid[partial_update_idx] <= 1'b0;
-        partial_data[partial_update_idx]  <= '0;
-        partial_mask[partial_update_idx]  <= '0;
-      end else begin
-        partial_valid[partial_update_idx] <= 1'b1;
-        partial_addr[partial_update_idx]  <= wr_addr;
-        partial_data[partial_update_idx]  <= partial_next_data;
-        partial_mask[partial_update_idx]  <= partial_next_mask;
+        end else if (partial_next_mask == '0) begin
+          partial_valid[partial_update_idx] <= 1'b0;
+          partial_data[partial_update_idx]  <= '0;
+          partial_mask[partial_update_idx]  <= '0;
+        end else begin
+          partial_valid[partial_update_idx] <= 1'b1;
+          partial_addr[partial_update_idx]  <= wr_req_addr;
+          partial_data[partial_update_idx]  <= partial_next_data;
+          partial_mask[partial_update_idx]  <= partial_next_mask;
+        end
       end
     end
   end
@@ -142,7 +168,7 @@ module unified_buffer #(
       tinynpu_byte_ram u_input_bank (
           .clk    (clk),
           .wr_en  (byte_commit_wr_en[byte_idx]),
-          .wr_addr(wr_addr),
+          .wr_addr(wr_req_addr),
           .wr_data(byte_commit_wr_data[byte_idx]),
           .rd_addr(input_addr),
           .rd_data(input_byte_rd_data[byte_idx])
@@ -151,7 +177,7 @@ module unified_buffer #(
       tinynpu_byte_ram u_weight_bank (
           .clk    (clk),
           .wr_en  (byte_commit_wr_en[byte_idx]),
-          .wr_addr(wr_addr),
+          .wr_addr(wr_req_addr),
           .wr_data(byte_commit_wr_data[byte_idx]),
           .rd_addr(weight_addr),
           .rd_data(weight_byte_rd_data[byte_idx])
@@ -162,12 +188,22 @@ module unified_buffer #(
   // Byte RAM rd_data is already registered, so expose it directly to keep the
   // same one-cycle read latency as the functional UB model.
   always_comb begin
-    input_data  = '0;
-    weight_data = '0;
+    input_data_raw  = '0;
+    weight_data_raw = '0;
+    input_data      = '0;
+    weight_data     = '0;
     if (rst_n) begin
       for (int b = 0; b < UB_BYTES; b++) begin
-        input_data[b*8 +: 8]  = input_byte_rd_data[b];
-        weight_data[b*8 +: 8] = weight_byte_rd_data[b];
+        input_data_raw[b*8 +: 8]  = input_byte_rd_data[b];
+        weight_data_raw[b*8 +: 8] = weight_byte_rd_data[b];
+      end
+      input_data = input_data_raw;
+      weight_data = weight_data_raw;
+      if (wr_req_valid && input_addr == wr_req_addr) begin
+        input_data = (input_data_raw & ~byte_commit_mask) | (byte_commit_word & byte_commit_mask);
+      end
+      if (wr_req_valid && weight_addr == wr_req_addr) begin
+        weight_data = (weight_data_raw & ~byte_commit_mask) | (byte_commit_word & byte_commit_mask);
       end
     end
   end
