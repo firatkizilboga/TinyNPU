@@ -144,11 +144,11 @@ def _state_for_block(
 
 
 def _summarize_artifact(name: str, artifact) -> None:
-    report = plan_program_memory(artifact.plan, ub_capacity=0x8000)
+    report = plan_program_memory(artifact.plan, ub_capacity=0xF000)
     max_im = max(len(segment.binary["im"]) for segment in artifact.segment_artifacts.values())
     print(
         f"{name}: segments={len(artifact.segment_artifacts)} "
-        f"ub_peak={report.total_ub_peak}/32768 static={report.static_zone_end} max_im={max_im}/1024"
+        f"ub_peak={report.total_ub_peak}/61440 static={report.static_zone_end} max_im={max_im}/1024"
     )
 
 

@@ -27,14 +27,14 @@ digraph TinyNPURuntimeState {
         arrowsize=0.8
     ];
 
-    Start [shape=ellipse, label="Enter runtime_v2.c", fillcolor="#F4F7FB", color="#6F8FB3", fontcolor="#233142"];
+    Start [shape=ellipse, label="Enter firmware runtime", fillcolor="#F4F7FB", color="#6F8FB3", fontcolor="#233142"];
     Init [label="load constants\nbind inputs", fillcolor="#EFE8FF", color="#8B74BD", fontcolor="#2C2236"];
     Session [label="reset or reuse state\npreload weights + instructions", fillcolor="#FFE8DB", color="#D18A66", fontcolor="#40261d"];
     Dispatch [shape=diamond, label="next plan step?", fillcolor="#F4F7FB", color="#6F8FB3", fontcolor="#233142"];
     Kind [shape=diamond, label="step kind?", fillcolor="#F4F7FB", color="#6F8FB3", fontcolor="#233142"];
 
     subgraph cluster_npu {
-        label="runtime_v2.c NPU Segment";
+        label="Accelerator Segment";
         color="#557AAB";
         penwidth=2.0;
         style="filled";
@@ -54,7 +54,7 @@ digraph TinyNPURuntimeState {
         Unpack [label="unpack outputs\nfor next step", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
     }
 
-    HostOp [label="CPU step\nsoftmax / reshape /\nother fallback", fillcolor="#FFF4E8", color="#C98A43", fontcolor="#4A3520"];
+    HostOp [label="CPU step\nsoftmax / reshape /\nlayout work", fillcolor="#FFF4E8", color="#C98A43", fontcolor="#4A3520"];
     Verify [label="check expected output", fillcolor="#FFF7D9", color="#C9A227", fontcolor="#4A3A00"];
     Finalize [label="return outputs\nand cycle counts", fillcolor="#EFE8FF", color="#8B74BD", fontcolor="#2C2236"];
     Done [shape=ellipse, label="Done", fillcolor="#F4F7FB", color="#6F8FB3", fontcolor="#233142"];
@@ -67,9 +67,9 @@ digraph TinyNPURuntimeState {
     Dispatch -> Finalize [label="plan exhausted"];
     Dispatch -> Kind [label="step available"];
 
-    Kind -> Pack [label="NpuSegment"];
-    Kind -> HostOp [label="HostOp"];
-    Kind -> Verify [label="VerifyTensor"];
+    Kind -> Pack [label="accelerator"];
+    Kind -> HostOp [label="CPU"];
+    Kind -> Verify [label="check"];
 
     Pack -> WriteSel;
     WriteSel -> WriteShared [label="yes"];

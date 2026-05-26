@@ -89,9 +89,9 @@ digraph TinyNPUControlStates {
     HOST_READ -> READ_WAIT [label="issue memory read"];
 
     READ_WAIT -> READ_WAIT [label="hold data valid"];
-    READ_WAIT -> HOST_WRITE [label="new CMD_WRITE_MEM"];
-    READ_WAIT -> HOST_READ [label="new CMD_READ_MEM"];
-    READ_WAIT -> FETCH [label="new CMD_RUN"];
+    READ_WAIT -> HOST_WRITE [label="CMD_WRITE_MEM"];
+    READ_WAIT -> HOST_READ [label="CMD_READ_MEM"];
+    READ_WAIT -> FETCH [label="CMD_RUN"];
     READ_WAIT -> IDLE [label="other / clear"];
 
     FETCH -> DECODE [label="read IM[pc]"];

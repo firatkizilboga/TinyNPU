@@ -417,7 +417,7 @@ def plan_segment_memory(
     Useful for unit tests and single-segment models.
     """
     if ub_capacity <= 0:
-        ub_capacity = 0x8000
+        ub_capacity = 0xF000
 
     packer, array_size = _get_packer()
     roles = infer_roles(segment)
@@ -470,7 +470,7 @@ def plan_program_memory(
     shared because only one segment executes at a time.
     """
     if ub_capacity <= 0:
-        ub_capacity = 0x8000
+        ub_capacity = 0xF000
 
     packer, array_size = _get_packer()
     segments = [step for step in plan.steps if isinstance(step, NpuSegment)]

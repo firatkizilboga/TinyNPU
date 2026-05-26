@@ -492,6 +492,144 @@ def _write_llama_decode_onnx(
     onnx.save(model, model_path)
 
 
+def _write_llama_prefill_onnx(
+    model_path: Path,
+    *,
+    d_model: int = 32,
+    d_head: int = 8,
+    n_heads: int = 4,
+    n_kv_heads: int = 2,
+    ffn_hidden_dim: int = 32,
+    prompt_len: int = 8,
+    seed: int = 0,
+    rope_theta: float = 500000.0,
+    rms_norm_eps: float = 1.0e-5,
+) -> None:
+    """Emit a configurable FP32 Llama-style prefill block for external CPU baselines."""
+    import onnx
+    from onnx import TensorProto, helper, numpy_helper
+
+    d = int(d_model)
+    dh = int(d_head)
+    nh = int(n_heads)
+    nkv = int(n_kv_heads)
+    ffn = int(ffn_hidden_dim)
+    seq = int(prompt_len)
+    if d <= 0 or dh <= 0 or nh <= 0 or nkv <= 0 or ffn <= 0 or seq <= 0:
+        raise ValueError("llama_prefill dimensions must be positive")
+    if nh % nkv != 0:
+        raise ValueError("n_heads must be divisible by n_kv_heads")
+    if d != nh * dh:
+        raise ValueError("llama_prefill baseline currently expects d_model == n_heads * d_head")
+    if dh % 2 != 0:
+        raise ValueError("d_head must be even for RoPE")
+
+    rng = np.random.default_rng(seed)
+
+    def w(shape: tuple[int, ...], scale: float) -> np.ndarray:
+        return rng.normal(0.0, scale, size=shape).astype(np.float32)
+
+    def norm_w(name: str) -> np.ndarray:
+        del name
+        return rng.uniform(0.75, 1.25, size=(d,)).astype(np.float32)
+
+    input_x = helper.make_tensor_value_info("input_x", TensorProto.FLOAT, [seq, d])
+    output_y = helper.make_tensor_value_info("output_y", TensorProto.FLOAT, [seq, d])
+    cos, sin = _rope_tables(seq, dh, float(rope_theta))
+
+    initializers = [
+        numpy_helper.from_array(np.array([float(rms_norm_eps)], dtype=np.float32), "rms_eps"),
+        numpy_helper.from_array(np.array([1.0 / np.sqrt(float(dh))], dtype=np.float32), "attn_temperature"),
+        numpy_helper.from_array(cos, "rope_cos"),
+        numpy_helper.from_array(sin, "rope_sin"),
+        numpy_helper.from_array(_causal_mask(seq), "causal_mask"),
+        numpy_helper.from_array(norm_w("rms1"), "rms1_w"),
+        numpy_helper.from_array(norm_w("rms2"), "rms2_w"),
+        numpy_helper.from_array(w((d, nh * dh), 0.035), "q_w"),
+        numpy_helper.from_array(w((d, nkv * dh), 0.035), "k_w"),
+        numpy_helper.from_array(w((d, nkv * dh), 0.035), "v_w"),
+        numpy_helper.from_array(w((nh * dh, d), 0.035), "o_w"),
+        numpy_helper.from_array(w((d, ffn), 0.030), "gate_w"),
+        numpy_helper.from_array(w((d, ffn), 0.030), "up_w"),
+        numpy_helper.from_array(w((ffn, d), 0.030), "down_w"),
+    ]
+
+    nodes = []
+    counter = 0
+
+    def out(prefix: str) -> str:
+        nonlocal counter
+        counter += 1
+        return f"{prefix}_{counter}"
+
+    def node(op: str, inputs: list[str], prefix: str, **attrs: object) -> str:
+        y = out(prefix)
+        nodes.append(helper.make_node(op, inputs, [y], **attrs))
+        return y
+
+    def slice_cols(x: str, prefix: str, start: int, end: int) -> str:
+        return node("Slice", [x], prefix, starts=[0, int(start)], ends=[seq, int(end)], axes=[0, 1])
+
+    def rmsnorm(x: str, weight: str, prefix: str) -> str:
+        sq = node("Mul", [x, x], f"{prefix}_sq")
+        mean = node("ReduceMean", [sq], f"{prefix}_mean", axes=[1], keepdims=1)
+        add = node("Add", [mean, "rms_eps"], f"{prefix}_eps")
+        root = node("Sqrt", [add], f"{prefix}_sqrt")
+        div = node("Div", [x, root], f"{prefix}_div")
+        return node("Mul", [div, weight], f"{prefix}_out")
+
+    def rope(x: str, prefix: str) -> str:
+        half = dh // 2
+        x0 = slice_cols(x, f"{prefix}_x0", 0, half)
+        x1 = slice_cols(x, f"{prefix}_x1", half, dh)
+        x0c = node("Mul", [x0, "rope_cos"], f"{prefix}_x0c")
+        x1s = node("Mul", [x1, "rope_sin"], f"{prefix}_x1s")
+        y0 = node("Sub", [x0c, x1s], f"{prefix}_y0")
+        x1c = node("Mul", [x1, "rope_cos"], f"{prefix}_x1c")
+        x0s = node("Mul", [x0, "rope_sin"], f"{prefix}_x0s")
+        y1 = node("Add", [x1c, x0s], f"{prefix}_y1")
+        return node("Concat", [y0, y1], f"{prefix}_out", axis=1)
+
+    n1 = rmsnorm("input_x", "rms1_w", "rms1")
+    q_all = node("MatMul", [n1, "q_w"], "q")
+    k_all = node("MatMul", [n1, "k_w"], "k")
+    v_all = node("MatMul", [n1, "v_w"], "v")
+
+    heads = []
+    heads_per_kv = nh // nkv
+    for head in range(nh):
+        kv_head = head // heads_per_kv
+        qh = slice_cols(q_all, f"q_h{head}", head * dh, (head + 1) * dh)
+        qh = rope(qh, f"q_h{head}_rope")
+        kh = slice_cols(k_all, f"k_h{kv_head}_for_q{head}", kv_head * dh, (kv_head + 1) * dh)
+        kh = rope(kh, f"k_h{kv_head}_rope_for_q{head}")
+        vh = slice_cols(v_all, f"v_h{kv_head}_for_q{head}", kv_head * dh, (kv_head + 1) * dh)
+        k_t = node("Transpose", [kh], f"k_t_h{head}", perm=[1, 0])
+        scores = node("MatMul", [qh, k_t], f"score_h{head}")
+        scaled = node("Mul", [scores, "attn_temperature"], f"scaled_h{head}")
+        masked = node("Add", [scaled, "causal_mask"], f"masked_h{head}")
+        probs = node("Softmax", [masked], f"probs_h{head}", axis=1)
+        heads.append(node("MatMul", [probs, vh], f"ctx_h{head}"))
+
+    attn_cat = node("Concat", heads, "attn_cat", axis=1)
+    attn_out = node("MatMul", [attn_cat, "o_w"], "attn_out")
+    resid1 = node("Add", ["input_x", attn_out], "resid1")
+    n2 = rmsnorm(resid1, "rms2_w", "rms2")
+    gate = node("MatMul", [n2, "gate_w"], "gate")
+    up = node("MatMul", [n2, "up_w"], "up")
+    sig = node("Sigmoid", [gate], "silu_sig")
+    silu = node("Mul", [gate, sig], "silu")
+    hidden = node("Mul", [silu, up], "hidden")
+    down = node("MatMul", [hidden, "down_w"], "down")
+    nodes.append(helper.make_node("Add", [resid1, down], ["output_y"]))
+
+    graph = helper.make_graph(nodes, "third_party_onnx2c_llama_prefill", [input_x], [output_y], initializers)
+    model = helper.make_model(graph, opset_imports=[helper.make_operatorsetid("", 9)])
+    model.ir_version = 7
+    onnx.checker.check_model(model)
+    onnx.save(model, model_path)
+
+
 def _onnx_generator_source(
     model: str,
     output_path: Path,
@@ -514,7 +652,7 @@ def _onnx_generator_source(
         extra = f", hidden_dim={int(mlp_hidden)}"
     elif model == "conv":
         extra = f", conv_channels={int(conv_channels)}"
-    elif model == "llama_decode":
+    elif model in {"llama_decode", "llama_prefill"}:
         extra = (
             f", d_model={int(d_model)}, d_head={int(d_head)}, n_heads={int(n_heads)}, "
             f"n_kv_heads={int(n_kv_heads)}, ffn_hidden_dim={int(ffn_hidden_dim)}, "
@@ -792,6 +930,60 @@ int main(void)
 """
 
 
+def _render_llama_prefill_wrapper(generated_c_name: str, signature: str, *, d_model: int, prompt_len: int) -> str:
+    token = _deterministic_llama_input(d_model)[0]
+    input_x = np.vstack([token + np.float32((i % 7) - 3) / np.float32(128.0) for i in range(int(prompt_len))])
+    return f"""// Bare-metal Llama-like prefill baseline generated by third-party onnx2c.
+// onnx2c: https://github.com/kraiskil/onnx2c
+// Generated model source: {generated_c_name}
+#include <stdint.h>
+#include <stdio.h>
+
+uint32_t runtime_cycle_start;
+uint32_t runtime_cycle_post_bss;
+uint32_t runtime_cycle_post_init;
+uint32_t runtime_cycle_pre_main;
+
+#define TIMER_CTRL  ((volatile uint32_t *) 0x15000000u)
+#define TIMER_VALUE ((volatile uint32_t *) 0x15000004u)
+#define TIMER_COUNT ((volatile uint32_t *) 0x15001000u)
+
+static inline uint32_t read_mcycle32(void) {{ return *TIMER_COUNT; }}
+
+static void reset_timer(void)
+{{
+    *TIMER_CTRL = 0u;
+    *TIMER_VALUE = 0xFFFFFFFFu;
+    while (*TIMER_COUNT == 0u) {{ }}
+}}
+
+void onnx2c_llama_prefill({signature});
+
+{_c_array("input_x_flat", input_x)}
+static float output_y[{int(prompt_len)}][{int(d_model)}];
+
+int main(void)
+{{
+    const float (*input_x)[{int(d_model)}] = (const float (*)[{int(d_model)}])input_x_flat;
+    reset_timer();
+    uint32_t t0 = read_mcycle32();
+    onnx2c_llama_prefill(input_x, output_y);
+    uint32_t t1 = read_mcycle32();
+    uint32_t cycles = t0 - t1;
+    float checksum = 0.0f;
+    for (int r = 0; r < {int(prompt_len)}; ++r) {{
+        for (int c = 0; c < {int(d_model)}; ++c) {{
+            checksum += output_y[r][c];
+        }}
+    }}
+    printf("third_party_onnx2c_llama_prefill d_model={int(d_model)} prompt_len={int(prompt_len)} cycles=%lu checksum=%.9g first=%.9g last=%.9g\\n",
+           (unsigned long)cycles, (double)checksum, (double)output_y[0][0], (double)output_y[{int(prompt_len) - 1}][{int(d_model) - 1}]);
+    puts("EXIT SUCCESS");
+    return 0;
+}}
+"""
+
+
 def build_elf_and_hex(program_name: str, wrapper_source: str, generated_model_c: Path) -> tuple[Path, Path, Path]:
     GENERATED_DIR.mkdir(exist_ok=True)
     CUSTOM_DIR.mkdir(exist_ok=True)
@@ -870,8 +1062,8 @@ def build_model(
         func_name = "onnx2c_mlp"
     elif model == "conv":
         func_name = "onnx2c_conv4"
-    elif model == "llama_decode":
-        func_name = "onnx2c_llama_decode"
+    elif model in {"llama_decode", "llama_prefill"}:
+        func_name = f"onnx2c_{model}"
     else:
         func_name = "onnx2c_tiny_lm"
     _generate_onnx(
@@ -897,6 +1089,13 @@ def build_model(
         wrapper = _render_tiny_lm_wrapper(generated_c.name, signature, prompt=prompt, prompt_len=prompt_len)
     elif model == "llama_decode":
         wrapper = _render_llama_decode_wrapper(generated_c.name, signature, d_model=d_model)
+    elif model == "llama_prefill":
+        wrapper = _render_llama_prefill_wrapper(
+            generated_c.name,
+            signature,
+            d_model=d_model,
+            prompt_len=prompt_len,
+        )
     else:
         raise ValueError(f"unsupported model: {model}")
     wrapper_path, elf_path, hex_path = build_elf_and_hex(program_name, wrapper, generated_c)
@@ -905,7 +1104,7 @@ def build_model(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", choices=["mlp", "conv", "tiny_lm", "llama_decode"], default="conv")
+    parser.add_argument("--model", choices=["mlp", "conv", "tiny_lm", "llama_decode", "llama_prefill"], default="conv")
     parser.add_argument("--program-name", default=None)
     parser.add_argument("--prompt", default="there was a little girl named lily .")
     parser.add_argument("--prompt-len", type=int, default=9)
@@ -928,6 +1127,7 @@ def main() -> int:
         "conv": "third_party_onnx2c_conv4",
         "tiny_lm": "third_party_onnx2c_tiny_lm",
         "llama_decode": "third_party_onnx2c_llama_decode",
+        "llama_prefill": "third_party_onnx2c_llama_prefill",
     }
     program_name = args.program_name or default_programs[args.model]
     onnx_path, generated_c, wrapper_path, elf_path, hex_path = build_model(

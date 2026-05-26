@@ -17,7 +17,7 @@ class HardwareConfig:
             'ARRAY_SIZE': 8,
             'DATA_WIDTH': 16,
             'BUFFER_WIDTH': 128,
-            'IM_BASE_ADDR': 0x9000
+            'IM_BASE_ADDR': 0xF000
         }
 
         if os.path.exists(defines_path):

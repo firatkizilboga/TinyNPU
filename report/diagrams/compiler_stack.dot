@@ -29,8 +29,8 @@ digraph TinyNPUCompilerStack {
     ];
 
     Model [label="PyTorch / quantized model", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
-    Quant [label="tinynpu_quant\ncompiler-ready conversion", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
-    FX [label="FX tracing\ncompile_module()", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
+    Quant [label="Quantized\nmodel artifact", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
+    FX [label="Model tracing", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
 
     subgraph cluster_partition {
         label="";
@@ -42,12 +42,12 @@ digraph TinyNPUCompilerStack {
         fontsize=16;
         margin="10,12";
 
-        Partition [label="partition_fx_graph()", fillcolor="#F4F7FB", color="#6F8FB3", fontcolor="#233142"];
-        Plan [label="ExecutionPlan\nNpuSegment + HostOp + VerifyTensor", fillcolor="#F4F7FB", color="#6F8FB3", fontcolor="#233142", width=2.7];
+        Partition [label="Partitioner", fillcolor="#F4F7FB", color="#6F8FB3", fontcolor="#233142"];
+        Plan [label="Execution IR\nNPU segments + host steps + checks", fillcolor="#F4F7FB", color="#6F8FB3", fontcolor="#233142", width=2.9];
         Expected [label="Expected tensors\nfor verification", fillcolor="#F4F7FB", color="#6F8FB3", fontcolor="#233142"];
     }
 
-    Validate [label="HostOp\nvalidation", fillcolor="#FFF4E8", color="#C98A43", fontcolor="#4A3520"];
+    Validate [label="Host-step\nvalidation", fillcolor="#FFF4E8", color="#C98A43", fontcolor="#4A3520"];
 
     subgraph cluster_lowering {
         label="Lowering and Runtime Packaging";
@@ -59,10 +59,10 @@ digraph TinyNPUCompilerStack {
         fontsize=16;
 
         Planner [label="Memory planner\nroles + layouts", fillcolor="#E7F6EC", color="#4F9A6C", fontcolor="#1f3328"];
-        Compiler [label="SegmentCompiler\noutput_layout selection", fillcolor="#E7F6EC", color="#4F9A6C", fontcolor="#1f3328"];
+        Compiler [label="Segment lowering\nlayout selection", fillcolor="#E7F6EC", color="#4F9A6C", fontcolor="#1f3328"];
         Program [label="code generator\nemit instructions + data", fillcolor="#E7F6EC", color="#4F9A6C", fontcolor="#1f3328", width=2.4];
         Segment [label="program C\ninstructions + buffer images", fillcolor="#E7F6EC", color="#4F9A6C", fontcolor="#1f3328", width=2.5];
-        Runner [label="runner C\ncalls runtime_v2.c", fillcolor="#E7F6EC", color="#4F9A6C", fontcolor="#1f3328"];
+        Runner [label="runner C\nexecution schedule", fillcolor="#E7F6EC", color="#4F9A6C", fontcolor="#1f3328"];
     }
 
     Artifact [label="Generated C package\nprogram + runner + checks", fillcolor="#EFE8FF", color="#8B74BD", fontcolor="#2C2236", width=2.6];
@@ -76,7 +76,7 @@ digraph TinyNPUCompilerStack {
         fontcolor="#8F4F32";
         fontsize=16;
 
-        SimExec [label="CV32E40P firmware\nruns runtime_v2.c\nunder Verilator", fillcolor="#FFE8DB", color="#D18A66", fontcolor="#40261d", width=2.4];
+        SimExec [label="CV32E40P firmware\nunder Verilator", fillcolor="#FFE8DB", color="#D18A66", fontcolor="#40261d", width=2.4];
     }
 
     Result [label="Outputs + checks\ncycle counts", fillcolor="#FFF7D9", color="#C9A227", fontcolor="#4A3A00", width=2.2];
@@ -86,10 +86,10 @@ digraph TinyNPUCompilerStack {
     Model -> FX [label="direct quantized module path"];
 
     FX -> Partition [label="GraphModule + example inputs"];
-    Partition -> Plan [label="mixed execution plan"];
+    Partition -> Plan [label="mixed execution graph"];
     Partition -> Expected [label="golden values"];
 
-    Plan -> Validate [label="compile_plan()"];
+    Plan -> Validate [label="validate"];
     Validate -> Planner [label="validated plan"];
     Planner -> Compiler [label="segment layouts"];
     Plan -> Compiler [label="NPU segments"];
