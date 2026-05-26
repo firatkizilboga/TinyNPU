@@ -281,7 +281,7 @@ When the integration provides it, the same UB and IM storage can also be exposed
     \label{fig:hardware-architecture}
 \end{figure}
 
-Figure~\ref{fig:hardware-architecture} shows the top-level organization. The compute path is a matrix path: the unified buffer feeds activation and weight streamers, the streamers feed the systolic array, and drained accumulators pass through the PPU before returning to the buffer. The XFORM unit is placed next to the unified buffer because it is a memory-side boundary converter: it reads packed words from UB, converts between FP16 and INT16 representations, and writes the result back to UB.
+Figure~\ref{fig:hardware-architecture} shows the top-level organization. The compute path is a matrix path: the unified buffer feeds activation and weight streamers, the streamers feed the systolic array, and drained accumulators pass through the PPU before returning to the buffer. Boundary quantization and dequantization are handled by the runtime/compiler contract rather than by a separate hardware transform instruction.
 
 \subsubsection{Unified Buffer and Physical Roles}
 
@@ -382,7 +382,7 @@ This behavior is programmed through a fixed-width 256-bit instruction format in 
     \end{tabularx}
 \end{table}
 
-\texttt{HALT} terminates the instruction stream and places the control unit in the halted state, \texttt{NOP} advances without side effects, \texttt{MOVE} is reserved for internal data movement, and \texttt{XFORM} performs explicit FP16/INT16 boundary transformations. In the JIT flow, \texttt{MATMUL}, \texttt{XFORM}, and \texttt{HALT} are the important emitted operations.
+\texttt{HALT} terminates the instruction stream and places the control unit in the halted state, \texttt{NOP} advances without side effects, and \texttt{MOVE} is reserved for internal data movement. In the JIT flow, \texttt{MATMUL} and \texttt{HALT} are the important emitted hardware operations.
 
 \begin{table}[H]
     \centering
@@ -400,8 +400,6 @@ This behavior is programmed through a fixed-width 256-bit instruction format in 
         \texttt{0x2} & \texttt{MATMUL} & Coarse-grained tiled matrix-multiplication instruction with integrated PPU configuration. \\
         \hline
         \texttt{0x3} & \texttt{MOVE} & Internal data-movement operation reserved by the RTL control path. \\
-        \hline
-        \texttt{0x4} & \texttt{XFORM} & Boundary transform operation used for FP16-to-INT16 quantization, INT16-to-FP16 dequantization, and the RoPE helper mode. \\
         \hline
     \end{tabularx}
 \end{table}
@@ -527,7 +525,7 @@ The evaluation uses three views. The first is a controlled multi-tile GEMM bench
 
 Correctness for the measured runs comes from compiler-owned expected tensors, runtime verification, or \texttt{autoverify} checks when explicit verify steps are not emitted. Separate unit, regression, and cocotb tests are used during development, but the headline numbers in this section come from the CV32E40P+TinyNPU execution path rather than host-only emulation.
 
-Wall-clock comparisons use the Vivado timing boundary. The CPU-only CV32E40P configuration routes at 57.1 MHz. The CPU+NPU real-BRAM configuration does not close at 50 MHz; its wall-clock comparison uses the measured 50 MHz timing violation as an approximate 39.17 MHz operating point. This is intentionally conservative for the integrated path: because the NPU clock is lower, CPU+NPU must achieve more than \(1.46\times\) cycle reduction before it wins in wall-clock time.
+Wall-clock comparisons use the Vivado timing boundary. The CPU-only CV32E40P configuration routes at 57.1 MHz. After removing the hardware XFORM path, the CPU+NPU real-BRAM configuration still does not close at 50 MHz; its measured 50 MHz timing violation corresponds to an approximate 33.9 MHz operating point. This is intentionally conservative for the integrated path: because the NPU clock is lower, CPU+NPU must achieve more than \(1.68\times\) cycle reduction before it wins in wall-clock time.
 
 \begin{table}[H]
     \centering
@@ -540,9 +538,9 @@ Wall-clock comparisons use the Vivado timing boundary. The CPU-only CV32E40P con
         \hline
         CPU only & 57.1 MHz & 0.000 ns & Meets & CPU wall-clock baseline. \\
         \hline
-        NPU only, real BRAM & 50 MHz & -4.853 ns & Fails & Shows NPU memory/timing pressure. \\
+        NPU only, real BRAM & 50 MHz & -9.851 ns & Fails & Approx. 33.5 MHz; critical path is control/address logic into UB write-mask logic. \\
         \hline
-        CPU+NPU, real BRAM & 50 MHz & -5.527 ns & Fails & Approximated as 39.17 MHz for wall-clock estimates. \\
+        CPU+NPU, real BRAM & 50 MHz & -9.486 ns & Fails & Approx. 33.9 MHz; used for CPU+NPU wall-clock estimates. \\
         \hline
         CPU+NPU, abstract memory & 50 MHz & +7.359 ns & Meets & Sanity check only; not used as a real implementation result. \\
         \hline
@@ -551,7 +549,7 @@ Wall-clock comparisons use the Vivado timing boundary. The CPU-only CV32E40P con
 
 \newpage
 \section{Comparative Evaluation and Discussion}
-This section focuses on artifacts that are representative of the implemented system: controlled GEMM scaling, trained-model wall-clock comparison, XFORM boundary use, and small transformer-like block scaling. The main distinction is between inner-kernel capability and system-level behavior. A compute-only speedup is not enough if staging, host operations, launch overhead, or a lower integrated clock dominate the full program.
+This section focuses on artifacts that are representative of the implemented system: controlled GEMM scaling, trained-model wall-clock comparison, and small transformer-like block scaling. The main distinction is between inner-kernel capability and system-level behavior. A compute-only speedup is not enough if staging, host operations, launch overhead, or a lower integrated clock dominate the full program.
 
 \subsection{Kernel-Level Benchmark}
 The GEMM scaling benchmark uses one explicit cold-invocation boundary. The numerator is the algorithmic GEMM work, \(M \cdot K \cdot N\) logical MACs. The denominator includes static UB/IM preload through the shared-SRAM window plus one full accelerator invocation, including launch, execution, and final INT16 readback. The \texttt{autoverify} pass runs after the measured window and is therefore excluded.
@@ -601,35 +599,29 @@ Table~\ref{tab:wall-clock-models} compares trained MNIST-derived MLP and convolu
 \begin{table}[H]
     \centering
     \footnotesize
-    \caption{Trained-model wall-clock comparison. CPU/ONNX uses 57.1 MHz; CPU+NPU uses the 39.17 MHz integrated timing estimate.}
+    \caption{Trained-model wall-clock comparison. CPU/ONNX uses 57.1 MHz; CPU+NPU uses the 33.9 MHz integrated timing estimate.}
     \label{tab:wall-clock-models}
     \resizebox{\textwidth}{!}{%
     \begin{tabular}{|l|r|r|r|r|r|}
         \hline
         \textbf{Workload} & \textbf{CPU/ONNX cycles} & \textbf{CPU+NPU cycles} & \textbf{CPU wall} & \textbf{CPU+NPU wall} & \textbf{Wall speedup} \\
         \hline
-        Conv 16ch cold & 259,688 & 124,838 & 4,548.0 us & 3,187.1 us & \(1.43\times\) \\
+        Conv 16ch cold & 259,688 & 124,838 & 4,548.0 us & 3,681.0 us & \(1.24\times\) \\
         \hline
-        Conv 16ch warm & 259,688 & 113,721 & 4,548.0 us & 2,903.3 us & \(1.57\times\) \\
+        Conv 16ch warm & 259,688 & 113,721 & 4,548.0 us & 3,353.2 us & \(1.36\times\) \\
         \hline
-        Conv wide32 cold & 1,013,314 & 253,018 & 17,746.3 us & 6,459.5 us & \(2.75\times\) \\
+        Conv wide32 cold & 1,013,314 & 253,018 & 17,746.3 us & 7,460.5 us & \(2.38\times\) \\
         \hline
-        Conv wide32 warm & 1,013,314 & 212,717 & 17,746.3 us & 5,430.6 us & \(3.27\times\) \\
+        Conv wide32 warm & 1,013,314 & 212,717 & 17,746.3 us & 6,272.2 us & \(2.83\times\) \\
         \hline
-        MLP h256 cold & 1,662,361 & 443,664 & 29,113.2 us & 11,326.6 us & \(2.57\times\) \\
+        MLP h256 cold & 1,662,361 & 443,664 & 29,113.2 us & 13,081.9 us & \(2.23\times\) \\
         \hline
-        MLP h256 warm & 1,662,361 & 45,987 & 29,113.2 us & 1,174.0 us & \(24.80\times\) \\
+        MLP h256 warm & 1,662,361 & 45,987 & 29,113.2 us & 1,356.0 us & \(21.47\times\) \\
         \hline
     \end{tabular}}
 \end{table}
 
-The MLP case shows the best behavior because it is matrix-native and benefits from resident execution. The warm MLP result reaches \(24.80\times\) wall-clock speedup even after applying the lower CPU+NPU timing estimate. The convolution case also improves with scale, but it remains more sensitive to host work because the compiler lowers convolution through \texttt{im2col}. The wide32 convolution reaches \(3.27\times\) warm wall-clock speedup, while the smaller 16-channel case is only \(1.57\times\) warm.
-
-\subsection{XFORM Boundary Use}
-
-The XFORM unit is used for explicit FP16/INT16 boundary conversion. Its most useful measured case is FP16-bit input quantization into INT16 before an MLP resident segment. In that test, replacing host quantization with XFORM quantization reduced the hot body from 16,679 cycles to 9,280 cycles and reduced cold end-to-end execution from 43,460 cycles to 36,068 cycles. The hot-body improvement is \(1.80\times\); the cold single-run improvement is smaller, \(1.20\times\), because preload and launch costs remain in the denominator.
-
-The same RTL contains an INT16-to-FP16 dequantization mode, but the public full-output contract still normally reads integer output and lets the host form the final floating result when needed. This is a deliberate reporting boundary: XFORM-DQ is implemented and tested as an instruction, but it is not yet a universal replacement for all host-side final-output conversion paths.
+The MLP case shows the best behavior because it is matrix-native and benefits from resident execution. The warm MLP result reaches \(21.47\times\) wall-clock speedup even after applying the lower CPU+NPU timing estimate. The convolution case also improves with scale, but it remains more sensitive to host work because the compiler lowers convolution through \texttt{im2col}. The wide32 convolution reaches \(2.83\times\) warm wall-clock speedup, while the smaller 16-channel case is only \(1.36\times\) warm.
 
 \subsection{Transformer-Like Block Scaling}
 
@@ -638,40 +630,40 @@ Small transformer-like blocks are included to test the compiler/runtime boundary
 \begin{table}[H]
     \centering
     \footnotesize
-    \caption{Small transformer-like runtime comparison. CPU+NPU wall speedups use the 57.1 MHz CPU-only and 39.17 MHz CPU+NPU timing assumptions.}
+    \caption{Small transformer-like runtime comparison. CPU+NPU wall speedups use the 57.1 MHz ONNX2C CPU and 33.9 MHz CPU+NPU timing assumptions.}
     \label{tab:transformer-scaling}
     \resizebox{\textwidth}{!}{%
     \begin{tabular}{|l|r|r|r|r|}
         \hline
-        \textbf{Workload} & \textbf{CPU cycles} & \textbf{CPU+NPU hot cycles} & \textbf{CPU+NPU cold cycles} & \textbf{Hot wall speedup} \\
+        \textbf{Workload} & \textbf{ONNX2C CPU cycles} & \textbf{CPU+NPU hot cycles} & \textbf{CPU+NPU cold cycles} & \textbf{Hot wall speedup} \\
         \hline
-        Llama-like decode \(d=32,h=8,n_h=4,n_{kv}=2,f=32,T=8\) & 224,719 & 172,789 & 187,030 & \(0.89\times\) \\
+        Llama-like decode \(d=32,h=8,n_h=4,n_{kv}=2,f=32,T=8\) & 67,902 & 227,508 & 241,807 & \(0.18\times\) \\
         \hline
-        Llama-like decode \(d=48,h=8,n_h=6,n_{kv}=3,f=48,T=8\) & 426,993 & 241,336 & 271,712 & \(1.21\times\) \\
+        Llama-like decode \(d=64,h=16,n_h=4,n_{kv}=2,f=64,T=8\) & 231,279 & 346,518 & 398,705 & \(0.40\times\) \\
         \hline
-        Llama-like decode \(d=64,h=16,n_h=4,n_{kv}=2,f=64,T=8\) & 668,974 & 277,909 & 330,045 & \(1.65\times\) \\
+        Llama-like decode \(d=96,h=16,n_h=6,n_{kv}=3,f=96,T=8\) & 494,338 & 503,899 & 618,806 & \(0.58\times\) \\
         \hline
-        GPT-2-like two-block \(d=16,h=16,n_h=1,f=16,T=4\) & 729,486 & 498,500 & 522,997 & \(1.00\times\) \\
+        Llama-like decode \(d=128,h=16,n_h=8,n_{kv}=4,f=128,T=8\) & 857,577 & 660,124 & 862,327 & \(0.77\times\) \\
         \hline
-        GPT-2-like two-block \(d=24,h=24,n_h=1,f=24,T=4\) & 1,333,079 & 709,199 & 757,888 & \(1.29\times\) \\
+        Llama-like decode \(d=192,h=16,n_h=12,n_{kv}=6,f=192,T=8\) & 1,876,388 & 977,033 & 1,427,556 & \(1.14\times\) \\
         \hline
     \end{tabular}}
 \end{table}
 
-The trend is consistent with the trained-model results. Very small decode shapes are not a good fit because the host operations and segment overhead consume too much of the total time. As the hidden dimension grows from \(d=32\) to \(d=64\), the Llama-like decode experiment moves from slower-than-CPU wall time to \(1.65\times\) hot wall-clock speedup. GPT-2-like two-block runs show the same direction but with a smaller margin at the tested sizes.
+The trend is consistent with the trained-model results, but the stronger ONNX2C baseline and lower integrated clock make the crossover later. Very small decode shapes are not a good fit because host operations and segment overhead consume too much of the total time. In the current no-XFORM path, the Llama-like decode experiment first beats the external ONNX2C CPU baseline at the largest measured resident case, \(d=192\), where hot execution reaches \(1.14\times\) wall-clock speedup. Cold one-shot execution at the same shape still loses because static preload remains in the measured window.
 
 \subsection{Bottlenecks and Interpretation}
 The bottleneck ranking is different for each class of workload. Matrix-native MLPs are dominated by whether weights and instruction images are resident. Convolutions are dominated by the remaining host-side \texttt{im2col} boundary. Transformer-like blocks are dominated by host operations, segment overhead, and whether the matrix dimensions are large enough to amortize fixed launch costs.
 
-The timing result also matters. On cycles alone, CPU+NPU often looks better than it does in wall-clock time. After applying 57.1 MHz for CPU-only and 39.17 MHz for CPU+NPU, the hybrid path must save enough cycles to overcome the lower integrated clock. The results still show useful wins for resident MLPs, larger convolutions, and larger transformer-like blocks, but they also show that timing closure and memory implementation are not secondary details. They directly affect the architectural conclusion.
+The timing result also matters. On cycles alone, CPU+NPU often looks better than it does in wall-clock time. After applying 57.1 MHz for CPU-only and 33.9 MHz for CPU+NPU, the hybrid path must save enough cycles to overcome the lower integrated clock. The results still show useful wins for resident MLPs, larger convolutions, and the largest measured resident Llama-like decode block, but they also show that timing closure and memory implementation are not secondary details. They directly affect the architectural conclusion.
 
 \newpage
 \section{Conclusion and Future Work}
 TinyNPU is a working mixed-precision accelerator platform with a usable hardware architecture, a PyTorch-oriented model-preparation flow, and a segmented compiler/runtime that keeps host boundaries explicit.
 
-The results show a clear split between compute capability and integration cost. The systolic core delivers useful throughput on tiled GEMM, and the runtime shows wall-clock wins on resident MLPs, larger convolution models, and larger transformer-like blocks. At the same time, practical execution still pays heavily for staging, packing, segmentation, host-visible boundaries, and timing closure. The convolution results make this especially clear: the NPU accelerates the matrix work, but the system still pays host-side \texttt{im2col}.
+The results show a clear split between compute capability and integration cost. The systolic core delivers useful throughput on tiled GEMM, and the runtime shows wall-clock wins on resident MLPs, larger convolution models, and the largest measured resident Llama-like decode block. At the same time, practical execution still pays heavily for staging, packing, segmentation, host-visible boundaries, and timing closure. The convolution results make this especially clear: the NPU accelerates the matrix work, but the system still pays host-side \texttt{im2col}.
 
-The immediate priorities are to close timing on the full CPU+NPU design with realistic memories, reduce avoidable runtime/interface overhead, and increase the size of useful accelerator regions. On the compiler side, the main target is to keep scale assignment, tensor layout, host fallbacks, and cache writeback policies explicit enough that new DNN blocks can be lowered without hand-specialized debugging. On the hardware side, the main target is not adding more features, but making the existing PPU, XFORM, memory, and control paths timing-clean enough for credible implementation claims.
+The immediate priorities are to close timing on the full CPU+NPU design with realistic memories, reduce avoidable runtime/interface overhead, and increase the size of useful accelerator regions. On the compiler side, the main target is to keep scale assignment, tensor layout, host fallbacks, and cache writeback policies explicit enough that new DNN blocks can be lowered without hand-specialized debugging. On the hardware side, the main target is not adding more features, but making the existing PPU, memory, and control paths timing-clean enough for credible implementation claims.
 
 \appendix
 \section{Implemented Activation Algorithms}
