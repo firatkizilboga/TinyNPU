@@ -110,6 +110,11 @@ module pe (
     logic signed [15:0] i16;
     logic signed [15:0] w16;
     logic signed [31:0] p16;
+
+`ifdef TINYNPU_PIPELINED_PE_MAC
+    logic signed [31:0] partial_sum_q;
+    logic               partial_valid_q;
+`endif
     
     always_comb begin
         partial_sum = '0;
@@ -189,13 +194,41 @@ module pe (
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             accumulator <= '0;
+`ifdef TINYNPU_PIPELINED_PE_MAC
+            partial_sum_q <= '0;
+            partial_valid_q <= 1'b0;
+`endif
         end else if (acc_clear) begin
             accumulator <= '0;
+`ifdef TINYNPU_PIPELINED_PE_MAC
+            partial_sum_q <= '0;
+            partial_valid_q <= 1'b0;
+`endif
         end else if (drain_enable) begin
             accumulator <= data_from_top;
+`ifdef TINYNPU_PIPELINED_PE_MAC
+            partial_sum_q <= '0;
+            partial_valid_q <= 1'b0;
+`endif
         end else if (local_valid) begin
+`ifdef TINYNPU_PIPELINED_PE_MAC
+            partial_sum_q <= partial_sum;
+            partial_valid_q <= 1'b1;
+            if (partial_valid_q) begin
+                accumulator <= accumulator + $signed({{(`ACC_WIDTH-32){partial_sum_q[31]}}, partial_sum_q});
+            end
+`else
             // Compute when local wavefront valid (OR of h/v valid signals)
             accumulator <= accumulator + $signed({{(`ACC_WIDTH-32){partial_sum[31]}}, partial_sum});
+`endif
+`ifdef TINYNPU_PIPELINED_PE_MAC
+        end else begin
+            partial_sum_q <= '0;
+            partial_valid_q <= 1'b0;
+            if (partial_valid_q) begin
+                accumulator <= accumulator + $signed({{(`ACC_WIDTH-32){partial_sum_q[31]}}, partial_sum_q});
+            end
+`endif
         end
     end
     

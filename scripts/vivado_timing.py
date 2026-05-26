@@ -55,7 +55,14 @@ def cv32e40p_files() -> list[Path]:
     return [rtl / name for name in names] + [bhv / "cv32e40p_sim_clock_gate.sv"]
 
 
-def write_tcl(workdir: Path, *, target: str, part: str, clock_ns: float) -> Path:
+def write_tcl(
+    workdir: Path,
+    *,
+    target: str,
+    part: str,
+    clock_ns: float,
+    extra_defines: list[str],
+) -> Path:
     if target == "npu":
         top = "tinynpu_top"
         clock_port = "clk"
@@ -69,7 +76,11 @@ def write_tcl(workdir: Path, *, target: str, part: str, clock_ns: float) -> Path
         clock_port = "clk_i"
         files = cv32e40p_files() + rtl_files() + [ROOT / "rtl" / "cv32e40p_tinynpu_synth_top.sv"]
 
-    read_flags = "-sv -define TINYNPU_FPGA_BRAM -define TINYNPU_VIVADO_BRAM"
+    define_flags = " ".join(
+        ["-define TINYNPU_FPGA_BRAM", "-define TINYNPU_VIVADO_BRAM"]
+        + [f"-define {name}" for name in extra_defines]
+    )
+    read_flags = f"-sv {define_flags}"
     file_lines = "\n".join(f"read_verilog {read_flags} {{{path}}}" for path in files)
     report_dir = workdir / "reports"
     checkpoint_dir = workdir / "checkpoints"
@@ -107,6 +118,11 @@ def main() -> int:
     ap.add_argument("--part", default=DEFAULT_PART)
     ap.add_argument("--clock-ns", type=float, default=20.0)
     ap.add_argument("--workdir", default="")
+    ap.add_argument(
+        "--pipelined-pe-mac",
+        action="store_true",
+        help="Enable the optional PE product register and matching control wait.",
+    )
     args = ap.parse_args()
 
     if not VIVADO.exists():
@@ -117,7 +133,14 @@ def main() -> int:
         shutil.rmtree(workdir)
     workdir.mkdir(parents=True)
 
-    tcl = write_tcl(workdir, target=args.target, part=args.part, clock_ns=args.clock_ns)
+    extra_defines = ["TINYNPU_PIPELINED_PE_MAC"] if args.pipelined_pe_mac else []
+    tcl = write_tcl(
+        workdir,
+        target=args.target,
+        part=args.part,
+        clock_ns=args.clock_ns,
+        extra_defines=extra_defines,
+    )
     log = workdir / "vivado.log"
     cmd = [str(VIVADO), "-mode", "batch", "-source", str(tcl), "-log", str(log), "-journal", str(workdir / "vivado.jou")]
     print(" ".join(cmd))

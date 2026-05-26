@@ -549,11 +549,25 @@ module control_unit #(
       CTRL_MM_WAIT: begin
         status_out = `STATUS_BUSY;
         compute_enable = 1'b1;  // Flush skewers
-        
+
+`ifdef TINYNPU_PIPELINED_PE_MAC
+        // The PE MAC pipeline registers the product one cycle before the
+        // accumulator add.  Hold off drain for one cycle after all_done so the
+        // final product is committed into the stationary accumulator.
+        if (all_done_in || cycle_cnt != '0) begin
+          if (cycle_cnt == 1) begin
+            cycle_next = '0;
+            next_state = CTRL_MM_DRAIN_SA;
+          end else begin
+            cycle_next = cycle_cnt + 1;
+          end
+        end
+`else
         if (all_done_in) begin
           cycle_next = '0;
           next_state = CTRL_MM_DRAIN_SA;
         end
+`endif
       end
 
       CTRL_MM_DRAIN_SA: begin
