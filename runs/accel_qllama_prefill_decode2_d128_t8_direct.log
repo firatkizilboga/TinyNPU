@@ -1,0 +1,8 @@
+Script started on 2026-05-28 03:54:10+02:00 [COMMAND="env VERILATOR_MAX_TICKS=5000000000000 external/cv32e40p/example_tb/core/obj_dir/cv32e40p_tb_vlt_npu +verilator+noassert +firmware=/root/compiler-optimization/external/cv32e40p/example_tb/core/custom/cv32e40p_qllama_prefill_decode2_seq_d128_h16_nh8_nkv4_f128_t8_s0.hex +maxcycles=3000000000" <not executed on terminal>]
+SBbIiMprefill_decode_sequence: QLlama
+EXIT FAILURE:          1
+- tb_top.sv:201: Verilog $finish
+[DUMP] UB memory snapshot: /tmp/tinynpu_dump_ub.hex
+[DUMP] IM memory snapshot: /tmp/tinynpu_dump_im.hex
+
+Script done on 2026-05-28 03:58:27+02:00 [COMMAND_EXIT_CODE="0"]

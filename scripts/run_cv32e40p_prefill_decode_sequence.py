@@ -145,8 +145,8 @@ static const TnpuTensorDesc *find_desc(const TnpuProgram *program, const char *n
 
 static int prepare_io(const TnpuProgram *program, TnpuTensor *ins, const TnpuTensor **ip, TnpuTensor *outs, const TnpuTensor **op)
 {{
-    if (program->input_count > 8u) return 1;
-    if (program->output_count > 8u) return 1;
+    if (program->input_count > 64u) return 1;
+    if (program->output_count > 64u) return 1;
     for (uint32_t i = 0; i < program->input_count; ++i) {{
         uint16_t t = program->input_tensor_indices[i];
         ins[i].data = program->tensors[t].data;
@@ -211,10 +211,10 @@ static int copy_v_cache(const TnpuProgram *src_program, const char *src_name, co
 int main(void)
 {{
     setbuf(stdout, NULL);
-    TnpuTensor ins[8];
-    const TnpuTensor *ip[8];
-    TnpuTensor outs[8];
-    const TnpuTensor *op[8];
+    TnpuTensor ins[64];
+    const TnpuTensor *ip[64];
+    TnpuTensor outs[64];
+    const TnpuTensor *op[64];
     uint32_t total_start = seq_read_mcycle32();
 
     puts("prefill_decode_sequence: {model}");
