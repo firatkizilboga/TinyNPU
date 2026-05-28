@@ -171,7 +171,8 @@ def _render_sequence_wrapper(
     decode_calls: list[str] = []
     for i, func in enumerate(decode_funcs):
         decode_calls.append(
-            f"""    t0 = read_mcycle32();
+            f"""    puts("onnx2c.decode{i}.start");
+    t0 = read_mcycle32();
     {func}(decode{i}_input, decode{i}_output);
     t1 = read_mcycle32();
     uint32_t decode{i}_cycles = t0 - t1;"""
@@ -219,10 +220,12 @@ static float prefill_output[{int(prompt_len)}][{int(d_model)}];
 
 int main(void)
 {{
+    setbuf(stdout, NULL);
     const float (*prefill_input)[{int(d_model)}] = (const float (*)[{int(d_model)}])prefill_input_flat;
 {decode_ptrs}
     reset_timer();
     uint32_t total_start = read_mcycle32();
+    puts("onnx2c.prefill.start");
     uint32_t t0 = read_mcycle32();
     {prefill_func}(prefill_input, prefill_output);
     uint32_t t1 = read_mcycle32();

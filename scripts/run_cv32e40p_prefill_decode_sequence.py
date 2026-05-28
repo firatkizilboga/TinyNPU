@@ -81,14 +81,16 @@ def _combined_runner_source(
     if (copy_v_cache(&{prior}, "v_cache_h{head}_td", &{symbol}, "v_cache_h{head}") != 0) return EXIT_FAILURE;"""
                 )
             decode_run_blocks.append(
-                f"""    t0 = seq_read_mcycle32();
+                f"""    seq_print_marker("sequence.decode{idx - 1}_to_decode{idx}_handoff.start");
+    t0 = seq_read_mcycle32();
 {chr(10).join(handoff)}
     t1 = seq_read_mcycle32();
     seq_print_delta("sequence.decode{idx - 1}_to_decode{idx}_handoff.total", t0, t1);
 """
             )
         decode_run_blocks.append(
-            f"""    if (prepare_io(&{symbol}, ins, ip, outs, op) != 0) return EXIT_FAILURE;
+            f"""    seq_print_marker("sequence.decode{idx}.start");
+    if (prepare_io(&{symbol}, ins, ip, outs, op) != 0) return EXIT_FAILURE;
     t0 = seq_read_mcycle32();
     rc = tinynpu_run(&{symbol}, ip, op, NULL, 0u);
     t1 = seq_read_mcycle32();
@@ -113,6 +115,11 @@ static inline uint32_t seq_read_mcycle32(void)
 static void seq_print_delta(const char *label, uint32_t start, uint32_t end)
 {{
     printf("%s cycles=%lu\\n", label, (unsigned long)(start - end));
+}}
+
+static void seq_print_marker(const char *label)
+{{
+    puts(label);
 }}
 
 static int streq(const char *a, const char *b)
@@ -203,6 +210,7 @@ static int copy_v_cache(const TnpuProgram *src_program, const char *src_name, co
 
 int main(void)
 {{
+    setbuf(stdout, NULL);
     TnpuTensor ins[8];
     const TnpuTensor *ip[8];
     TnpuTensor outs[8];
@@ -210,6 +218,7 @@ int main(void)
     uint32_t total_start = seq_read_mcycle32();
 
     puts("prefill_decode_sequence: {model}");
+    seq_print_marker("sequence.prefill.start");
     if (prepare_io(&{prefill_symbol}, ins, ip, outs, op) != 0) return EXIT_FAILURE;
     uint32_t t0 = seq_read_mcycle32();
     int rc = tinynpu_run(&{prefill_symbol}, ip, op, NULL, 0u);
@@ -217,6 +226,7 @@ int main(void)
     seq_print_delta("sequence.prefill.total", t0, t1);
     if (rc != 0) return EXIT_FAILURE;
 
+    seq_print_marker("sequence.cache_handoff.start");
     t0 = seq_read_mcycle32();
 {chr(10).join(prefill_to_decode)}
     t1 = seq_read_mcycle32();
