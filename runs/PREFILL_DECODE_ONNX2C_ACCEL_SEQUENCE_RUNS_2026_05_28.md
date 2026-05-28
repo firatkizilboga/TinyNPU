@@ -121,6 +121,22 @@ should not be used for performance numbers.
 | QGPT2 | `d128 h16 nh8 nkv8 f128 T8 decode_tokens=2` | 5,420,502 | 8,708,968 | 1.61x | Prefill wins: 2,924,429 vs 6,942,157 cycles (2.37x). Decode0 and decode1 are slower on the accelerated path: 1,057,619 vs 881,327 and 1,060,890 vs 884,243 cycles. Handoff copy costs in this pre-shared-cache accelerated run were 181,299 and 175,621 cycles. |
 | QGPT2 shared-cache | `d128 h16 nh8 nkv8 f128 T8 decode_tokens=2` | 5,275,649 | 8,708,968 | 1.65x | Prefill wins: 2,915,943 vs 6,942,157 cycles (2.38x). Handoff is reduced to 1 cycle for prefill-to-decode and 1 cycle for decode0-to-decode1. Decode0 and decode1 remain slower than ONNX2C: 1,169,403 vs 881,327 and 1,172,647 vs 884,243 cycles. |
 
+## Wall-Clock Conversion For Completed Two-Decode Rows
+
+Wall time uses the current routed timing assumptions from the report:
+ONNX2C CPU-only at `66.0 MHz`, integrated CPU+NPU at `50.17 MHz`.
+
+| Workload | ONNX2C wall | CPU+NPU wall | Wall speedup | Notes |
+| --- | ---: | ---: | ---: | --- |
+| QLlama shared-cache `d128 h16 nh8 nkv4 f128 T8 decode_tokens=2` e2e | 128.80 ms | 117.55 ms | 1.10x | Full prefill + decode0 + decode1 remains a wall-clock win after the lower CPU+NPU clock. |
+| QLlama shared-cache `d128` prefill | 102.73 ms | 67.42 ms | 1.52x | Prefill is the useful section-level win. |
+| QLlama shared-cache `d128` decode0 | 12.98 ms | 24.89 ms | 0.52x | Decode alone loses. |
+| QLlama shared-cache `d128` decode1 | 13.07 ms | 24.89 ms | 0.53x | Decode alone loses. |
+| QGPT2 shared-cache `d128 h16 nh8 nkv8 f128 T8 decode_tokens=2` e2e | 131.95 ms | 105.16 ms | 1.25x | Stronger full-sequence wall-clock win than QLlama at the same `d128` scale. |
+| QGPT2 shared-cache `d128` prefill | 105.18 ms | 58.12 ms | 1.81x | Prefill is the useful section-level win. |
+| QGPT2 shared-cache `d128` decode0 | 13.35 ms | 23.31 ms | 0.57x | Decode alone loses. |
+| QGPT2 shared-cache `d128` decode1 | 13.40 ms | 23.37 ms | 0.57x | Decode alone loses. |
+
 The clean smoke also validated two runner fixes needed before larger
 measurements:
 
