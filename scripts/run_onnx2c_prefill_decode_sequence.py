@@ -111,6 +111,7 @@ def _run_rtl_streamed(
     cmd = [
         str(CORE_DIR / "obj_dir" / "cv32e40p_tb_vlt_npu"),
         "+verilator+noassert",
+        "+verbose",
         f"+firmware={hex_path}",
         f"+maxcycles={maxcycles}",
     ]
