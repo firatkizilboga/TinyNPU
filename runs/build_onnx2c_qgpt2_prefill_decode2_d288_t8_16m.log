@@ -1,0 +1,28 @@
+Script started on 2026-05-28 03:30:30+02:00 [COMMAND="env PYTHONPATH=software/compiler python3 scripts/run_onnx2c_prefill_decode_sequence.py --model qgpt2 --d-model 288 --d-head 32 --n-heads 9 --ffn-dim 288 --prompt-len 8 --decode-tokens 2 --seed 0 --sim-ram-bytes 0x1000000 --sim-ram-addr-width 24" <not executed on terminal>]
+verilator -Wall -Wno-fatal -Wno-DECLFILENAME --timing -GNUM_MHPMCOUNTERS=0 --top-module tb_top -GRAM_ADDR_WIDTH=24 -CFLAGS "-std=c++17 -march=native -flto" -LDFLAGS "-flto" --threads 28 --x-assign fast --x-initial fast --inline-mult 0 --build-jobs 28 -MAKEFLAGS OPT_FAST="-O3" -GFPU=1 -cc -exe --build \
+	-o cv32e40p_tb_vlt_npu \
+	-I../../rtl/vendor/pulp_platform_common_cells/include \
+	-I../../../..//rtl \
+	verilator_main.cpp \
+	-f ../../cv32e40p_fpu_manifest.flist \
+	../../../..//rtl/unified_buffer.sv ../../../..//rtl/skewer.sv ../../../..//rtl/pe.sv ../../../..//rtl/systolic_array.sv ../../../..//rtl/di_exp.sv ../../../..//rtl/di_sigmoid.sv ../../../..//rtl/h_gelu.sv ../../../..//rtl/ppu.sv ../../../..//rtl/ubss.sv ../../../..//rtl/mmio_interface.sv ../../../..//rtl/instruction_memory.sv ../../../..//rtl/control_unit.sv ../../../..//rtl/control_top.sv ../../../..//rtl/tinynpu_top.sv \
+	include/perturbation_pkg.sv amo_shim.sv riscv_gnt_stall.sv riscv_rvalid_stall.sv dp_ram.sv mm_ram.sv cv32e40p_tb_subsystem.sv tb_top.sv \
+	cv32e40p_random_interrupt_generator.sv
+make[1]: Entering directory '/root/compiler-optimization/external/cv32e40p/example_tb/core/obj_dir'
+make[1]: Nothing to be done for 'default'.
+make[1]: Leaving directory '/root/compiler-optimization/external/cv32e40p/example_tb/core/obj_dir'
+- V e r i l a t i o n   R e p o r t: Verilator 5.036 2025-04-27 rev v5.036
+- Verilator: Built from 0.000 MB sources in 0 modules, into 0.000 MB in 0 C++ files needing 0.000 MB
+- Verilator: Walltime 0.022 s (elab=0.000, cvt=0.000, bld=0.021); cpu 0.001 s on 28 threads; alloced 8.395 MB
+/usr/lib/gcc/riscv64-unknown-elf/13.2.0/../../../riscv64-unknown-elf/bin/ld: warning: /root/compiler-optimization/external/cv32e40p/example_tb/core/custom/third_party_onnx2c_qgpt2_prefill_decode2_seq_d288_h32_nh9_nkv9_f288_t8_s0.elf has a LOAD segment with RWX permissions
+prefill_onnx=/root/compiler-optimization/generated/third_party_onnx2c_qgpt2_prefill_decode2_seq_d288_h32_nh9_nkv9_f288_t8_s0_prefill.onnx
+decode0_onnx=/root/compiler-optimization/generated/third_party_onnx2c_qgpt2_prefill_decode2_seq_d288_h32_nh9_nkv9_f288_t8_s0_decode0.onnx
+decode1_onnx=/root/compiler-optimization/generated/third_party_onnx2c_qgpt2_prefill_decode2_seq_d288_h32_nh9_nkv9_f288_t8_s0_decode1.onnx
+prefill_generated_c=/root/compiler-optimization/generated/third_party_onnx2c_qgpt2_prefill_decode2_seq_d288_h32_nh9_nkv9_f288_t8_s0_prefill_model.c
+decode0_generated_c=/root/compiler-optimization/generated/third_party_onnx2c_qgpt2_prefill_decode2_seq_d288_h32_nh9_nkv9_f288_t8_s0_decode0_model.c
+decode1_generated_c=/root/compiler-optimization/generated/third_party_onnx2c_qgpt2_prefill_decode2_seq_d288_h32_nh9_nkv9_f288_t8_s0_decode1_model.c
+wrapper=/root/compiler-optimization/generated/third_party_onnx2c_qgpt2_prefill_decode2_seq_d288_h32_nh9_nkv9_f288_t8_s0.c
+elf=/root/compiler-optimization/external/cv32e40p/example_tb/core/custom/third_party_onnx2c_qgpt2_prefill_decode2_seq_d288_h32_nh9_nkv9_f288_t8_s0.elf
+hex=/root/compiler-optimization/external/cv32e40p/example_tb/core/custom/third_party_onnx2c_qgpt2_prefill_decode2_seq_d288_h32_nh9_nkv9_f288_t8_s0.hex
+
+Script done on 2026-05-28 03:30:40+02:00 [COMMAND_EXIT_CODE="0"]

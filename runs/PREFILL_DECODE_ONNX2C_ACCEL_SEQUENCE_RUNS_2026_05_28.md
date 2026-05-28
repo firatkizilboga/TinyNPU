@@ -50,12 +50,47 @@ These artifacts link successfully and are ready for RTL execution.
 | QGPT2-like ONNX2C | `d8 h8 nh1 nkv1 f8 T8 decode_tokens=2` | `external/cv32e40p/example_tb/core/custom/third_party_onnx2c_qgpt2_prefill_decode2_seq_d8_h8_nh1_nkv1_f8_t8_s0.elf` |
 | QLlama accelerated | `d8 h8 nh1 nkv1 f8 T8 decode_tokens=2` | `external/cv32e40p/example_tb/core/custom/cv32e40p_qllama_prefill_decode2_seq_d8_h8_nh1_nkv1_f8_t8_s0.elf` |
 | QGPT2 accelerated | `d8 h8 nh1 nkv1 f8 T8 decode_tokens=2` | `external/cv32e40p/example_tb/core/custom/cv32e40p_qgpt2_prefill_decode2_seq_d8_h8_nh1_nkv1_f8_t8_s0.elf` |
+| QLlama-like ONNX2C | `d128 h16 nh8 nkv4 f128 T8 decode_tokens=2` | `external/cv32e40p/example_tb/core/custom/third_party_onnx2c_qllama_prefill_decode2_seq_d128_h16_nh8_nkv4_f128_t8_s0.elf` |
+| QGPT2-like ONNX2C | `d128 h16 nh8 nkv8 f128 T8 decode_tokens=2` | `external/cv32e40p/example_tb/core/custom/third_party_onnx2c_qgpt2_prefill_decode2_seq_d128_h16_nh8_nkv8_f128_t8_s0.elf` |
+| QLlama accelerated | `d128 h16 nh8 nkv4 f128 T8 decode_tokens=2` | `external/cv32e40p/example_tb/core/custom/cv32e40p_qllama_prefill_decode2_seq_d128_h16_nh8_nkv4_f128_t8_s0.elf` |
+| QGPT2 accelerated | `d128 h16 nh8 nkv8 f128 T8 decode_tokens=2` | `external/cv32e40p/example_tb/core/custom/cv32e40p_qgpt2_prefill_decode2_seq_d128_h16_nh8_nkv8_f128_t8_s0.elf` |
+
+## Large-RAM d288 Two-Token Build Artifacts
+
+The default CV32E40P testbench RAM is 4 MiB. The sequence runners now accept
+`--sim-ram-bytes` and `--sim-ram-addr-width` so large CPU firmware images can be
+linked and run against a larger simulated CPU RAM without changing the NPU RTL
+datapath or UB/IM sizes. The d288 two-token images below were built with
+`--sim-ram-bytes 0x1000000 --sim-ram-addr-width 24`.
+
+| Model | Config | Build log | ELF |
+| --- | --- | --- | --- |
+| QLlama-like ONNX2C | `d288 h32 nh9 nkv3 f288 T8 decode_tokens=2` | `runs/build_onnx2c_qllama_prefill_decode2_d288_t8_16m.log` | `external/cv32e40p/example_tb/core/custom/third_party_onnx2c_qllama_prefill_decode2_seq_d288_h32_nh9_nkv3_f288_t8_s0.elf` |
+| QGPT2-like ONNX2C | `d288 h32 nh9 nkv9 f288 T8 decode_tokens=2` | `runs/build_onnx2c_qgpt2_prefill_decode2_d288_t8_16m.log` | `external/cv32e40p/example_tb/core/custom/third_party_onnx2c_qgpt2_prefill_decode2_seq_d288_h32_nh9_nkv9_f288_t8_s0.elf` |
+| QLlama accelerated | `d288 h32 nh9 nkv3 f288 T8 decode_tokens=2` | `runs/build_accel_qllama_prefill_decode2_d288_t8_16m.log` | `external/cv32e40p/example_tb/core/custom/cv32e40p_qllama_prefill_decode2_seq_d288_h32_nh9_nkv3_f288_t8_s0.elf` |
+| QGPT2 accelerated | `d288 h32 nh9 nkv9 f288 T8 decode_tokens=2` | `runs/build_accel_qgpt2_prefill_decode2_d288_t8_16m.log` | `external/cv32e40p/example_tb/core/custom/cv32e40p_qgpt2_prefill_decode2_seq_d288_h32_nh9_nkv9_f288_t8_s0.elf` |
+
+## Build Failures Under Default 4 MiB CV32E40P RAM Image
+
+| Model | Config | Failure |
+| --- | --- | --- |
+| QLlama accelerated | `d192 h16 nh12 nkv6 f192 T8 decode_tokens=2` | linker region `ram` overflowed by 535,152 bytes |
+| QLlama accelerated | `d288 h32 nh9 nkv3 f288 T8 decode_tokens=2` | linker region `ram` overflowed by 5,099,664 bytes |
+| QGPT2 accelerated | `d288 h32 nh9 nkv9 f288 T8 decode_tokens=2` | linker region `ram` overflowed by 5,618,576 bytes |
 
 ## Current Caveats
 
 - The ONNX2C sequence timing measures independent ONNX2C calls in one firmware
   image. It is a CPU-only workload baseline with section timing; it does not yet
   feed prefill-produced K/V tensors into the decode ONNX graph.
+- d192 and d288 two-token accelerated runs do not fit the default 4 MiB
+  CV32E40P bare-metal RAM image because prefill, decode0, and decode1 are linked
+  as separate generated programs with duplicated constants. d288 now links under
+  the opt-in 16 MiB simulation RAM path. A compiler/runtime refactor that shares
+  weights/constants across the sequence is still the better long-term fix.
+- The older d192 one-decode ONNX2C uncapped run is still live with no firmware
+  output in `runs/onnx2c_qllama_prefill_decode_d192_t8_unlimited.log`; it is not
+  the two-token comparison target.
 - Checkpoint commits are available through the alternate gitdir:
   `git --git-dir=/root/compiler-optimization/.git-real --work-tree=/root/compiler-optimization ...`.
   Current relevant commits are `69eb1d0` and `e332087`.

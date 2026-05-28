@@ -37,6 +37,21 @@ from tinynpu_jit.rtl_runner import (  # noqa: E402
 )
 
 
+def _linker_script_for_ram_bytes(ram_bytes: int | None) -> str:
+    if ram_bytes is None or ram_bytes <= 0:
+        return "custom/link.ld"
+    if ram_bytes < 0x400000:
+        raise ValueError("--sim-ram-bytes must be at least the default 0x400000")
+    base = CORE_DIR / "custom" / "link.ld"
+    generated = CORE_DIR / "custom" / f"link_ram_{ram_bytes:x}.ld"
+    text = base.read_text()
+    old = "LENGTH = 0x400000"
+    if old not in text:
+        raise RuntimeError(f"could not find default RAM length in {base}")
+    generated.write_text(text.replace(old, f"LENGTH = 0x{ram_bytes:x}", 1))
+    return f"custom/{generated.name}"
+
+
 def _canonical_model(name: str) -> str:
     if name in {"qllama", "llama"}:
         return "qllama"
@@ -236,6 +251,8 @@ def _build_elf_and_hex(
     wrapper_source: str,
     prefill_c: Path,
     decode_cs: list[Path],
+    linker_script: str,
+    sim_ram_addr_width: int | None,
 ) -> tuple[Path, Path, Path]:
     GENERATED_DIR.mkdir(exist_ok=True)
     CUSTOM_DIR.mkdir(exist_ok=True)
@@ -251,6 +268,9 @@ def _build_elf_and_hex(
     build_env = dict(os.environ)
     build_env["CCACHE_DISABLE"] = "1"
     build_env["TMPDIR"] = "/tmp"
+    if sim_ram_addr_width is not None:
+        extra_flags = build_env.get("VERILATOR_EXTRA_FLAGS", "--x-assign fast --x-initial fast --inline-mult 0")
+        build_env["VERILATOR_EXTRA_FLAGS"] = f"{extra_flags} -GRAM_ADDR_WIDTH={sim_ram_addr_width}"
     run_checked(["make", "verilator-build-npu"], cwd=CORE_DIR, env=build_env)
     run_checked(
         [
@@ -265,7 +285,7 @@ def _build_elf_and_hex(
             "-DNDEBUG",
             "-nostdlib",
             "-T",
-            "custom/link.ld",
+            linker_script,
             "-static",
             "custom/crt0.S",
             str(wrapper_path),
@@ -357,6 +377,8 @@ def build_sequence(args: argparse.Namespace) -> tuple[Path, list[Path], Path, li
         wrapper_source=wrapper,
         prefill_c=prefill_c,
         decode_cs=decode_c,
+        linker_script=_linker_script_for_ram_bytes(args.sim_ram_bytes),
+        sim_ram_addr_width=args.sim_ram_addr_width,
     )
     return prefill_onnx, decode_onnx, prefill_c, decode_c, wrapper_path, elf_path, hex_path
 
@@ -378,6 +400,8 @@ def main() -> int:
     parser.add_argument("--timeout-s", type=int, default=900, help="Python wall-time timeout. Use 0 or a negative value to disable it.")
     parser.add_argument("--dump-stdout", action="store_true")
     parser.add_argument("--log-path", type=Path, default=None)
+    parser.add_argument("--sim-ram-bytes", type=lambda value: int(value, 0), default=0, help="Optional larger bare-metal RAM size for generated linker script, e.g. 0x1000000.")
+    parser.add_argument("--sim-ram-addr-width", type=int, default=None, help="Optional Verilator tb RAM_ADDR_WIDTH override. Use with --sim-ram-bytes when the image exceeds 4 MiB.")
     args = parser.parse_args()
     args.model = _canonical_model(args.model)
     if args.n_kv_heads is None:

@@ -39,6 +39,21 @@ from tinynpu_jit.rtl_runner import (  # noqa: E402
 )
 
 
+def _linker_script_for_ram_bytes(ram_bytes: int | None) -> str:
+    if ram_bytes is None or ram_bytes <= 0:
+        return "custom/link.ld"
+    if ram_bytes < 0x400000:
+        raise ValueError("--sim-ram-bytes must be at least the default 0x400000")
+    base = CORE_DIR / "custom" / "link.ld"
+    generated = CORE_DIR / "custom" / f"link_ram_{ram_bytes:x}.ld"
+    text = base.read_text()
+    old = "LENGTH = 0x400000"
+    if old not in text:
+        raise RuntimeError(f"could not find default RAM length in {base}")
+    generated.write_text(text.replace(old, f"LENGTH = 0x{ram_bytes:x}", 1))
+    return f"custom/{generated.name}"
+
+
 def _combined_runner_source(
     *,
     prefill_symbol: str,
@@ -222,6 +237,8 @@ def _build_sequence_elf_and_hex(
     prefill_source: str,
     decode_sources: list[str],
     runner_source: str,
+    linker_script: str,
+    sim_ram_addr_width: int | None,
 ) -> tuple[Path, list[Path], Path, Path, Path]:
     GENERATED_DIR.mkdir(exist_ok=True)
     prefill_path = GENERATED_DIR / f"{program_name}_prefill_program.c"
@@ -242,6 +259,9 @@ def _build_sequence_elf_and_hex(
     build_env = dict(os.environ)
     build_env["CCACHE_DISABLE"] = "1"
     build_env["TMPDIR"] = "/tmp"
+    if sim_ram_addr_width is not None:
+        extra_flags = build_env.get("VERILATOR_EXTRA_FLAGS", "--x-assign fast --x-initial fast --inline-mult 0")
+        build_env["VERILATOR_EXTRA_FLAGS"] = f"{extra_flags} -GRAM_ADDR_WIDTH={sim_ram_addr_width}"
     run_checked(["make", "verilator-build-npu"], cwd=CORE_DIR, env=build_env)
     cfg = RunnerConfig(repeat_count=1, dump_final_outputs=True, verbose_steps=True)
     run_checked(
@@ -253,7 +273,7 @@ def _build_sequence_elf_and_hex(
             str(elf_path),
             *runtime_cflags(cfg, extra_cflags=["-ffast-math", "-fno-builtin-printf"]),
             "-T",
-            "custom/link.ld",
+            linker_script,
             "-static",
             "custom/crt0.S",
             str(runner_path),
@@ -467,6 +487,8 @@ def main() -> int:
     parser.add_argument("--timeout-s", type=int, default=900, help="Python wall-time timeout. Use 0 or a negative value to disable it.")
     parser.add_argument("--dump-stdout", action="store_true")
     parser.add_argument("--log-path", type=Path, default=None, help="Persistent RTL stdout/stderr log path. Defaults to runs/<program>_rtl_<timestamp>.log.")
+    parser.add_argument("--sim-ram-bytes", type=lambda value: int(value, 0), default=0, help="Optional larger bare-metal RAM size for generated linker script, e.g. 0x1000000.")
+    parser.add_argument("--sim-ram-addr-width", type=int, default=None, help="Optional Verilator tb RAM_ADDR_WIDTH override. Use with --sim-ram-bytes when the image exceeds 4 MiB.")
     args = parser.parse_args()
     args.model = _canonical_model(args.model)
     if args.n_kv_heads is None:
@@ -490,6 +512,7 @@ def main() -> int:
         emit_cv32e40p_program_v2(artifact, {}, program_name=name)
         for artifact, name in zip(decode_artifacts, decode_names, strict=True)
     ]
+    linker_script = _linker_script_for_ram_bytes(args.sim_ram_bytes)
     runner_source = _combined_runner_source(
         prefill_symbol=prefill_symbol,
         decode_symbols=decode_symbols,
@@ -501,6 +524,8 @@ def main() -> int:
         prefill_source=prefill_source,
         decode_sources=decode_sources,
         runner_source=runner_source,
+        linker_script=linker_script,
+        sim_ram_addr_width=args.sim_ram_addr_width,
     )
     print(f"prefill_program={prefill_path}")
     for idx, path in enumerate(decode_paths):
