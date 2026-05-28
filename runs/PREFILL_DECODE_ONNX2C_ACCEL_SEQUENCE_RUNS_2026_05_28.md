@@ -70,6 +70,23 @@ datapath or UB/IM sizes. The d288 two-token images below were built with
 | QLlama accelerated | `d288 h32 nh9 nkv3 f288 T8 decode_tokens=2` | `runs/build_accel_qllama_prefill_decode2_d288_t8_16m.log` | `external/cv32e40p/example_tb/core/custom/cv32e40p_qllama_prefill_decode2_seq_d288_h32_nh9_nkv3_f288_t8_s0.elf` |
 | QGPT2 accelerated | `d288 h32 nh9 nkv9 f288 T8 decode_tokens=2` | `runs/build_accel_qgpt2_prefill_decode2_d288_t8_16m.log` | `external/cv32e40p/example_tb/core/custom/cv32e40p_qgpt2_prefill_decode2_seq_d288_h32_nh9_nkv9_f288_t8_s0.elf` |
 
+## Sequence Runner Debug Notes
+
+| Case | Log | Result |
+| --- | --- | --- |
+| QLlama accelerated `d128 h16 nh8 nkv4 f128 T8 decode_tokens=2` old runner | `runs/accel_qllama_prefill_decode2_d128_t8_direct.log` | Failed before section timing: prefill exposes 9 outputs (`final + K/V cache for 4 KV heads`) but the generated runner only allocated 8 output descriptors. Fixed in commit `bcc7dc7` by raising the generated runner I/O descriptor capacity to 64. |
+| QLlama accelerated `d128 h16 nh8 nkv4 f128 T8 decode_tokens=2` fixed runner | `runs/accel_qllama_prefill_decode2_d128_t8_fixed.log` | Running at note time. It reached `prefill_decode_sequence: QLlama` and `sequence.prefill.start`; no `sequence.prefill.total` yet. This run was started with the temporary `+verbose` flag and is therefore noisy/slow. |
+
+Observability notes:
+
+- Commit `71b6d1c` disables stdout buffering in generated sequence firmware and
+  adds start markers for prefill, cache handoff, decode, and decode-to-decode
+  handoff.
+- Commit `840ed7a` briefly enabled `+verbose`, but that was too noisy because
+  the CV32E40P testbench prints low-level memory traffic under that flag.
+- Commit `2b44132` removes `+verbose` again. Future concise load visibility
+  should use a dedicated testbench message, not the global verbose flag.
+
 ## Build Failures Under Default 4 MiB CV32E40P RAM Image
 
 | Model | Config | Failure |
