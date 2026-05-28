@@ -56,6 +56,6 @@ These artifacts link successfully and are ready for RTL execution.
 - The ONNX2C sequence timing measures independent ONNX2C calls in one firmware
   image. It is a CPU-only workload baseline with section timing; it does not yet
   feed prefill-produced K/V tensors into the decode ONNX graph.
-- Git checkpoint commits are blocked in this checkout because `git status`
-  currently fails with:
-  `fatal: not a git repository: /home/firatkizilboga/TinyNPU/.git/worktrees/compiler-optimization`.
+- Checkpoint commits are available through the alternate gitdir:
+  `git --git-dir=/root/compiler-optimization/.git-real --work-tree=/root/compiler-optimization ...`.
+  Current relevant commits are `69eb1d0` and `e332087`.
