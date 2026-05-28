@@ -20,6 +20,10 @@ section-level cycle counts where available.
 - Both sequence runners now support `--decode-tokens 2`. The accelerated runner
   builds a true second decode artifact whose cache length is `prompt_len + 2`;
   firmware copies decode0 K/V outputs into decode1 before running decode1.
+- Work in progress after the QGPT2 d128 ONNX2C run: the accelerated sequence
+  runner is being converted from full-cache copy handoff to shared K/V cache
+  backing storage. The intended model is pointer handoff for existing cache
+  contents plus one-token append after each decode.
 
 ## Completed ONNX2C CPU-only Sequence Runs
 
@@ -96,23 +100,37 @@ should not be used for performance numbers.
 | --- | --- | --- | --- |
 | QLlama accelerated | `d8 h8 nh1 nkv1 f8 T8 decode_tokens=2` | `runs/accel_qllama_prefill_decode2_d8_t8_fixed_sequence.log` | `EXIT SUCCESS`; prefill 717,659 cycles, prefill-to-decode handoff 8,148 cycles, decode0 256,086 cycles, decode0-to-decode1 handoff 8,068 cycles, decode1 256,783 cycles, e2e 1,265,362 cycles. |
 | QLlama ONNX2C | `d8 h8 nh1 nkv1 f8 T8 decode_tokens=2` | `runs/onnx2c_qllama_prefill_decode2_d8_t8_sequence.log` | `EXIT SUCCESS`; total 44,710 cycles, prefill 33,310 cycles, decode0 4,969 cycles, decode1 5,243 cycles. ONNX2C is faster at this tiny smoke size, so this is not a reportable accelerator win. |
+| QLlama accelerated shared-cache smoke | `d8 h8 nh1 nkv1 f8 T8 decode_tokens=2` | `runs/accel_qllama_prefill_decode2_d8_t8_shared_cache_smoke.log` | `EXIT SUCCESS`; prefill 401,503 cycles, prefill-to-decode handoff 1 cycle, decode0 241,694 cycles, decode0-to-decode1 handoff 1 cycle, decode1 242,107 cycles, e2e 902,111 cycles. This validates the shared-cache pointer handoff on the tiny QLlama sequence. |
 | QLlama accelerated | `d128 h16 nh8 nkv4 f128 T8 decode_tokens=2` | `runs/accel_qllama_prefill_decode2_d128_t8_nodump_sequence.log` | `EXIT SUCCESS`; prefill 3,375,256 cycles, prefill-to-decode handoff 85,164 cycles, decode0 1,192,925 cycles, decode0-to-decode1 handoff 82,188 cycles, decode1 1,193,125 cycles, e2e 5,948,866 cycles. |
 | QLlama ONNX2C | `d128 h16 nh8 nkv4 f128 T8 decode_tokens=2` | `runs/onnx2c_qllama_prefill_decode2_d128_t8_sequence.log` | `EXIT SUCCESS`; total 8,500,853 cycles, prefill 6,780,108 cycles, decode0 856,981 cycles, decode1 862,522 cycles. Accelerated e2e is 1.43x faster overall; accelerated prefill is 2.01x faster, while individual accelerated decode sections are slower. |
+| QLlama accelerated shared-cache | `d128 h16 nh8 nkv4 f128 T8 decode_tokens=2` | `runs/accel_qllama_prefill_decode2_d128_t8_shared_cache_sequence.log` | `EXIT SUCCESS`; prefill 3,382,226 cycles, prefill-to-decode handoff 1 cycle, decode0 1,248,626 cycles, decode0-to-decode1 handoff 1 cycle, decode1 1,248,747 cycles, e2e 5,897,388 cycles. Compared against ONNX2C, this is a 1.44x e2e cycle win and a 2.00x prefill cycle win. Compared against the pre-shared-cache accelerated run, e2e improves by 51,478 cycles because full-cache copy handoff is removed, while decode bodies are slower in this configuration. |
+| QGPT2 accelerated | `d128 h16 nh8 nkv8 f128 T8 decode_tokens=2` | `runs/accel_qgpt2_prefill_decode2_d128_t8_nodump_sequence.log` | `EXIT SUCCESS`; prefill 2,924,429 cycles, prefill-to-decode handoff 181,299 cycles, decode0 1,057,619 cycles, decode0-to-decode1 handoff 175,621 cycles, decode1 1,060,890 cycles, e2e 5,420,502 cycles. Compared against the ONNX2C row below, this is a 1.61x e2e cycle win and a 2.37x prefill cycle win. |
+| QGPT2 ONNX2C | `d128 h16 nh8 nkv8 f128 T8 decode_tokens=2` | `runs/onnx2c_qgpt2_prefill_decode2_d128_t8_sequence.log` | `EXIT SUCCESS`; total 8,708,968 cycles, prefill 6,942,157 cycles, decode0 881,327 cycles, decode1 884,243 cycles. Accelerated e2e from the pre-shared-cache run is 1.61x faster overall; accelerated prefill is 2.37x faster, while individual accelerated decode sections are slower. |
+| QGPT2 accelerated shared-cache | `d128 h16 nh8 nkv8 f128 T8 decode_tokens=2` | `runs/accel_qgpt2_prefill_decode2_d128_t8_shared_cache_sequence.log` | `EXIT SUCCESS`; prefill 2,915,943 cycles, prefill-to-decode handoff 1 cycle, decode0 1,169,403 cycles, decode0-to-decode1 handoff 1 cycle, decode1 1,172,647 cycles, e2e 5,275,649 cycles. Compared against ONNX2C, this is a 1.65x e2e cycle win and a 2.38x prefill cycle win. Compared against the pre-shared-cache accelerated run, e2e improves by 144,853 cycles because handoff copies are removed, even though decode bodies are slower in this configuration. |
+| QGPT2 accelerated shared-cache smoke | `d8 h8 nh1 nkv1 f8 T8 decode_tokens=2` | `runs/accel_qgpt2_prefill_decode2_d8_t8_shared_cache_smoke.log` | Started after converting the handoff to shared cache backing. It stalled before the first sequence marker with only the boot character `S` in the log, likely because the first shared-cache implementation reserved oversized per-head buffers and paid that startup cost before firmware markers. |
+| QGPT2 accelerated shared-cache exact-size smoke | `d8 h8 nh1 nkv1 f8 T8 decode_tokens=2` | `runs/accel_qgpt2_prefill_decode2_d8_t8_shared_cache_smoke_exact.log` | Command: `PYTHONPATH=software/compiler python3 scripts/run_cv32e40p_prefill_decode_sequence.py --model qgpt2 --d-model 8 --d-head 8 --n-heads 1 --ffn-dim 8 --prompt-len 8 --decode-tokens 2 --seed 0 --run-rtl --maxcycles 50000000 --verilator-max-ticks 1000000000000 --timeout-s 900 --log-path runs/accel_qgpt2_prefill_decode2_d8_t8_shared_cache_smoke_exact.log`. It currently records only the boot character `S`; next debug step is adding earlier firmware markers and reducing generated descriptor storage before rerunning. |
+| QGPT2 accelerated shared-cache boot/timer-fixed smoke | `d8 h8 nh1 nkv1 f8 T8 decode_tokens=2` | `runs/accel_qgpt2_prefill_decode2_d8_t8_shared_cache_timerfix_smoke.log` | `EXIT SUCCESS`; prefill 364,293 cycles, prefill-to-decode handoff 1 cycle, decode0 214,691 cycles, decode0-to-decode1 handoff 1 cycle, decode1 215,545 cycles, e2e 811,287 cycles. This validates the shared-cache pointer handoff on the tiny QGPT2 sequence. |
+| QGPT2 accelerated shared-cache `int16_t` backing experiment | `d8 h8 nh1 nkv1 f8 T8 decode_tokens=2` | `runs/accel_qgpt2_prefill_decode2_d8_t8_shared_cache_i16_smoke.log` | `EXIT FAILURE`; prefill verification failed. The generated C ABI stores logical `TNPU_DTYPE_INT16` tensor values in `int32_t` backing arrays, so shared-cache storage must also use `int32_t` backing even though the tensor dtype is INT16. |
 
 ## Reportable Wins
 
 | Model | Config | Accelerated e2e | ONNX2C e2e | Speedup | Section notes |
 | --- | --- | ---: | ---: | ---: | --- |
 | QLlama | `d128 h16 nh8 nkv4 f128 T8 decode_tokens=2` | 5,948,866 | 8,500,853 | 1.43x | Prefill wins: 3,375,256 vs 6,780,108 cycles (2.01x). Decode0 and decode1 are slower on the accelerated path: 1,192,925 vs 856,981 and 1,193,125 vs 862,522 cycles. |
+| QLlama shared-cache | `d128 h16 nh8 nkv4 f128 T8 decode_tokens=2` | 5,897,388 | 8,500,853 | 1.44x | Prefill wins: 3,382,226 vs 6,780,108 cycles (2.00x). Handoff is reduced to 1 cycle for prefill-to-decode and 1 cycle for decode0-to-decode1. Decode0 and decode1 remain slower than ONNX2C: 1,248,626 vs 856,981 and 1,248,747 vs 862,522 cycles. |
+| QGPT2 | `d128 h16 nh8 nkv8 f128 T8 decode_tokens=2` | 5,420,502 | 8,708,968 | 1.61x | Prefill wins: 2,924,429 vs 6,942,157 cycles (2.37x). Decode0 and decode1 are slower on the accelerated path: 1,057,619 vs 881,327 and 1,060,890 vs 884,243 cycles. Handoff copy costs in this pre-shared-cache accelerated run were 181,299 and 175,621 cycles. |
+| QGPT2 shared-cache | `d128 h16 nh8 nkv8 f128 T8 decode_tokens=2` | 5,275,649 | 8,708,968 | 1.65x | Prefill wins: 2,915,943 vs 6,942,157 cycles (2.38x). Handoff is reduced to 1 cycle for prefill-to-decode and 1 cycle for decode0-to-decode1. Decode0 and decode1 remain slower than ONNX2C: 1,169,403 vs 881,327 and 1,172,647 vs 884,243 cycles. |
 
 The clean smoke also validated two runner fixes needed before larger
 measurements:
 
 - Non-verbose Verilator stdout is now flushed after each pseudo-UART byte, so
   timeout-killed runs do not lose firmware progress markers.
-- Decode-to-decode handoff copies the full mutated cache tensors
-  (`k_cache_h*`/`v_cache_h*`) into the next decode image instead of trying to
-  copy the one-token `_td` tensors as complete caches.
+- The original clean accelerated sequence handoff copied the full mutated cache
+  tensors (`k_cache_h*`/`v_cache_h*`) into the next decode image instead of
+  trying to copy the one-token `_td` tensors as complete caches. This made the
+  runs correct but made handoff expensive. A shared-cache pointer handoff is now
+  being tested to remove that full-cache copy.
 - The sequence runner owns the testbench timer for the whole image and disables
   the runtime's per-program timer reset, so `sequence.*.total` lines are valid.
 - Sequence runs now disable full final tensor dumps in runtime v2. Kernel-level

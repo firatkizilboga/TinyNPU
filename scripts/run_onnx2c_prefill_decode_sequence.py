@@ -197,17 +197,17 @@ uint32_t runtime_cycle_post_bss;
 uint32_t runtime_cycle_post_init;
 uint32_t runtime_cycle_pre_main;
 
-#define TIMER_CTRL  ((volatile uint32_t *) 0x15000000u)
-#define TIMER_VALUE ((volatile uint32_t *) 0x15000004u)
-#define TIMER_COUNT ((volatile uint32_t *) 0x15001000u)
-
-static inline uint32_t read_mcycle32(void) {{ return *TIMER_COUNT; }}
+static inline uint32_t read_mcycle32(void)
+{{
+    return *((volatile uint32_t *)0x15001000u);
+}}
 
 static void reset_timer(void)
 {{
-    *TIMER_CTRL = 0u;
-    *TIMER_VALUE = 0xFFFFFFFFu;
-    while (*TIMER_COUNT == 0u) {{ }}
+    *((volatile uint32_t *)0x15000000u) = 0u;
+    *((volatile uint32_t *)0x15000004u) = 0xFFFFFFFFu;
+    while (read_mcycle32() == 0u) {{
+    }}
 }}
 
 void {prefill_func}({prefill_signature});
@@ -404,7 +404,7 @@ def main() -> int:
     parser.add_argument("--dump-stdout", action="store_true")
     parser.add_argument("--log-path", type=Path, default=None)
     parser.add_argument("--sim-ram-bytes", type=lambda value: int(value, 0), default=0, help="Optional larger bare-metal RAM size for generated linker script, e.g. 0x1000000.")
-    parser.add_argument("--sim-ram-addr-width", type=int, default=None, help="Optional Verilator tb RAM_ADDR_WIDTH override. Use with --sim-ram-bytes when the image exceeds 4 MiB.")
+    parser.add_argument("--sim-ram-addr-width", type=int, default=22, help="Verilator tb RAM_ADDR_WIDTH override. Default 22 gives the normal 4 MiB firmware RAM; use 24 with --sim-ram-bytes 0x1000000 for large d288 images.")
     args = parser.parse_args()
     args.model = _canonical_model(args.model)
     if args.n_kv_heads is None:

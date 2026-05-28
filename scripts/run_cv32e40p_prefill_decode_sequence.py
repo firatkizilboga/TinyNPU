@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -60,39 +61,45 @@ def _combined_runner_source(
     decode_symbols: list[str],
     model: str,
     n_cache_heads: int,
+    shared_cache_elems_per_head: int,
+    max_tensors: int,
 ) -> str:
     extern_decodes = "\n".join(f"extern const TnpuProgram {symbol};" for symbol in decode_symbols)
+    decode_count = len(decode_symbols)
+    decode_program_refs = ", ".join(f"&{symbol}" for symbol in decode_symbols)
+    decode_programs_array = f"static const TnpuProgram *decode_const_programs[{decode_count}] = {{{decode_program_refs}}};"
 
-    prefill_to_decode = []
+    bind_prefill_lines = []
     for head in range(n_cache_heads):
-        prefill_to_decode.append(
-            f"""    if (copy_k_cache(&{prefill_symbol}, "prefill_k_cache_h{head}", &{decode_symbols[0]}, "k_cache_h{head}") != 0) return EXIT_FAILURE;
-    if (copy_v_cache(&{prefill_symbol}, "prefill_v_cache_h{head}", &{decode_symbols[0]}, "v_cache_h{head}") != 0) return EXIT_FAILURE;"""
+        bind_prefill_lines.append(
+            f"""    if (bind_cache_tensor(&prefill_runtime, "prefill_k_cache_h{head}", shared_k_cache[{head}], SEQ_SHARED_CACHE_ELEMS_PER_HEAD) != 0) return 1;
+    if (bind_cache_tensor(&prefill_runtime, "prefill_v_cache_h{head}", shared_v_cache[{head}], SEQ_SHARED_CACHE_ELEMS_PER_HEAD) != 0) return 1;"""
         )
+    bind_decode_lines = []
+    for idx in range(decode_count):
+        for head in range(n_cache_heads):
+            bind_decode_lines.append(
+                f"""    if (bind_cache_tensor(&decode_runtime[{idx}], "k_cache_h{head}", shared_k_cache[{head}], SEQ_SHARED_CACHE_ELEMS_PER_HEAD) != 0) return 1;
+    if (bind_cache_tensor(&decode_runtime[{idx}], "v_cache_h{head}", shared_v_cache[{head}], SEQ_SHARED_CACHE_ELEMS_PER_HEAD) != 0) return 1;"""
+            )
 
     decode_run_blocks: list[str] = []
-    for idx, symbol in enumerate(decode_symbols):
+    for idx in range(decode_count):
         if idx > 0:
-            prior = decode_symbols[idx - 1]
-            handoff = []
-            for head in range(n_cache_heads):
-                handoff.append(
-                    f"""    if (copy_k_cache(&{prior}, "k_cache_h{head}", &{symbol}, "k_cache_h{head}") != 0) return EXIT_FAILURE;
-    if (copy_v_cache(&{prior}, "v_cache_h{head}", &{symbol}, "v_cache_h{head}") != 0) return EXIT_FAILURE;"""
-                )
             decode_run_blocks.append(
                 f"""    seq_print_marker("sequence.decode{idx - 1}_to_decode{idx}_handoff.start");
     t0 = seq_read_mcycle32();
-{chr(10).join(handoff)}
+    if (cache_pointer_handoff() != 0) return EXIT_FAILURE;
     t1 = seq_read_mcycle32();
     seq_print_delta("sequence.decode{idx - 1}_to_decode{idx}_handoff.total", t0, t1);
 """
             )
         decode_run_blocks.append(
             f"""    seq_print_marker("sequence.decode{idx}.start");
-    if (prepare_io(&{symbol}, ins, ip, outs, op) != 0) return EXIT_FAILURE;
+    if (prepare_io(&decode_runtime[{idx}], ins, ip, outs, op) != 0) return EXIT_FAILURE;
     t0 = seq_read_mcycle32();
-    rc = tinynpu_run(&{symbol}, ip, op, NULL, 0u);
+    rc = tinynpu_run(&decode_runtime[{idx}], ip, op, NULL, 0u);
+    if (rc == 0 && append_decode_cache_token(&decode_runtime[{idx}]) != 0) rc = 1;
     t1 = seq_read_mcycle32();
     seq_print_delta("sequence.decode{idx}.total", t0, t1);
     if (rc != 0) return EXIT_FAILURE;
@@ -102,10 +109,22 @@ def _combined_runner_source(
     return f"""#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "tinynpu_runtime_v2.h"
 
 extern const TnpuProgram {prefill_symbol};
 {extern_decodes}
+{decode_programs_array}
+
+#define SEQ_MAX_TENSORS {max_tensors}
+#define SEQ_SHARED_CACHE_ELEMS_PER_HEAD {shared_cache_elems_per_head}
+
+static TnpuTensorDesc prefill_tensor_descs[SEQ_MAX_TENSORS];
+static TnpuTensorDesc decode_tensor_descs[{decode_count}][SEQ_MAX_TENSORS];
+static TnpuProgram prefill_runtime;
+static TnpuProgram decode_runtime[{decode_count}];
+static int32_t shared_k_cache[{n_cache_heads}][SEQ_SHARED_CACHE_ELEMS_PER_HEAD];
+static int32_t shared_v_cache[{n_cache_heads}][SEQ_SHARED_CACHE_ELEMS_PER_HEAD];
 
 static inline uint32_t seq_read_mcycle32(void)
 {{
@@ -142,13 +161,108 @@ static int streq(const char *a, const char *b)
 
 static const TnpuTensorDesc *find_desc(const TnpuProgram *program, const char *name)
 {{
-    for (uint32_t i = 0; i < program->tensor_count; ++i) {{
+    for (int32_t i = (int32_t)program->tensor_count - 1; i >= 0; --i) {{
         if (streq(program->tensors[i].name, name)) {{
             return &program->tensors[i];
         }}
     }}
     printf("missing tensor: %s in %s\\n", name, program->name);
     return NULL;
+}}
+
+static TnpuTensorDesc *find_mutable_desc(TnpuProgram *program, const char *name)
+{{
+    return (TnpuTensorDesc *)find_desc(program, name);
+}}
+
+static int clone_program(TnpuProgram *dst, TnpuTensorDesc *tensor_storage, const TnpuProgram *src)
+{{
+    if (src->tensor_count > SEQ_MAX_TENSORS) {{
+        printf("program has too many tensors: %s count=%lu max=%u\\n", src->name, (unsigned long)src->tensor_count, SEQ_MAX_TENSORS);
+        return 1;
+    }}
+    *dst = *src;
+    memcpy(tensor_storage, src->tensors, (size_t)src->tensor_count * sizeof(TnpuTensorDesc));
+    dst->tensors = tensor_storage;
+    return 0;
+}}
+
+static int bind_cache_tensor(TnpuProgram *program, const char *name, int32_t *storage, uint32_t storage_elems)
+{{
+    TnpuTensorDesc *desc = find_mutable_desc(program, name);
+    if (desc == NULL) return 1;
+    if (desc->dtype != TNPU_DTYPE_INT16) return 1;
+    if ((uint32_t)desc->elem_count > storage_elems) {{
+        printf("shared cache too small: %s elems=%lu max=%lu\\n", name, (unsigned long)desc->elem_count, (unsigned long)storage_elems);
+        return 1;
+    }}
+    desc->data = storage;
+    return 0;
+}}
+
+static int init_runtime_programs(void)
+{{
+    if (clone_program(&prefill_runtime, prefill_tensor_descs, &{prefill_symbol}) != 0) return 1;
+    for (uint32_t i = 0; i < {decode_count}u; ++i) {{
+        if (clone_program(&decode_runtime[i], decode_tensor_descs[i], decode_const_programs[i]) != 0) return 1;
+    }}
+{chr(10).join(bind_prefill_lines)}
+{chr(10).join(bind_decode_lines)}
+    return 0;
+}}
+
+static int cache_pointer_handoff(void)
+{{
+    return 0;
+}}
+
+static int append_one_k_cache_token(TnpuProgram *program, uint32_t head)
+{{
+    char base_name[32];
+    char token_name[32];
+    snprintf(base_name, sizeof(base_name), "k_cache_h%lu", (unsigned long)head);
+    snprintf(token_name, sizeof(token_name), "k_cache_h%lu_td", (unsigned long)head);
+    TnpuTensorDesc *base = find_mutable_desc(program, base_name);
+    const TnpuTensorDesc *token = find_desc(program, token_name);
+    if (base == NULL || token == NULL) return 1;
+    if (base->dtype != TNPU_DTYPE_INT16 || token->dtype != TNPU_DTYPE_INT16) return 1;
+    const int d_head = base->shape[0];
+    const int token_index = base->shape[1] - 1;
+    if (token->elem_count != d_head || token_index < 0) return 1;
+    int32_t *base_data = (int32_t *)base->data;
+    const int32_t *token_data = (const int32_t *)token->data;
+    for (int row = 0; row < d_head; ++row) {{
+        base_data[row * base->shape[1] + token_index] = token_data[row];
+    }}
+    return 0;
+}}
+
+static int append_one_v_cache_token(TnpuProgram *program, uint32_t head)
+{{
+    char base_name[32];
+    char token_name[32];
+    snprintf(base_name, sizeof(base_name), "v_cache_h%lu", (unsigned long)head);
+    snprintf(token_name, sizeof(token_name), "v_cache_h%lu_td", (unsigned long)head);
+    TnpuTensorDesc *base = find_mutable_desc(program, base_name);
+    const TnpuTensorDesc *token = find_desc(program, token_name);
+    if (base == NULL || token == NULL) return 1;
+    if (base->dtype != TNPU_DTYPE_INT16 || token->dtype != TNPU_DTYPE_INT16) return 1;
+    const int token_index = base->shape[0] - 1;
+    const int d_head = base->shape[1];
+    if (token->elem_count != d_head || token_index < 0) return 1;
+    int32_t *base_data = (int32_t *)base->data;
+    const int32_t *token_data = (const int32_t *)token->data;
+    memcpy(base_data + token_index * d_head, token_data, (size_t)d_head * sizeof(int32_t));
+    return 0;
+}}
+
+static int append_decode_cache_token(TnpuProgram *program)
+{{
+    for (uint32_t head = 0; head < {n_cache_heads}u; ++head) {{
+        if (append_one_k_cache_token(program, head) != 0) return 1;
+        if (append_one_v_cache_token(program, head) != 0) return 1;
+    }}
+    return 0;
 }}
 
 static int prepare_io(const TnpuProgram *program, TnpuTensor *ins, const TnpuTensor **ip, TnpuTensor *outs, const TnpuTensor **op)
@@ -172,73 +286,35 @@ static int prepare_io(const TnpuProgram *program, TnpuTensor *ins, const TnpuTen
     return 0;
 }}
 
-static int copy_k_cache(const TnpuProgram *src_program, const char *src_name, const TnpuProgram *dst_program, const char *dst_name)
-{{
-    const TnpuTensorDesc *src = find_desc(src_program, src_name);
-    const TnpuTensorDesc *dst = find_desc(dst_program, dst_name);
-    if (src == NULL || dst == NULL) return 1;
-    if (src->dtype != TNPU_DTYPE_INT16 || dst->dtype != TNPU_DTYPE_INT16) return 1;
-    const int d_head = src->shape[0];
-    const int prompt_len = src->shape[1];
-    if (dst->shape[0] != d_head || dst->shape[1] < prompt_len) return 1;
-    int16_t *src_data = (int16_t *)src->data;
-    int16_t *dst_data = (int16_t *)dst->data;
-    for (uint32_t i = 0; i < dst->elem_count; ++i) {{
-        dst_data[i] = 0;
-    }}
-    for (int row = 0; row < d_head; ++row) {{
-        for (int token = 0; token < prompt_len; ++token) {{
-            dst_data[row * dst->shape[1] + token] = src_data[row * src->shape[1] + token];
-        }}
-    }}
-    return 0;
-}}
-
-static int copy_v_cache(const TnpuProgram *src_program, const char *src_name, const TnpuProgram *dst_program, const char *dst_name)
-{{
-    const TnpuTensorDesc *src = find_desc(src_program, src_name);
-    const TnpuTensorDesc *dst = find_desc(dst_program, dst_name);
-    if (src == NULL || dst == NULL) return 1;
-    if (src->dtype != TNPU_DTYPE_INT16 || dst->dtype != TNPU_DTYPE_INT16) return 1;
-    const int prompt_len = src->shape[0];
-    const int d_head = src->shape[1];
-    if (dst->shape[0] < prompt_len || dst->shape[1] != d_head) return 1;
-    int16_t *src_data = (int16_t *)src->data;
-    int16_t *dst_data = (int16_t *)dst->data;
-    for (uint32_t i = 0; i < dst->elem_count; ++i) {{
-        dst_data[i] = 0;
-    }}
-    for (int token = 0; token < prompt_len; ++token) {{
-        for (int col = 0; col < d_head; ++col) {{
-            dst_data[token * d_head + col] = src_data[token * d_head + col];
-        }}
-    }}
-    return 0;
-}}
-
 int main(void)
 {{
     setbuf(stdout, NULL);
+    puts("sequence.main.start");
     tinynpu_set_reset_timer_on_run(0);
+    puts("sequence.timer.reset.start");
     seq_reset_timer_counter();
+    puts("sequence.timer.reset.done");
     TnpuTensor ins[64];
     const TnpuTensor *ip[64];
     TnpuTensor outs[64];
     const TnpuTensor *op[64];
+    puts("sequence.init.start");
+    if (init_runtime_programs() != 0) return EXIT_FAILURE;
+    puts("sequence.init.done");
     uint32_t total_start = seq_read_mcycle32();
 
     puts("prefill_decode_sequence: {model}");
     seq_print_marker("sequence.prefill.start");
-    if (prepare_io(&{prefill_symbol}, ins, ip, outs, op) != 0) return EXIT_FAILURE;
+    if (prepare_io(&prefill_runtime, ins, ip, outs, op) != 0) return EXIT_FAILURE;
     uint32_t t0 = seq_read_mcycle32();
-    int rc = tinynpu_run(&{prefill_symbol}, ip, op, NULL, 0u);
+    int rc = tinynpu_run(&prefill_runtime, ip, op, NULL, 0u);
     uint32_t t1 = seq_read_mcycle32();
     seq_print_delta("sequence.prefill.total", t0, t1);
     if (rc != 0) return EXIT_FAILURE;
 
     seq_print_marker("sequence.cache_handoff.start");
     t0 = seq_read_mcycle32();
-{chr(10).join(prefill_to_decode)}
+    if (cache_pointer_handoff() != 0) return EXIT_FAILURE;
     t1 = seq_read_mcycle32();
     seq_print_delta("sequence.cache_handoff.total", t0, t1);
 
@@ -320,6 +396,13 @@ def _build_sequence_elf_and_hex(
     )
     run_checked([objcopy, "-O", "verilog", str(elf_path), str(hex_path)], cwd=CORE_DIR, env=build_env)
     return prefill_path, decode_paths, runner_path, elf_path, hex_path
+
+
+def _emitted_tensor_count(source: str) -> int:
+    match = re.search(r"\.tensor_count\s*=\s*(\d+)u", source)
+    if match is None:
+        raise ValueError("could not find emitted .tensor_count in generated program source")
+    return int(match.group(1))
 
 
 def _build_artifacts(args: argparse.Namespace):
@@ -508,7 +591,7 @@ def main() -> int:
     parser.add_argument("--dump-stdout", action="store_true")
     parser.add_argument("--log-path", type=Path, default=None, help="Persistent RTL stdout/stderr log path. Defaults to runs/<program>_rtl_<timestamp>.log.")
     parser.add_argument("--sim-ram-bytes", type=lambda value: int(value, 0), default=0, help="Optional larger bare-metal RAM size for generated linker script, e.g. 0x1000000.")
-    parser.add_argument("--sim-ram-addr-width", type=int, default=None, help="Optional Verilator tb RAM_ADDR_WIDTH override. Use with --sim-ram-bytes when the image exceeds 4 MiB.")
+    parser.add_argument("--sim-ram-addr-width", type=int, default=22, help="Verilator tb RAM_ADDR_WIDTH override. Default 22 gives the normal 4 MiB firmware RAM; use 24 with --sim-ram-bytes 0x1000000 for large d288 images.")
     args = parser.parse_args()
     args.model = _canonical_model(args.model)
     if args.n_kv_heads is None:
@@ -532,12 +615,15 @@ def main() -> int:
         emit_cv32e40p_program_v2(artifact, {}, program_name=name)
         for artifact, name in zip(decode_artifacts, decode_names, strict=True)
     ]
+    max_tensors = max(_emitted_tensor_count(source) for source in [prefill_source, *decode_sources])
     linker_script = _linker_script_for_ram_bytes(args.sim_ram_bytes)
     runner_source = _combined_runner_source(
         prefill_symbol=prefill_symbol,
         decode_symbols=decode_symbols,
         model=_model_label(args.model),
         n_cache_heads=n_cache_heads,
+        shared_cache_elems_per_head=args.d_head * (args.prompt_len + args.decode_tokens),
+        max_tensors=max_tensors,
     )
     prefill_path, decode_paths, runner_path, elf_path, hex_path = _build_sequence_elf_and_hex(
         program_name=stem,

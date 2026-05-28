@@ -5,9 +5,9 @@
 #include <string.h>
 
 #define NPU_BASE 0x30000000u
-#define TB_TIMER_CTRL_BASE 0x15000000u
-#define TB_TIMER_COUNT_REG 0x15001000u
+#ifndef TINY_IM_BASE_ADDR
 #define TINY_IM_BASE_ADDR 0xF000u
+#endif
 #define NPU_SHARED_UB_BASE 0x31000000u
 #define NPU_SHARED_IM_BASE 0x32000000u
 #define TINY_ARRAY_SIZE __TINY_ARRAY_SIZE__
@@ -87,10 +87,6 @@ typedef struct {
 } TinyTensor;
 
 static volatile uint8_t *const npu = (volatile uint8_t *)NPU_BASE;
-static volatile uint32_t *const tb_timer_ctrl = (volatile uint32_t *)TB_TIMER_CTRL_BASE;
-static volatile uint32_t *const tb_timer_value = (volatile uint32_t *)(TB_TIMER_CTRL_BASE + 4u);
-static volatile uint32_t *const tb_timer_count = (volatile uint32_t *)TB_TIMER_COUNT_REG;
-
 volatile uint32_t runtime_cycle_start __attribute__((section(".noinit")));
 volatile uint32_t runtime_cycle_post_bss __attribute__((section(".noinit")));
 volatile uint32_t runtime_cycle_post_init __attribute__((section(".noinit")));
@@ -98,12 +94,11 @@ volatile uint32_t runtime_cycle_pre_main __attribute__((section(".noinit")));
 
 static inline uint32_t read_mcycle32(void)
 {
-    return *tb_timer_count;
+    return *((volatile uint32_t *)0x15001000u);
 }
 
 static void print_cycle_delta32(const char *label, uint32_t start, uint32_t end)
 {
-    /* The testbench timer counts down from 0xFFFFFFFF, so elapsed cycles are start - end. */
     printf("%s cycles=%lu\n", label, (unsigned long)(start - end));
 }
 
@@ -117,9 +112,9 @@ static void print_startup_cycle_report(void)
 
 static void tb_timer_reset_counter(void)
 {
-    *tb_timer_ctrl = 0u;
-    *tb_timer_value = 0xFFFFFFFFu;
-    while (*tb_timer_count == 0u) {
+    *((volatile uint32_t *)0x15000000u) = 0u;
+    *((volatile uint32_t *)0x15000004u) = 0xFFFFFFFFu;
+    while (read_mcycle32() == 0u) {
     }
 }
 
