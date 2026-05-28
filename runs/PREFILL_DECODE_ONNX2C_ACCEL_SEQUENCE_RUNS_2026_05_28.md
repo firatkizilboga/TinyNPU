@@ -96,6 +96,14 @@ should not be used for performance numbers.
 | --- | --- | --- | --- |
 | QLlama accelerated | `d8 h8 nh1 nkv1 f8 T8 decode_tokens=2` | `runs/accel_qllama_prefill_decode2_d8_t8_fixed_sequence.log` | `EXIT SUCCESS`; prefill 717,659 cycles, prefill-to-decode handoff 8,148 cycles, decode0 256,086 cycles, decode0-to-decode1 handoff 8,068 cycles, decode1 256,783 cycles, e2e 1,265,362 cycles. |
 | QLlama ONNX2C | `d8 h8 nh1 nkv1 f8 T8 decode_tokens=2` | `runs/onnx2c_qllama_prefill_decode2_d8_t8_sequence.log` | `EXIT SUCCESS`; total 44,710 cycles, prefill 33,310 cycles, decode0 4,969 cycles, decode1 5,243 cycles. ONNX2C is faster at this tiny smoke size, so this is not a reportable accelerator win. |
+| QLlama accelerated | `d128 h16 nh8 nkv4 f128 T8 decode_tokens=2` | `runs/accel_qllama_prefill_decode2_d128_t8_nodump_sequence.log` | `EXIT SUCCESS`; prefill 3,375,256 cycles, prefill-to-decode handoff 85,164 cycles, decode0 1,192,925 cycles, decode0-to-decode1 handoff 82,188 cycles, decode1 1,193,125 cycles, e2e 5,948,866 cycles. |
+| QLlama ONNX2C | `d128 h16 nh8 nkv4 f128 T8 decode_tokens=2` | `runs/onnx2c_qllama_prefill_decode2_d128_t8_sequence.log` | `EXIT SUCCESS`; total 8,500,853 cycles, prefill 6,780,108 cycles, decode0 856,981 cycles, decode1 862,522 cycles. Accelerated e2e is 1.43x faster overall; accelerated prefill is 2.01x faster, while individual accelerated decode sections are slower. |
+
+## Reportable Wins
+
+| Model | Config | Accelerated e2e | ONNX2C e2e | Speedup | Section notes |
+| --- | --- | ---: | ---: | ---: | --- |
+| QLlama | `d128 h16 nh8 nkv4 f128 T8 decode_tokens=2` | 5,948,866 | 8,500,853 | 1.43x | Prefill wins: 3,375,256 vs 6,780,108 cycles (2.01x). Decode0 and decode1 are slower on the accelerated path: 1,192,925 vs 856,981 and 1,193,125 vs 862,522 cycles. |
 
 The clean smoke also validated two runner fixes needed before larger
 measurements:
@@ -107,6 +115,9 @@ measurements:
   copy the one-token `_td` tensors as complete caches.
 - The sequence runner owns the testbench timer for the whole image and disables
   the runtime's per-program timer reset, so `sequence.*.total` lines are valid.
+- Sequence runs now disable full final tensor dumps in runtime v2. Kernel-level
+  cycle lines are still printed, but sequence totals are no longer dominated by
+  printing large tensors.
 
 Observability notes:
 

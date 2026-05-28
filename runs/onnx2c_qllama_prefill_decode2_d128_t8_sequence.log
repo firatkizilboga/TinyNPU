@@ -1,0 +1,15 @@
+status=running
+command=/root/compiler-optimization/external/cv32e40p/example_tb/core/obj_dir/cv32e40p_tb_vlt_npu +verilator+noassert +firmware=/root/compiler-optimization/external/cv32e40p/example_tb/core/custom/third_party_onnx2c_qllama_prefill_decode2_seq_d128_h16_nh8_nkv4_f128_t8_s0.hex +maxcycles=3000000000
+
+--- stdout/stderr ---
+SBbIiMonnx2c.prefill.start
+onnx2c.decode0.start
+onnx2c.decode1.start
+third_party_onnx2c_qllama_prefill_decode2 d_model=128 prompt_len=8 cycles=8500853 prefill_cycles=6780108 decode0_cycles=856981 decode1_cycles=862522 checksum=-2.39968777 first=-0.292292804 last=0.208551764
+EXIT SUCCESS
+EXIT SUCCESS
+- tb_top.sv:201: Verilog $finish
+[DUMP] UB memory snapshot: /tmp/tinynpu_dump_ub.hex
+[DUMP] IM memory snapshot: /tmp/tinynpu_dump_im.hex
+
+status=success

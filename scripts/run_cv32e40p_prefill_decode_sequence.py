@@ -283,7 +283,7 @@ def _build_sequence_elf_and_hex(
         extra_flags = build_env.get("VERILATOR_EXTRA_FLAGS", "--x-assign fast --x-initial fast --inline-mult 0")
         build_env["VERILATOR_EXTRA_FLAGS"] = f"{extra_flags} -GRAM_ADDR_WIDTH={sim_ram_addr_width}"
     run_checked(["make", "verilator-build-npu"], cwd=CORE_DIR, env=build_env)
-    cfg = RunnerConfig(repeat_count=1, dump_final_outputs=True, verbose_steps=True)
+    cfg = RunnerConfig(repeat_count=1, dump_final_outputs=False, verbose_steps=True)
     run_checked(
         [
             gcc,
