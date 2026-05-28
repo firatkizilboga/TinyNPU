@@ -17,6 +17,9 @@ section-level cycle counts where available.
   directly into the requested log path while the simulator runs.
 - `scripts/run_cv32e40p_prefill_decode_sequence.py` was updated with the same
   streamed-log and `--timeout-s 0` behavior for accelerated CPU+NPU runs.
+- Both sequence runners now support `--decode-tokens 2`. The accelerated runner
+  builds a true second decode artifact whose cache length is `prompt_len + 2`;
+  firmware copies decode0 K/V outputs into decode1 before running decode1.
 
 ## Completed ONNX2C CPU-only Sequence Runs
 
@@ -43,16 +46,16 @@ These artifacts link successfully and are ready for RTL execution.
 | QGPT2-like ONNX2C | `d192 h16 nh12 nkv12 f192 T8` | `external/cv32e40p/example_tb/core/custom/third_party_onnx2c_qgpt2_prefill_decode_seq_d192_h16_nh12_nkv12_f192_t8_s0.elf` |
 | QLlama accelerated | `d192 h16 nh12 nkv6 f192 T8` | `external/cv32e40p/example_tb/core/custom/cv32e40p_qllama_prefill_decode_seq_d192_h16_nh12_nkv6_f192_t8_s0.elf` |
 | QGPT2 accelerated | `d192 h16 nh12 nkv12 f192 T8` | `external/cv32e40p/example_tb/core/custom/cv32e40p_qgpt2_prefill_decode_seq_d192_h16_nh12_nkv12_f192_t8_s0.elf` |
+| QLlama-like ONNX2C | `d8 h8 nh1 nkv1 f8 T8 decode_tokens=2` | `external/cv32e40p/example_tb/core/custom/third_party_onnx2c_qllama_prefill_decode2_seq_d8_h8_nh1_nkv1_f8_t8_s0.elf` |
+| QGPT2-like ONNX2C | `d8 h8 nh1 nkv1 f8 T8 decode_tokens=2` | `external/cv32e40p/example_tb/core/custom/third_party_onnx2c_qgpt2_prefill_decode2_seq_d8_h8_nh1_nkv1_f8_t8_s0.elf` |
+| QLlama accelerated | `d8 h8 nh1 nkv1 f8 T8 decode_tokens=2` | `external/cv32e40p/example_tb/core/custom/cv32e40p_qllama_prefill_decode2_seq_d8_h8_nh1_nkv1_f8_t8_s0.elf` |
+| QGPT2 accelerated | `d8 h8 nh1 nkv1 f8 T8 decode_tokens=2` | `external/cv32e40p/example_tb/core/custom/cv32e40p_qgpt2_prefill_decode2_seq_d8_h8_nh1_nkv1_f8_t8_s0.elf` |
 
 ## Current Caveats
 
-- The sequence runners currently execute prefill plus one decode token. Extending
-  the accelerated path to two decode tokens requires constructing a second decode
-  artifact at `prompt_len + 1` and handing off the first decode cache into it,
-  rather than re-running the same fixed-position decode image.
-- The ONNX2C sequence timing currently measures two independent ONNX2C calls in
-  one firmware image. It is a CPU-only workload baseline with section timing; it
-  does not yet feed prefill-produced K/V tensors into the decode ONNX graph.
+- The ONNX2C sequence timing measures independent ONNX2C calls in one firmware
+  image. It is a CPU-only workload baseline with section timing; it does not yet
+  feed prefill-produced K/V tensors into the decode ONNX graph.
 - Git checkpoint commits are blocked in this checkout because `git status`
   currently fails with:
   `fatal: not a git repository: /home/firatkizilboga/TinyNPU/.git/worktrees/compiler-optimization`.

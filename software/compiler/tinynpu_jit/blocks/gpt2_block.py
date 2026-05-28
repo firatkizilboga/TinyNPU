@@ -39,7 +39,7 @@ from tinynpu_jit import (
     make_native_int16_kv_cache_specs,
 )
 from tinynpu_jit.golden import GoldenModel
-from tinynpu_jit.runtime_approx import quantize_fp16_to_i16_xform, softmax_f16_approx
+from tinynpu_jit.runtime_approx import quantize_fp16_to_i16_host, softmax_f16_approx
 
 
 def _rand_i16(rng: np.random.Generator, shape: tuple[int, ...], low: int = -2, high: int = 3) -> np.ndarray:
@@ -91,7 +91,7 @@ def _fp16_roundtrip(value: np.ndarray) -> np.ndarray:
 
 
 def _quantize_fp16_boundary(source: np.ndarray, *, scale: float) -> np.ndarray:
-    return quantize_fp16_to_i16_xform(source, scale=scale)
+    return quantize_fp16_to_i16_host(source, scale=scale)
 
 
 def _layernorm_fp32(x: np.ndarray, wb: np.ndarray, eps: float) -> np.ndarray:
@@ -337,7 +337,7 @@ def build_shared_state(
     layer_norm_epsilon: float = 1.0e-5,
 ) -> dict[str, object]:
     rng = np.random.default_rng(seed)
-    pos_capacity = prompt_len + 1
+    pos_capacity = prompt_len + 2
     config = QGPT2BlockConfig(
         d_model=d_model,
         d_head=d_head,
@@ -354,6 +354,7 @@ def build_shared_state(
         "tok_prompt": _rand_f32(rng, (prompt_len, d_model)),
         "tok_decode": _rand_f32(rng, (1, d_model)),
         "pos_emb": _rand_f32(rng, (pos_capacity, d_model)),
+        "tok_decode2": _rand_f32(rng, (1, d_model)),
         "ln1_wb": np.array(block.ln_1_wb, dtype=np.float32, copy=True),
         "ln2_wb": np.array(block.ln_2_wb, dtype=np.float32, copy=True),
         "attn_c_attn_w": np.array(block.attn_c_attn_w, dtype=np.int16, copy=True),
@@ -385,6 +386,7 @@ def build_shared_state(
     )
     state["x_prompt_in"] = _materialize_inputs(state["tok_prompt"], state["pos_emb"], slice(0, prompt_len))
     state["x_decode_in"] = _materialize_inputs(state["tok_decode"], state["pos_emb"], slice(prompt_len, prompt_len + 1))
+    state["x_decode2_in"] = _materialize_inputs(state["tok_decode2"], state["pos_emb"], slice(prompt_len + 1, prompt_len + 2))
     return state
 
 
@@ -966,8 +968,6 @@ def _add_decode_head_runtime_tensors(
         builder.tensors[f"v_cache_h{head_idx}"].kind = TensorKind.CONSTANT
         builder.tensors[f"v_cache_h{head_idx}"].data = v_base
         builder.add_tensor(TensorSpec(f"q_int_h{head_idx}", (1, d_head), DType.INT16, TensorKind.INTERMEDIATE))
-        builder.add_tensor(TensorSpec(f"k_cur_h{head_idx}", (1, d_head), DType.INT16, TensorKind.INTERMEDIATE))
-        builder.add_tensor(TensorSpec(f"v_cur_h{head_idx}", (1, d_head), DType.INT16, TensorKind.INTERMEDIATE))
         builder.add_tensor(
             TensorSpec(
                 f"q_a_h{head_idx}",
@@ -1128,6 +1128,7 @@ def build_prefill_artifact(
     act_scale: float = 1.0 / 32.0,
     attn_scale: float = 1.0 / 256.0,
     layer_norm_epsilon: float = 1.0e-5,
+    state: dict[str, object] | None = None,
 ):
     if d_model <= 0 or d_model % 8 != 0:
         raise ValueError("d_model must be a positive multiple of 8")
@@ -1142,17 +1143,18 @@ def build_prefill_artifact(
     if layer_norm_epsilon <= 0.0:
         raise ValueError("layer_norm_epsilon must be positive")
 
-    state = build_shared_state(
-        d_model=d_model,
-        d_head=d_head,
-        n_heads=n_heads,
-        ffn_dim=ffn_dim,
-        prompt_len=prompt_len,
-        seed=seed,
-        act_scale=act_scale,
-        attn_scale=attn_scale,
-        layer_norm_epsilon=layer_norm_epsilon,
-    )
+    if state is None:
+        state = build_shared_state(
+            d_model=d_model,
+            d_head=d_head,
+            n_heads=n_heads,
+            ffn_dim=ffn_dim,
+            prompt_len=prompt_len,
+            seed=seed,
+            act_scale=act_scale,
+            attn_scale=attn_scale,
+            layer_norm_epsilon=layer_norm_epsilon,
+        )
     block = state["block"]
     act_scale = block.config.act_scale
     attn_scale = block.config.attn_scale
@@ -1250,33 +1252,42 @@ def build_decode_artifact(
     act_scale: float = 1.0 / 32.0,
     attn_scale: float = 1.0 / 256.0,
     layer_norm_epsilon: float = 1.0e-5,
+    state: dict[str, object] | None = None,
+    cache_ref: dict[str, object] | None = None,
+    x_decode_in: np.ndarray | None = None,
 ):
     if layer_norm_epsilon <= 0.0:
         raise ValueError("layer_norm_epsilon must be positive")
 
-    state = build_shared_state(
-        d_model=d_model,
-        d_head=d_head,
-        n_heads=n_heads,
-        ffn_dim=ffn_dim,
-        prompt_len=prompt_len,
-        seed=seed,
-        act_scale=act_scale,
-        attn_scale=attn_scale,
-        layer_norm_epsilon=layer_norm_epsilon,
-    )
+    if state is None:
+        state = build_shared_state(
+            d_model=d_model,
+            d_head=d_head,
+            n_heads=n_heads,
+            ffn_dim=ffn_dim,
+            prompt_len=prompt_len,
+            seed=seed,
+            act_scale=act_scale,
+            attn_scale=attn_scale,
+            layer_norm_epsilon=layer_norm_epsilon,
+        )
     block = state["block"]
     act_scale = block.config.act_scale
     attn_scale = block.config.attn_scale
     layer_norm_epsilon = block.config.layer_norm_epsilon
-    prefill_ref = reference_prefill(
-        state,
-        d_head=d_head,
-        n_heads=n_heads,
-        act_scale=act_scale,
-        attn_scale=attn_scale,
-        layer_norm_epsilon=layer_norm_epsilon,
+    prefill_ref = (
+        cache_ref
+        if cache_ref is not None
+        else reference_prefill(
+            state,
+            d_head=d_head,
+            n_heads=n_heads,
+            act_scale=act_scale,
+            attn_scale=attn_scale,
+            layer_norm_epsilon=layer_norm_epsilon,
+        )
     )
+    effective_prompt_len = int(np.asarray(prefill_ref["k_heads"][0]).shape[0])
     decode_ref = reference_decode(
         state,
         prefill_ref,
@@ -1284,19 +1295,20 @@ def build_decode_artifact(
         n_heads=n_heads,
         act_scale=act_scale,
         attn_scale=attn_scale,
+        x_in=x_decode_in,
         layer_norm_epsilon=layer_norm_epsilon,
     )
 
-    cache_len = prompt_len + 1
+    cache_len = effective_prompt_len + 1
     attn_dim = n_heads * d_head
     decode_token_name = "td"
-    cache_token_names = [f"t{i}" for i in range(prompt_len)] + [decode_token_name]
+    cache_token_names = [f"t{i}" for i in range(effective_prompt_len)] + [decode_token_name]
     b = IRBuilder()
     _add_tensor_specs(
         b,
         _common_io_tensors(
             block=block,
-            x_in=np.array(state["x_decode_in"], dtype=np.float32, copy=True),
+            x_in=np.array(state["x_decode_in"] if x_decode_in is None else x_decode_in, dtype=np.float32, copy=True),
             d_model=d_model,
             ffn_dim=ffn_dim,
             attn_dim=attn_dim,
@@ -1310,7 +1322,7 @@ def build_decode_artifact(
         prefill_ref=prefill_ref,
         d_head=d_head,
         n_heads=n_heads,
-        prompt_len=prompt_len,
+        prompt_len=effective_prompt_len,
         cache_len=cache_len,
         act_scale=act_scale,
         decode_token_name=decode_token_name,
@@ -1331,31 +1343,25 @@ def build_decode_artifact(
         qkv_ops.extend(
             [
                 b.matmul(f"op_q_h{head_idx}", "x_norm1_q", f"w_q_h{head_idx}", f"q_int_h{head_idx}", bias=f"b_q_h{head_idx}", in_dtype=DType.INT16, out_dtype=DType.INT16),
-                b.matmul(f"op_k_h{head_idx}", "x_norm1_q", f"w_k_h{head_idx}", f"k_cur_h{head_idx}", bias=f"b_k_h{head_idx}", in_dtype=DType.INT16, out_dtype=DType.INT16),
-                b.matmul(f"op_v_h{head_idx}", "x_norm1_q", f"w_v_h{head_idx}", f"v_cur_h{head_idx}", bias=f"b_v_h{head_idx}", in_dtype=DType.INT16, out_dtype=DType.INT16),
+                b.matmul(f"op_k_h{head_idx}", "x_norm1_q", f"w_k_h{head_idx}", f"k_cache_h{head_idx}_{decode_token_name}", bias=f"b_k_h{head_idx}", in_dtype=DType.INT16, out_dtype=DType.INT16),
+                b.matmul(f"op_v_h{head_idx}", "x_norm1_q", f"w_v_h{head_idx}", f"v_cache_h{head_idx}_{decode_token_name}", bias=f"b_v_h{head_idx}", in_dtype=DType.INT16, out_dtype=DType.INT16),
             ]
         )
     b.segment(
         "seg_qkv",
         ops=qkv_ops,
         inputs=["x_norm1_q"],
-        outputs=[f"{kind}_h{head_idx}" for head_idx in range(n_heads) for kind in ("q_int", "k_cur", "v_cur")],
+        outputs=[
+            name
+            for head_idx in range(n_heads)
+            for name in (
+                f"q_int_h{head_idx}",
+                f"k_cache_h{head_idx}_{decode_token_name}",
+                f"v_cache_h{head_idx}_{decode_token_name}",
+            )
+        ],
     )
     for head_idx in range(n_heads):
-        b.host(
-            f"k_append_h{head_idx}",
-            "k_cache_scatter_write",
-            inputs=[f"k_cur_h{head_idx}", f"k_cache_h{head_idx}"],
-            outputs=[f"k_cache_h{head_idx}_{decode_token_name}"],
-            attrs={"token_index": prompt_len, "k_cache_base": f"k_cache_h{head_idx}"},
-        )
-        b.host(
-            f"v_append_h{head_idx}",
-            "v_cache_scatter_write",
-            inputs=[f"v_cur_h{head_idx}", f"v_cache_h{head_idx}"],
-            outputs=[f"v_cache_h{head_idx}_{decode_token_name}"],
-            attrs={"token_index": prompt_len, "v_cache_base": f"v_cache_h{head_idx}"},
-        )
         b.host(f"alias_q_a_h{head_idx}", "alias", inputs=[f"q_int_h{head_idx}"], outputs=[f"q_a_h{head_idx}"])
     b.segment(
         "seg_score",

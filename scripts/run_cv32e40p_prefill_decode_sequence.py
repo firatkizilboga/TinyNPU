@@ -17,10 +17,12 @@ from tinynpu_jit import RunnerConfig, emit_cv32e40p_program_v2  # noqa: E402
 from tinynpu_jit.blocks.gpt2_block import (  # noqa: E402
     build_decode_artifact as build_gpt2_decode_artifact,
     build_prefill_artifact as build_gpt2_prefill_artifact,
+    extend_kv_cache as extend_gpt2_kv_cache,
 )
 from tinynpu_jit.blocks.llama_block import (  # noqa: E402
     build_decode_artifact as build_llama_decode_artifact,
     build_prefill_artifact as build_llama_prefill_artifact,
+    extend_kv_cache as extend_llama_kv_cache,
 )
 from tinynpu_jit.rtl_runner import (  # noqa: E402
     CORE_DIR,
@@ -40,25 +42,44 @@ from tinynpu_jit.rtl_runner import (  # noqa: E402
 def _combined_runner_source(
     *,
     prefill_symbol: str,
-    decode_symbol: str,
+    decode_symbols: list[str],
     model: str,
     n_cache_heads: int,
 ) -> str:
-    cache_copies: list[str] = []
+    extern_decodes = "\n".join(f"extern const TnpuProgram {symbol};" for symbol in decode_symbols)
+
+    prefill_to_decode = []
     for head in range(n_cache_heads):
-        if model == "llama":
-            prefill_k = f"prefill_k_cache_h{head}"
-            prefill_v = f"prefill_v_cache_h{head}"
-            decode_k = f"k_cache_h{head}"
-            decode_v = f"v_cache_h{head}"
-        else:
-            prefill_k = f"prefill_k_cache_h{head}"
-            prefill_v = f"prefill_v_cache_h{head}"
-            decode_k = f"k_cache_h{head}"
-            decode_v = f"v_cache_h{head}"
-        cache_copies.append(
-            f"""    if (copy_k_cache(&{prefill_symbol}, "{prefill_k}", &{decode_symbol}, "{decode_k}") != 0) return EXIT_FAILURE;
-    if (copy_v_cache(&{prefill_symbol}, "{prefill_v}", &{decode_symbol}, "{decode_v}") != 0) return EXIT_FAILURE;"""
+        prefill_to_decode.append(
+            f"""    if (copy_k_cache(&{prefill_symbol}, "prefill_k_cache_h{head}", &{decode_symbols[0]}, "k_cache_h{head}") != 0) return EXIT_FAILURE;
+    if (copy_v_cache(&{prefill_symbol}, "prefill_v_cache_h{head}", &{decode_symbols[0]}, "v_cache_h{head}") != 0) return EXIT_FAILURE;"""
+        )
+
+    decode_run_blocks: list[str] = []
+    for idx, symbol in enumerate(decode_symbols):
+        if idx > 0:
+            prior = decode_symbols[idx - 1]
+            handoff = []
+            for head in range(n_cache_heads):
+                handoff.append(
+                    f"""    if (copy_k_cache(&{prior}, "k_cache_h{head}_td", &{symbol}, "k_cache_h{head}") != 0) return EXIT_FAILURE;
+    if (copy_v_cache(&{prior}, "v_cache_h{head}_td", &{symbol}, "v_cache_h{head}") != 0) return EXIT_FAILURE;"""
+                )
+            decode_run_blocks.append(
+                f"""    t0 = seq_read_mcycle32();
+{chr(10).join(handoff)}
+    t1 = seq_read_mcycle32();
+    seq_print_delta("sequence.decode{idx - 1}_to_decode{idx}_handoff.total", t0, t1);
+"""
+            )
+        decode_run_blocks.append(
+            f"""    if (prepare_io(&{symbol}, ins, ip, outs, op) != 0) return EXIT_FAILURE;
+    t0 = seq_read_mcycle32();
+    rc = tinynpu_run(&{symbol}, ip, op, NULL, 0u);
+    t1 = seq_read_mcycle32();
+    seq_print_delta("sequence.decode{idx}.total", t0, t1);
+    if (rc != 0) return EXIT_FAILURE;
+"""
         )
 
     return f"""#include <stdint.h>
@@ -67,7 +88,7 @@ def _combined_runner_source(
 #include "tinynpu_runtime_v2.h"
 
 extern const TnpuProgram {prefill_symbol};
-extern const TnpuProgram {decode_symbol};
+{extern_decodes}
 
 static inline uint32_t seq_read_mcycle32(void)
 {{
@@ -182,16 +203,11 @@ int main(void)
     if (rc != 0) return EXIT_FAILURE;
 
     t0 = seq_read_mcycle32();
-{chr(10).join(cache_copies)}
+{chr(10).join(prefill_to_decode)}
     t1 = seq_read_mcycle32();
     seq_print_delta("sequence.cache_handoff.total", t0, t1);
 
-    if (prepare_io(&{decode_symbol}, ins, ip, outs, op) != 0) return EXIT_FAILURE;
-    t0 = seq_read_mcycle32();
-    rc = tinynpu_run(&{decode_symbol}, ip, op, NULL, 0u);
-    t1 = seq_read_mcycle32();
-    seq_print_delta("sequence.decode.total", t0, t1);
-    if (rc != 0) return EXIT_FAILURE;
+{chr(10).join(decode_run_blocks)}
 
     uint32_t total_end = seq_read_mcycle32();
     seq_print_delta("sequence.e2e.total", total_start, total_end);
@@ -204,15 +220,16 @@ def _build_sequence_elf_and_hex(
     *,
     program_name: str,
     prefill_source: str,
-    decode_source: str,
+    decode_sources: list[str],
     runner_source: str,
-) -> tuple[Path, Path, Path, Path, Path]:
+) -> tuple[Path, list[Path], Path, Path, Path]:
     GENERATED_DIR.mkdir(exist_ok=True)
     prefill_path = GENERATED_DIR / f"{program_name}_prefill_program.c"
-    decode_path = GENERATED_DIR / f"{program_name}_decode_program.c"
+    decode_paths = [GENERATED_DIR / f"{program_name}_decode{i}_program.c" for i in range(len(decode_sources))]
     runner_path = GENERATED_DIR / f"{program_name}_runner.c"
     prefill_path.write_text(prefill_source)
-    decode_path.write_text(decode_source)
+    for path, source in zip(decode_paths, decode_sources, strict=True):
+        path.write_text(source)
     runner_path.write_text(runner_source)
 
     prefix = toolchain_prefix()
@@ -241,7 +258,7 @@ def _build_sequence_elf_and_hex(
             "custom/crt0.S",
             str(runner_path),
             str(prefill_path),
-            str(decode_path),
+            *(str(path) for path in decode_paths),
             str(RUNTIME_DIR / "tinynpu_runtime_v2.c"),
             "mem_stall/mem_stall.c",
             "custom/syscalls.c",
@@ -262,7 +279,7 @@ def _build_sequence_elf_and_hex(
         env=build_env,
     )
     run_checked([objcopy, "-O", "verilog", str(elf_path), str(hex_path)], cwd=CORE_DIR, env=build_env)
-    return prefill_path, decode_path, runner_path, elf_path, hex_path
+    return prefill_path, decode_paths, runner_path, elf_path, hex_path
 
 
 def _build_artifacts(args: argparse.Namespace):
@@ -277,7 +294,7 @@ def _build_artifacts(args: argparse.Namespace):
             seed=args.seed,
             expose_kv_cache_outputs=True,
         )
-        decode, _, _, _ = build_llama_decode_artifact(
+        decode0, _, prefill_ref, decode0_ref = build_llama_decode_artifact(
             d_model=args.d_model,
             d_head=args.d_head,
             n_heads=args.n_heads,
@@ -287,9 +304,25 @@ def _build_artifacts(args: argparse.Namespace):
             seed=args.seed,
             state=state,
         )
-        return prefill, decode, args.n_kv_heads
+        decodes = [decode0]
+        if args.decode_tokens >= 2:
+            decode1_cache = extend_llama_kv_cache(prefill_ref, decode0_ref)
+            decode1, _, _, _ = build_llama_decode_artifact(
+                d_model=args.d_model,
+                d_head=args.d_head,
+                n_heads=args.n_heads,
+                n_kv_heads=args.n_kv_heads,
+                ffn_hidden_dim=args.ffn_dim,
+                prompt_len=args.prompt_len,
+                seed=args.seed,
+                state=state,
+                cache_ref=decode1_cache,
+                x_decode_in=state["x_decode2_in"],
+            )
+            decodes.append(decode1)
+        return prefill, decodes, args.n_kv_heads
 
-    prefill, _, _ = build_gpt2_prefill_artifact(
+    prefill, state, _ = build_gpt2_prefill_artifact(
         d_model=args.d_model,
         d_head=args.d_head,
         n_heads=args.n_heads,
@@ -297,15 +330,31 @@ def _build_artifacts(args: argparse.Namespace):
         prompt_len=args.prompt_len,
         seed=args.seed,
     )
-    decode, _, _, _ = build_gpt2_decode_artifact(
+    decode0, _, prefill_ref, decode0_ref = build_gpt2_decode_artifact(
         d_model=args.d_model,
         d_head=args.d_head,
         n_heads=args.n_heads,
         ffn_dim=args.ffn_dim,
         prompt_len=args.prompt_len,
         seed=args.seed,
+        state=state,
     )
-    return prefill, decode, args.n_heads
+    decodes = [decode0]
+    if args.decode_tokens >= 2:
+        decode1_cache = extend_gpt2_kv_cache(prefill_ref, decode0_ref)
+        decode1, _, _, _ = build_gpt2_decode_artifact(
+            d_model=args.d_model,
+            d_head=args.d_head,
+            n_heads=args.n_heads,
+            ffn_dim=args.ffn_dim,
+            prompt_len=args.prompt_len,
+            seed=args.seed,
+            state=state,
+            cache_ref=decode1_cache,
+            x_decode_in=state["x_decode2_in"],
+        )
+        decodes.append(decode1)
+    return prefill, decodes, args.n_heads
 
 
 def _canonical_model(name: str) -> str:
@@ -410,6 +459,7 @@ def main() -> int:
     parser.add_argument("--n-kv-heads", type=int, default=None)
     parser.add_argument("--ffn-dim", type=int, default=64)
     parser.add_argument("--prompt-len", type=int, default=8)
+    parser.add_argument("--decode-tokens", type=int, choices=(1, 2), default=1, help="Number of decode tokens to run after prefill.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--run-rtl", action="store_true")
     parser.add_argument("--maxcycles", type=int, default=20_000_000)
@@ -426,31 +476,35 @@ def main() -> int:
     if args.model == "qgpt2" and args.n_kv_heads != args.n_heads:
         raise SystemExit("GPT-2 uses full multi-head KV; pass --n-kv-heads equal to --n-heads or omit it.")
 
-    prefill_artifact, decode_artifact, n_cache_heads = _build_artifacts(args)
+    prefill_artifact, decode_artifacts, n_cache_heads = _build_artifacts(args)
     stem = (
-        f"cv32e40p_{args.model}_prefill_decode_seq_d{args.d_model}_h{args.d_head}_"
+        f"cv32e40p_{args.model}_prefill_decode{args.decode_tokens}_seq_d{args.d_model}_h{args.d_head}_"
         f"nh{args.n_heads}_nkv{args.n_kv_heads}_f{args.ffn_dim}_t{args.prompt_len}_s{args.seed}"
     )
     prefill_name = f"{stem}_prefill"
-    decode_name = f"{stem}_decode"
+    decode_names = [f"{stem}_decode{i}" for i in range(len(decode_artifacts))]
     prefill_symbol = sanitize_program_symbol(prefill_name)
-    decode_symbol = sanitize_program_symbol(decode_name)
+    decode_symbols = [sanitize_program_symbol(name) for name in decode_names]
     prefill_source = emit_cv32e40p_program_v2(prefill_artifact, {}, program_name=prefill_name)
-    decode_source = emit_cv32e40p_program_v2(decode_artifact, {}, program_name=decode_name)
+    decode_sources = [
+        emit_cv32e40p_program_v2(artifact, {}, program_name=name)
+        for artifact, name in zip(decode_artifacts, decode_names, strict=True)
+    ]
     runner_source = _combined_runner_source(
         prefill_symbol=prefill_symbol,
-        decode_symbol=decode_symbol,
+        decode_symbols=decode_symbols,
         model=_model_label(args.model),
         n_cache_heads=n_cache_heads,
     )
-    prefill_path, decode_path, runner_path, elf_path, hex_path = _build_sequence_elf_and_hex(
+    prefill_path, decode_paths, runner_path, elf_path, hex_path = _build_sequence_elf_and_hex(
         program_name=stem,
         prefill_source=prefill_source,
-        decode_source=decode_source,
+        decode_sources=decode_sources,
         runner_source=runner_source,
     )
     print(f"prefill_program={prefill_path}")
-    print(f"decode_program={decode_path}")
+    for idx, path in enumerate(decode_paths):
+        print(f"decode{idx}_program={path}")
     print(f"runner={runner_path}")
     print(f"elf={elf_path}")
     print(f"hex={hex_path}")

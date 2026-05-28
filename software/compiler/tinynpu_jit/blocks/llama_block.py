@@ -14,8 +14,8 @@ from tinynpu_jit import (
 )
 from tinynpu_jit.golden import GoldenModel
 from tinynpu_jit.runtime_approx import (
-    dequantize_i16_to_fp16_bits_xform,
-    quantize_fp16_to_i16_xform,
+    dequantize_i16_to_fp16_bits_host,
+    quantize_fp16_to_i16_host,
     rmsnorm_approx,
     silu_approx,
     softmax_f16_approx,
@@ -44,11 +44,11 @@ def _silu(x: np.ndarray) -> np.ndarray:
 
 
 def _quantize_fp16_boundary(source: np.ndarray, *, scale: float) -> np.ndarray:
-    return quantize_fp16_to_i16_xform(source, scale=scale)
+    return quantize_fp16_to_i16_host(source, scale=scale)
 
 
 def _dequantize_fp16_boundary(source: np.ndarray, *, scale: float) -> np.ndarray:
-    bits = dequantize_i16_to_fp16_bits_xform(source, scale=scale, zero_point=0)
+    bits = dequantize_i16_to_fp16_bits_host(source, scale=scale, zero_point=0)
     return np.asarray(bits, dtype=np.int16).view(np.uint16).view(np.float16).astype(np.float32)
 
 
@@ -359,6 +359,7 @@ def build_shared_state(
         "block": block,
         "x_prompt_in": _rand_f32(rng, (prompt_len, d_model)),
         "x_decode_in": _rand_f32(rng, (1, d_model)),
+        "x_decode2_in": _rand_f32(rng, (1, d_model)),
     }
 
 
@@ -1249,6 +1250,8 @@ def build_decode_artifact(
     rope_scaling: dict[str, object] | None = None,
     enable_dq_xform: bool = False,
     state: dict[str, object] | None = None,
+    cache_ref: dict[str, object] | None = None,
+    x_decode_in: np.ndarray | None = None,
 ):
     if rms_norm_eps <= 0.0:
         raise ValueError("rms_norm_eps must be positive")
@@ -1276,17 +1279,22 @@ def build_decode_artifact(
     attn_scale = block.config.attn_scale
     rms_norm_eps = block.config.rms_norm_eps
     rope_theta = block.config.rope_theta
-    prefill_ref = reference_prefill(
-        state,
-        d_head=d_head,
-        n_heads=n_heads,
-        n_kv_heads=n_kv_heads,
-        act_scale=act_scale,
-        attn_scale=attn_scale,
-        rope_theta=rope_theta,
-        rope_scaling=block.config.rope_scaling,
-        enable_dq_xform=enable_dq_xform,
+    prefill_ref = (
+        cache_ref
+        if cache_ref is not None
+        else reference_prefill(
+            state,
+            d_head=d_head,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            act_scale=act_scale,
+            attn_scale=attn_scale,
+            rope_theta=rope_theta,
+            rope_scaling=block.config.rope_scaling,
+            enable_dq_xform=enable_dq_xform,
+        )
     )
+    effective_prompt_len = int(np.asarray(prefill_ref["k_heads"][0]).shape[0])
     decode_ref = reference_decode(
         state,
         prefill_ref,
@@ -1297,19 +1305,20 @@ def build_decode_artifact(
         attn_scale=attn_scale,
         rope_theta=rope_theta,
         rope_scaling=block.config.rope_scaling,
+        x_in=x_decode_in,
         enable_dq_xform=enable_dq_xform,
     )
-    cache_len = prompt_len + 1
+    cache_len = effective_prompt_len + 1
     attn_dim = n_heads * d_head
     decode_token_name = "td"
-    cache_token_names = [f"t{i}" for i in range(prompt_len)] + [decode_token_name]
+    cache_token_names = [f"t{i}" for i in range(effective_prompt_len)] + [decode_token_name]
 
     b = IRBuilder()
     _add_tensor_specs(
         b,
         _common_io_tensors(
             block=block,
-            x_in=np.array(state["x_decode_in"], dtype=np.float32, copy=True),
+            x_in=np.array(state["x_decode_in"] if x_decode_in is None else x_decode_in, dtype=np.float32, copy=True),
             d_model=d_model,
             ffn_hidden_dim=ffn_hidden_dim,
             attn_dim=attn_dim,
@@ -1325,7 +1334,7 @@ def build_decode_artifact(
         d_head=d_head,
         n_heads=n_heads,
         n_kv_heads=n_kv_heads,
-        prompt_len=prompt_len,
+        prompt_len=effective_prompt_len,
         cache_len=cache_len,
         act_scale=act_scale,
         score_scale=_qscore_scale(block, d_head),
@@ -1382,7 +1391,7 @@ def build_decode_artifact(
             "rope",
             inputs=[f"q_f_h{q_head}"],
             outputs=[f"q_rope_f_h{q_head}"],
-            attrs={"head_dim": d_head, "position": prompt_len, "theta": rope_theta, **rope_input_attrs},
+            attrs={"head_dim": d_head, "position": effective_prompt_len, "theta": rope_theta, **rope_input_attrs},
         )
         b.host(
             f"quant_q_rope_h{q_head}",
@@ -1398,7 +1407,7 @@ def build_decode_artifact(
             "rope",
             inputs=[f"k_f_h{kv_head}"],
             outputs=[f"k_rope_f_h{kv_head}"],
-            attrs={"head_dim": d_head, "position": prompt_len, "theta": rope_theta, **rope_input_attrs},
+            attrs={"head_dim": d_head, "position": effective_prompt_len, "theta": rope_theta, **rope_input_attrs},
         )
         b.host(
             f"quant_k_rope_h{kv_head}",
@@ -1412,7 +1421,7 @@ def build_decode_artifact(
             "k_cache_scatter_write",
             inputs=[f"k_rope_q_h{kv_head}", f"k_cache_h{kv_head}"],
             outputs=[f"k_cache_h{kv_head}_{decode_token_name}"],
-            attrs={"token_index": prompt_len, "k_cache_base": f"k_cache_h{kv_head}"},
+            attrs={"token_index": effective_prompt_len, "k_cache_base": f"k_cache_h{kv_head}"},
         )
     b.segment(
         "seg_score",
