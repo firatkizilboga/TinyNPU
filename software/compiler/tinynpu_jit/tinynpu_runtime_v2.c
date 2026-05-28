@@ -18,6 +18,13 @@
 
 #define TNPU_ARRAY_SIZE 8
 
+static int g_tinynpu_reset_timer_on_run = 1;
+
+void tinynpu_set_reset_timer_on_run(int enabled)
+{
+    g_tinynpu_reset_timer_on_run = enabled ? 1 : 0;
+}
+
 #ifndef TNPU_RUNTIME_V2_DUMP_FINAL_OUTPUTS
 #define TNPU_RUNTIME_V2_DUMP_FINAL_OUTPUTS 1
 #endif
@@ -961,7 +968,9 @@ int tinynpu_run(
     }
 
     printf("TinyNPU runtime v2 program: %s\n", program->name ? program->name : "program_v2");
-    tb_timer_reset_counter();
+    if (g_tinynpu_reset_timer_on_run) {
+        tb_timer_reset_counter();
+    }
 
     if (tnpu_execute_preloads(program, NULL) != 0) {
         free(runtime_tensors);
@@ -1011,7 +1020,9 @@ int tinynpu_run_repeat(
 
     printf("TinyNPU runtime v2 program: %s\n", program->name ? program->name : "program_v2");
     printf("body.kind=%s\n", body_kind);
-    tb_timer_reset_counter();
+    if (g_tinynpu_reset_timer_on_run) {
+        tb_timer_reset_counter();
+    }
 
     if (tnpu_execute_preloads(program, &preload_total) != 0) {
         free(runtime_tensors);

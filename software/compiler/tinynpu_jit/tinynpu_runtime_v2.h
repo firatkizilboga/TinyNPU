@@ -190,6 +190,7 @@ int tinynpu_run(
     uint32_t scratch_words);
 
 void tinynpu_set_force_mmio(int enabled);
+void tinynpu_set_reset_timer_on_run(int enabled);
 
 int tinynpu_run_repeat(
     const TnpuProgram *program,

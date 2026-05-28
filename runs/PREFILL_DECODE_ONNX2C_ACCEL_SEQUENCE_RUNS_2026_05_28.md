@@ -75,7 +75,38 @@ datapath or UB/IM sizes. The d288 two-token images below were built with
 | Case | Log | Result |
 | --- | --- | --- |
 | QLlama accelerated `d128 h16 nh8 nkv4 f128 T8 decode_tokens=2` old runner | `runs/accel_qllama_prefill_decode2_d128_t8_direct.log` | Failed before section timing: prefill exposes 9 outputs (`final + K/V cache for 4 KV heads`) but the generated runner only allocated 8 output descriptors. Fixed in commit `bcc7dc7` by raising the generated runner I/O descriptor capacity to 64. |
-| QLlama accelerated `d128 h16 nh8 nkv4 f128 T8 decode_tokens=2` fixed runner | `runs/accel_qllama_prefill_decode2_d128_t8_fixed.log` | Running at note time. It reached `prefill_decode_sequence: QLlama` and `sequence.prefill.start`; no `sequence.prefill.total` yet. This run was started with the temporary `+verbose` flag and is therefore noisy/slow. |
+| QLlama accelerated `d128 h16 nh8 nkv4 f128 T8 decode_tokens=2` fixed runner | `runs/accel_qllama_prefill_decode2_d128_t8_fixed.log` | Aborted after roughly 6.5 h because it was started with the temporary `+verbose` flag. The log grew to 4.9 MiB of per-memory-access traffic and did not reach a complete section timing line. |
+
+## Aborted / Invalid Long Runs
+
+These runs were stopped at 2026-05-28 10:34 local time because they were stale
+or invalid and were pinning the 32-core host at a load average above 70. They
+should not be used for performance numbers.
+
+| Case | Log | Why invalid |
+| --- | --- | --- |
+| QLlama ONNX2C `d192 h16 nh12 nkv6 f192 T8` one-decode | `runs/onnx2c_qllama_prefill_decode_d192_t8_unlimited.log` | Old one-decode baseline, not the requested two-decode sequence. It ran for about 8.1 h with no firmware result. |
+| QLlama accelerated `d288 h32 nh9 nkv3 f288 T8 decode_tokens=2` | `runs/accel_qllama_prefill_decode2_d288_t8_16m_unlimited.log` | Started before the concise progress-marker and timeout discipline was in place. It ran for about 7.0 h with no firmware result. |
+| QLlama accelerated `d128 h16 nh8 nkv4 f128 T8 decode_tokens=2` | `runs/accel_qllama_prefill_decode2_d128_t8_fixed.log` | Started with `+verbose`, which prints low-level memory traffic and makes the run unusably slow/noisy. It ran for about 6.6 h without a complete result. |
+| QLlama accelerated `d8 h8 nh1 nkv1 f8 T8 decode_tokens=2` smoke | `runs/accel_qllama_prefill_decode2_d8_t8_fixed_smoke.log` | Timed out after 180 s while the host was overloaded by the invalid long runs. Rerun required on a clean host. |
+
+## Clean Two-Decode Smoke Results
+
+| Model | Config | Log | Result |
+| --- | --- | --- | --- |
+| QLlama accelerated | `d8 h8 nh1 nkv1 f8 T8 decode_tokens=2` | `runs/accel_qllama_prefill_decode2_d8_t8_fixed_sequence.log` | `EXIT SUCCESS`; prefill 717,659 cycles, prefill-to-decode handoff 8,148 cycles, decode0 256,086 cycles, decode0-to-decode1 handoff 8,068 cycles, decode1 256,783 cycles, e2e 1,265,362 cycles. |
+| QLlama ONNX2C | `d8 h8 nh1 nkv1 f8 T8 decode_tokens=2` | `runs/onnx2c_qllama_prefill_decode2_d8_t8_sequence.log` | `EXIT SUCCESS`; total 44,710 cycles, prefill 33,310 cycles, decode0 4,969 cycles, decode1 5,243 cycles. ONNX2C is faster at this tiny smoke size, so this is not a reportable accelerator win. |
+
+The clean smoke also validated two runner fixes needed before larger
+measurements:
+
+- Non-verbose Verilator stdout is now flushed after each pseudo-UART byte, so
+  timeout-killed runs do not lose firmware progress markers.
+- Decode-to-decode handoff copies the full mutated cache tensors
+  (`k_cache_h*`/`v_cache_h*`) into the next decode image instead of trying to
+  copy the one-token `_td` tensors as complete caches.
+- The sequence runner owns the testbench timer for the whole image and disables
+  the runtime's per-program timer reset, so `sequence.*.total` lines are valid.
 
 Observability notes:
 
@@ -105,7 +136,7 @@ Observability notes:
   as separate generated programs with duplicated constants. d288 now links under
   the opt-in 16 MiB simulation RAM path. A compiler/runtime refactor that shares
   weights/constants across the sequence is still the better long-term fix.
-- The older d192 one-decode ONNX2C uncapped run is still live with no firmware
+- The older d192 one-decode ONNX2C uncapped run was aborted with no firmware
   output in `runs/onnx2c_qllama_prefill_decode_d192_t8_unlimited.log`; it is not
   the two-token comparison target.
 - Checkpoint commits are available through the alternate gitdir:

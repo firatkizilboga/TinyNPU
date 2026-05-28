@@ -1,0 +1,264 @@
+status=running
+command=/root/compiler-optimization/external/cv32e40p/example_tb/core/obj_dir/cv32e40p_tb_vlt_npu +verilator+noassert +firmware=/root/compiler-optimization/external/cv32e40p/example_tb/core/custom/cv32e40p_qllama_prefill_decode2_seq_d8_h8_nh1_nkv1_f8_t8_s0.hex +maxcycles=30000000
+
+--- stdout/stderr ---
+SBbIiMprefill_decode_sequence: QLlama
+sequence.prefill.start
+TinyNPU runtime v2 program: cv32e40p_qllama_prefill_decode2_seq_d8_h8_nh1_nkv1_f8_t8_s0_prefill
+preload.ub_image cycles=915
+preload.im_seg_qkv cycles=155
+preload.im_seg_score cycles=91
+preload.im_seg_value cycles=91
+preload.im_seg_o_proj cycles=91
+preload.im_seg_ffn_up cycles=123
+preload.im_seg_ffn_down cycles=91
+HostOp: rmsnorm1
+hostop.rmsnorm1 cycles=4347
+NpuSegment: seg_qkv
+segment.seg_qkv.stage cycles=3390
+segment.seg_qkv.run cycles=202
+segment.seg_qkv.readback cycles=4570
+segment.seg_qkv.npu cycles=14973
+HostOp: rope_q_h0
+hostop.rope_q_h0 cycles=8133
+HostOp: rope_k_h0
+hostop.rope_k_h0 cycles=8133
+HostOp: quant_k_rope_h0
+hostop.quant_k_rope_h0 cycles=4009
+HostOp: k_cache_scatter_matrix_h0
+hostop.k_cache_scatter_matrix_h0 cycles=4835
+HostOp: v_cache_scatter_matrix_h0
+hostop.v_cache_scatter_matrix_h0 cycles=4542
+NpuSegment: seg_score
+segment.seg_score.stage cycles=6717
+segment.seg_score.run cycles=92
+segment.seg_score.readback cycles=1598
+segment.seg_score.npu cycles=15159
+HostOp: scale_scores_h0
+hostop.scale_scores_h0 cycles=24251
+HostOp: causal_mask_h0
+hostop.causal_mask_h0 cycles=3063
+HostOp: softmax_h0
+hostop.softmax_h0 cycles=8738
+HostOp: quant_probs_h0
+hostop.quant_probs_h0 cycles=5558
+NpuSegment: seg_value
+segment.seg_value.stage cycles=4449
+segment.seg_value.run cycles=92
+segment.seg_value.readback cycles=1404
+segment.seg_value.npu cycles=12697
+HostOp: alias_attn_cat
+hostop.alias_attn_cat cycles=3540
+HostOp: alias_attn_cat_a
+hostop.alias_attn_cat_a cycles=3596
+NpuSegment: seg_o_proj
+segment.seg_o_proj.stage cycles=1084
+segment.seg_o_proj.run cycles=92
+segment.seg_o_proj.readback cycles=1598
+segment.seg_o_proj.npu cycles=9646
+HostOp: residual1
+hostop.residual1 cycles=24213
+HostOp: rmsnorm2
+hostop.rmsnorm2 cycles=4379
+NpuSegment: seg_ffn_up
+segment.seg_ffn_up.stage cycles=3411
+segment.seg_ffn_up.run cycles=147
+segment.seg_ffn_up.readback cycles=3181
+segment.seg_ffn_up.npu cycles=13910
+HostOp: silu_gate
+hostop.silu_gate cycles=13626
+HostOp: ffn_mul
+hostop.ffn_mul cycles=24027
+NpuSegment: seg_ffn_down
+segment.seg_ffn_down.stage cycles=3388
+segment.seg_ffn_down.run cycles=92
+segment.seg_ffn_down.readback cycles=1598
+segment.seg_ffn_down.npu cycles=12190
+HostOp: residual2
+hostop.residual2 cycles=24213
+Final outputs:
+out shape=(8, 8)
+  row 0: 51.469 7.238 91.231 -7.254 133.186 -68.751 -62.075 -38.919
+  row 1: 52.659 6.470 90.323 -8.097 133.714 -67.422 -61.513 -39.396
+  row 2: 14.485 55.267 26.365 -27.432 31.864 -54.616 -50.620 -9.505
+  row 3: -68.992 21.826 87.668 82.008 7.597 41.782 26.526 -73.752
+  row 4: 55.284 -43.160 24.432 -33.574 83.982 5.154 -36.709 -20.850
+  row 5: 45.722 37.693 125.828 -15.315 154.033 -107.127 -65.966 -55.719
+  row 6: 83.053 2.854 22.900 -69.938 39.993 -11.064 -54.461 -10.602
+  row 7: 46.951 55.896 118.542 -35.576 141.718 -90.180 -53.622 -64.737
+prefill_k_cache_h0 shape=(8, 8)
+  row 0: 13 -156 -63 78 -198 -44 78 140
+  row 1: 248 56 171 178 -10 -226 -65 96
+  row 2: -42 175 -156 -99 -101 -4 -62 50
+  row 3: -260 -33 34 -231 20 191 73 -30
+  row 4: -29 -110 179 -179 31 27 -148 -144
+  row 5: -146 146 -65 72 -2 103 133 -62
+  row 6: -45 -2 -178 22 32 108 5 44
+  row 7: 11 151 -114 272 -68 -9 44 -240
+prefill_v_cache_h0 shape=(8, 8)
+  row 0: -45 -263 -154 -178 -331 59 16 323
+  row 1: -106 68 -149 119 124 -192 -264 10
+  row 2: 232 -66 -42 -15 -38 122 19 18
+  row 3: -284 -175 -210 -32 -279 -14 -67 204
+  row 4: 105 -119 -30 -267 -254 99 14 125
+  row 5: -28 142 100 34 128 -24 -31 -205
+  row 6: 152 -48 -122 -264 -232 37 -144 170
+  row 7: 122 -103 74 -124 -64 70 -60 106
+sequence.prefill.total cycles=717659
+sequence.cache_handoff.start
+sequence.cache_handoff.total cycles=8148
+sequence.decode0.start
+TinyNPU runtime v2 program: cv32e40p_qllama_prefill_decode2_seq_d8_h8_nh1_nkv1_f8_t8_s0_decode0
+preload.ub_image cycles=1427
+preload.im_seg_qkv cycles=155
+preload.im_seg_score cycles=91
+preload.im_seg_value cycles=91
+preload.im_seg_o_proj cycles=91
+preload.im_seg_ffn_up cycles=123
+preload.im_seg_ffn_down cycles=91
+HostOp: rmsnorm1
+hostop.rmsnorm1 cycles=1309
+NpuSegment: seg_qkv
+segment.seg_qkv.stage cycles=1492
+segment.seg_qkv.run cycles=202
+segment.seg_qkv.readback cycles=5297
+segment.seg_qkv.npu cycles=13802
+HostOp: rope_q_h0
+hostop.rope_q_h0 cycles=1906
+HostOp: rope_k_h0
+hostop.rope_k_h0 cycles=1906
+HostOp: quant_k_rope_h0
+hostop.quant_k_rope_h0 cycles=1395
+HostOp: k_append_h0
+hostop.k_append_h0 cycles=1668
+NpuSegment: seg_score
+segment.seg_score.stage cycles=1496
+segment.seg_score.run cycles=147
+segment.seg_score.readback cycles=2284
+segment.seg_score.npu cycles=10978
+HostOp: scale_scores_h0
+hostop.scale_scores_h0 cycles=4304
+HostOp: softmax_h0
+hostop.softmax_h0 cycles=2157
+HostOp: quant_probs_h0
+hostop.quant_probs_h0 cycles=1703
+NpuSegment: seg_value
+segment.seg_value.stage cycles=1171
+segment.seg_value.run cycles=92
+segment.seg_value.readback cycles=1201
+segment.seg_value.npu cycles=9216
+HostOp: alias_attn_cat
+hostop.alias_attn_cat cycles=1300
+HostOp: alias_attn_cat_a
+hostop.alias_attn_cat_a cycles=1356
+NpuSegment: seg_o_proj
+segment.seg_o_proj.stage cycles=708
+segment.seg_o_proj.run cycles=92
+segment.seg_o_proj.readback cycles=1220
+segment.seg_o_proj.npu cycles=8593
+HostOp: residual1
+hostop.residual1 cycles=3789
+HostOp: rmsnorm2
+hostop.rmsnorm2 cycles=1313
+NpuSegment: seg_ffn_up
+segment.seg_ffn_up.stage cycles=1486
+segment.seg_ffn_up.run cycles=147
+segment.seg_ffn_up.readback cycles=2425
+segment.seg_ffn_up.npu cycles=11229
+HostOp: silu_gate
+hostop.silu_gate cycles=2573
+HostOp: ffn_mul
+hostop.ffn_mul cycles=3715
+NpuSegment: seg_ffn_down
+segment.seg_ffn_down.stage cycles=1502
+segment.seg_ffn_down.run cycles=92
+segment.seg_ffn_down.readback cycles=1220
+segment.seg_ffn_down.npu cycles=9926
+HostOp: residual2
+hostop.residual2 cycles=3789
+Final outputs:
+out shape=(1, 8)
+  row 0: 53.012 69.951 125.366 -41.683 138.066 -98.989 -62.198 -57.924
+sequence.decode0.total cycles=256086
+sequence.decode0_to_decode1_handoff.start
+sequence.decode0_to_decode1_handoff.total cycles=8068
+sequence.decode1.start
+TinyNPU runtime v2 program: cv32e40p_qllama_prefill_decode2_seq_d8_h8_nh1_nkv1_f8_t8_s0_decode1
+preload.ub_image cycles=1427
+preload.im_seg_qkv cycles=155
+preload.im_seg_score cycles=91
+preload.im_seg_value cycles=91
+preload.im_seg_o_proj cycles=91
+preload.im_seg_ffn_up cycles=123
+preload.im_seg_ffn_down cycles=91
+HostOp: rmsnorm1
+hostop.rmsnorm1 cycles=1309
+NpuSegment: seg_qkv
+segment.seg_qkv.stage cycles=1491
+segment.seg_qkv.run cycles=202
+segment.seg_qkv.readback cycles=5297
+segment.seg_qkv.npu cycles=13801
+HostOp: rope_q_h0
+hostop.rope_q_h0 cycles=1925
+HostOp: rope_k_h0
+hostop.rope_k_h0 cycles=1925
+HostOp: quant_k_rope_h0
+hostop.quant_k_rope_h0 cycles=1410
+HostOp: k_append_h0
+hostop.k_append_h0 cycles=1668
+NpuSegment: seg_score
+segment.seg_score.stage cycles=1487
+segment.seg_score.run cycles=147
+segment.seg_score.readback cycles=2286
+segment.seg_score.npu cycles=10971
+HostOp: scale_scores_h0
+hostop.scale_scores_h0 cycles=4669
+HostOp: softmax_h0
+hostop.softmax_h0 cycles=2201
+HostOp: quant_probs_h0
+hostop.quant_probs_h0 cycles=1792
+NpuSegment: seg_value
+segment.seg_value.stage cycles=1175
+segment.seg_value.run cycles=92
+segment.seg_value.readback cycles=1201
+segment.seg_value.npu cycles=9220
+HostOp: alias_attn_cat
+hostop.alias_attn_cat cycles=1300
+HostOp: alias_attn_cat_a
+hostop.alias_attn_cat_a cycles=1356
+NpuSegment: seg_o_proj
+segment.seg_o_proj.stage cycles=708
+segment.seg_o_proj.run cycles=92
+segment.seg_o_proj.readback cycles=1220
+segment.seg_o_proj.npu cycles=8593
+HostOp: residual1
+hostop.residual1 cycles=3789
+HostOp: rmsnorm2
+hostop.rmsnorm2 cycles=1313
+NpuSegment: seg_ffn_up
+segment.seg_ffn_up.stage cycles=1487
+segment.seg_ffn_up.run cycles=147
+segment.seg_ffn_up.readback cycles=2425
+segment.seg_ffn_up.npu cycles=11230
+HostOp: silu_gate
+hostop.silu_gate cycles=2448
+HostOp: ffn_mul
+hostop.ffn_mul cycles=3715
+NpuSegment: seg_ffn_down
+segment.seg_ffn_down.stage cycles=1492
+segment.seg_ffn_down.run cycles=92
+segment.seg_ffn_down.readback cycles=1220
+segment.seg_ffn_down.npu cycles=9916
+HostOp: residual2
+hostop.residual2 cycles=3789
+Final outputs:
+out shape=(1, 8)
+  row 0: 47.410 48.094 109.430 -29.715 128.914 -67.355 -43.769 -69.151
+sequence.decode1.total cycles=256783
+sequence.e2e.total cycles=1265362
+EXIT SUCCESS
+- tb_top.sv:201: Verilog $finish
+[DUMP] UB memory snapshot: /tmp/tinynpu_dump_ub.hex
+[DUMP] IM memory snapshot: /tmp/tinynpu_dump_im.hex
+
+status=success

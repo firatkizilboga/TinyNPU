@@ -77,8 +77,8 @@ def _combined_runner_source(
             handoff = []
             for head in range(n_cache_heads):
                 handoff.append(
-                    f"""    if (copy_k_cache(&{prior}, "k_cache_h{head}_td", &{symbol}, "k_cache_h{head}") != 0) return EXIT_FAILURE;
-    if (copy_v_cache(&{prior}, "v_cache_h{head}_td", &{symbol}, "v_cache_h{head}") != 0) return EXIT_FAILURE;"""
+                    f"""    if (copy_k_cache(&{prior}, "k_cache_h{head}", &{symbol}, "k_cache_h{head}") != 0) return EXIT_FAILURE;
+    if (copy_v_cache(&{prior}, "v_cache_h{head}", &{symbol}, "v_cache_h{head}") != 0) return EXIT_FAILURE;"""
                 )
             decode_run_blocks.append(
                 f"""    seq_print_marker("sequence.decode{idx - 1}_to_decode{idx}_handoff.start");
@@ -110,6 +110,14 @@ extern const TnpuProgram {prefill_symbol};
 static inline uint32_t seq_read_mcycle32(void)
 {{
     return *((volatile uint32_t *)0x15001000u);
+}}
+
+static void seq_reset_timer_counter(void)
+{{
+    *((volatile uint32_t *)0x15000000u) = 0u;
+    *((volatile uint32_t *)0x15000004u) = 0xFFFFFFFFu;
+    while (seq_read_mcycle32() == 0u) {{
+    }}
 }}
 
 static void seq_print_delta(const char *label, uint32_t start, uint32_t end)
@@ -211,6 +219,8 @@ static int copy_v_cache(const TnpuProgram *src_program, const char *src_name, co
 int main(void)
 {{
     setbuf(stdout, NULL);
+    tinynpu_set_reset_timer_on_run(0);
+    seq_reset_timer_counter();
     TnpuTensor ins[64];
     const TnpuTensor *ip[64];
     TnpuTensor outs[64];
