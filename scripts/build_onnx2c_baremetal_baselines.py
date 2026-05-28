@@ -630,6 +630,304 @@ def _write_llama_prefill_onnx(
     onnx.save(model, model_path)
 
 
+def _write_gpt2_prefill_onnx(
+    model_path: Path,
+    *,
+    d_model: int = 32,
+    d_head: int = 8,
+    n_heads: int = 4,
+    ffn_hidden_dim: int = 32,
+    prompt_len: int = 8,
+    seed: int = 0,
+    layer_norm_eps: float = 1.0e-5,
+) -> None:
+    """Emit a configurable FP32 GPT-2-style prefill block for ONNX2C baselines."""
+    import onnx
+    from onnx import TensorProto, helper, numpy_helper
+
+    d = int(d_model)
+    dh = int(d_head)
+    nh = int(n_heads)
+    ffn = int(ffn_hidden_dim)
+    seq = int(prompt_len)
+    if d <= 0 or dh <= 0 or nh <= 0 or ffn <= 0 or seq <= 0:
+        raise ValueError("gpt2_prefill dimensions must be positive")
+    if d != nh * dh:
+        raise ValueError("gpt2_prefill baseline currently expects d_model == n_heads * d_head")
+
+    rng = np.random.default_rng(seed)
+
+    def w(shape: tuple[int, ...], scale: float) -> np.ndarray:
+        return rng.normal(0.0, scale, size=shape).astype(np.float32)
+
+    def bias(shape: tuple[int, ...], scale: float) -> np.ndarray:
+        return rng.uniform(-scale, scale, size=shape).astype(np.float32)
+
+    def ln_wb(prefix: str) -> tuple[np.ndarray, np.ndarray]:
+        del prefix
+        gamma = rng.uniform(0.75, 1.25, size=(d,)).astype(np.float32)
+        beta = rng.uniform(-0.05, 0.05, size=(d,)).astype(np.float32)
+        return gamma, beta
+
+    ln1_w, ln1_b = ln_wb("ln1")
+    ln2_w, ln2_b = ln_wb("ln2")
+
+    input_x = helper.make_tensor_value_info("input_x", TensorProto.FLOAT, [seq, d])
+    output_y = helper.make_tensor_value_info("output_y", TensorProto.FLOAT, [seq, d])
+
+    initializers = [
+        numpy_helper.from_array(np.array([float(layer_norm_eps)], dtype=np.float32), "ln_eps"),
+        numpy_helper.from_array(np.array([1.0 / np.sqrt(float(dh))], dtype=np.float32), "attn_temperature"),
+        numpy_helper.from_array(np.array([0.5], dtype=np.float32), "gelu_half"),
+        numpy_helper.from_array(np.array([1.0], dtype=np.float32), "gelu_one"),
+        numpy_helper.from_array(np.array([0.044715], dtype=np.float32), "gelu_cubic"),
+        numpy_helper.from_array(np.array([0.7978845608028654], dtype=np.float32), "gelu_sqrt_2_over_pi"),
+        numpy_helper.from_array(_causal_mask(seq), "causal_mask"),
+        numpy_helper.from_array(ln1_w, "ln1_w"),
+        numpy_helper.from_array(ln1_b, "ln1_b"),
+        numpy_helper.from_array(ln2_w, "ln2_w"),
+        numpy_helper.from_array(ln2_b, "ln2_b"),
+        numpy_helper.from_array(w((d, nh * dh), 0.035), "q_w"),
+        numpy_helper.from_array(bias((nh * dh,), 0.020), "q_b"),
+        numpy_helper.from_array(w((d, nh * dh), 0.035), "k_w"),
+        numpy_helper.from_array(bias((nh * dh,), 0.020), "k_b"),
+        numpy_helper.from_array(w((d, nh * dh), 0.035), "v_w"),
+        numpy_helper.from_array(bias((nh * dh,), 0.020), "v_b"),
+        numpy_helper.from_array(w((nh * dh, d), 0.035), "o_w"),
+        numpy_helper.from_array(bias((d,), 0.020), "o_b"),
+        numpy_helper.from_array(w((d, ffn), 0.030), "fc_w"),
+        numpy_helper.from_array(bias((ffn,), 0.020), "fc_b"),
+        numpy_helper.from_array(w((ffn, d), 0.030), "proj_w"),
+        numpy_helper.from_array(bias((d,), 0.020), "proj_b"),
+    ]
+
+    nodes = []
+    counter = 0
+
+    def out(prefix: str) -> str:
+        nonlocal counter
+        counter += 1
+        return f"{prefix}_{counter}"
+
+    def node(op: str, inputs: list[str], prefix: str, **attrs: object) -> str:
+        y = out(prefix)
+        nodes.append(helper.make_node(op, inputs, [y], **attrs))
+        return y
+
+    def slice_cols(x: str, prefix: str, start: int, end: int) -> str:
+        return node("Slice", [x], prefix, starts=[0, int(start)], ends=[seq, int(end)], axes=[0, 1])
+
+    def layernorm(x: str, weight: str, bias_name: str, prefix: str) -> str:
+        mean = node("ReduceMean", [x], f"{prefix}_mean", axes=[1], keepdims=1)
+        centered = node("Sub", [x, mean], f"{prefix}_centered")
+        sq = node("Mul", [centered, centered], f"{prefix}_sq")
+        var = node("ReduceMean", [sq], f"{prefix}_var", axes=[1], keepdims=1)
+        eps = node("Add", [var, "ln_eps"], f"{prefix}_eps")
+        root = node("Sqrt", [eps], f"{prefix}_sqrt")
+        div = node("Div", [centered, root], f"{prefix}_div")
+        scaled = node("Mul", [div, weight], f"{prefix}_scaled")
+        return node("Add", [scaled, bias_name], f"{prefix}_out")
+
+    def linear(x: str, weight: str, bias_name: str, prefix: str) -> str:
+        mm = node("MatMul", [x, weight], f"{prefix}_mm")
+        return node("Add", [mm, bias_name], f"{prefix}_out")
+
+    def gelu_tanh(x: str, prefix: str) -> str:
+        x2 = node("Mul", [x, x], f"{prefix}_x2")
+        x3 = node("Mul", [x2, x], f"{prefix}_x3")
+        cubic = node("Mul", [x3, "gelu_cubic"], f"{prefix}_cubic")
+        inner = node("Add", [x, cubic], f"{prefix}_inner")
+        scaled = node("Mul", [inner, "gelu_sqrt_2_over_pi"], f"{prefix}_scaled")
+        tanh = node("Tanh", [scaled], f"{prefix}_tanh")
+        one_plus = node("Add", [tanh, "gelu_one"], f"{prefix}_one_plus")
+        half_x = node("Mul", [x, "gelu_half"], f"{prefix}_half_x")
+        return node("Mul", [half_x, one_plus], f"{prefix}_out")
+
+    n1 = layernorm("input_x", "ln1_w", "ln1_b", "ln1")
+    q_all = linear(n1, "q_w", "q_b", "q")
+    k_all = linear(n1, "k_w", "k_b", "k")
+    v_all = linear(n1, "v_w", "v_b", "v")
+
+    heads = []
+    for head in range(nh):
+        qh = slice_cols(q_all, f"q_h{head}", head * dh, (head + 1) * dh)
+        kh = slice_cols(k_all, f"k_h{head}", head * dh, (head + 1) * dh)
+        vh = slice_cols(v_all, f"v_h{head}", head * dh, (head + 1) * dh)
+        k_t = node("Transpose", [kh], f"k_t_h{head}", perm=[1, 0])
+        scores = node("MatMul", [qh, k_t], f"score_h{head}")
+        scaled = node("Mul", [scores, "attn_temperature"], f"scaled_h{head}")
+        masked = node("Add", [scaled, "causal_mask"], f"masked_h{head}")
+        probs = node("Softmax", [masked], f"probs_h{head}", axis=1)
+        heads.append(node("MatMul", [probs, vh], f"ctx_h{head}"))
+
+    attn_cat = node("Concat", heads, "attn_cat", axis=1)
+    attn_out = linear(attn_cat, "o_w", "o_b", "attn_out")
+    resid1 = node("Add", ["input_x", attn_out], "resid1")
+    n2 = layernorm(resid1, "ln2_w", "ln2_b", "ln2")
+    fc = linear(n2, "fc_w", "fc_b", "fc")
+    gelu = gelu_tanh(fc, "gelu")
+    proj = linear(gelu, "proj_w", "proj_b", "proj")
+    nodes.append(helper.make_node("Add", [resid1, proj], ["output_y"]))
+
+    graph = helper.make_graph(nodes, "third_party_onnx2c_gpt2_prefill", [input_x], [output_y], initializers)
+    model = helper.make_model(graph, opset_imports=[helper.make_operatorsetid("", 9)])
+    model.ir_version = 7
+    onnx.checker.check_model(model)
+    onnx.save(model, model_path)
+
+
+def _write_gpt2_decode_onnx(
+    model_path: Path,
+    *,
+    d_model: int = 32,
+    d_head: int = 8,
+    n_heads: int = 4,
+    ffn_hidden_dim: int = 32,
+    prompt_len: int = 8,
+    seed: int = 0,
+    layer_norm_eps: float = 1.0e-5,
+) -> None:
+    """Emit a configurable FP32 GPT-2-style decode block for ONNX2C baselines."""
+    import onnx
+    from onnx import TensorProto, helper, numpy_helper
+
+    d = int(d_model)
+    dh = int(d_head)
+    nh = int(n_heads)
+    ffn = int(ffn_hidden_dim)
+    prompt = int(prompt_len)
+    cache_len = prompt + 1
+    if d <= 0 or dh <= 0 or nh <= 0 or ffn <= 0 or prompt <= 0:
+        raise ValueError("gpt2_decode dimensions must be positive")
+    if d != nh * dh:
+        raise ValueError("gpt2_decode baseline currently expects d_model == n_heads * d_head")
+
+    rng = np.random.default_rng(seed)
+
+    def w(shape: tuple[int, ...], scale: float) -> np.ndarray:
+        return rng.normal(0.0, scale, size=shape).astype(np.float32)
+
+    def bias(shape: tuple[int, ...], scale: float) -> np.ndarray:
+        return rng.uniform(-scale, scale, size=shape).astype(np.float32)
+
+    def ln_wb(prefix: str) -> tuple[np.ndarray, np.ndarray]:
+        del prefix
+        gamma = rng.uniform(0.75, 1.25, size=(d,)).astype(np.float32)
+        beta = rng.uniform(-0.05, 0.05, size=(d,)).astype(np.float32)
+        return gamma, beta
+
+    ln1_w, ln1_b = ln_wb("ln1")
+    ln2_w, ln2_b = ln_wb("ln2")
+
+    input_x = helper.make_tensor_value_info("input_x", TensorProto.FLOAT, [1, d])
+    output_y = helper.make_tensor_value_info("output_y", TensorProto.FLOAT, [1, d])
+
+    initializers = [
+        numpy_helper.from_array(np.array([float(layer_norm_eps)], dtype=np.float32), "ln_eps"),
+        numpy_helper.from_array(np.array([1.0 / np.sqrt(float(dh))], dtype=np.float32), "attn_temperature"),
+        numpy_helper.from_array(np.array([0.5], dtype=np.float32), "gelu_half"),
+        numpy_helper.from_array(np.array([1.0], dtype=np.float32), "gelu_one"),
+        numpy_helper.from_array(np.array([0.044715], dtype=np.float32), "gelu_cubic"),
+        numpy_helper.from_array(np.array([0.7978845608028654], dtype=np.float32), "gelu_sqrt_2_over_pi"),
+        numpy_helper.from_array(np.zeros((1, cache_len), dtype=np.float32), "causal_mask"),
+        numpy_helper.from_array(ln1_w, "ln1_w"),
+        numpy_helper.from_array(ln1_b, "ln1_b"),
+        numpy_helper.from_array(ln2_w, "ln2_w"),
+        numpy_helper.from_array(ln2_b, "ln2_b"),
+        numpy_helper.from_array(w((d, nh * dh), 0.035), "q_w"),
+        numpy_helper.from_array(bias((nh * dh,), 0.020), "q_b"),
+        numpy_helper.from_array(w((d, nh * dh), 0.035), "k_w"),
+        numpy_helper.from_array(bias((nh * dh,), 0.020), "k_b"),
+        numpy_helper.from_array(w((d, nh * dh), 0.035), "v_w"),
+        numpy_helper.from_array(bias((nh * dh,), 0.020), "v_b"),
+        numpy_helper.from_array(w((nh * dh, d), 0.035), "o_w"),
+        numpy_helper.from_array(bias((d,), 0.020), "o_b"),
+        numpy_helper.from_array(w((d, ffn), 0.030), "fc_w"),
+        numpy_helper.from_array(bias((ffn,), 0.020), "fc_b"),
+        numpy_helper.from_array(w((ffn, d), 0.030), "proj_w"),
+        numpy_helper.from_array(bias((d,), 0.020), "proj_b"),
+    ]
+    for head in range(nh):
+        initializers.append(numpy_helper.from_array(w((prompt, dh), 0.05), f"k_cache_h{head}"))
+        initializers.append(numpy_helper.from_array(w((prompt, dh), 0.05), f"v_cache_h{head}"))
+
+    nodes = []
+    counter = 0
+
+    def out(prefix: str) -> str:
+        nonlocal counter
+        counter += 1
+        return f"{prefix}_{counter}"
+
+    def node(op: str, inputs: list[str], prefix: str, **attrs: object) -> str:
+        y = out(prefix)
+        nodes.append(helper.make_node(op, inputs, [y], **attrs))
+        return y
+
+    def slice_cols(x: str, prefix: str, start: int, end: int) -> str:
+        return node("Slice", [x], prefix, starts=[0, int(start)], ends=[1, int(end)], axes=[0, 1])
+
+    def layernorm(x: str, weight: str, bias_name: str, prefix: str) -> str:
+        mean = node("ReduceMean", [x], f"{prefix}_mean", axes=[1], keepdims=1)
+        centered = node("Sub", [x, mean], f"{prefix}_centered")
+        sq = node("Mul", [centered, centered], f"{prefix}_sq")
+        var = node("ReduceMean", [sq], f"{prefix}_var", axes=[1], keepdims=1)
+        eps = node("Add", [var, "ln_eps"], f"{prefix}_eps")
+        root = node("Sqrt", [eps], f"{prefix}_sqrt")
+        div = node("Div", [centered, root], f"{prefix}_div")
+        scaled = node("Mul", [div, weight], f"{prefix}_scaled")
+        return node("Add", [scaled, bias_name], f"{prefix}_out")
+
+    def linear(x: str, weight: str, bias_name: str, prefix: str) -> str:
+        mm = node("MatMul", [x, weight], f"{prefix}_mm")
+        return node("Add", [mm, bias_name], f"{prefix}_out")
+
+    def gelu_tanh(x: str, prefix: str) -> str:
+        x2 = node("Mul", [x, x], f"{prefix}_x2")
+        x3 = node("Mul", [x2, x], f"{prefix}_x3")
+        cubic = node("Mul", [x3, "gelu_cubic"], f"{prefix}_cubic")
+        inner = node("Add", [x, cubic], f"{prefix}_inner")
+        scaled = node("Mul", [inner, "gelu_sqrt_2_over_pi"], f"{prefix}_scaled")
+        tanh = node("Tanh", [scaled], f"{prefix}_tanh")
+        one_plus = node("Add", [tanh, "gelu_one"], f"{prefix}_one_plus")
+        half_x = node("Mul", [x, "gelu_half"], f"{prefix}_half_x")
+        return node("Mul", [half_x, one_plus], f"{prefix}_out")
+
+    n1 = layernorm("input_x", "ln1_w", "ln1_b", "ln1")
+    q_all = linear(n1, "q_w", "q_b", "q")
+    k_all = linear(n1, "k_w", "k_b", "k")
+    v_all = linear(n1, "v_w", "v_b", "v")
+
+    heads = []
+    for head in range(nh):
+        qh = slice_cols(q_all, f"q_h{head}", head * dh, (head + 1) * dh)
+        kh = slice_cols(k_all, f"k_h{head}", head * dh, (head + 1) * dh)
+        vh = slice_cols(v_all, f"v_h{head}", head * dh, (head + 1) * dh)
+        k_full = node("Concat", [f"k_cache_h{head}", kh], f"k_full_h{head}", axis=0)
+        v_full = node("Concat", [f"v_cache_h{head}", vh], f"v_full_h{head}", axis=0)
+        k_t = node("Transpose", [k_full], f"k_t_h{head}", perm=[1, 0])
+        scores = node("MatMul", [qh, k_t], f"score_h{head}")
+        scaled = node("Mul", [scores, "attn_temperature"], f"scaled_h{head}")
+        masked = node("Add", [scaled, "causal_mask"], f"masked_h{head}")
+        probs = node("Softmax", [masked], f"probs_h{head}", axis=1)
+        heads.append(node("MatMul", [probs, v_full], f"ctx_h{head}"))
+
+    attn_cat = node("Concat", heads, "attn_cat", axis=1)
+    attn_out = linear(attn_cat, "o_w", "o_b", "attn_out")
+    resid1 = node("Add", ["input_x", attn_out], "resid1")
+    n2 = layernorm(resid1, "ln2_w", "ln2_b", "ln2")
+    fc = linear(n2, "fc_w", "fc_b", "fc")
+    gelu = gelu_tanh(fc, "gelu")
+    proj = linear(gelu, "proj_w", "proj_b", "proj")
+    nodes.append(helper.make_node("Add", [resid1, proj], ["output_y"]))
+
+    graph = helper.make_graph(nodes, "third_party_onnx2c_gpt2_decode", [input_x], [output_y], initializers)
+    model = helper.make_model(graph, opset_imports=[helper.make_operatorsetid("", 9)])
+    model.ir_version = 7
+    onnx.checker.check_model(model)
+    onnx.save(model, model_path)
+
+
 def _onnx_generator_source(
     model: str,
     output_path: Path,
@@ -652,12 +950,17 @@ def _onnx_generator_source(
         extra = f", hidden_dim={int(mlp_hidden)}"
     elif model == "conv":
         extra = f", conv_channels={int(conv_channels)}"
-    elif model in {"llama_decode", "llama_prefill"}:
+    elif model in {"llama_decode", "llama_prefill", "gpt2_decode", "gpt2_prefill"}:
         extra = (
             f", d_model={int(d_model)}, d_head={int(d_head)}, n_heads={int(n_heads)}, "
-            f"n_kv_heads={int(n_kv_heads)}, ffn_hidden_dim={int(ffn_hidden_dim)}, "
-            f"prompt_len={int(prompt_len)}, seed={int(seed)}"
+            f"ffn_hidden_dim={int(ffn_hidden_dim)}, prompt_len={int(prompt_len)}, seed={int(seed)}"
         )
+        if model in {"llama_decode", "llama_prefill"}:
+            extra = (
+                f", d_model={int(d_model)}, d_head={int(d_head)}, n_heads={int(n_heads)}, "
+                f"n_kv_heads={int(n_kv_heads)}, ffn_hidden_dim={int(ffn_hidden_dim)}, "
+                f"prompt_len={int(prompt_len)}, seed={int(seed)}"
+            )
     return f"""import runpy
 ns = runpy.run_path({str(script_path)!r})
 ns['_write_{model}_onnx']({str(output_path)!r}{extra})
@@ -930,6 +1233,57 @@ int main(void)
 """
 
 
+def _render_gpt2_decode_wrapper(generated_c_name: str, signature: str, *, d_model: int) -> str:
+    input_x = _deterministic_llama_input(d_model)
+    return f"""// Bare-metal GPT-2-like decode baseline generated by third-party onnx2c.
+// onnx2c: https://github.com/kraiskil/onnx2c
+// Generated model source: {generated_c_name}
+#include <stdint.h>
+#include <stdio.h>
+
+uint32_t runtime_cycle_start;
+uint32_t runtime_cycle_post_bss;
+uint32_t runtime_cycle_post_init;
+uint32_t runtime_cycle_pre_main;
+
+#define TIMER_CTRL  ((volatile uint32_t *) 0x15000000u)
+#define TIMER_VALUE ((volatile uint32_t *) 0x15000004u)
+#define TIMER_COUNT ((volatile uint32_t *) 0x15001000u)
+
+static inline uint32_t read_mcycle32(void) {{ return *TIMER_COUNT; }}
+
+static void reset_timer(void)
+{{
+    *TIMER_CTRL = 0u;
+    *TIMER_VALUE = 0xFFFFFFFFu;
+    while (*TIMER_COUNT == 0u) {{ }}
+}}
+
+void onnx2c_gpt2_decode({signature});
+
+{_c_array("input_x_flat", input_x)}
+static float output_y[1][{int(d_model)}];
+
+int main(void)
+{{
+    const float (*input_x)[{int(d_model)}] = (const float (*)[{int(d_model)}])input_x_flat;
+    reset_timer();
+    uint32_t t0 = read_mcycle32();
+    onnx2c_gpt2_decode(input_x, output_y);
+    uint32_t t1 = read_mcycle32();
+    uint32_t cycles = t0 - t1;
+    float checksum = 0.0f;
+    for (int i = 0; i < {int(d_model)}; ++i) {{
+        checksum += output_y[0][i];
+    }}
+    printf("third_party_onnx2c_gpt2_decode d_model={int(d_model)} cycles=%lu checksum=%.9g first=%.9g last=%.9g\\n",
+           (unsigned long)cycles, (double)checksum, (double)output_y[0][0], (double)output_y[0][{int(d_model) - 1}]);
+    puts("EXIT SUCCESS");
+    return 0;
+}}
+"""
+
+
 def _render_llama_prefill_wrapper(generated_c_name: str, signature: str, *, d_model: int, prompt_len: int) -> str:
     token = _deterministic_llama_input(d_model)[0]
     input_x = np.vstack([token + np.float32((i % 7) - 3) / np.float32(128.0) for i in range(int(prompt_len))])
@@ -977,6 +1331,60 @@ int main(void)
         }}
     }}
     printf("third_party_onnx2c_llama_prefill d_model={int(d_model)} prompt_len={int(prompt_len)} cycles=%lu checksum=%.9g first=%.9g last=%.9g\\n",
+           (unsigned long)cycles, (double)checksum, (double)output_y[0][0], (double)output_y[{int(prompt_len) - 1}][{int(d_model) - 1}]);
+    puts("EXIT SUCCESS");
+    return 0;
+}}
+"""
+
+
+def _render_gpt2_prefill_wrapper(generated_c_name: str, signature: str, *, d_model: int, prompt_len: int) -> str:
+    token = _deterministic_llama_input(d_model)[0]
+    input_x = np.vstack([token + np.float32((i % 5) - 2) / np.float32(96.0) for i in range(int(prompt_len))])
+    return f"""// Bare-metal GPT-2-like prefill baseline generated by third-party onnx2c.
+// onnx2c: https://github.com/kraiskil/onnx2c
+// Generated model source: {generated_c_name}
+#include <stdint.h>
+#include <stdio.h>
+
+uint32_t runtime_cycle_start;
+uint32_t runtime_cycle_post_bss;
+uint32_t runtime_cycle_post_init;
+uint32_t runtime_cycle_pre_main;
+
+#define TIMER_CTRL  ((volatile uint32_t *) 0x15000000u)
+#define TIMER_VALUE ((volatile uint32_t *) 0x15000004u)
+#define TIMER_COUNT ((volatile uint32_t *) 0x15001000u)
+
+static inline uint32_t read_mcycle32(void) {{ return *TIMER_COUNT; }}
+
+static void reset_timer(void)
+{{
+    *TIMER_CTRL = 0u;
+    *TIMER_VALUE = 0xFFFFFFFFu;
+    while (*TIMER_COUNT == 0u) {{ }}
+}}
+
+void onnx2c_gpt2_prefill({signature});
+
+{_c_array("input_x_flat", input_x)}
+static float output_y[{int(prompt_len)}][{int(d_model)}];
+
+int main(void)
+{{
+    const float (*input_x)[{int(d_model)}] = (const float (*)[{int(d_model)}])input_x_flat;
+    reset_timer();
+    uint32_t t0 = read_mcycle32();
+    onnx2c_gpt2_prefill(input_x, output_y);
+    uint32_t t1 = read_mcycle32();
+    uint32_t cycles = t0 - t1;
+    float checksum = 0.0f;
+    for (int r = 0; r < {int(prompt_len)}; ++r) {{
+        for (int c = 0; c < {int(d_model)}; ++c) {{
+            checksum += output_y[r][c];
+        }}
+    }}
+    printf("third_party_onnx2c_gpt2_prefill d_model={int(d_model)} prompt_len={int(prompt_len)} cycles=%lu checksum=%.9g first=%.9g last=%.9g\\n",
            (unsigned long)cycles, (double)checksum, (double)output_y[0][0], (double)output_y[{int(prompt_len) - 1}][{int(d_model) - 1}]);
     puts("EXIT SUCCESS");
     return 0;
@@ -1062,7 +1470,7 @@ def build_model(
         func_name = "onnx2c_mlp"
     elif model == "conv":
         func_name = "onnx2c_conv4"
-    elif model in {"llama_decode", "llama_prefill"}:
+    elif model in {"llama_decode", "llama_prefill", "gpt2_decode", "gpt2_prefill"}:
         func_name = f"onnx2c_{model}"
     else:
         func_name = "onnx2c_tiny_lm"
@@ -1089,8 +1497,17 @@ def build_model(
         wrapper = _render_tiny_lm_wrapper(generated_c.name, signature, prompt=prompt, prompt_len=prompt_len)
     elif model == "llama_decode":
         wrapper = _render_llama_decode_wrapper(generated_c.name, signature, d_model=d_model)
+    elif model == "gpt2_decode":
+        wrapper = _render_gpt2_decode_wrapper(generated_c.name, signature, d_model=d_model)
     elif model == "llama_prefill":
         wrapper = _render_llama_prefill_wrapper(
+            generated_c.name,
+            signature,
+            d_model=d_model,
+            prompt_len=prompt_len,
+        )
+    elif model == "gpt2_prefill":
+        wrapper = _render_gpt2_prefill_wrapper(
             generated_c.name,
             signature,
             d_model=d_model,
@@ -1104,7 +1521,7 @@ def build_model(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", choices=["mlp", "conv", "tiny_lm", "llama_decode", "llama_prefill"], default="conv")
+    parser.add_argument("--model", choices=["mlp", "conv", "tiny_lm", "llama_decode", "llama_prefill", "gpt2_decode", "gpt2_prefill"], default="conv")
     parser.add_argument("--program-name", default=None)
     parser.add_argument("--prompt", default="there was a little girl named lily .")
     parser.add_argument("--prompt-len", type=int, default=9)
@@ -1128,6 +1545,8 @@ def main() -> int:
         "tiny_lm": "third_party_onnx2c_tiny_lm",
         "llama_decode": "third_party_onnx2c_llama_decode",
         "llama_prefill": "third_party_onnx2c_llama_prefill",
+        "gpt2_decode": "third_party_onnx2c_gpt2_decode",
+        "gpt2_prefill": "third_party_onnx2c_gpt2_prefill",
     }
     program_name = args.program_name or default_programs[args.model]
     onnx_path, generated_c, wrapper_path, elf_path, hex_path = build_model(

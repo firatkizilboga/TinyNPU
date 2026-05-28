@@ -1,0 +1,489 @@
+from __future__ import annotations
+
+import argparse
+from datetime import datetime
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+RUNS_DIR = REPO_ROOT / "runs"
+if str(REPO_ROOT / "software" / "compiler") not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT / "software" / "compiler"))
+
+from tinynpu_jit import RunnerConfig, emit_cv32e40p_program_v2  # noqa: E402
+from tinynpu_jit.blocks.gpt2_block import (  # noqa: E402
+    build_decode_artifact as build_gpt2_decode_artifact,
+    build_prefill_artifact as build_gpt2_prefill_artifact,
+)
+from tinynpu_jit.blocks.llama_block import (  # noqa: E402
+    build_decode_artifact as build_llama_decode_artifact,
+    build_prefill_artifact as build_llama_prefill_artifact,
+)
+from tinynpu_jit.rtl_runner import (  # noqa: E402
+    CORE_DIR,
+    CUSTOM_DIR,
+    GENERATED_DIR,
+    RUNTIME_DIR,
+    TNPU_RISCV_MABI,
+    TNPU_RISCV_MARCH,
+    run_checked,
+    runtime_cflags,
+    sanitize_program_symbol,
+    toolchain_include_lib_dirs,
+    toolchain_prefix,
+)
+
+
+def _combined_runner_source(
+    *,
+    prefill_symbol: str,
+    decode_symbol: str,
+    model: str,
+    n_cache_heads: int,
+) -> str:
+    cache_copies: list[str] = []
+    for head in range(n_cache_heads):
+        if model == "llama":
+            prefill_k = f"prefill_k_cache_h{head}"
+            prefill_v = f"prefill_v_cache_h{head}"
+            decode_k = f"k_cache_h{head}"
+            decode_v = f"v_cache_h{head}"
+        else:
+            prefill_k = f"prefill_k_cache_h{head}"
+            prefill_v = f"prefill_v_cache_h{head}"
+            decode_k = f"k_cache_h{head}"
+            decode_v = f"v_cache_h{head}"
+        cache_copies.append(
+            f"""    if (copy_k_cache(&{prefill_symbol}, "{prefill_k}", &{decode_symbol}, "{decode_k}") != 0) return EXIT_FAILURE;
+    if (copy_v_cache(&{prefill_symbol}, "{prefill_v}", &{decode_symbol}, "{decode_v}") != 0) return EXIT_FAILURE;"""
+        )
+
+    return f"""#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include "tinynpu_runtime_v2.h"
+
+extern const TnpuProgram {prefill_symbol};
+extern const TnpuProgram {decode_symbol};
+
+static inline uint32_t seq_read_mcycle32(void)
+{{
+    return *((volatile uint32_t *)0x15001000u);
+}}
+
+static void seq_print_delta(const char *label, uint32_t start, uint32_t end)
+{{
+    printf("%s cycles=%lu\\n", label, (unsigned long)(start - end));
+}}
+
+static int streq(const char *a, const char *b)
+{{
+    while (*a != 0 && *b != 0) {{
+        if (*a != *b) return 0;
+        ++a;
+        ++b;
+    }}
+    return *a == *b;
+}}
+
+static const TnpuTensorDesc *find_desc(const TnpuProgram *program, const char *name)
+{{
+    for (uint32_t i = 0; i < program->tensor_count; ++i) {{
+        if (streq(program->tensors[i].name, name)) {{
+            return &program->tensors[i];
+        }}
+    }}
+    printf("missing tensor: %s in %s\\n", name, program->name);
+    return NULL;
+}}
+
+static int prepare_io(const TnpuProgram *program, TnpuTensor *ins, const TnpuTensor **ip, TnpuTensor *outs, const TnpuTensor **op)
+{{
+    if (program->input_count > 8u) return 1;
+    if (program->output_count > 8u) return 1;
+    for (uint32_t i = 0; i < program->input_count; ++i) {{
+        uint16_t t = program->input_tensor_indices[i];
+        ins[i].data = program->tensors[t].data;
+        ins[i].desc = &program->tensors[t];
+        ins[i].elem_count = program->tensors[t].elem_count;
+        ip[i] = &ins[i];
+    }}
+    for (uint32_t i = 0; i < program->output_count; ++i) {{
+        uint16_t t = program->output_tensor_indices[i];
+        outs[i].data = program->tensors[t].data;
+        outs[i].desc = &program->tensors[t];
+        outs[i].elem_count = program->tensors[t].elem_count;
+        op[i] = &outs[i];
+    }}
+    return 0;
+}}
+
+static int copy_k_cache(const TnpuProgram *src_program, const char *src_name, const TnpuProgram *dst_program, const char *dst_name)
+{{
+    const TnpuTensorDesc *src = find_desc(src_program, src_name);
+    const TnpuTensorDesc *dst = find_desc(dst_program, dst_name);
+    if (src == NULL || dst == NULL) return 1;
+    if (src->dtype != TNPU_DTYPE_INT16 || dst->dtype != TNPU_DTYPE_INT16) return 1;
+    const int d_head = src->shape[0];
+    const int prompt_len = src->shape[1];
+    if (dst->shape[0] != d_head || dst->shape[1] < prompt_len) return 1;
+    int16_t *src_data = (int16_t *)src->data;
+    int16_t *dst_data = (int16_t *)dst->data;
+    for (uint32_t i = 0; i < dst->elem_count; ++i) {{
+        dst_data[i] = 0;
+    }}
+    for (int row = 0; row < d_head; ++row) {{
+        for (int token = 0; token < prompt_len; ++token) {{
+            dst_data[row * dst->shape[1] + token] = src_data[row * src->shape[1] + token];
+        }}
+    }}
+    return 0;
+}}
+
+static int copy_v_cache(const TnpuProgram *src_program, const char *src_name, const TnpuProgram *dst_program, const char *dst_name)
+{{
+    const TnpuTensorDesc *src = find_desc(src_program, src_name);
+    const TnpuTensorDesc *dst = find_desc(dst_program, dst_name);
+    if (src == NULL || dst == NULL) return 1;
+    if (src->dtype != TNPU_DTYPE_INT16 || dst->dtype != TNPU_DTYPE_INT16) return 1;
+    const int prompt_len = src->shape[0];
+    const int d_head = src->shape[1];
+    if (dst->shape[0] < prompt_len || dst->shape[1] != d_head) return 1;
+    int16_t *src_data = (int16_t *)src->data;
+    int16_t *dst_data = (int16_t *)dst->data;
+    for (uint32_t i = 0; i < dst->elem_count; ++i) {{
+        dst_data[i] = 0;
+    }}
+    for (int token = 0; token < prompt_len; ++token) {{
+        for (int col = 0; col < d_head; ++col) {{
+            dst_data[token * d_head + col] = src_data[token * d_head + col];
+        }}
+    }}
+    return 0;
+}}
+
+int main(void)
+{{
+    TnpuTensor ins[8];
+    const TnpuTensor *ip[8];
+    TnpuTensor outs[8];
+    const TnpuTensor *op[8];
+    uint32_t total_start = seq_read_mcycle32();
+
+    puts("prefill_decode_sequence: {model}");
+    if (prepare_io(&{prefill_symbol}, ins, ip, outs, op) != 0) return EXIT_FAILURE;
+    uint32_t t0 = seq_read_mcycle32();
+    int rc = tinynpu_run(&{prefill_symbol}, ip, op, NULL, 0u);
+    uint32_t t1 = seq_read_mcycle32();
+    seq_print_delta("sequence.prefill.total", t0, t1);
+    if (rc != 0) return EXIT_FAILURE;
+
+    t0 = seq_read_mcycle32();
+{chr(10).join(cache_copies)}
+    t1 = seq_read_mcycle32();
+    seq_print_delta("sequence.cache_handoff.total", t0, t1);
+
+    if (prepare_io(&{decode_symbol}, ins, ip, outs, op) != 0) return EXIT_FAILURE;
+    t0 = seq_read_mcycle32();
+    rc = tinynpu_run(&{decode_symbol}, ip, op, NULL, 0u);
+    t1 = seq_read_mcycle32();
+    seq_print_delta("sequence.decode.total", t0, t1);
+    if (rc != 0) return EXIT_FAILURE;
+
+    uint32_t total_end = seq_read_mcycle32();
+    seq_print_delta("sequence.e2e.total", total_start, total_end);
+    return EXIT_SUCCESS;
+}}
+"""
+
+
+def _build_sequence_elf_and_hex(
+    *,
+    program_name: str,
+    prefill_source: str,
+    decode_source: str,
+    runner_source: str,
+) -> tuple[Path, Path, Path, Path, Path]:
+    GENERATED_DIR.mkdir(exist_ok=True)
+    prefill_path = GENERATED_DIR / f"{program_name}_prefill_program.c"
+    decode_path = GENERATED_DIR / f"{program_name}_decode_program.c"
+    runner_path = GENERATED_DIR / f"{program_name}_runner.c"
+    prefill_path.write_text(prefill_source)
+    decode_path.write_text(decode_source)
+    runner_path.write_text(runner_source)
+
+    prefix = toolchain_prefix()
+    gcc = f"{prefix}gcc"
+    objcopy = f"{prefix}objcopy"
+    include_dir, lib_dir = toolchain_include_lib_dirs(prefix)
+    elf_path = CUSTOM_DIR / f"{program_name}.elf"
+    hex_path = CUSTOM_DIR / f"{program_name}.hex"
+
+    build_env = dict(os.environ)
+    build_env["CCACHE_DISABLE"] = "1"
+    build_env["TMPDIR"] = "/tmp"
+    run_checked(["make", "verilator-build-npu"], cwd=CORE_DIR, env=build_env)
+    cfg = RunnerConfig(repeat_count=1, dump_final_outputs=True, verbose_steps=True)
+    run_checked(
+        [
+            gcc,
+            f"-march={TNPU_RISCV_MARCH}",
+            f"-mabi={TNPU_RISCV_MABI}",
+            "-o",
+            str(elf_path),
+            *runtime_cflags(cfg, extra_cflags=["-ffast-math", "-fno-builtin-printf"]),
+            "-T",
+            "custom/link.ld",
+            "-static",
+            "custom/crt0.S",
+            str(runner_path),
+            str(prefill_path),
+            str(decode_path),
+            str(RUNTIME_DIR / "tinynpu_runtime_v2.c"),
+            "mem_stall/mem_stall.c",
+            "custom/syscalls.c",
+            "custom/vectors.S",
+            "-I",
+            str(include_dir),
+            "-I",
+            "mem_stall",
+            "-I",
+            str(RUNTIME_DIR),
+            "-L",
+            str(lib_dir),
+            "-lc",
+            "-lm",
+            "-lgcc",
+        ],
+        cwd=CORE_DIR,
+        env=build_env,
+    )
+    run_checked([objcopy, "-O", "verilog", str(elf_path), str(hex_path)], cwd=CORE_DIR, env=build_env)
+    return prefill_path, decode_path, runner_path, elf_path, hex_path
+
+
+def _build_artifacts(args: argparse.Namespace):
+    if args.model == "qllama":
+        prefill, state, _ = build_llama_prefill_artifact(
+            d_model=args.d_model,
+            d_head=args.d_head,
+            n_heads=args.n_heads,
+            n_kv_heads=args.n_kv_heads,
+            ffn_hidden_dim=args.ffn_dim,
+            prompt_len=args.prompt_len,
+            seed=args.seed,
+            expose_kv_cache_outputs=True,
+        )
+        decode, _, _, _ = build_llama_decode_artifact(
+            d_model=args.d_model,
+            d_head=args.d_head,
+            n_heads=args.n_heads,
+            n_kv_heads=args.n_kv_heads,
+            ffn_hidden_dim=args.ffn_dim,
+            prompt_len=args.prompt_len,
+            seed=args.seed,
+            state=state,
+        )
+        return prefill, decode, args.n_kv_heads
+
+    prefill, _, _ = build_gpt2_prefill_artifact(
+        d_model=args.d_model,
+        d_head=args.d_head,
+        n_heads=args.n_heads,
+        ffn_dim=args.ffn_dim,
+        prompt_len=args.prompt_len,
+        seed=args.seed,
+    )
+    decode, _, _, _ = build_gpt2_decode_artifact(
+        d_model=args.d_model,
+        d_head=args.d_head,
+        n_heads=args.n_heads,
+        ffn_dim=args.ffn_dim,
+        prompt_len=args.prompt_len,
+        seed=args.seed,
+    )
+    return prefill, decode, args.n_heads
+
+
+def _canonical_model(name: str) -> str:
+    if name in {"qllama", "llama"}:
+        return "qllama"
+    if name in {"qgpt2", "gpt2"}:
+        return "qgpt2"
+    raise ValueError(f"unsupported model {name}")
+
+
+def _model_label(name: str) -> str:
+    return "QLlama" if name == "qllama" else "QGPT2"
+
+
+def _text_from_completed(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return value
+
+
+def _default_rtl_log_path(stem: str) -> Path:
+    timestamp = datetime.now().strftime("%Y_%m_%d_%H%M%S")
+    return RUNS_DIR / f"{stem}_rtl_{timestamp}.log"
+
+
+def _write_rtl_log(
+    path: Path,
+    *,
+    command: list[str] | None,
+    stdout: str | bytes | None,
+    stderr: str | bytes | None,
+    status: str,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    out_text = _text_from_completed(stdout)
+    err_text = _text_from_completed(stderr)
+    cmd_text = " ".join(command or [])
+    path.write_text(
+        f"status={status}\n"
+        f"command={cmd_text}\n"
+        "\n--- stdout ---\n"
+        f"{out_text}"
+        "\n--- stderr ---\n"
+        f"{err_text}"
+    )
+
+
+def _run_rtl_streamed(
+    *,
+    hex_path: Path,
+    maxcycles: int,
+    verilator_max_ticks: int,
+    timeout_s: int | None,
+    log_path: Path,
+) -> tuple[int, str]:
+    cmd = [
+        str(CORE_DIR / "obj_dir" / "cv32e40p_tb_vlt_npu"),
+        "+verilator+noassert",
+        f"+firmware={hex_path}",
+        f"+maxcycles={maxcycles}",
+    ]
+    env = dict(os.environ)
+    env["VERILATOR_MAX_TICKS"] = str(verilator_max_ticks)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("w") as log:
+        log.write("status=running\n")
+        log.write(f"command={' '.join(cmd)}\n")
+        log.write("\n--- stdout/stderr ---\n")
+        log.flush()
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(CORE_DIR),
+                env=env,
+                check=False,
+                text=True,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                timeout=timeout_s,
+            )
+        except subprocess.TimeoutExpired:
+            log.write(f"\nstatus=timeout:{timeout_s}\n")
+            return 124, "timeout"
+        status = "success" if proc.returncode == 0 else f"failed:{proc.returncode}"
+        log.write(f"\nstatus={status}\n")
+        return proc.returncode, status
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Build/run one CV32E40P image that executes prefill then decode with firmware-side KV handoff.")
+    parser.add_argument(
+        "--model",
+        choices=("qllama", "qgpt2", "llama", "gpt2"),
+        required=True,
+        help="Model block family. Use qllama/qgpt2; llama/gpt2 are accepted as aliases.",
+    )
+    parser.add_argument("--d-model", type=int, default=64)
+    parser.add_argument("--d-head", type=int, default=16)
+    parser.add_argument("--n-heads", type=int, default=4)
+    parser.add_argument("--n-kv-heads", type=int, default=None)
+    parser.add_argument("--ffn-dim", type=int, default=64)
+    parser.add_argument("--prompt-len", type=int, default=8)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--run-rtl", action="store_true")
+    parser.add_argument("--maxcycles", type=int, default=20_000_000)
+    parser.add_argument("--verilator-max-ticks", type=int, default=1_000_000_000_000)
+    parser.add_argument("--timeout-s", type=int, default=900, help="Python wall-time timeout. Use 0 or a negative value to disable it.")
+    parser.add_argument("--dump-stdout", action="store_true")
+    parser.add_argument("--log-path", type=Path, default=None, help="Persistent RTL stdout/stderr log path. Defaults to runs/<program>_rtl_<timestamp>.log.")
+    args = parser.parse_args()
+    args.model = _canonical_model(args.model)
+    if args.n_kv_heads is None:
+        args.n_kv_heads = args.n_heads if args.model == "qgpt2" else max(1, args.n_heads // 2)
+    timeout_s = None if args.timeout_s <= 0 else args.timeout_s
+
+    if args.model == "qgpt2" and args.n_kv_heads != args.n_heads:
+        raise SystemExit("GPT-2 uses full multi-head KV; pass --n-kv-heads equal to --n-heads or omit it.")
+
+    prefill_artifact, decode_artifact, n_cache_heads = _build_artifacts(args)
+    stem = (
+        f"cv32e40p_{args.model}_prefill_decode_seq_d{args.d_model}_h{args.d_head}_"
+        f"nh{args.n_heads}_nkv{args.n_kv_heads}_f{args.ffn_dim}_t{args.prompt_len}_s{args.seed}"
+    )
+    prefill_name = f"{stem}_prefill"
+    decode_name = f"{stem}_decode"
+    prefill_symbol = sanitize_program_symbol(prefill_name)
+    decode_symbol = sanitize_program_symbol(decode_name)
+    prefill_source = emit_cv32e40p_program_v2(prefill_artifact, {}, program_name=prefill_name)
+    decode_source = emit_cv32e40p_program_v2(decode_artifact, {}, program_name=decode_name)
+    runner_source = _combined_runner_source(
+        prefill_symbol=prefill_symbol,
+        decode_symbol=decode_symbol,
+        model=_model_label(args.model),
+        n_cache_heads=n_cache_heads,
+    )
+    prefill_path, decode_path, runner_path, elf_path, hex_path = _build_sequence_elf_and_hex(
+        program_name=stem,
+        prefill_source=prefill_source,
+        decode_source=decode_source,
+        runner_source=runner_source,
+    )
+    print(f"prefill_program={prefill_path}")
+    print(f"decode_program={decode_path}")
+    print(f"runner={runner_path}")
+    print(f"elf={elf_path}")
+    print(f"hex={hex_path}")
+
+    if args.run_rtl:
+        log_path = args.log_path or _default_rtl_log_path(stem)
+        rc, status = _run_rtl_streamed(
+            hex_path=hex_path,
+            maxcycles=args.maxcycles,
+            verilator_max_ticks=args.verilator_max_ticks,
+            timeout_s=timeout_s,
+            log_path=log_path,
+        )
+        print(f"rtl_log={log_path}")
+        log_text = log_path.read_text(errors="replace")
+        if args.dump_stdout:
+            print(log_text)
+        else:
+            for line in log_text.splitlines():
+                if (
+                    "prefill_decode_sequence:" in line
+                    or "sequence." in line
+                    or "VerifyTensor:" in line
+                    or "verify." in line
+                    or line.startswith("EXIT ")
+                ):
+                    print(line)
+        if status.startswith("timeout"):
+            print(f"RTL run timed out after {args.timeout_s}s", file=sys.stderr)
+        if rc != 0:
+            return rc
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
