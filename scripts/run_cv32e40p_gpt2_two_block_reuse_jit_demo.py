@@ -208,8 +208,8 @@ def _add_decode_block(
     if f"{cache_prefix}_v_cache_l{cache_len}" not in builder.tensors:
         builder.add_tensor(make_b_cache_view_spec(f"{cache_prefix}_v_cache_l{cache_len}", f"{cache_prefix}_v_cache", (cache_len, d_head), DType.INT16, kind=TensorKind.INTERMEDIATE, word_offset=0))
     builder.add_tensor(TensorSpec(f"{prefix}_q_int", (1, d_head), DType.INT16, TensorKind.INTERMEDIATE))
-    builder.add_tensor(TensorSpec(f"{prefix}_k_cur", (1, d_head), DType.INT16, TensorKind.INTERMEDIATE))
-    builder.add_tensor(TensorSpec(f"{prefix}_v_cur", (1, d_head), DType.INT16, TensorKind.INTERMEDIATE))
+    k_slot_name = f"{cache_prefix}_k_cache_{decode_token_name}"
+    v_slot_name = f"{cache_prefix}_v_cache_{decode_token_name}"
     builder.add_tensor(TensorSpec(f"{prefix}_q_a", (1, d_head), DType.INT16, TensorKind.INTERMEDIATE, metadata={"storage_role": "A"}))
     builder.add_tensor(TensorSpec(f"{prefix}_scores", (1, cache_len), DType.INT16, TensorKind.INTERMEDIATE))
     builder.add_tensor(TensorSpec(f"{prefix}_scores_f", (1, cache_len), DType.FLOAT32, TensorKind.INTERMEDIATE))
@@ -225,14 +225,12 @@ def _add_decode_block(
         f"{prefix}_seg_qkv",
         ops=[
             builder.matmul(f"{prefix}_op_q", f"{prefix}_x_norm1_q", f"{prefix}_w_q", f"{prefix}_q_int", bias=f"{prefix}_b_q", in_dtype=DType.INT16, out_dtype=DType.INT16),
-            builder.matmul(f"{prefix}_op_k", f"{prefix}_x_norm1_q", f"{prefix}_w_k", f"{prefix}_k_cur", bias=f"{prefix}_b_k", in_dtype=DType.INT16, out_dtype=DType.INT16),
-            builder.matmul(f"{prefix}_op_v", f"{prefix}_x_norm1_q", f"{prefix}_w_v", f"{prefix}_v_cur", bias=f"{prefix}_b_v", in_dtype=DType.INT16, out_dtype=DType.INT16),
+            builder.matmul(f"{prefix}_op_k", f"{prefix}_x_norm1_q", f"{prefix}_w_k", k_slot_name, bias=f"{prefix}_b_k", in_dtype=DType.INT16, out_dtype=DType.INT16),
+            builder.matmul(f"{prefix}_op_v", f"{prefix}_x_norm1_q", f"{prefix}_w_v", v_slot_name, bias=f"{prefix}_b_v", in_dtype=DType.INT16, out_dtype=DType.INT16),
         ],
         inputs=[f"{prefix}_x_norm1_q"],
-        outputs=[f"{prefix}_q_int", f"{prefix}_k_cur", f"{prefix}_v_cur"],
+        outputs=[f"{prefix}_q_int", k_slot_name, v_slot_name],
     )
-    builder.host(f"{prefix}_k_append", "k_cache_scatter_write", inputs=[f"{prefix}_k_cur"], outputs=[f"{cache_prefix}_k_cache_{decode_token_name}"], attrs={"token_index": cache_len - 1, "k_cache_base": f"{cache_prefix}_k_cache"})
-    builder.host(f"{prefix}_v_append", "v_cache_scatter_write", inputs=[f"{prefix}_v_cur"], outputs=[f"{cache_prefix}_v_cache_{decode_token_name}"], attrs={"token_index": cache_len - 1, "v_cache_base": f"{cache_prefix}_v_cache"})
     builder.host(f"{prefix}_alias_q_a", "alias", inputs=[f"{prefix}_q_int"], outputs=[f"{prefix}_q_a"])
     builder.segment(f"{prefix}_seg_score", ops=[builder.matmul(f"{prefix}_op_qk", f"{prefix}_q_a", f"{cache_prefix}_k_cache_l{cache_len}", f"{prefix}_scores", in_dtype=DType.INT16, out_dtype=DType.INT16)], inputs=[f"{prefix}_q_a"], outputs=[f"{prefix}_scores"])
     builder.host(f"{prefix}_dequant_scores", "dequantize", inputs=[f"{prefix}_scores"], outputs=[f"{prefix}_scores_f"], attrs={"scale": 1.0, "zero_point": 0})

@@ -685,7 +685,7 @@ def test_semantic_frontend_reports_non_fuseable_activation():
         compile_module(model, (example,))
 
 
-def test_compiler_dequantize_stub_can_request_fp16_bits_xform():
+def test_compiler_dequantize_stub_lowers_fp16_bits_to_host_op():
     model = TinySemanticFp16DequantModel().eval()
     example = torch.tensor([[0.25, -0.25, 0.5, 0.0, 0.75, -0.5, 1.0, -1.0]], dtype=torch.float32)
 
@@ -695,8 +695,11 @@ def test_compiler_dequantize_stub_can_request_fp16_bits_xform():
     assert artifact.plan.tensors["dq"].dtype == DType.INT16
     assert artifact.plan.tensors["dq"].metadata.get("value_encoding") == "fp16_bits"
     segment = next(step for step in artifact.plan.steps if step.__class__.__name__ == "NpuSegment")
-    assert segment.outputs == ["dq"]
-    assert segment.ops[0].dequantize_to_fp16
+    assert segment.outputs == ["fc"]
+    dq_step = next(step for step in artifact.plan.steps if getattr(step, "name", "") == "dq")
+    assert dq_step.kind == "dequantize"
+    assert dq_step.inputs == ["fc"]
+    assert dq_step.outputs == ["dq"]
 
 
 def test_semantic_frontend_supports_plain_float_linear_chain():

@@ -23,7 +23,7 @@ from import_tinystories_to_qllama import load_qllama_layer  # noqa: E402
 from run_tinystories_prefill_decode_chain_rtl import _encode, _load_checkpoint  # noqa: E402
 from tinynpu_jit.baremetal_emit_v2 import emit_cv32e40p_program_v2  # noqa: E402
 from tinynpu_jit.blocks.llama_block import build_decode_artifact, build_prefill_artifact  # noqa: E402
-from tinynpu_jit.ir import NpuSegment, TensorKind, VerifyTensor  # noqa: E402
+from tinynpu_jit.ir import DType, HostOp, TensorKind, TensorSpec, VerifyTensor  # noqa: E402
 from tinynpu_jit.rtl_runner import (  # noqa: E402
     CORE_DIR,
     CUSTOM_DIR,
@@ -48,24 +48,53 @@ def _externalize_input(artifact, name: str) -> None:
         artifact.plan.inputs.append(name)
 
 
-def _externalize_decode_cache_inputs(artifact, *, n_kv_heads: int) -> None:
+def _stage_decode_cache_inputs(artifact, *, n_kv_heads: int) -> None:
+    stage_steps: list[HostOp] = []
     for kv_head in range(n_kv_heads):
-        for prefix in ("k", "v"):
-            name = f"{prefix}_cache_h{kv_head}"
-            _externalize_input(artifact, name)
-    for step in artifact.plan.steps:
-        if not isinstance(step, NpuSegment):
-            continue
-        if step.name == "seg_score":
-            for kv_head in range(n_kv_heads):
-                name = f"k_cache_h{kv_head}"
-                if name not in step.inputs:
-                    step.inputs.append(name)
-        elif step.name == "seg_value":
-            for kv_head in range(n_kv_heads):
-                name = f"v_cache_h{kv_head}"
-                if name not in step.inputs:
-                    step.inputs.append(name)
+        k_name = f"k_cache_h{kv_head}"
+        v_name = f"v_cache_h{kv_head}"
+        k_spec = artifact.plan.tensors[k_name]
+        v_spec = artifact.plan.tensors[v_name]
+        k_stage_name = f"{k_name}_stage"
+
+        artifact.plan.tensors[k_name] = TensorSpec(
+            k_name,
+            k_spec.shape,
+            k_spec.dtype,
+            TensorKind.INTERMEDIATE,
+            data=None,
+            metadata=dict(k_spec.metadata),
+        )
+        artifact.plan.tensors[k_stage_name] = TensorSpec(
+            k_stage_name,
+            (k_spec.shape[1], k_spec.shape[0]),
+            DType.INT16,
+            TensorKind.INPUT,
+            data=None,
+        )
+        v_spec.kind = TensorKind.INPUT
+        v_spec.data = None
+        for name in (k_stage_name, v_name):
+            if name not in artifact.plan.inputs:
+                artifact.plan.inputs.append(name)
+
+        stage_steps.append(
+            HostOp(
+                name=f"stage_k_cache_h{kv_head}",
+                kind="k_cache_scatter_matrix",
+                inputs=[k_stage_name],
+                outputs=[k_name],
+            )
+        )
+        stage_steps.append(
+            HostOp(
+                name=f"stage_v_cache_h{kv_head}",
+                kind="v_cache_scatter_matrix",
+                inputs=[v_name],
+                outputs=[v_name],
+            )
+        )
+    artifact.plan.steps = [*stage_steps, *artifact.plan.steps]
 
 
 def _strip_verification(artifact) -> None:
@@ -107,7 +136,7 @@ def _build_decode(block, state: dict[str, object], *, prompt_len: int):
         rope_theta=cfg.rope_theta,
         state=state,
     )
-    _externalize_decode_cache_inputs(artifact, n_kv_heads=cfg.n_kv_heads)
+    _stage_decode_cache_inputs(artifact, n_kv_heads=cfg.n_kv_heads)
     return artifact, decode_ref
 
 
@@ -280,6 +309,15 @@ static float checksum_f32(const float *data, int count)
     return total;
 }}
 
+static int32_t checksum_i32(const int32_t *data, int count)
+{{
+    int32_t total = 0;
+    for (int i = 0; i < count; ++i) {{
+        total += data[i];
+    }}
+    return total;
+}}
+
 static int argmax_next_token(const float *hidden)
 {{
     float ss = 0.0f;
@@ -407,11 +445,19 @@ def _render_multitoken_runner(
                 for step in range(generate_tokens)
             ],
             *[
+                f'static int32_t l0_k_cache_stage_s{step}[{prompt_len + step + 1} * D_HEAD] __attribute__((section(".data")));'
+                for step in range(generate_tokens)
+            ],
+            *[
                 f'static int32_t l0_v_cache_s{step}[{prompt_len + step + 1} * D_HEAD] __attribute__((section(".data")));'
                 for step in range(generate_tokens)
             ],
             *[
                 f'static int32_t l1_k_cache_s{step}[D_HEAD * {prompt_len + step + 1}] __attribute__((section(".data")));'
+                for step in range(generate_tokens)
+            ],
+            *[
+                f'static int32_t l1_k_cache_stage_s{step}[{prompt_len + step + 1} * D_HEAD] __attribute__((section(".data")));'
                 for step in range(generate_tokens)
             ],
             *[
@@ -421,8 +467,10 @@ def _render_multitoken_runner(
         ]
     )
     l0_k_ptrs = ", ".join(f"l0_k_cache_s{step}" for step in range(generate_tokens))
+    l0_k_stage_ptrs = ", ".join(f"l0_k_cache_stage_s{step}" for step in range(generate_tokens))
     l0_v_ptrs = ", ".join(f"l0_v_cache_s{step}" for step in range(generate_tokens))
     l1_k_ptrs = ", ".join(f"l1_k_cache_s{step}" for step in range(generate_tokens))
+    l1_k_stage_ptrs = ", ".join(f"l1_k_cache_stage_s{step}" for step in range(generate_tokens))
     l1_v_ptrs = ", ".join(f"l1_v_cache_s{step}" for step in range(generate_tokens))
     return f"""#include <math.h>
 #include <stdint.h>
@@ -453,9 +501,17 @@ static const TnpuProgram *const l0_decode_programs[GENERATE_TOKENS] = {{ {l0_dec
 static const TnpuProgram *const l1_decode_programs[GENERATE_TOKENS] = {{ {l1_decode_ptrs} }};
 static const int cache_lens[GENERATE_TOKENS] = {{ {cache_lens} }};
 static int32_t *const l0_k_caches[GENERATE_TOKENS] = {{ {l0_k_ptrs} }};
+static int32_t *const l0_k_stage_caches[GENERATE_TOKENS] = {{ {l0_k_stage_ptrs} }};
 static int32_t *const l0_v_caches[GENERATE_TOKENS] = {{ {l0_v_ptrs} }};
 static int32_t *const l1_k_caches[GENERATE_TOKENS] = {{ {l1_k_ptrs} }};
+static int32_t *const l1_k_stage_caches[GENERATE_TOKENS] = {{ {l1_k_stage_ptrs} }};
 static int32_t *const l1_v_caches[GENERATE_TOKENS] = {{ {l1_v_ptrs} }};
+
+#define MAX_TENSORS_PER_PROGRAM 256
+static TnpuTensorDesc l0_decode_descs[GENERATE_TOKENS][MAX_TENSORS_PER_PROGRAM];
+static TnpuTensorDesc l1_decode_descs[GENERATE_TOKENS][MAX_TENSORS_PER_PROGRAM];
+static TnpuProgram l0_decode_runtime[GENERATE_TOKENS];
+static TnpuProgram l1_decode_runtime[GENERATE_TOKENS];
 
 static int find_tensor_index(const TnpuProgram *program, const char *name)
 {{
@@ -519,6 +575,59 @@ static void *tensor_data(const TnpuProgram *program, const char *name)
     return program->tensors[idx].data;
 }}
 
+static TnpuTensorDesc *mutable_tensor_desc(TnpuProgram *program, const char *name)
+{{
+    int idx = find_tensor_index(program, name);
+    if (idx < 0) {{
+        return NULL;
+    }}
+    return &program->tensors[idx];
+}}
+
+static int clone_program(TnpuProgram *dst, TnpuTensorDesc *tensor_storage, const TnpuProgram *src)
+{{
+    if (src->tensor_count > MAX_TENSORS_PER_PROGRAM) {{
+        printf("too many tensors in %s\\n", src->name);
+        return 1;
+    }}
+    *dst = *src;
+    memcpy(tensor_storage, src->tensors, (size_t)src->tensor_count * sizeof(TnpuTensorDesc));
+    dst->tensors = tensor_storage;
+    return 0;
+}}
+
+static int bind_cache_tensor(TnpuProgram *program, const char *name, int32_t *data, int elem_count)
+{{
+    TnpuTensorDesc *desc = mutable_tensor_desc(program, name);
+    if (desc == NULL) {{
+        return 1;
+    }}
+    if (desc->dtype != TNPU_DTYPE_INT16) {{
+        printf("cache tensor %s is not INT16\\n", name);
+        return 1;
+    }}
+    if (desc->elem_count != elem_count) {{
+        printf("cache tensor %s elem_count mismatch expected=%d got=%d\\n", name, desc->elem_count, elem_count);
+        return 1;
+    }}
+    desc->data = data;
+    return 0;
+}}
+
+static int init_decode_programs(void)
+{{
+    for (int step = 0; step < GENERATE_TOKENS; ++step) {{
+        int cache_len = cache_lens[step];
+        if (clone_program(&l0_decode_runtime[step], l0_decode_descs[step], l0_decode_programs[step]) != 0) return 1;
+        if (clone_program(&l1_decode_runtime[step], l1_decode_descs[step], l1_decode_programs[step]) != 0) return 1;
+        if (bind_cache_tensor(&l0_decode_runtime[step], "k_cache_h0", l0_k_caches[step], D_HEAD * cache_len) != 0) return 1;
+        if (bind_cache_tensor(&l0_decode_runtime[step], "v_cache_h0", l0_v_caches[step], cache_len * D_HEAD) != 0) return 1;
+        if (bind_cache_tensor(&l1_decode_runtime[step], "k_cache_h0", l1_k_caches[step], D_HEAD * cache_len) != 0) return 1;
+        if (bind_cache_tensor(&l1_decode_runtime[step], "v_cache_h0", l1_v_caches[step], cache_len * D_HEAD) != 0) return 1;
+    }}
+    return 0;
+}}
+
 static int run_program(const TnpuProgram *program, TnpuTensor *ins, const TnpuTensor **ip)
 {{
     TnpuTensor outs[8];
@@ -563,6 +672,15 @@ static void copy_v_cache(int32_t *dst, int dst_len, const int32_t *src, int src_
     }}
 }}
 
+static void copy_k_cache_stage(int32_t *dst, const int32_t *src, int cache_len)
+{{
+    for (int token = 0; token < cache_len; ++token) {{
+        for (int row = 0; row < D_HEAD; ++row) {{
+            dst[token * D_HEAD + row] = src[row * cache_len + token];
+        }}
+    }}
+}}
+
 static void copy_embedding(int token_id, float *dst)
 {{
     const float *src = &lm_head_w[token_id * D_MODEL];
@@ -574,6 +692,15 @@ static void copy_embedding(int token_id, float *dst)
 static float checksum_f32(const float *data, int count)
 {{
     float total = 0.0f;
+    for (int i = 0; i < count; ++i) {{
+        total += data[i];
+    }}
+    return total;
+}}
+
+static int32_t checksum_i32(const int32_t *data, int count)
+{{
+    int32_t total = 0;
     for (int i = 0; i < count; ++i) {{
         total += data[i];
     }}
@@ -619,10 +746,14 @@ int main(void)
 
     puts("tinystories_single_binary_prefill_decode_multitoken");
 
+    if (init_decode_programs() != 0) return EXIT_FAILURE;
+
     if (run_program_default_inputs(&tinystories_single_l0_prefill) != 0) return EXIT_FAILURE;
     k_prefill = (int32_t *)tensor_data(&tinystories_single_l0_prefill, "prefill_k_cache_h0");
     v_prefill = (int32_t *)tensor_data(&tinystories_single_l0_prefill, "prefill_v_cache_h0");
     if (k_prefill == NULL || v_prefill == NULL) return EXIT_FAILURE;
+    printf("single.layer0.prefill.k_cache.checksum %ld\\n", (long)checksum_i32(k_prefill, D_HEAD * PROMPT_LEN));
+    printf("single.layer0.prefill.v_cache.checksum %ld\\n", (long)checksum_i32(v_prefill, PROMPT_LEN * D_HEAD));
     copy_k_cache(l0_k_caches[0], cache_lens[0], k_prefill, PROMPT_LEN);
     copy_v_cache(l0_v_caches[0], cache_lens[0], v_prefill, PROMPT_LEN);
 
@@ -634,6 +765,8 @@ int main(void)
     k_prefill = (int32_t *)tensor_data(&tinystories_single_l1_prefill, "prefill_k_cache_h0");
     v_prefill = (int32_t *)tensor_data(&tinystories_single_l1_prefill, "prefill_v_cache_h0");
     if (k_prefill == NULL || v_prefill == NULL) return EXIT_FAILURE;
+    printf("single.layer1.prefill.k_cache.checksum %ld\\n", (long)checksum_i32(k_prefill, D_HEAD * PROMPT_LEN));
+    printf("single.layer1.prefill.v_cache.checksum %ld\\n", (long)checksum_i32(v_prefill, PROMPT_LEN * D_HEAD));
     copy_k_cache(l1_k_caches[0], cache_lens[0], k_prefill, PROMPT_LEN);
     copy_v_cache(l1_v_caches[0], cache_lens[0], v_prefill, PROMPT_LEN);
 
@@ -643,15 +776,16 @@ int main(void)
     printf("single.layer1.prefill.checksum %.6f\\n", (double)checksum_f32(l1_prefill_out, PROMPT_LEN * D_MODEL));
 
     for (int step = 0; step < GENERATE_TOKENS; ++step) {{
-        const TnpuProgram *l0_decode = l0_decode_programs[step];
-        const TnpuProgram *l1_decode = l1_decode_programs[step];
+        TnpuProgram *l0_decode = &l0_decode_runtime[step];
+        TnpuProgram *l1_decode = &l1_decode_runtime[step];
         int cache_len = cache_lens[step];
         copy_embedding(current_token_id, current_embed);
         printf("single.decode_input.step%d id=%d token='%s'\\n", step, current_token_id, vocab_tokens[current_token_id]);
 
         fill_program_inputs(l0_decode, ins, ip);
         if (override_input(l0_decode, ins, "x_in", current_embed, D_MODEL) != 0) return EXIT_FAILURE;
-        if (override_input(l0_decode, ins, "k_cache_h0", l0_k_caches[step], D_HEAD * cache_len) != 0) return EXIT_FAILURE;
+        copy_k_cache_stage(l0_k_stage_caches[step], l0_k_caches[step], cache_len);
+        if (override_input(l0_decode, ins, "k_cache_h0_stage", l0_k_stage_caches[step], cache_len * D_HEAD) != 0) return EXIT_FAILURE;
         if (override_input(l0_decode, ins, "v_cache_h0", l0_v_caches[step], cache_len * D_HEAD) != 0) return EXIT_FAILURE;
         if (run_program(l0_decode, ins, ip) != 0) return EXIT_FAILURE;
         l0_decode_out = (float *)tensor_data(l0_decode, "out");
@@ -659,7 +793,8 @@ int main(void)
 
         fill_program_inputs(l1_decode, ins, ip);
         if (override_input(l1_decode, ins, "x_in", l0_decode_out, D_MODEL) != 0) return EXIT_FAILURE;
-        if (override_input(l1_decode, ins, "k_cache_h0", l1_k_caches[step], D_HEAD * cache_len) != 0) return EXIT_FAILURE;
+        copy_k_cache_stage(l1_k_stage_caches[step], l1_k_caches[step], cache_len);
+        if (override_input(l1_decode, ins, "k_cache_h0_stage", l1_k_stage_caches[step], cache_len * D_HEAD) != 0) return EXIT_FAILURE;
         if (override_input(l1_decode, ins, "v_cache_h0", l1_v_caches[step], cache_len * D_HEAD) != 0) return EXIT_FAILURE;
         if (run_program(l1_decode, ins, ip) != 0) return EXIT_FAILURE;
         l1_decode_out = (float *)tensor_data(l1_decode, "out");
@@ -856,16 +991,21 @@ def main() -> int:
     for step, (decode0_artifact, decode1_artifact) in enumerate(decode_artifacts):
         ctx_len = args.prompt_len + step
         zero_decode_x = np.zeros((1, cfg.d_model), dtype=np.float32)
-        zero_k_cache = np.zeros((cfg.d_head, ctx_len + 1), dtype=np.int16)
+        zero_k_cache_stage = np.zeros((ctx_len + 1, cfg.d_head), dtype=np.int16)
         zero_v_cache = np.zeros((ctx_len + 1, cfg.d_head), dtype=np.int16)
+        decode_inputs = {
+            "x_in": zero_decode_x,
+            "k_cache_h0_stage": zero_k_cache_stage,
+            "v_cache_h0": zero_v_cache,
+        }
         program_sources[f"l0_decode_s{step}_program"] = emit_cv32e40p_program_v2(
             decode0_artifact,
-            {"x_in": zero_decode_x, "k_cache_h0": zero_k_cache, "v_cache_h0": zero_v_cache},
+            decode_inputs,
             program_name=f"tinystories_single_l0_decode_s{step}",
         )
         program_sources[f"l1_decode_s{step}_program"] = emit_cv32e40p_program_v2(
             decode1_artifact,
-            {"x_in": zero_decode_x, "k_cache_h0": zero_k_cache, "v_cache_h0": zero_v_cache},
+            decode_inputs,
             program_name=f"tinystories_single_l1_decode_s{step}",
         )
 

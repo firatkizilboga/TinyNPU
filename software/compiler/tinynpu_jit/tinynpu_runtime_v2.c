@@ -1038,7 +1038,7 @@ int tinynpu_run_repeat(
         printf("repeat.iter=%lu\n", (unsigned long)(iter + 1u));
         fflush(stdout);
         t0 = read_mcycle32();
-        if (tnpu_execute_body(runtime_tensors, program, 0) != 0) {
+        if (tnpu_execute_body(runtime_tensors, program, iter == 0u ? TNPU_RUNTIME_V2_VERBOSE_STEPS : 0) != 0) {
             free(runtime_tensors);
             return EXIT_FAILURE;
         }

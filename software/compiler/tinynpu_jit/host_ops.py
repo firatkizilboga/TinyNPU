@@ -9,7 +9,9 @@ import numpy as np
 from .golden import GoldenModel
 from .ir import DType, HostOp
 from .runtime_approx import (
+    dequantize_i16_to_fp16_bits_host as _dequantize_i16_to_fp16_bits_host,
     dequantize_i16_to_fp16_bits_xform as _dequantize_i16_to_fp16_bits_xform,
+    quantize_fp16_bits_to_i16_host as _quantize_fp16_bits_to_i16_host,
     quantize_fp16_bits_to_i16_xform as _quantize_fp16_bits_to_i16_xform,
     rmsnorm_approx as _rmsnorm_runtime_approx,
     sigmoid_approx as _sigmoid_runtime_approx,
@@ -638,15 +640,6 @@ def _softmax_f16_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple
 def _quantize_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
     source = values[step.inputs[0]]
     if str(step.attrs.get("input_encoding", "")) == "fp16_bits":
-        if (
-            int(step.attrs.get("zero_point", 0)) == 0
-            and _dtype_attr(step.attrs.get("dtype", DType.INT8)) == DType.INT16
-        ):
-            values[step.outputs[0]] = _quantize_fp16_bits_to_i16_xform(
-                np.asarray(source),
-                scale=float(step.attrs["scale"]),
-            )
-            return
         if str(step.attrs.get("_npu_write_transform", "")) in {"xform_q_f16_i16", "xform_q_f32_i16"}:
             if int(step.attrs.get("zero_point", 0)) != 0:
                 raise ValueError("xform quantize does not support non-zero zero_point.")
@@ -663,6 +656,13 @@ def _quantize_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenMo
             values[step.outputs[0]] = _quantize_fp16_bits_to_i16_xform(
                 np.asarray(source),
                 scale=float(step.attrs["scale"]),
+            )
+            return
+        if _dtype_attr(step.attrs.get("dtype", DType.INT8)) == DType.INT16:
+            values[step.outputs[0]] = _quantize_fp16_bits_to_i16_host(
+                np.asarray(source),
+                scale=float(step.attrs["scale"]),
+                zero_point=int(step.attrs.get("zero_point", 0)),
             )
             return
         source = _fp16_bits_to_float32_array(np.asarray(source))
@@ -689,7 +689,14 @@ def _quantize_benchmark(step: HostOp, values: dict[str, np.ndarray]) -> tuple[st
 
 def _dequantize_eval(step: HostOp, values: dict[str, np.ndarray], golden: GoldenModel) -> None:
     if str(step.attrs.get("output_encoding", "")) == "fp16_bits":
-        values[step.outputs[0]] = _dequantize_i16_to_fp16_bits_xform(
+        if str(step.attrs.get("_npu_write_transform", "")) in {"xform_dq_i16_f16", "xform_dq_i16_f32"}:
+            values[step.outputs[0]] = _dequantize_i16_to_fp16_bits_xform(
+                values[step.inputs[0]],
+                scale=float(step.attrs["scale"]),
+                zero_point=int(step.attrs.get("zero_point", 0)),
+            )
+            return
+        values[step.outputs[0]] = _dequantize_i16_to_fp16_bits_host(
             values[step.inputs[0]],
             scale=float(step.attrs["scale"]),
             zero_point=int(step.attrs.get("zero_point", 0)),

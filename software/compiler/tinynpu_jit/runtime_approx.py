@@ -13,6 +13,36 @@ def float32_to_fp16_bits(value: np.ndarray) -> np.ndarray:
     return np.asarray(value, dtype=np.float32).astype(np.float16).view(np.uint16)
 
 
+def fp16_bits_to_float32(value: np.ndarray) -> np.ndarray:
+    return np.asarray(value, dtype=np.int16).astype(np.uint16, copy=False).view(np.float16).astype(np.float32)
+
+
+def quantize_fp16_to_i16_host(source: np.ndarray, *, scale: float, zero_point: int = 0) -> np.ndarray:
+    """Match the no-XFORM runtime path: fp32 -> fp16 bits -> fp32 -> RNE quantize."""
+    if scale <= 0.0:
+        raise ValueError(f"host fp16 quantize scale must be positive, got {scale}.")
+    values = fp16_roundtrip(np.asarray(source, dtype=np.float32))
+    q = np.rint(values / np.float32(scale)).astype(np.int64) + np.int64(zero_point)
+    return np.clip(q, -32768, 32767).astype(np.int16)
+
+
+def quantize_fp16_bits_to_i16_host(source: np.ndarray, *, scale: float, zero_point: int = 0) -> np.ndarray:
+    """Match cv32e40p_runtime_template.c host_quantize_fp16bits."""
+    if scale <= 0.0:
+        raise ValueError(f"host fp16-bits quantize scale must be positive, got {scale}.")
+    values = fp16_bits_to_float32(source)
+    q = np.rint(values / np.float32(scale)).astype(np.int64) + np.int64(zero_point)
+    return np.clip(q, -32768, 32767).astype(np.int16)
+
+
+def dequantize_i16_to_fp16_bits_host(source: np.ndarray, *, scale: float, zero_point: int = 0) -> np.ndarray:
+    """Match a scalar host dequantize followed by tensor_set_float into fp16 bits."""
+    if scale <= 0.0:
+        raise ValueError(f"host fp16 dequantize scale must be positive, got {scale}.")
+    values = (np.asarray(source, dtype=np.int16).astype(np.float32) - np.float32(zero_point)) * np.float32(scale)
+    return float32_to_fp16_bits(values).astype(np.int16)
+
+
 def choose_xform_q_f16_i16_scale_params(inv_scale: float) -> tuple[int, int]:
     best_err = float("inf")
     best_mult = 1

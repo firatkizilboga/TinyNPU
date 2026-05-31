@@ -76,12 +76,16 @@ int main(void)
 
 def runtime_cflags(config: RunnerConfig | None = None, *, extra_cflags: list[str] | None = None) -> list[str]:
     cfg = config or RunnerConfig()
+    from tinynpu.program import TinyNPUProgram
+
+    im_base_addr = int(TinyNPUProgram().hw.params.get("IM_BASE_ADDR", 0xF000))
     cflags = [
         "-w",
         "-O3",
         "-g",
         "-nostdlib",
         "-DTINYNPU_USE_SHARED_SRAM=1",
+        f"-DTINY_IM_BASE_ADDR=0x{im_base_addr:X}u",
         f"-DTNPU_RUNTIME_V2_DUMP_FINAL_OUTPUTS={1 if cfg.dump_final_outputs else 0}",
         f"-DTNPU_RUNTIME_V2_VERBOSE_STEPS={1 if cfg.verbose_steps else 0}",
     ]

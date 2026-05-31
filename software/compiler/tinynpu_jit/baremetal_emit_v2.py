@@ -221,6 +221,7 @@ def emit_cv32e40p_program_v2(
     *,
     program_name: str = "tinynpu_program_v2",
     defines_path: str | None = None,
+    emit_preloads: bool = True,
 ) -> str:
     for name in artifact.plan.inputs:
         if name not in inputs:
@@ -342,7 +343,7 @@ def emit_cv32e40p_program_v2(
         )
 
     ub_preloads: list[str] = []
-    if artifact.static_ub_image:
+    if emit_preloads and artifact.static_ub_image:
         image_name = f"{symbol}_ub_image"
         decls.append(_emit_u32x4_image(image_name, [int(word) for word in artifact.static_ub_image]))
         ub_preloads.append(
@@ -583,15 +584,16 @@ def emit_cv32e40p_program_v2(
             buffer_width=buffer_width,
             chunks_per_inst=im_chunks_per_inst,
         )
-        image_name = f"{symbol}_im_{_sanitize(step.name)}"
-        decls.append(_emit_u32x4_image(image_name, flattened_chunks))
         segment_im_start[step.name] = next_im_addr
-        im_preloads.append(
-            "    {"
-            f'.label = "preload.im_{_sanitize(step.name)}", '
-            f".base_addr = 0x{next_im_addr:04x}u, .image = {image_name}, .word_count = {len(flattened_chunks)}"
-            "}"
-        )
+        if emit_preloads:
+            image_name = f"{symbol}_im_{_sanitize(step.name)}"
+            decls.append(_emit_u32x4_image(image_name, flattened_chunks))
+            im_preloads.append(
+                "    {"
+                f'.label = "preload.im_{_sanitize(step.name)}", '
+                f".base_addr = 0x{next_im_addr:04x}u, .image = {image_name}, .word_count = {len(flattened_chunks)}"
+                "}"
+            )
         next_im_addr += len(flattened_chunks)
         writes_name = f"{symbol}_seg_{_sanitize(step.name)}_writes"
         reads_name = f"{symbol}_seg_{_sanitize(step.name)}_reads"
@@ -911,6 +913,7 @@ def write_cv32e40p_program_v2(
     *,
     program_name: str = "tinynpu_program_v2",
     defines_path: str | None = None,
+    emit_preloads: bool = True,
 ) -> Path:
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -920,6 +923,7 @@ def write_cv32e40p_program_v2(
             inputs,
             program_name=program_name,
             defines_path=defines_path,
+            emit_preloads=emit_preloads,
         )
     )
     return output

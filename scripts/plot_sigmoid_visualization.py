@@ -87,10 +87,6 @@ def main() -> None:
     y_sigmoid = ppu_hard_sigmoid(x, shift=SIGMOID_PLOT_SHIFT)
     y_ideal = ideal_sigmoid_from_integer(x)
 
-    op_x = np.array([OPERATING_X], dtype=np.int64)
-    op_ideal = float(ideal_sigmoid_from_integer(op_x)[0])
-    op_sigmoid = float(ppu_hard_sigmoid(op_x, shift=SIGMOID_PLOT_SHIFT)[0])
-
     plt.rcParams.update(
         {
             "font.family": "DejaVu Sans",
@@ -110,17 +106,8 @@ def main() -> None:
     ax.set_facecolor("#fffdf8")
     ax.plot(x, y_ideal, color="#1f2937", linewidth=2.0, label="Ideal sigmoid after logit scale")
     ax.plot(x, y_sigmoid, color="#0f766e", linewidth=2.4, label=f"TinyNPU hard sigmoid, k={SIGMOID_PLOT_SHIFT}")
-    ax.scatter([OPERATING_X], [op_sigmoid], s=42, color="#0f766e", zorder=5)
-    ax.scatter([OPERATING_X], [op_ideal], s=42, color="#1f2937", marker="x", zorder=5)
     ax.axvline(0, color="#9ca3af", linewidth=1.0)
     ax.axhline(0.5, color="#9ca3af", linewidth=1.0, linestyle=":")
-    ax.annotate(
-        f"example x={OPERATING_X}\nideal={op_ideal:.3f}, hardware={op_sigmoid:.3f}",
-        xy=(OPERATING_X, op_sigmoid),
-        xytext=(-10800, 0.68),
-        arrowprops={"arrowstyle": "->", "color": "#374151", "lw": 1.0},
-        bbox={"boxstyle": "round,pad=0.35", "fc": "#fff7ed", "ec": "#fed7aa"},
-    )
     ax.set_title("Calibrated fused hard-sigmoid response")
     ax.set_xlabel("PPU post-rescale integer input")
     ax.set_ylabel("Probability-like output")

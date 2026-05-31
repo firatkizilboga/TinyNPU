@@ -126,8 +126,8 @@
 \newcommand{\theturkishtitle}{TinyNPU}
 \newcommand{\theauthor}{Fırat Kızılboğa}
 \newcommand{\thestudentid}{150200115}
-\newcommand{\thedate}{March 2026}
-\newcommand{\theturkishdate}{Mart 2026}
+\newcommand{\thedate}{May 2026}
+\newcommand{\theturkishdate}{Mayıs 2026}
 \newcommand{\theadvisor}{Assoc. Prof. Dr. Ayse Yilmazer}
 
 \usepackage{color}
@@ -169,7 +169,6 @@
         \Large{\thestudentid} \\
         \vspace{4cm}
         \large{Department: Computer Engineering} \\
-        \large{Division: Computer Engineering} \\
         \vspace{1.5cm}
         \large{Advisor: \theadvisor} \\
         \vspace{\fill} % Fill out until the page end
@@ -196,22 +195,24 @@ I would like to thank my advisor, Assoc. Prof. Dr. Ayse Yilmazer, for her guidan
 \newpage
 \section*{\centering\thetitle}
 \centerline{\fontsize{16pt}{21.6pt}\sffamily\bfseries (SUMMARY)}
-TinyNPU is a compact neural-network accelerator built and evaluated as a full hardware/software system. It combines an output-stationary systolic-array accelerator with a segmented compiler and runtime, a quantized model-preparation flow, and RTL-backed validation.
+TinyNPU is a compact neural-network accelerator built and evaluated as a full hardware/software system. The purpose is not only to design a small systolic-array core, but to make that core usable from a quantized model flow. The system therefore combines model preparation, a compiler/code generator, a firmware runtime, and RTL-backed validation around the accelerator.
 
-The hardware centers on an $N \times N$ systolic array, a unified buffer, an instruction memory, streamer logic, and a post-processing unit that performs bias addition, rescaling, activation, and packed writeback. The software traces PyTorch models, partitions them into accelerator segments and explicit scalar operations owned by the core, lowers supported segments into TinyNPU instruction and buffer images, and executes the result on the attached CV32E40P core.
+The hardware centers on an $N \times N$ output-stationary systolic array, a unified buffer, an instruction memory, streamer logic, and a post-processing unit that performs bias addition, rescaling, activation, and packed writeback. The software accepts supported PyTorch models or direct IR-builder inputs, partitions them into accelerator segments and explicit scalar operations owned by the core, lowers supported segments into TinyNPU instruction and buffer images, and executes the result on the attached CV32E40P core.
 
-This report treats the whole stack as the useful unit of design. Tensor layout, quantization boundaries, scalar core operations, runtime overhead, and realizable clock frequency all affect whether the accelerator is practical to use. The implemented system is validated on trained MNIST-derived MLP and convolution models, controlled multi-tile GEMM benchmarks, small transformer-like blocks, and synthesis/timing experiments that expose the system limits.
+This report treats the whole stack as the useful unit of design. Tensor layout, quantization boundaries, scalar core operations, runtime overhead, and realizable clock frequency all affect whether the accelerator is practical to use. The implemented system is validated on trained MNIST-derived MLP and convolution models, controlled resident-GEMM benchmarks, small GPT/Llama-like transformer blocks, and Vivado synthesis/timing experiments. The measurements separate resident kernel efficiency from full-program cost, and wall-clock comparisons use routed timing estimates for both the core-only baseline and the integrated TinyNPU system.
+
+The results show that dense quantized matrix regions benefit most from the accelerator, especially when weights and instruction images remain resident across repeated execution. MLP, convolution, and larger transformer-like experiments all improve when enough dense work is available to amortize launch and scalar-operation costs. The same results also expose the system limits: scalar operations, layout packing, segment boundaries, local buffer capacity, and the lower integrated clock still determine end-to-end behavior.
 
 \newpage
 \section*{\centering\theturkishtitle}
 \centerline{\fontsize{16pt}{21.6pt}\sffamily\bfseries (ÖZET)}
-TinyNPU, sistolik dizi tabanlı bir nöral işlemci birimini onu kullanılabilir hale getiren derleyici, çalışma zamanı, niceleme akışı ve benzetim tabanlı doğrulama ortamıyla birlikte ele alan bütünleşik bir donanım-yazılım sistemidir. Amaç yalnızca küçük bir hızlandırıcı çekirdeği tasarlamak değil, bu çekirdeği gerçek bir makine öğrenmesi iş akışında kullanılabilir hale getirmektir. Bu nedenle sistem, PyTorch tabanlı model hazırlama sürecini destekleyen, nicelemeli modelleri hızlandırıcı segmentlerine dönüştüren, desteklenmeyen işlemleri ana işlemci üzerinde çalıştıran ve sonuçları yazılım referanslarıyla doğrulayan bir yapı olarak tasarlanmıştır.
+TinyNPU, bütünleşik bir donanım-yazılım sistemi olarak tasarlanmış ve değerlendirilmiş kompakt bir nöral ağ hızlandırıcısıdır. Amaç yalnızca küçük bir sistolik dizi çekirdeği tasarlamak değil, bu çekirdeği nicelemeli model akışı içinden kullanılabilir hale getirmektir. Bu nedenle sistem, hızlandırıcının etrafında model hazırlama, derleyici/kod üretici, gömülü çalışma zamanı ve RTL tabanlı doğrulamayı birlikte ele alır.
 
-Donanım tarafında TinyNPU, birleşik tampon bellek ve komut belleği ile beslenen sistolik dizi tabanlı bir hesaplama çekirdeği etrafında kurulmuştur. Girdi aktivasyonları ve ağırlıklar birleşik tampondan akıtıcı birimlere, oradan da sistolik diziye iletilir. Hesaplama sonucunda oluşan değerler son işleme biriminden geçirilerek paketlenmiş biçimde tekrar belleğe yazılır. Bu yapı, yoğun nicelemeli matris işlemleri için verimli bir veri yolu sağlarken, dışarıdan görülen programlama modelini de yönetilebilir düzeyde tutmaktadır. Yazılım tarafı ise yüksek seviyeli model işlemlerini hızlandırıcı segmentleri ve gerekirse ana işlemci işlemlerini birlikte içeren bir yürütme planına dönüştürmektedir.
+Donanım, \(N \times N\) boyutlu çıktı-durağan bir sistolik dizi, birleşik tampon, komut belleği, akıtıcı mantık ve önyargı ekleme, yeniden ölçekleme, aktivasyon ve paketli geri yazma yapan bir son işleme birimi etrafında kurulmuştur. Yazılım, desteklenen PyTorch modellerini veya doğrudan IR-builder girdilerini alır, bunları hızlandırıcı segmentleri ve çekirdeğe ait açık skaler işlemler olarak böler, desteklenen segmentleri TinyNPU komut ve tampon imgelerine indirger ve sonucu bağlı CV32E40P çekirdeği üzerinde çalıştırır.
 
-Bu çalışmada sistem, eğitilmiş MNIST tabanlı MLP ve evrişim modelleri, kontrollü GEMM deneyleri, küçük transformer benzeri bloklar ve sentez/zamanlama deneyleri üzerinde doğrulanmıştır. Ayrıca, hızlandırıcının gerçek hesaplama çevrimlerini paketleme, arayüz, çalışma zamanı ve saat frekansı maliyetlerinden ayıran bir ölçüm altyapısı kurulmuştur. Böylece çekirdeğin kendi verimliliği ile entegrasyon maliyetleri ayrı ayrı değerlendirilebilmektedir. Tekrarlı çıkarım senaryoları için oturum tabanlı çalışma ve ağırlık kalıcılığı desteği de eklenmiştir.
+Bu rapor, bütün yığını asıl tasarım birimi olarak ele alır. Tensör yerleşimi, niceleme sınırları, skaler çekirdek işlemleri, çalışma zamanı maliyeti ve elde edilebilir saat frekansı hızlandırıcının pratikte ne kadar kullanılabilir olduğunu birlikte belirler. Gerçeklenen sistem, eğitilmiş MNIST tabanlı MLP ve evrişim modelleri, kontrollü yerleşik-GEMM deneyleri, küçük GPT/Llama benzeri transformer blokları ve Vivado sentez/zamanlama deneyleri üzerinde doğrulanmıştır. Ölçümler, yerleşik çekirdek verimliliğini tam program maliyetinden ayırır; duvar saati karşılaştırmaları ise hem yalnız çekirdek tabanı hem de bütünleşik TinyNPU sistemi için yönlendirilmiş zamanlama tahminlerini kullanır.
 
-Rapor, bu sistemi donanım mimarisi, model hazırlama ve derleme akışı, doğrulama yöntemi ve deneysel sonuçlarıyla birlikte sunmaktadır. Sonuçlar, sistolik çekirdeğin güçlü hesaplama sağladığını, ancak toplam davranışın hâlâ veri yerleşimi, bölütleme ve çalışma zamanı maliyetlerine duyarlı olduğunu göstermektedir.
+Sonuçlar, yoğun nicelemeli matris bölgelerinin hızlandırıcıdan en çok yararlandığını, özellikle ağırlıklar ve komut imgeleri tekrarlı çalıştırmalarda yerleşik kaldığında kazancın arttığını göstermektedir. MLP, evrişim ve daha büyük transformer benzeri deneyler, başlatma ve skaler işlem maliyetlerini örtecek kadar yoğun iş olduğunda iyileşmektedir. Aynı sonuçlar sistem sınırlarını da gösterir: skaler işlemler, yerleşim paketleme, segment sınırları, yerel tampon kapasitesi ve daha düşük bütünleşik saat frekansı uçtan uca davranışı belirlemeye devam etmektedir.
 
 \newpage
 \tableofcontents
@@ -246,10 +247,10 @@ TinyNPU runs trained MNIST-derived MLP and convolution models through the full c
 \subsection{Mixed-Precision Quantization}
 Mixed-precision quantization work is the clearest algorithmic motivation for TinyNPU. Wu et al. formulate layer-wise quantization as a search problem and show that different layers can be assigned different bit-widths without treating the whole model uniformly \cite{wu2018mixedprecision}. This is the key observation behind a variable-precision accelerator: if model layers do not all need the same precision, a fixed-precision datapath cannot exploit the full efficiency opportunity.
 
-Quantization is also relevant as a compiler concern rather than only a hardware concern. SmoothQuant is an example of pushing difficult numerical adjustments into an offline transformation so that runtime execution becomes simpler and more hardware-friendly \cite{xiao2023smoothquant}. TinyNPU follows the same general philosophy even though it does not implement the full SmoothQuant method itself: model preparation, fused rescaling, and compiler-ready conversion are treated as software responsibilities that simplify the accelerator contract.
+Quantization is also relevant as a compiler concern rather than only a hardware concern. SmoothQuant is an example of pushing difficult numerical adjustments into an offline transformation so that runtime execution becomes simpler and more hardware-friendly \cite{xiao2023smoothquant}. I-LLM motivated an attempted DI-Sigmoid/DI-Exp style integer nonlinearity path \cite{hu2024illm}. That path was not retained in the reported accelerator because its RTL implementation did not synthesize into a routed system at the target frequency. The retained flow instead treats model preparation, fused rescaling, and compiler-ready conversion as software responsibilities that simplify the accelerator contract.
 
 \subsection{High-Performance Matrix Multiplication}
-The mathematical core of TinyNPU is still matrix-style computation, so the project is strongly informed by classical GEMM literature. Goto and van de Geijn show that high-performance matrix multiplication depends not only on arithmetic throughput, but on careful tiling and data movement through the memory hierarchy \cite{goto2008anatomy}. The same principle appears in TinyNPU at a smaller scale. When matrices exceed the dimensions of the systolic array, the compiler and runtime must tile along the $M$, $N$, and $K$ dimensions while preserving the data reuse pattern expected by the array and its post-processing path.
+The mathematical core of TinyNPU is still matrix-style computation, so the project is informed by classical GEMM literature. Goto and van de Geijn show that high-performance matrix multiplication depends not only on arithmetic throughput, but on blocking and data movement through the memory hierarchy \cite{goto2008anatomy}. TinyNPU applies the same idea inside a much smaller local memory system: matrices are tiled to the systolic-array shape, operands are packed into feed-oriented layouts, and outputs are written back in a layout chosen by the compiler. The relevant lesson is therefore not a specific CPU micro-kernel, but the broader principle that matrix performance is determined by the data layout around the multiply as much as by the multipliers themselves.
 
 \subsection{Existing Accelerator Architectures}
 On the accelerator side, Google's TPU remains the canonical reference for systolic-array-style matrix acceleration \cite{jouppi2017datacenter}. Gemmini is especially relevant because it demonstrates how a systolic array, programming model, and system context can be treated as one full-stack research object rather than as an isolated RTL block \cite{genc2021gemmini}. That full-stack perspective is one of the strongest methodological reference points for TinyNPU.
@@ -276,23 +277,23 @@ Within that buffer, the names A, B, C, and BIAS refer to physical roles in the d
 
 The physical layouts are intentionally different. A layout is feed-oriented: each unified-buffer word represents one activation-side feed step, with one 16-bit lane per array row and one, two, or four packed \(K\)-elements per lane for INT16, INT8, or INT4. B layout is similar on the weight side, with each word representing one top-fed step into the array columns. C layout is writeback-oriented instead: it stores output tiles compactly by output column, and at lower precision it packs several logical results into subword slots. C is still useful as the default result layout, but it is not automatically a good input layout for the next layer. When a result must feed another accelerator matmul without scalar layout repair on the core, the compiler selects an A-compatible writeback layout instead.
 
-For a matrix multiplication \(C = A \times B\), the compiler divides the logical matrices into \(S \times S\) array tiles, where \(S=8\) in the measured design. Let \(m_t\), \(k_t\), and \(n_t\) be the tile indices along the \(M\), \(K\), and \(N\) dimensions. Let \(p\) be the number of packed scalar values inside one 16-bit lane: \(p=1\) for INT16, \(p=2\) for INT8, and \(p=4\) for INT4. Each unified-buffer word is 128 bits and contains eight 16-bit lanes.
+For a matrix multiplication \(C = A \times B\), the compiler divides the logical matrices into \(S \times S\) array tiles, where \(S=8\) in the measured design. Let \(m_t\), \(k_t\), and \(n_t\) be the tile indices along the \(M\), packed-\(K\), and \(N\) dimensions. Let \(p\) be the number of packed scalar values inside one 16-bit lane: \(p=1\) for INT16, \(p=2\) for INT8, and \(p=4\) for INT4. The packed reduction length is counted in 16-bit lane words, so \(K_{\mathrm{words}}=\lceil K/p\rceil\) conceptually and \(K_{\mathrm{tiles}}=\lceil K_{\mathrm{words}}/S\rceil\). The reported INT8 and INT4 experiments use \(K\) dimensions aligned to \(p\), so no partial packed-\(K\) word is exercised. Each unified-buffer word is 128 bits and contains eight 16-bit lanes.
 
 In A layout, one physical word feeds all eight rows on the left edge of the array for one packed \(K\)-step. The word offset for tile \((m_t,k_t)\) and local packed-\(K\) word \(r\) is
 \[
     \mathrm{addr}_A = A_{\mathrm{base}} + (m_t \cdot K_{\mathrm{tiles}} + k_t) \cdot S + r,
     \quad 0 \le r < S.
 \]
-Lane \(i\) of that word contains logical row \(m_t S+i\). Within that lane, subslot \(q\) contains logical \(K\) position \((k_t S+r)p+q\). Thus the next local \(K\)-word is the next UB word, the next \(K\)-tile is \(S\) words later, and the next \(M\)-tile is \(K_{\mathrm{tiles}}S\) words later.
+Lane \(i\) of that word contains logical row \(m_t S+i\). Within that lane, subslot \(q\) contains logical \(K\) position \((k_t S+r)p+q\). Thus the next local packed-\(K\) word is the next UB word, the next packed-\(K\) tile is \(S\) words later, and the next \(M\)-tile is \(K_{\mathrm{tiles}}S\) words later.
 
 In B layout, one physical word feeds all eight columns from the top edge of the array for one packed \(K\)-step. The word offset for tile \((k_t,n_t)\) and local packed-\(K\) word \(r\) is
 \[
     \mathrm{addr}_B = B_{\mathrm{base}} + (k_t \cdot N_{\mathrm{tiles}} + n_t) \cdot S + r,
     \quad 0 \le r < S.
 \]
-Lane \(j\) contains logical column \(n_t S+j\), and subslot \(q\) contains logical \(K\) position \((k_t S+r)p+q\). The next \(N\)-tile is \(S\) words later, while the next \(K\)-tile is \(N_{\mathrm{tiles}}S\) words later.
+Lane \(j\) contains logical column \(n_t S+j\), and subslot \(q\) contains logical \(K\) position \((k_t S+r)p+q\). The next \(N\)-tile is \(S\) words later, while the next packed-\(K\) tile is \(N_{\mathrm{tiles}}S\) words later.
 
-C layout is optimized for compact writeback rather than for feeding the next A-side operand. For INT16, each output tile \((m_t,n_t)\) occupies \(S\) words: word \(i\) stores output row \(m_tS+i\), and lane \(j\) stores output column \(n_tS+j\). For INT8 and INT4, several logical \(M\)-tiles share one physical C tile. The physical M-tile index is \(m'_t=\lfloor m_t/p \rfloor\), and subslot \(q=m_t \bmod p\) selects which logical M-tile inside the packed lane is being updated. The C word offset is
+C layout is optimized for compact writeback rather than for feeding the next A-side operand. For INT16, each output tile \((m_t,n_t)\) occupies \(S\) words: word \(i\) stores output row \(m_tS+i\), and lane \(j\) stores output column \(n_tS+j\). For INT8 and INT4, several logical \(M\)-tiles share one physical C tile. The physical M-tile index is \(m'_t=\lfloor m_t/p \rfloor\), and subslot \(q=m_t \bmod p\) selects which logical \(M\)-tile inside the packed lane receives the result. Equivalently, physical word \(i\) in group \(m'_t\) stores rows \((m'_t p+q)S+i\) across subslots \(q\). The C word offset is
 \[
     \mathrm{addr}_C = C_{\mathrm{base}} + (m'_t \cdot N_{\mathrm{tiles}} + n_t) \cdot S + i,
     \quad 0 \le i < S.
@@ -308,9 +309,9 @@ This is why packed low-precision C writes need a bit mask: a single physical wor
         \hline
         \textbf{Layout} & \textbf{One UB word represents} & \textbf{Next word in same tile} & \textbf{Next major tile} \\
         \hline
-        A & Eight rows for one packed \(K\)-step & \(+1\) advances local \(K\)-word \(r\) & next \(K\)-tile: \(+S\); next \(M\)-tile: \(+K_{\mathrm{tiles}}S\) \\
+        A & Eight rows for one packed \(K\)-step & \(+1\) advances local packed-\(K\) word \(r\) & next packed-\(K\) tile: \(+S\); next \(M\)-tile: \(+K_{\mathrm{tiles}}S\) \\
         \hline
-        B & Eight columns for one packed \(K\)-step & \(+1\) advances local \(K\)-word \(r\) & next \(N\)-tile: \(+S\); next \(K\)-tile: \(+N_{\mathrm{tiles}}S\) \\
+        B & Eight columns for one packed \(K\)-step & \(+1\) advances local packed-\(K\) word \(r\) & next \(N\)-tile: \(+S\); next packed-\(K\) tile: \(+N_{\mathrm{tiles}}S\) \\
         \hline
         C & One output row across eight columns, with low-precision M-tiles packed into subslots & \(+1\) advances output row \(i\) & next \(N\)-tile: \(+S\); next physical \(M\)-tile group: \(+N_{\mathrm{tiles}}S\) \\
         \hline
@@ -419,11 +420,29 @@ Instruction execution is paired with a small MMIO command interface on the firmw
 \end{table}
 
 \subsubsection{Quantization Configuration}
-The quantization path exists to prepare trained models into coherent compiler-ready artifacts. Its goal is practical rather than open-ended: make weights, activations, ranges, signedness, and mixed-precision choices explicit enough that the compiler can lower the model without losing numerical coherence.
+The quantization configuration is the contract between model preparation and code generation. It records the integer precision of each lowered layer, the activation and weight scales used at accelerator boundaries, the 32-bit bias tensors consumed by the PPU, and the fixed-point multiplier/shift pair used for requantization. The compiler consumes these values; it does not discover an optimal quantization policy by itself.
 
-This subsystem also includes the mixed-precision helper. It is not intended to solve global bit allocation for arbitrary models. It provides a one-layer-at-a-time sensitivity workflow that can generate usable mixed-precision configurations, recalibrate them, and pass them to the compiler-ready conversion path. Users can also provide their own quantization configuration if they already have a better assignment for a model.
+For a single lowered matrix multiplication, scale assignment is mechanical once the layer precision has been chosen. If a layer is assigned signed INT8, the calibration flow first runs the floating-point or QAT-prepared model on a calibration set and observes the maximum absolute value of the layer input activation. The input activation scale is then
+\[
+    s_x = \frac{\max |x|}{127}.
+\]
+The trained weight tensor gives the weight scale
+\[
+    s_w = \frac{\max |W|}{127}.
+\]
+For INT16 and INT4 the same rule is used with \(q_{\max}=32767\) and \(q_{\max}=7\), respectively. The output scale \(s_y\) is the scale expected by the next quantized consumer. In a simple feed-forward chain this is normally the next layer's calibrated input scale; for a final output, transformer boundary, or hand-built block, it may be supplied explicitly by the experiment configuration.
 
-To verify and benchmark the hardware with non-random inputs, MNIST is used to train small MLP and convolution classifiers before lowering them through the quantized stack. The purpose is not to claim a new quantization method, but to produce reasonable weights, activation ranges, and fixed-point parameters for the accelerator experiments. Weights are quantized into the selected integer precision, activation scales are fixed by the compiler-ready configuration, and bias is always kept 32-bit for the PPU. The fixed-point multipliers and shifts generated for each lowered matmul must also satisfy the PPU ABI limits described above. Table~\ref{tab:trained-ptq-accuracy} reports the trained-model accuracy checks.
+The remaining integer parameters follow from these three scales. Bias is stored as INT32 using \(s_b=s_xs_w\). The PPU requantization approximates
+\[
+    \frac{s_xs_w}{s_y} \approx \frac{\text{multiplier}}{2^{\text{shift}}},
+\]
+where the multiplier must fit in 16 bits and the shift must fit the PPU ABI. If no legal multiplier/shift pair can approximate the requested scale, that quantization configuration is rejected before RTL execution. The compiler-ready layer therefore carries the integer weights, INT32 bias, input scale, weight scale, output scale, multiplier, and shift. Lowering copies the multiplier and shift into the accelerator instruction; it does not re-estimate them.
+
+The reusable software support for this contract is intentionally small. It includes per-layer configuration objects, symmetric fake-quantized linear and convolution modules for QAT experiments, calibration helpers, compiler-ready conversion wrappers, and shared synthesis of PPU-compatible multiplier/shift values. The model-specific training loops, MNIST PTQ/QAT sweeps, and TinyLM calibration/export flows are experiment scripts built on top of those primitives rather than a general-purpose quantization product.
+
+The mixed-precision helper is therefore a practical experiment tool, not a global bit-allocation optimizer. It can run one-layer-at-a-time sensitivity studies, recalibrate scales after changing layer precision, and produce a usable configuration for the compiler-ready conversion path. A user can also provide the quantization configuration directly when the desired precision assignment is already known.
+
+To verify and benchmark the hardware with non-random inputs, MNIST is used to train small MLP and convolution classifiers before lowering them through the quantized stack. The purpose is not to claim a novel quantization method, but to produce reasonable weights, activation ranges, and fixed-point parameters for the accelerator experiments. Weights are quantized into the selected integer precision, activation scales are fixed by the compiler-ready configuration, and bias is always kept 32-bit for the PPU. The fixed-point multipliers and shifts generated for each lowered matmul must also satisfy the PPU ABI limits described above. Table~\ref{tab:trained-ptq-accuracy} reports the trained-model accuracy checks.
 
 \begin{table}[H]
     \centering
@@ -444,7 +463,7 @@ To verify and benchmark the hardware with non-random inputs, MNIST is used to tr
 
 The small drop from FP32 to INT4 shows that these MNIST \texttt{is\_zero} models are useful hardware test cases but weak precision-stress tests. The task is binary, the networks have enough capacity for it, and the activation ranges are well behaved after calibration. As a result, INT4 remains close to FP32 accuracy, so Table~\ref{tab:trained-ptq-accuracy} should be read as a correctness and compilation check rather than as evidence that INT4 is generally safe.
 
-To make the accuracy/speed tradeoff visible, a second experiment trains harder 10-class MNIST MLPs at \(1\times\), \(2\times\), and \(4\times\) width. Each model is evaluated under uniform PTQ, greedy mixed precision, and short QAT fine-tuning. Table~\ref{tab:mnist-speed-quality} reports both accuracy and macro-F1, where macro-F1 is the unweighted average F1 score across the ten digit classes. The speed column is an estimated resident-kernel speedup relative to the same model in INT16, using the measured TinyNPU kernel throughputs from the GEMM run-window experiments. It is not a new end-to-end RTL timing measurement, but it uses the measured accelerator precision scaling to connect model quality to expected dense-kernel cost.
+To make the accuracy/speed tradeoff visible, a second experiment trains harder 10-class MNIST MLPs at \(1\times\), \(2\times\), and \(4\times\) width. Each model is evaluated under uniform PTQ, greedy mixed precision, and short QAT fine-tuning. Table~\ref{tab:mnist-speed-quality} reports both accuracy and macro-F1, where macro-F1 is the unweighted average F1 score across the ten digit classes. The speed column is an estimated resident-kernel speedup relative to the same model in INT16, using the measured TinyNPU kernel throughputs from the GEMM run-window experiments. It is not an additional end-to-end RTL timing measurement; it uses the measured accelerator precision scaling to connect model quality to expected dense-kernel cost.
 
 \begin{table}[H]
     \centering
@@ -569,6 +588,8 @@ The compiler converts model structure into a mixed execution structure. Rather t
 
 The Python-side intermediate representation has two layers. The first layer records tensors with shape, dtype, storage role, and metadata such as cache role or view relationship. The second layer records operations and execution steps. Matmul-like operations carry the operands, bias tensor, precision, rescale multiplier and shift, activation selector, and required output layout. Scalar operations represent work intentionally executed on the core, such as normalization, softmax, reshape, cache scatter, or verification. This representation is semantic enough for partitioning and validation, but still close enough to the hardware contract that lowering can emit exact instruction fields and buffer layouts.
 
+The compiler is therefore best understood as a code generator for a constrained hardware/software target, not as a global neural-network optimizer. It does not search for an optimal graph rewrite, precision assignment, or schedule across the whole model. Its job is to take a model and quantization configuration that already satisfy the intended contract, validate what can run on the accelerator, preserve the required scalar-core operations explicitly, and emit a legal executable image for the firmware runtime.
+
 \subsubsection{Runtime and Verification}
 The deployed firmware runtime is linked into the generated CV32E40P program. It executes the compiled plan as a mixed core/accelerator loop. For each step, it either launches an accelerator segment, executes a required scalar operation on the core, or checks an expected tensor. Scalar core work is therefore visible both in the plan and in the benchmark accounting.
 
@@ -636,7 +657,7 @@ The transformer experiments use reduced-dimensional decoder blocks rather than f
 
 The Llama-like block uses RMSNorm, grouped-query attention, scalar RoPE on Q/K, an attention output projection, and a SwiGLU feed-forward tail. Dense projections are lowered to INT16 accelerator matmuls: Q/K/V projection, QK score matmul, probability-times-value matmul, attention output projection, gate/up projections, and down projection. The core handles the non-matrix pieces: RMSNorm, RoPE, softmax, residual adds, SiLU, elementwise feed-forward multiplication, and the quantize/dequantize boundaries around those operations.
 
-Prefill and decode exercise different cache behavior. In prefill, the prompt is processed as a short sequence and the key/value cache is materialized for all prompt positions. In decode, the input has one new token, the previous cache is reused, and attention reads over the prompt plus the new token. The RTL includes INT16 cache append and cache-read modes. V-cache append can be used directly after the V projection. K-cache append is only directly usable when the value being written is already the rotated key; because this design keeps RoPE on the core, the Llama-like K-cache update remains a scalar cache update after RoPE.
+Prefill and decode exercise different cache behavior. In prefill, the prompt is processed as a short sequence and the key/value cache is materialized for all prompt positions. In decode, the input is a single token, the existing cache is reused, and attention reads over the cached context plus that token. The RTL includes INT16 cache append and cache-read modes. V-cache append can be used directly after the V projection. K-cache append is only directly usable when the value being written is already the rotated key; because this design keeps RoPE on the core, the Llama-like K-cache update remains a scalar cache update after RoPE.
 
 The GPT-2-like block uses LayerNorm, causal self-attention, an attention output projection, residual connections, and a two-layer GELU feed-forward network. Its accelerator work is the same class of dense matmul work: Q/K/V projections, score and value matmuls, output projection, and feed-forward projections. The core handles LayerNorm, causal mask and softmax, residual adds, and cache bookkeeping. The reported GPT-2-like runtime experiment chains two blocks back-to-back and includes prefill, decode, and cache reuse so that intermediate state must survive across more than one block.
 
@@ -682,15 +703,15 @@ Wall-clock comparisons use the Vivado timing boundary. The core-only CV32E40P co
     \footnotesize
     \caption{Vivado timing boundary used for wall-clock comparisons. Target device is \texttt{xc7a200tsbg484-1}.}
     \label{tab:vivado-timing}
-    \begin{tabularx}{\textwidth}{|l|c|c|c|Y|}
+    \begin{tabularx}{\textwidth}{|Y|c|c|c|}
         \hline
-        \textbf{Design} & \textbf{Target} & \textbf{WNS} & \textbf{Status} & \textbf{Use in report} \\
+        \textbf{Design} & \textbf{Target} & \textbf{WNS} & \textbf{Status} \\
         \hline
-        Core only & 66.0 MHz & 0.000 ns & Meets & ONNX2C/core wall-clock baseline. \\
+        Core only & 66.0 MHz & 0.000 ns & Meets \\
         \hline
-        Accelerator only, real BRAM & 50 MHz & +0.106 ns & Meets & Standalone accelerator timing with implemented memories. \\
+        Accelerator only, real BRAM & 50 MHz & +0.106 ns & Meets \\
         \hline
-        TinyNPU system, fitted real BRAM & 50 MHz & -0.408 ns & Routed, below target & Integrated core+accelerator wall-clock estimate, 49.00 MHz. \\
+        TinyNPU system, fitted real BRAM & 50 MHz & -0.408 ns & Routed, below target \\
         \hline
     \end{tabularx}
 \end{table}
@@ -716,7 +737,7 @@ Table~\ref{tab:vivado-resource-utilization} reports post-route resource utilizat
     \end{tabular}}
 \end{table}
 
-The integrated timing point uses the BRAM-mapped TinyNPU configuration that fits the target FPGA. A direct rerun with the largest current unified-buffer default does not place on \texttt{xc7a200tsbg484-1}: Vivado reports 512 required RAMB36/FIFO cells against 365 available. This makes local memory capacity the main FPGA resource boundary for larger tensors; LUT and DSP utilization leave more headroom than the BRAM system. The reported wall-clock conversion therefore uses the fitted memory configuration rather than the oversized debug-capacity default.
+The integrated timing point uses the BRAM-mapped TinyNPU configuration that fits the target FPGA. The oversized debug-capacity unified-buffer configuration does not place on \texttt{xc7a200tsbg484-1}: Vivado reports 512 required RAMB36/FIFO cells against 365 available. This makes local memory capacity the main FPGA resource boundary for larger tensors; LUT and DSP utilization leave more headroom than the BRAM system. The reported wall-clock conversion therefore uses the fitted memory configuration rather than the oversized debug-capacity configuration.
 
 \newpage
 \section{Comparative Evaluation and Discussion}
@@ -815,6 +836,79 @@ For the trained MLP and convolution rows reported here, the emitted segment writ
 
 The speed/quality sweep in Table~\ref{tab:mnist-speed-quality} uses the resident GEMM throughputs from Tables~\ref{tab:mixgemm-kernel-scaling} and~\ref{tab:long-k-resident-gemm}; it explains why mixed precision is useful inside dense kernels. Table~\ref{tab:wall-clock-models} is the stricter system-level comparison: it includes the runtime path, scalar core work, readback, and the routed TinyNPU system clock. The two tables therefore answer different questions: Table~\ref{tab:mnist-speed-quality} shows quality versus arithmetic precision, while Table~\ref{tab:wall-clock-models} shows whether those choices still win after integration cost.
 
+Table~\ref{tab:mlp-conv-plan} shows why the two trained model families behave differently before giving the raw cycle table. The MLP is matrix-native: each layer becomes an accelerator segment, and no scalar tensor expansion is needed between dense layers. The convolution examples use the same accelerator backend for the dense multiply, but each convolution first requires scalar \texttt{im2col} materialization on the core. That plan difference is why convolution improves with scale but does not reach the warm MLP speedup.
+
+\begin{table}[H]
+    \centering
+    \footnotesize
+    \caption{Case-study comparison using literal forward-style model definitions, lowered execution-plan structure, and measured wall-clock speedup.}
+    \label{tab:mlp-conv-plan}
+    \begin{tabularx}{\textwidth}{|>{\raggedright\arraybackslash}X|>{\raggedright\arraybackslash}X|}
+        \hline
+        \textbf{Convolution MNIST models} & \textbf{MLP h256 model} \\
+        \hline
+        \multicolumn{2}{|l|}{\textbf{Forward definition}} \\
+        \hline
+        {\ttfamily\small
+        x = relu(conv1(x))\par
+        x = relu(conv2(x))\par
+        x = relu(conv3(x))\par
+        x = sigmoid(conv4(x))\par
+        \vspace{0.25em}
+        Conv 16ch uses 16 hidden channels.\par
+        Conv wide32 uses the same valid-convolution chain with 32 hidden channels.\par
+        }
+        &
+        {\ttfamily\small
+        x = relu(fc1(x))\par
+        x = relu(fc2(x))\par
+        x = relu(fc3(x))\par
+        x = sigmoid(fc4(x))\par
+        \vspace{0.25em}
+        All hidden layers use width 256.\par
+        } \\
+        \hline
+        \multicolumn{2}{|l|}{\textbf{Lowered execution plan}} \\
+        \hline
+        {\ttfamily\small
+        ScalarOp(im2col)\par
+        NpuSegment(conv1 + relu)\par
+        ScalarOp(im2col)\par
+        NpuSegment(conv2 + relu)\par
+        ScalarOp(im2col)\par
+        NpuSegment(conv3 + relu)\par
+        ScalarOp(im2col)\par
+        NpuSegment(conv4 + sigmoid)\par
+        VerifyTensor(output)\par
+        \vspace{0.25em}
+        The dense work runs on the accelerator, but every convolution first materializes a window matrix on the core.\par
+        }
+        &
+        {\ttfamily\small
+        NpuSegment(fc1 + relu)\par
+        NpuSegment(fc2 + relu)\par
+        NpuSegment(fc3 + relu)\par
+        NpuSegment(fc4 + sigmoid)\par
+        VerifyTensor(output)\par
+        \vspace{0.25em}
+        No scalar tensor expansion is needed between dense layers; the accelerator-consumable output layout is preserved across the chain.\par
+        } \\
+        \hline
+        \multicolumn{2}{|l|}{\textbf{Measured wall-clock result}} \\
+        \hline
+        Conv 16ch: \(1.44\times\) cold, \(1.58\times\) warm.\par
+        Conv wide32: \(2.80\times\) cold, \(3.29\times\) warm.\par
+        \vspace{0.25em}
+        Scaling the channel count improves the result because more dense work is available per scalar \texttt{im2col} step.
+        &
+        MLP h256: \(2.78\times\) cold, \(26.34\times\) warm.\par
+        \vspace{0.25em}
+        The warm result is high because weights and instruction images stay resident and the repeated execution is almost entirely matrix-native.
+        \\
+        \hline
+    \end{tabularx}
+\end{table}
+
 \begin{table}[H]
     \centering
     \footnotesize
@@ -842,7 +936,7 @@ The speed/quality sweep in Table~\ref{tab:mnist-speed-quality} uses the resident
 
 The MLP case shows the best behavior because it is matrix-native and benefits from resident execution. The warm MLP result reaches \(26.34\times\) wall-clock speedup even after applying the lower TinyNPU system clock, but this is a repeated-inference result with static preload excluded, not a cold one-shot claim. The convolution case also improves with scale, but it remains more sensitive to scalar core work because the compiler lowers convolution through \texttt{im2col}. The wide32 convolution reaches \(3.29\times\) warm wall-clock speedup, while the smaller 16-channel case reaches \(1.58\times\) warm.
 
-F-BFQ, a contemporaneous FPGA-based mixed-precision accelerator using a dynamic super-block vector processor rather than a systolic array, reports \(1.4\times\) average end-to-end speedup over an Arm NEON CPU baseline across three BFP-quantized LLMs \cite{haris2025fbfq}. This is a real LLM-scale FPGA result, so TinyNPU's smaller resident-buffer experiments should not be read as a direct ranking against it. The useful comparison is structural. TinyNPU reaches \(2.78\times\) cold and \(26.34\times\) warm wall-clock speedup on the matrix-native h256 MLP, and the reduced transformer-like experiments below show that larger dense blocks amortize launch and scalar-operation costs. At the larger measured points, Llama-like decode reaches \(1.64\times\) hot wall speedup, and the large prefill+decode+decode sequence reaches \(2.39\times\) end-to-end for Llama-like and \(2.74\times\) for GPT-2-like. These numbers describe the benefit of the current on-chip resident-buffer regime. F-BFQ instead streams instructions, weights, inputs, and outputs through an AXI-Stream interface to main memory, and the F-BFQ authors identify data-transfer bandwidth as a remaining bottleneck. Scaling TinyNPU to larger language models would also require an external DDR/DDR5 memory system, so the speedups reported here should not be projected directly to full LLM scale without modeling off-chip traffic.
+F-BFQ, a contemporaneous FPGA-based mixed-precision accelerator using a dynamic super-block vector processor rather than a systolic array, reports \(1.4\times\) average end-to-end speedup over an Arm NEON CPU baseline across three BFP-quantized LLMs \cite{haris2025fbfq}. This is a real LLM-scale FPGA result, so TinyNPU's smaller resident-buffer experiments should not be read as a direct ranking against it. The useful comparison is structural. TinyNPU reaches \(2.78\times\) cold and \(26.34\times\) warm wall-clock speedup on the matrix-native h256 MLP, and the reduced transformer-like experiments below show that larger dense blocks amortize launch and scalar-operation costs. At the larger measured points, Llama-like decode reaches \(1.64\times\) hot wall speedup, and the large prefill+decode+decode sequence reaches \(2.39\times\) end-to-end for Llama-like and \(2.74\times\) for GPT-2-like. These numbers describe the benefit of the on-chip resident-buffer regime. F-BFQ instead streams instructions, weights, inputs, and outputs through an AXI-Stream interface to main memory, and the F-BFQ authors identify data-transfer bandwidth as a remaining bottleneck. Scaling TinyNPU to larger language models would also require an external DDR/DDR5 memory system, so the speedups reported here should not be projected directly to full LLM scale without modeling off-chip traffic.
 
 \subsection{Transformer-Like Block Scaling}
 
@@ -945,9 +1039,9 @@ TinyNPU is a working mixed-precision accelerator platform with a usable hardware
 
 The results show a clear split between compute capability and integration cost. The systolic array delivers useful throughput on tiled GEMM, and the runtime shows wall-clock wins on resident MLPs, larger convolution models, and larger transformer-like blocks. At the same time, practical execution still pays heavily for staging, packing, segmentation, scalar-operation boundaries, and timing closure. The strongest use case is therefore not arbitrary DNN execution, but quantized models that expose sufficiently large dense linear work for the array.
 
-The next compiler step is to remove the remaining manual seams between model preparation and executable image generation. Today, quantization configuration, layout assignment, runtime-image construction, and benchmark invocation can still diverge because they are driven by separate scripts and per-experiment entry points. A stronger toolchain would use one model manifest that owns tensor scales, layer precision, physical layouts, memory placement, generated instruction images, expected outputs, and benchmark metadata. That would make failed lowers attributable to a specific compiler decision instead of to mismatched scripts, and it would make larger model experiments reproducible without hand-editing the flow.
+The next compiler step is to remove the remaining manual seams between model preparation and executable image generation. Quantization configuration, layout assignment, runtime-image construction, and benchmark invocation can diverge when they are driven by separate scripts and per-experiment entry points. A stronger toolchain would use one model manifest that owns tensor scales, layer precision, physical layouts, memory placement, generated instruction images, expected outputs, and benchmark metadata. That would make failed lowers attributable to a specific compiler decision instead of to mismatched scripts, and it would make larger model experiments reproducible without hand-editing the flow.
 
-The main hardware extension is external-memory support. The current evaluation relies on accelerator-resident buffers, which is sufficient for controlled kernels and reduced model blocks but not for larger images or larger language-model layers. A practical system needs a DDR/DRAM interface, explicit movement between external memory and the accelerator-local buffer, and a compiler/runtime policy that schedules those transfers rather than assuming that all useful tensors fit locally.
+The main hardware extension is external-memory support. The evaluation relies on accelerator-resident buffers, which is sufficient for controlled kernels and reduced model blocks but not for larger images or larger language-model layers. A practical system needs a DDR/DRAM interface, explicit movement between external memory and the accelerator-local buffer, and a compiler/runtime policy that schedules those transfers rather than assuming that all useful tensors fit locally.
 
 The integration between the core and accelerator should also become deeper. MMIO is useful as a simple control interface, but it is not the right long-term mechanism for moving programs and tensors. Future work should reduce MMIO to a small command/status path and move instruction images, tensor storage, and DMA descriptors into a shared addressable memory system. In that design the core, accelerator, and DDR controller would share a clearer system-level contract, reducing staging overhead and making the platform closer to a deployable SoC rather than a testbench-driven accelerator attachment.
 
@@ -955,7 +1049,7 @@ The integration between the core and accelerator should also become deeper. MMIO
 \section{Implemented Activation Algorithms}
 \label{app:activation-algorithms}
 
-This appendix records the activation functions implemented in the staged PPU datapath. Older standalone DI-Exp/DI-Sigmoid RTL primitives and a legacy scalar-runtime helper still exist in the source tree, but the accelerator PPU path used in the reported measurements uses the inlined hard-sigmoid gate and hard-GELU logic below. The hard-sigmoid gate follows the standard idea of a saturated linear ramp \cite{courbariaux2016binarized}, with the MobileNetV3-style \(\mathrm{clip}(\cdot+3,0,6)/6\) form used for hardware deployment \cite{howard2019mobilenetv3}. Its integer window, rounding, and precision scaling are TinyNPU-specific.
+This appendix records the activation functions implemented in the staged PPU datapath used in the reported measurements. The hard-sigmoid gate follows the standard idea of a saturated linear ramp \cite{courbariaux2016binarized}, with the MobileNetV3-style \(\mathrm{clip}(\cdot+3,0,6)/6\) form used for hardware deployment \cite{howard2019mobilenetv3}. Its integer window, rounding, and precision scaling are TinyNPU-specific.
 
 \begin{algorithm}[H]
 \caption{TinyNPU Hard-Sigmoid Gate}
