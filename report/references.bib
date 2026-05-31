@@ -29,32 +29,48 @@
 }
 
 @article{garofalo2021xpulpnn,
-  author  = {Garofalo, Angelo and Conti, Francesco and Tagliavini, Giuseppe and Rossi, Davide and Benini, Luca},
+  author  = {Garofalo, Angelo and Tagliavini, Giuseppe and Conti, Francesco and Benini, Luca and Rossi, Davide},
   title   = {{XpulpNN}: Enabling Energy Efficient and Flexible Inference of Quantized Neural Networks on {RISC-V} Based IoT End Nodes},
   journal = {IEEE Transactions on Emerging Topics in Computing},
   year    = {2021},
-  volume  = {10},
-  number  = {4},
-  pages   = {1849--1863},
-  doi     = {10.1109/TETC.2021.3066884}
+  volume  = {9},
+  number  = {3},
+  pages   = {1489--1505},
+  doi     = {10.1109/TETC.2021.3072337}
 }
 
-@misc{armeniakos2024mixedprecision,
-  author       = {Armeniakos, Georgios and Ottavi, Francesco Maria and Garofalo, Angelo and Benini, Luca},
-  title        = {Mixed-Precision Support for {RISC-V} Soft-{SIMD} Extensions},
-  year         = {2024},
-  eprint       = {2407.15814},
+@misc{haris2025fbfq,
+  author        = {Haris, Jude and Cano, Jos{\'e}},
+  title         = {{F-BFQ}: Flexible Block Floating-Point Quantization Accelerator for {LLMs}},
+  year          = {2025},
+  eprint        = {2510.13401},
   archivePrefix = {arXiv},
-  primaryClass = {cs.AR},
-  url          = {https://arxiv.org/abs/2407.15814}
+  primaryClass  = {cs.AR},
+  doi           = {10.48550/arXiv.2510.13401},
+  note          = {Accepted for publication at the LG-ARC'2025 Workshop @ ISCA 2025},
+  url           = {https://arxiv.org/abs/2510.13401}
 }
 
-@article{fornt2025mixgemm,
-  author  = {Fornt, Quim and Armeniakos, Georgios and Schiavone, Pasquale Davide and Benini, Luca},
-  title   = {{Mix-GEMM}: Mixed-Precision {RISC-V} Matrix Multiplication Using Binary Segmentation},
-  journal = {IEEE Transactions on Computers},
-  year    = {2025},
-  doi     = {10.1109/TC.2025.3547507}
+@inproceedings{chen2025hybridsa,
+  author    = {Chen, Chun-Ting and Mun, HanGyeol and Meng, Jian and Abdelfattah, Mohamed S. and Seo, Jae-sun},
+  title     = {Hybrid Systolic Array Accelerator with Optimized Dataflow for Edge Large Language Model Inference},
+  booktitle = {ACM/IEEE International Symposium on Low Power Electronics and Design (ISLPED)},
+  year      = {2025},
+  doi       = {10.1109/ISLPED65674.2025.11261776},
+  url       = {https://arxiv.org/abs/2507.09010}
+}
+
+@inproceedings{armeniakos2024mixedprecision,
+  author        = {Armeniakos, Giorgos and Maras, Alexis and Xydis, Sotirios and Soudris, Dimitrios},
+  title         = {Mixed-Precision Neural Networks on {RISC-V} Cores: {ISA} Extensions for Multi-Pumped Soft {SIMD} Operations},
+  booktitle     = {Proceedings of the 43rd IEEE/ACM International Conference on Computer-Aided Design (ICCAD)},
+  year          = {2024},
+  pages         = {1--9},
+  doi           = {10.1145/3676536.3676840},
+  eprint        = {2407.14274},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.AR},
+  url           = {https://arxiv.org/abs/2407.14274}
 }
 
 @inproceedings{reggiani2023mixgemm,
@@ -62,16 +78,17 @@
   title     = {{Mix-GEMM}: An Efficient HW-SW Architecture for Mixed-Precision Quantized Deep Neural Networks Inference on Edge Devices},
   booktitle = {2023 IEEE International Symposium on High-Performance Computer Architecture (HPCA)},
   year      = {2023},
+  pages     = {1085--1098},
   doi       = {10.1109/HPCA56546.2023.10071076}
 }
 
-@article{genc2021gemmini,
-  author  = {Genc, Hasan and Haj{-}Ali, Ameer and Ittycheriah, Vivek and others},
-  title   = {Gemmini: Enabling Systematic Deep-Learning Architecture Evaluation via Full-Stack Integration},
-  journal = {Proceedings of the 58th Annual Design Automation Conference (DAC)},
-  year    = {2021},
-  pages   = {769--774},
-  doi     = {10.1109/DAC18074.2021.9586216}
+@inproceedings{genc2021gemmini,
+  author    = {Genc, Hasan and Kim, Seah and Amid, Alon and Haj{-}Ali, Ameer and Iyer, Vighnesh and Prakash, Pranav and Zhao, Jerry and Grubb, Daniel and Liew, Harrison and Mao, Howard and Ou, Albert and Schmidt, Colin and Steffl, Samuel and Wright, John and Stoica, Ion and Ragan-Kelley, Jonathan and Asanovic, Krste and Nikolic, Borivoje and Shao, Yakun Sophia},
+  title     = {Gemmini: Enabling Systematic Deep-Learning Architecture Evaluation via Full-Stack Integration},
+  booktitle = {Proceedings of the 58th Annual Design Automation Conference (DAC)},
+  year      = {2021},
+  pages     = {769--774},
+  doi       = {10.1109/DAC18074.2021.9586216}
 }
 
 @misc{chin2025tinytpu,
@@ -84,9 +101,11 @@
 }
 
 @inproceedings{xiao2023smoothquant,
-  author    = {Xiao, Guangxuan and Lin, Ji and Seznec, Meryem and Demouth, Julien and Han, Song},
-  title     = {SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models},
-  booktitle = {Proceedings of the 40th International Conference on Machine Learning (ICML)},
+  author    = {Xiao, Guangxuan and Lin, Ji and Seznec, Mickael and Wu, Hao and Demouth, Julien and Han, Song},
+  title     = {{SmoothQuant}: Accurate and Efficient Post-Training Quantization for Large Language Models},
+  booktitle = {Proceedings of the 40th International Conference on Machine Learning},
+  series    = {Proceedings of Machine Learning Research},
+  volume    = {202},
   year      = {2023},
   pages     = {38087--38099},
   url       = {https://proceedings.mlr.press/v202/xiao23c.html}
@@ -112,6 +131,15 @@
   year      = {2021},
   pages     = {5506--5518},
   url       = {https://proceedings.mlr.press/v139/kim21d.html}
+}
+
+@inproceedings{courbariaux2016binarized,
+  author    = {Courbariaux, Matthieu and Hubara, Itay and Soudry, Daniel and El{-}Yaniv, Ran and Bengio, Yoshua},
+  title     = {Binarized Neural Networks},
+  booktitle = {Advances in Neural Information Processing Systems},
+  volume    = {29},
+  year      = {2016},
+  url       = {https://papers.nips.cc/paper/6573-binarized-neural-networks}
 }
 
 @misc{hendrycks2016gelu,

@@ -43,11 +43,11 @@ digraph TinyNPUCompilerStack {
         margin="10,12";
 
         Partition [label="Partitioner", fillcolor="#F4F7FB", color="#6F8FB3", fontcolor="#233142"];
-        Plan [label="Execution IR\nNPU segments + host steps + checks", fillcolor="#F4F7FB", color="#6F8FB3", fontcolor="#233142", width=2.9];
+        Plan [label="Execution IR\naccelerator segments + scalar ops + checks", fillcolor="#F4F7FB", color="#6F8FB3", fontcolor="#233142", width=2.9];
         Expected [label="Expected tensors\nfor verification", fillcolor="#F4F7FB", color="#6F8FB3", fontcolor="#233142"];
     }
 
-    Validate [label="Host-step\nvalidation", fillcolor="#FFF4E8", color="#C98A43", fontcolor="#4A3520"];
+    Validate [label="Scalar-op\nvalidation", fillcolor="#FFF4E8", color="#C98A43", fontcolor="#4A3520"];
 
     subgraph cluster_lowering {
         label="Lowering and Runtime Packaging";

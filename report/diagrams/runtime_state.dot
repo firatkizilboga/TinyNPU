@@ -54,12 +54,12 @@ digraph TinyNPURuntimeState {
         Unpack [label="unpack outputs\nfor next step", fillcolor="#E8F0FE", color="#557AAB", fontcolor="#1f2d3d"];
     }
 
-    HostOp [label="CPU step\nsoftmax / reshape /\nlayout work", fillcolor="#FFF4E8", color="#C98A43", fontcolor="#4A3520"];
+    ScalarOp [label="Scalar op on core\nsoftmax / reshape /\nlayout work", fillcolor="#FFF4E8", color="#C98A43", fontcolor="#4A3520"];
     Verify [label="check expected output", fillcolor="#FFF7D9", color="#C9A227", fontcolor="#4A3A00"];
     Finalize [label="return outputs\nand cycle counts", fillcolor="#EFE8FF", color="#8B74BD", fontcolor="#2C2236"];
     Done [shape=ellipse, label="Done", fillcolor="#F4F7FB", color="#6F8FB3", fontcolor="#233142"];
 
-    { rank=same; HostOp; Verify; }
+    { rank=same; ScalarOp; Verify; }
 
     Start -> Init;
     Init -> Session;
@@ -68,7 +68,7 @@ digraph TinyNPURuntimeState {
     Dispatch -> Kind [label="step available"];
 
     Kind -> Pack [label="accelerator"];
-    Kind -> HostOp [label="CPU"];
+    Kind -> ScalarOp [label="scalar"];
     Kind -> Verify [label="check"];
 
     Pack -> WriteSel;
@@ -82,7 +82,7 @@ digraph TinyNPURuntimeState {
     ReadShared -> Unpack;
     ReadMMIO -> Unpack;
     Unpack -> Dispatch [label="continue"];
-    HostOp -> Dispatch [label="continue"];
+    ScalarOp -> Dispatch [label="continue"];
     Verify -> Dispatch [label="continue"];
     Finalize -> Done;
 }

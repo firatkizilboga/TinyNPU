@@ -29,8 +29,8 @@ digraph TinyNPUArchitecture {
         labeldistance=2.0
     ];
 
-    subgraph cluster_hostcpu {
-        label="CV32E40P Host Core";
+    subgraph cluster_core {
+        label="CV32E40P Core";
         color="#557aab";
         penwidth=2.0;
         style="rounded,dashed";
@@ -42,7 +42,7 @@ digraph TinyNPUArchitecture {
         Runtime [label="Firmware\nRuntime", fillcolor="#e8f0fe", color="#557aab", fontcolor="#1f2d3d", width=2.0, height=1.0];
     }
     MMIO [label="MMIO Interface", fillcolor="#e8f0fe", color="#557aab", fontcolor="#1f2d3d"];
-    Shared [label="Shared-SRAM\nHost Window", fillcolor="#e8f0fe", color="#557aab", fontcolor="#1f2d3d"];
+    Shared [label="Shared-SRAM\nCore Window", fillcolor="#e8f0fe", color="#557aab", fontcolor="#1f2d3d"];
     IM [label="Instruction Memory", fillcolor="#efe8ff", color="#8b74bd", fontcolor="#2c2236"];
     RuntimeMMIOSpacer [label="", shape=point, width=0.18, height=0.01, style=invis];
 
@@ -73,7 +73,7 @@ digraph TinyNPUArchitecture {
     { rank=same; IM; UB; }
     { rank=same; SA; PPU; }
 
-    Runtime:e -> MMIO:s [minlen=2, label="host commands"];
+    Runtime:e -> MMIO:s [minlen=2, label="core commands"];
     MMIO:s -> Runtime:w [minlen=2, label="status / data"];
     MMIO -> IM [label="instruction load"];
     MMIO -> UB [dir=both, label="buffer load / readback"];
