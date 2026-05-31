@@ -25,7 +25,7 @@
 // ----------------------------------------------------------------------------
 // Buffer Parameters
 // ----------------------------------------------------------------------------
-`define BUFFER_DEPTH 61440        // Number of vectors in unified buffer
+`define BUFFER_DEPTH 32768        // Number of vectors in unified buffer; fitted for xc7a200t BRAM capacity
 `define BUFFER_WIDTH (`DATA_WIDTH * `ARRAY_SIZE)  // 1024 vectors × N elements
 
 // ----------------------------------------------------------------------------

@@ -226,7 +226,7 @@ Modern deep neural networks demand substantial compute and memory bandwidth even
 However, quantization is not a single fixed target. Mixed-precision work has shown that different layers or kernels inside the same model can tolerate different bit-widths \cite{wu2018mixedprecision}. This creates a hardware opportunity and a software problem at the same time. Hardware should benefit from narrower arithmetic when it is safe to do so, but the software stack must still prepare the model, preserve numerical intent, and decide where accelerator execution ends and scalar execution on the core begins.
 
 \subsection{Problem Definition}
-The main problem addressed by TinyNPU is not only how to build a small systolic-array accelerator, but how to make mixed-precision quantized computation usable from a real model flow. Fixed-precision accelerators leave throughput on the table when different parts of a model tolerate different bit-widths. Processor-centric low-bit approaches, on the other hand, still pay software-side cost for packing, unpacking, and data movement around the arithmetic \cite{garofalo2021xpulpnn, armeniakos2024mixedprecision, reggiani2023mixgemm}.
+The main problem addressed by TinyNPU is not only how to build a small systolic-array accelerator, but how to make mixed-precision quantized computation usable from a real model flow. Fixed-precision accelerators leave throughput on the table when different parts of a model tolerate different bit-widths. Processor-centric low-bit approaches, on the other hand, still pay software-side cost for packing, unpacking, and data movement around the arithmetic \cite{garofalo2021xpulpnn, armeniakos2024mixedprecision, reggiani2023mixgemm, fornt2025mixgemm}.
 
 This project therefore treats the problem as a co-design task. The hardware must expose a regular packed-integer datapath, and the compiler/runtime must make tensor layout, quantization boundaries, and scalar core work explicit. The result should be measurable honestly, with accelerator compute, runtime overhead, and scalar core work kept separate.
 
@@ -260,7 +260,7 @@ Taken together, these references define TinyNPU's design space. It is not trying
 \newpage
 
 \section{Developed Approach and System Model}
-The system is described here as one CV32E40P-plus-accelerator platform with four cooperating subsystems: TinyNPU hardware, model preparation, compilation, and firmware execution. In the reported implementation, the useful local system is the firmware core plus the matrix accelerator, not the matrix RTL block alone. A larger deployment could attach this subsystem to an external host through an SoC interconnect, AXI-style fabric, PCIe bridge, or another platform-specific interface. That outer system interface is intentionally left abstract; the measurements in this report are taken at the implemented TinyNPU prototype boundary.
+The system is described here as one CV32E40P-plus-accelerator platform with four cooperating subsystems: TinyNPU hardware, model preparation, compilation, and firmware execution. CV32E40P is the OpenHW CORE-V continuation of the RI5CY/PULP-class 32-bit RISC-V core lineage \cite{gautschi2017ri5cy}. In the reported implementation, the useful local system is the firmware core plus the matrix accelerator, not the matrix RTL block alone. A larger deployment could attach this subsystem to an external host through an SoC interconnect, AXI-style fabric, PCIe bridge, or another platform-specific interface. That outer system interface is intentionally left abstract; the measurements in this report are taken at the implemented TinyNPU prototype boundary.
 
 \subsection{System Overview}
 At a high level, a model starts either as a quantized PyTorch module or as a compiler-ready artifact produced by the quantization path. The compiler traces the model, partitions it into accelerator-supported regions and explicit scalar operations owned by the core, lowers legal regions into TinyNPU instruction and buffer images, and packages the result as a compiled artifact. The firmware runtime on the CV32E40P core then executes that artifact step by step. Inside the hardware, the unified buffer, streamers, systolic array, and post-processing unit implement the matrix-style execution path.
@@ -547,9 +547,18 @@ The PPU is a sequenced pipeline, not a single combinational tail after the array
 
 Before drain begins, the PPU loads the 32-bit bias vector for the output columns. For each drained row it then evaluates the same requantization pipeline lane by lane:
 \[
-q = \mathrm{clip}_{p}\left(\mathrm{act}\left(\left((acc + bias) \times multiplier + 2^{shift-1}\right) \gg shift\right)\right)
+\begin{aligned}
+v &= (acc+bias)\times multiplier,\\
+u &=
+\begin{cases}
+\mathrm{sat}_{16}(v), & shift = 0,\\
+\mathrm{sat}_{16}\left((v + 2^{shift-1}) \gg shift\right), & shift > 0,
+\end{cases}
+\\
+q &= \mathrm{clip}_{p}\left(\mathrm{act}(u)\right)
+\end{aligned}
 \]
-where \(acc\) is the 64-bit drained accumulator, \(bias\) is a sign-extended 32-bit bias term, \(multiplier\) is the 16-bit fixed-point requantization factor, \(\gg\) is an arithmetic right shift, \(\mathrm{act}(\cdot)\) selects the configured post-processing nonlinearity, and \(\mathrm{clip}_{p}(\cdot)\) saturates to the signed range of the selected output precision. The PE and drain paths carry 64-bit accumulators; inside the staged PPU, the bias-added value is clamped into the narrower internal activation datapath before fixed-point multiplication. The compiler enforces the hardware ABI for this path: matmul rescale shifts are limited to 0--63, fused clipped-sigmoid shifts are limited to 0--29, and the hard-GELU input-domain shift is limited to 0--15. These limits keep the variable-shift hardware bounded and make the quantization configuration part of the compile-time validity check. The activation stage supports plain ReLU, a clipped affine integer sigmoid approximation, and a hardware-friendly hard-GELU approximation used when GELU is lowered into the accelerator \cite{hendrycks2016gelu,kim2021ibert}. Concretely, the datapath performs bias addition, fixed-point multiplication, round-to-nearest when \(shift > 0\), the selected activation, and final saturation to INT16, INT8, or INT4.
+where \(acc\) is the 64-bit drained accumulator, \(bias\) is a sign-extended 32-bit bias term, \(multiplier\) is the 16-bit fixed-point requantization factor, \(\gg\) is an arithmetic right shift, \(\mathrm{act}(\cdot)\) selects the configured post-processing nonlinearity, and \(\mathrm{clip}_{p}(\cdot)\) saturates to the signed range of the selected output precision. The PE and drain paths carry 64-bit accumulators; inside the staged PPU, the bias-added value is clamped into the narrower internal activation datapath before fixed-point multiplication. The compiler enforces the hardware ABI for this path: matmul rescale shifts are limited to 0--63, fused clipped-sigmoid shifts are limited to 0--29, and the hard-GELU input-domain shift is limited to 0--15. These limits keep the variable-shift hardware bounded and make the quantization configuration part of the compile-time validity check. The activation stage supports plain ReLU, a clipped affine integer sigmoid approximation inspired by hard-sigmoid style piecewise-linear deployment functions \cite{howard2019mobilenetv3}, and a hardware-friendly hard-GELU approximation. The hard-GELU path combines the GELU approximation \(x\cdot\sigma(1.702x)\) with the MobileNetV3-style hard gate \(x\cdot\mathrm{ReLU6}(\cdot+3)/6\), replacing the sigmoid with a clipped affine gate in the integer activation domain \cite{hendrycks2016gelu,howard2019mobilenetv3,kim2021ibert}. Concretely, the datapath performs bias addition, fixed-point multiplication, round-to-nearest when \(shift > 0\), the selected activation, and final saturation to INT16, INT8, or INT4.
 
 Writeback is also precision-dependent. After the tile buffer has been filled, the ordinary C-layout path emits one buffered row per writeback cycle. For INT16 output, each 16-bit lane is written back directly. For INT8 and INT4 output, the PPU shifts the quantized value into the byte or nibble slot selected by the packed write offset, and the unified buffer applies a bit mask so that only that subword is written while sibling tiles in the same physical word are preserved. The control unit derives this packed write offset from the output tile index: two logical M-tiles share one physical word for INT8, and four logical M-tiles share one physical word for INT4.
 
@@ -795,6 +804,8 @@ Table~\ref{tab:long-k-resident-gemm} shows the same effect at a larger reduction
 
 This distinction is important for interpreting the XpulpNN comparison. XpulpNN's reported 0.94 operating efficiency is for the optimized matrix inner kernel, where low-precision operands are already in the expected memory representation and the measurement is dominated by the dot-product loop. It is not a full-layer timing that includes offline model quantization, tensor packing from floating-point activations, or complete network execution. Their convolution results separately expose the additional cost of im2col-style preparation and output quantization/writeback. TinyNPU's long-\(K\) resident GEMM rows use the same kind of boundary: operands and instructions are resident, and the metric asks how efficiently the local packed matrix engine retires useful MACs. The trained-model and transformer tables below then show the stricter system-level cost once runtime staging, scalar core work, and readback are included.
 
+Mix-GEMM provides another adjacent comparison point, but with a different integration model. The HPCA version reports 5.3--15.1\(\times\) performance over OpenBLAS GEMM on a commercial RISC-V edge processor and up to 13.6 GOPS for quantized CNN kernels, while the later IEEE Transactions on Computers version extends the same binary-segmentation direction for mixed-precision RISC-V CPU support \cite{reggiani2023mixgemm, fornt2025mixgemm}. These numbers support the same architectural conclusion as TinyNPU's kernel rows: low-bit arithmetic is valuable when the kernel boundary is tight, but the full-program result depends on the surrounding data-layout and runtime costs.
+
 \subsection{Trained Model Wall-Clock Comparison}
 \label{sec:trained-model-wallclock}
 
@@ -966,6 +977,8 @@ This appendix records the activation functions implemented in the staged PPU dat
 \end{algorithmic}
 \end{algorithm}
 
+This activation is best viewed as a hardware-calibrated clipped-sigmoid output, not as the same gate used by hard-GELU. The hard-GELU path below already uses the MobileNetV3-style \(\mathrm{clip}(\cdot+3,0,6)/6\) gate because that gate is multiplied by \(x\) and stays in the activation scale domain. The standalone sigmoid opcode has a different contract: it must produce a quantized output value directly. Its result is not multiplied by \(x\), and it must map into the signed output range selected by the instruction. The integer window \(B=8\cdot2^k\) therefore lets the compiler calibrate where the ramp sits in the post-rescale integer domain, while the \(q_{max}\) term maps the result directly into INT4, INT8, or INT16 output space without an additional floating-point normalization step.
+
 \begin{figure}[H]
     \centering
     \includegraphics[width=0.96\linewidth]{figures/iszero_sigmoid_calibrated_comparison.pdf}
@@ -1006,6 +1019,12 @@ This appendix records the activation functions implemented in the staged PPU dat
 \State \Return $y$
 \end{algorithmic}
 \end{algorithm}
+
+The hard-GELU form is the place where the MobileNetV3 analogy is most direct. Standard GELU can be approximated as \(x\cdot\sigma(1.702x)\). The TinyNPU PPU replaces that sigmoid gate with a clipped affine gate, giving the integer-domain equivalent of
+\[
+    y \approx x \cdot \frac{\mathrm{clip}(1.703x + 3, 0, 6)}{6}.
+\]
+This matches the deployment idea behind MobileNetV3 hard-swish, but with the slope chosen to approximate GELU's sigmoid gate rather than swish's \(\sigma(x)\) gate.
 
 \begin{figure}[H]
     \centering

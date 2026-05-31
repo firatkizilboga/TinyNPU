@@ -21,9 +21,9 @@ module cv32e40p_tinynpu_synth_top (
   localparam logic [31:0] NPU_SHARED_UB_BASE_ADDR = 32'h3100_0000;
   localparam logic [31:0] NPU_SHARED_IM_BASE_ADDR = 32'h3200_0000;
   localparam int unsigned NPU_MMIO_SIZE = 32;
-  localparam int unsigned NPU_SHARED_WORDS = 61440;
+  localparam int unsigned NPU_SHARED_WORDS = `BUFFER_DEPTH;
   localparam int unsigned NPU_SHARED_SIZE = NPU_SHARED_WORDS * 16;
-  localparam logic [15:0] NPU_IM_BASE_WORD_ADDR = 16'hF000;
+  localparam logic [15:0] NPU_IM_BASE_WORD_ADDR = `IM_BASE_ADDR;
 
   logic        instr_req;
   logic        instr_rvalid_q;
