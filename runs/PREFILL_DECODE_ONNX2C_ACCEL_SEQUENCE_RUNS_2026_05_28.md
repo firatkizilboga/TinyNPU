@@ -81,7 +81,7 @@ datapath or UB/IM sizes. The d288 two-token images below were built with
 | QGPT2 ONNX2C | `d288 h32 nh9 nkv9 f288 T8 decode_tokens=2` | `runs/onnx2c_qgpt2_prefill_decode2_d288_t8_16m_sequence_10h_20260528.log` | `EXIT SUCCESS`; total 41,802,669 cycles, prefill 33,371,930 cycles, decode0 4,211,679 cycles, decode1 4,217,823 cycles, checksum -116.647812. |
 | QGPT2 accelerated shared-cache | `d288 h32 nh9 nkv9 f288 T8 decode_tokens=2` | `runs/accel_qgpt2_prefill_decode2_d288_t8_16m_sequence_20260529.log` | `EXIT SUCCESS`; total 11,324,259 cycles, prefill 6,160,032 cycles, prefill-to-decode handoff 1 cycle, decode0 2,570,421 cycles, decode0-to-decode1 handoff 1 cycle, decode1 2,576,148 cycles. Compared against ONNX2C, this is a 3.69x e2e cycle win and a 5.42x prefill cycle win. |
 | QLlama ONNX2C | `d288 h32 nh9 nkv3 f288 T8 decode_tokens=2` | `runs/onnx2c_qllama_prefill_decode2_d288_t8_16m_sequence_long_20260529.log` | `EXIT SUCCESS`; total 39,139,676 cycles, prefill 31,248,397 cycles, decode0 3,940,790 cycles, decode1 3,949,251 cycles, checksum -41.8177147. |
-| QLlama accelerated shared-cache | `d288 h32 nh9 nkv3 f288 T8 decode_tokens=2` | `runs/accel_qllama_prefill_decode2_d288_t8_16m_sequence_rerun_20260529.log` | `EXIT SUCCESS`; total 12,138,556 cycles, prefill 6,940,965 cycles, prefill-to-decode handoff 1 cycle, decode0 2,587,651 cycles, decode0-to-decode1 handoff 1 cycle, decode1 2,592,178 cycles. Compared against ONNX2C, this is a 3.22x e2e cycle win and a 4.50x prefill cycle win. With 66.0 MHz CPU-only and 50.17 MHz CPU+NPU timing, this is a 2.45x e2e wall-clock win and a 3.42x prefill wall-clock win. |
+| QLlama accelerated shared-cache | `d288 h32 nh9 nkv3 f288 T8 decode_tokens=2` | `runs/accel_qllama_prefill_decode2_d288_t8_16m_sequence_rerun_20260529.log` | `EXIT SUCCESS`; total 12,138,556 cycles, prefill 6,940,965 cycles, prefill-to-decode handoff 1 cycle, decode0 2,587,651 cycles, decode0-to-decode1 handoff 1 cycle, decode1 2,592,178 cycles. Compared against ONNX2C, this is a 3.22x e2e cycle win and a 4.50x prefill cycle win. With 66.0 MHz CPU-only and 49.00 MHz CPU+NPU timing, this is a 2.39x e2e wall-clock win and a 3.34x prefill wall-clock win. |
 
 ## Sequence Runner Debug Notes
 
@@ -133,22 +133,22 @@ should not be used for performance numbers.
 ## Wall-Clock Conversion For Completed Two-Decode Rows
 
 Wall time uses the current routed timing assumptions from the report:
-ONNX2C CPU-only at `66.0 MHz`, integrated CPU+NPU at `50.17 MHz`.
+ONNX2C CPU-only at `66.0 MHz`, integrated CPU+NPU at `49.00 MHz`.
 
 | Workload | ONNX2C wall | CPU+NPU wall | Wall speedup | Notes |
 | --- | ---: | ---: | ---: | --- |
-| QLlama shared-cache `d128 h16 nh8 nkv4 f128 T8 decode_tokens=2` e2e | 128.80 ms | 117.55 ms | 1.10x | Full prefill + decode0 + decode1 remains a wall-clock win after the lower CPU+NPU clock. |
-| QLlama shared-cache `d128` prefill | 102.73 ms | 67.42 ms | 1.52x | Prefill is the useful section-level win. |
-| QLlama shared-cache `d128` decode0 | 12.98 ms | 24.89 ms | 0.52x | Decode alone loses. |
-| QLlama shared-cache `d128` decode1 | 13.07 ms | 24.89 ms | 0.53x | Decode alone loses. |
-| QGPT2 shared-cache `d128 h16 nh8 nkv8 f128 T8 decode_tokens=2` e2e | 131.95 ms | 105.16 ms | 1.25x | Stronger full-sequence wall-clock win than QLlama at the same `d128` scale. |
-| QGPT2 shared-cache `d128` prefill | 105.18 ms | 58.12 ms | 1.81x | Prefill is the useful section-level win. |
-| QGPT2 shared-cache `d128` decode0 | 13.35 ms | 23.31 ms | 0.57x | Decode alone loses. |
-| QGPT2 shared-cache `d128` decode1 | 13.40 ms | 23.37 ms | 0.57x | Decode alone loses. |
-| QLlama shared-cache `d288 h32 nh9 nkv3 f288 T8 decode_tokens=2` e2e | 593.03 ms | 241.95 ms | 2.45x | Full prefill + decode0 + decode1 is a strong wall-clock win at the larger scale. |
-| QLlama shared-cache `d288` prefill | 473.46 ms | 138.35 ms | 3.42x | Prefill is the dominant win. |
-| QLlama shared-cache `d288` decode0 | 59.71 ms | 51.58 ms | 1.16x | Decode becomes a modest wall-clock win at this scale. |
-| QLlama shared-cache `d288` decode1 | 59.84 ms | 51.67 ms | 1.16x | Decode remains a modest wall-clock win. |
+| QLlama shared-cache `d128 h16 nh8 nkv4 f128 T8 decode_tokens=2` e2e | 128.80 ms | 120.35 ms | 1.07x | Full prefill + decode0 + decode1 remains a wall-clock win after the lower CPU+NPU clock. |
+| QLlama shared-cache `d128` prefill | 102.73 ms | 69.03 ms | 1.49x | Prefill is the useful section-level win. |
+| QLlama shared-cache `d128` decode0 | 12.98 ms | 25.48 ms | 0.51x | Decode alone loses. |
+| QLlama shared-cache `d128` decode1 | 13.07 ms | 25.48 ms | 0.51x | Decode alone loses. |
+| QGPT2 shared-cache `d128 h16 nh8 nkv8 f128 T8 decode_tokens=2` e2e | 131.95 ms | 107.67 ms | 1.23x | Stronger full-sequence wall-clock win than QLlama at the same `d128` scale. |
+| QGPT2 shared-cache `d128` prefill | 105.18 ms | 59.51 ms | 1.77x | Prefill is the useful section-level win. |
+| QGPT2 shared-cache `d128` decode0 | 13.35 ms | 23.87 ms | 0.56x | Decode alone loses. |
+| QGPT2 shared-cache `d128` decode1 | 13.40 ms | 23.93 ms | 0.56x | Decode alone loses. |
+| QLlama shared-cache `d288 h32 nh9 nkv3 f288 T8 decode_tokens=2` e2e | 593.03 ms | 247.73 ms | 2.39x | Full prefill + decode0 + decode1 is a strong wall-clock win at the larger scale. |
+| QLlama shared-cache `d288` prefill | 473.46 ms | 141.65 ms | 3.34x | Prefill is the dominant win. |
+| QLlama shared-cache `d288` decode0 | 59.71 ms | 52.81 ms | 1.13x | Decode becomes a modest wall-clock win at this scale. |
+| QLlama shared-cache `d288` decode1 | 59.84 ms | 52.90 ms | 1.13x | Decode remains a modest wall-clock win. |
 
 The clean smoke also validated two runner fixes needed before larger
 measurements:
