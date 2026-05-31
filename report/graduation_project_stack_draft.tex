@@ -265,33 +265,16 @@ The system is described here as one CV32E40P-plus-accelerator platform with four
 \subsection{System Overview}
 At a high level, a model starts either as a quantized PyTorch module or as a compiler-ready artifact produced by the quantization path. The compiler traces the model, partitions it into accelerator-supported regions and explicit scalar operations owned by the core, lowers legal regions into TinyNPU instruction and buffer images, and packages the result as a compiled artifact. The firmware runtime on the CV32E40P core then executes that artifact step by step. Inside the hardware, the unified buffer, streamers, systolic array, and post-processing unit implement the matrix-style execution path.
 
-The firmware-core/accelerator contract has two parts. MMIO commands launch execution and expose status. Bulk instruction and tensor payloads can be moved through the same MMIO memory-service path, or through a wider shared-buffer window when the integration provides it. In either case, the software contract is the same: logical tensors must be assigned physical packed layouts, unsupported operations must stay as explicit scalar operations on the core, and every accelerator segment must receive the instruction and buffer images expected by the RTL. The rest of this section follows that order: hardware first, then model preparation, then compilation, then runtime execution and verification.
+The firmware-core/accelerator contract has two parts. MMIO commands launch execution and expose status. Bulk instruction and tensor payloads can be moved through the same MMIO memory-service path, or through a wider shared-buffer window when the integration provides it. In either case, the software contract is the same: logical tensors must be assigned physical packed layouts, unsupported operations must stay as explicit scalar operations on the core, and every accelerator segment must receive the instruction and buffer images expected by the RTL. The rest of this section organizes the system through the template model views: data model, structural model, and dynamic model.
 
-\subsection{Accelerator Hardware}
-The TinyNPU hardware is organized around a control path and a compute path. The control path sequences instructions and services the local control interface. The compute path consists of the unified buffer, streamer logic, a parameterized $N \times N$ output-stationary systolic array, and the post-processing unit.
+\subsection{Data Model}
 
-The baseline local control contract is MMIO. Through this command path, the CV32E40P firmware can launch execution, read status, and transfer memory payloads one accelerator word at a time. That path is portable because it only assumes the standard control registers are present.
-
-When the integration provides it, the same UB and IM storage can also be exposed through a wider shared-buffer window. This path is faster because it bypasses the MMIO memory-service loop for bulk preload and readback traffic. The arbitration policy is intentionally simple: it is time-multiplexed rather than fully concurrent. The firmware may use the shared window while the accelerator is idle, and shared access is blocked while the accelerator is busy. This avoids adding a more complex concurrent memory arbiter while still capturing the main performance benefit of direct buffer access.
-
-\begin{figure}[H]
-    \centering
-    \includegraphics[width=\textwidth]{diagrams/hardware_architecture_graphviz.pdf}
-    \caption{Top-level TinyNPU hardware architecture.}
-    \label{fig:hardware-architecture}
-\end{figure}
-
-Figure~\ref{fig:hardware-architecture} shows the top-level organization. The compute path is a matrix path: the unified buffer feeds activation and weight streamers, the streamers feed the systolic array, and drained accumulators pass through the PPU before returning to the buffer. The figure also shows the two local access paths used by firmware. MMIO is the universal command and memory-service interface, while the shared-buffer window is the faster bulk path used for instruction images, tensor preload, and readback when the accelerator is idle. Boundary quantization and dequantization are handled by the runtime/compiler contract rather than by a separate hardware transform instruction.
-
-\subsubsection{Unified Buffer and Physical Roles}
-
+\subsubsection{Tensor Roles and Matrix Layouts}
 The unified buffer is the central staging memory of the datapath. Architecturally it provides one activation-side read path, one weight-side read path, and a masked write path for packed output updates. This organization keeps both feed directions active at the same time while preserving subword updates for INT8 and INT4 outputs.
 
 Within that buffer, the names A, B, C, and BIAS refer to physical roles in the datapath. A is the left-fed operand: its tiles are packed so that each unified-buffer row can launch one horizontal activation vector into the array boundary. B is the top-fed operand: its tiles are packed for the vertical weight stream. C is the normal output layout: it is compact, easy to read back, and suitable for final outputs, verification, and tensors that return to firmware before being reused. BIAS is a separate region consumed only by the PPU. These names therefore describe how data is stored and consumed by the hardware pipeline, not whether a tensor was logically an activation, a weight, or an intermediate result in the original model.
 
 The physical layouts are intentionally different. A layout is feed-oriented: each unified-buffer word represents one activation-side feed step, with one 16-bit lane per array row and one, two, or four packed \(K\)-elements per lane for INT16, INT8, or INT4. B layout is similar on the weight side, with each word representing one top-fed step into the array columns. C layout is writeback-oriented instead: it stores output tiles compactly by output column, and at lower precision it packs several logical results into subword slots. C is still useful as the default result layout, but it is not automatically a good input layout for the next layer. When a result must feed another accelerator matmul without scalar layout repair on the core, the compiler selects an A-compatible writeback layout instead.
-
-\subsubsection{Matrix Tile Layouts}
 
 For a matrix multiplication \(C = A \times B\), the compiler divides the logical matrices into \(S \times S\) array tiles, where \(S=8\) in the measured design. Let \(m_t\), \(k_t\), and \(n_t\) be the tile indices along the \(M\), \(K\), and \(N\) dimensions. Let \(p\) be the number of packed scalar values inside one 16-bit lane: \(p=1\) for INT16, \(p=2\) for INT8, and \(p=4\) for INT4. Each unified-buffer word is 128 bits and contains eight 16-bit lanes.
 
@@ -336,43 +319,7 @@ This is why packed low-precision C writes need a bit mask: a single physical wor
     \end{tabularx}
 \end{table}
 
-\subsubsection{Systolic Array and Skewers}
-
-The array is output-stationary: packed activation words enter from the left edge and move one PE to the right per cycle, packed weight words enter from the top edge and move one PE downward per cycle, and each PE keeps its output accumulator stationary for the full reduction along the $K$ dimension. Only after the last $K$ contribution has been consumed does the array switch into drain mode and shift those accumulated results downward into the post-processing unit. This choice fits the dominant tiled-GEMM workload well because it keeps the reduction local to the PE and avoids repeatedly moving partial sums through the buffer system during the $K$ loop.
-
-The streamer logic between the unified buffer and the array provides the timing skew that makes the systolic wavefront legal. On the activation side, row \(i\) is delayed before it enters the left edge; on the weight side, column \(j\) is delayed before it enters the top edge. The values themselves do not change. What changes is when they enter the array. That timing offset creates the diagonal wavefront expected by the schedule, so the activation and weight pieces that belong together meet at the correct PE in the correct cycle. A tile therefore executes in three phases: feed the packed $K$-steps into the array, allow the wavefront to fill across the remaining diagonals, and then drain the stationary accumulators.
-
-\subsubsection{Processing Element}
-
-The processing element is where mixed precision becomes concrete. Each PE consumes one packed activation word and one packed weight word. In INT16 mode that produces one signed multiply, in INT8 mode two byte multiplies, and in INT4 mode four nibble multiplies. The products are summed and accumulated into a 64-bit stationary register.
-
-One practical implementation detail is that the vertical PE-to-PE link is wider than the packed weight word used during feed. The reason is reuse. During the compute phase the array only needs the packed incoming weight value, but during drain the same physical column path is reused to move full accumulators toward the PPU. Reusing one wider column link keeps the PE interface uniform across compute and drain instead of introducing a second dedicated drain network.
-
-\begin{figure}[H]
-    \centering
-    \includegraphics[width=0.88\textwidth,height=0.64\textheight,keepaspectratio]{diagrams/pe_internals_graphviz.pdf}
-    \caption{Processing-element I/O in compute and drain modes.}
-    \label{fig:pe-internals}
-\end{figure}
-
-\subsubsection{Post-Processing Unit}
-
-The post-processing unit (PPU) is an \(N\)-lane row processor backed by an internal \(N \times N\) tile buffer. During drain, it receives one accumulator row vector per cycle from the bottom of the systolic array, processes the row in parallel, and stores the quantized result into its internal buffer. After the full tile has been captured, it writes the buffered rows back to the unified buffer.
-
-The PPU is a sequenced pipeline, not a single combinational tail after the array. Drain capture, bias/rescale/activation, packed-lane formation, and unified-buffer writeback are separated into controlled phases. The control unit stalls the surrounding execution state until the PPU reports completion, so the architectural result is still one completed matmul tile even though the post-processing work spans multiple cycles internally. This staging is important for timing because the original operation combines wide accumulation, fixed-point rescale, activation selection, saturation, and packed writeback.
-
-Before drain begins, the PPU loads the 32-bit bias vector for the output columns. For each drained row it then evaluates the same requantization pipeline lane by lane:
-\[
-q = \mathrm{clip}_{p}\left(\mathrm{act}\left(\left((acc + bias) \times multiplier + 2^{shift-1}\right) \gg shift\right)\right)
-\]
-where \(acc\) is the 64-bit drained accumulator, \(bias\) is a sign-extended 32-bit bias term, \(multiplier\) is the 16-bit fixed-point requantization factor, \(\gg\) is an arithmetic right shift, \(\mathrm{act}(\cdot)\) selects the configured post-processing nonlinearity, and \(\mathrm{clip}_{p}(\cdot)\) saturates to the signed range of the selected output precision. The PE and drain paths carry 64-bit accumulators; inside the staged PPU, the bias-added value is clamped into the narrower internal activation datapath before fixed-point multiplication. The compiler enforces the hardware ABI for this path: matmul rescale shifts are limited to 0--63, fused clipped-sigmoid shifts are limited to 0--29, and the hard-GELU input-domain shift is limited to 0--15. These limits keep the variable-shift hardware bounded and make the quantization configuration part of the compile-time validity check. The activation stage supports plain ReLU, a clipped affine integer sigmoid approximation, and a hardware-friendly hard-GELU approximation used when GELU is lowered into the accelerator \cite{hendrycks2016gelu,kim2021ibert}. Concretely, the datapath performs bias addition, fixed-point multiplication, round-to-nearest when \(shift > 0\), the selected activation, and final saturation to INT16, INT8, or INT4.
-
-Writeback is also precision-dependent. After the tile buffer has been filled, the ordinary C-layout path emits one buffered row per writeback cycle. For INT16 output, each 16-bit lane is written back directly. For INT8 and INT4 output, the PPU shifts the quantized value into the byte or nibble slot selected by the packed write offset, and the unified buffer applies a bit mask so that only that subword is written while sibling tiles in the same physical word are preserved. The control unit derives this packed write offset from the output tile index: two logical M-tiles share one physical word for INT8, and four logical M-tiles share one physical word for INT4.
-
-The PPU therefore supports several practical writeback forms. For firmware-visible outputs it emits the ordinary C-oriented packed result layout. For internal chained tensors it can instead emit an A-compatible layout so the next accelerator consumer can read the result directly without a scalar layout conversion on the core. The RTL also contains INT16 K-cache and V-cache append modes for transformer-shaped experiments. In the Llama-like lowering, V-cache append can be selected directly after the V projection. K-cache update is different because RoPE is always executed on the core in this design, and the rotated key is what must be stored. Appending the unrotated key directly from the accelerator would force firmware to read that cache entry back, apply RoPE, and rewrite the same cache location through the shared buffer. That round trip defeats the purpose of the append mode, so the compiler keeps the Llama-like K-cache update as an explicit scalar cache step after RoPE. The compiler selects the required form when it lowers a segment.
-
-\subsubsection{Control and Instruction Format}
-
+\subsubsection{Instruction Format}
 This behavior is programmed through a fixed-width 256-bit instruction format in instruction memory. The \texttt{MATMUL} instruction encodes base addresses, tile counts, PPU configuration, output-layout selection, cache writeback modes, and B-side read modes. The control unit therefore fetches one coarse-grained instruction for a tiled matrix-multiplication region and then steps through clear, feed, wait, drain, bias-load, and writeback states internally.
 
 \begin{table}[H]
@@ -471,7 +418,7 @@ Instruction execution is paired with a small MMIO command interface on the firmw
     \end{tabularx}
 \end{table}
 
-\subsection{Quantizer and Model Preparation}
+\subsubsection{Quantization Configuration}
 The quantization path exists to prepare trained models into coherent compiler-ready artifacts. Its goal is practical rather than open-ended: make weights, activations, ranges, signedness, and mixed-precision choices explicit enough that the compiler can lower the model without losing numerical coherence.
 
 This subsystem also includes the mixed-precision helper. It is not intended to solve global bit allocation for arbitrary models. It provides a one-layer-at-a-time sensitivity workflow that can generate usable mixed-precision configurations, recalibrate them, and pass them to the compiler-ready conversion path. Users can also provide their own quantization configuration if they already have a better assignment for a model.
@@ -559,11 +506,68 @@ The sweep shows the role of the mixed-precision stack more clearly than the bina
 
 The role of this subsystem is to bridge trained or quantized models into forms that the TinyNPU compiler can lower without losing track of numerical meaning. It supplies the weights, scales, multipliers, and shifts used in later RTL measurements.
 
-\subsection{Compiler}
+\subsection{Structural Model}
+
+\subsubsection{Accelerator Hardware}
+The TinyNPU hardware is organized around a control path and a compute path. The control path sequences instructions and services the local control interface. The compute path consists of the unified buffer, streamer logic, a parameterized $N \times N$ output-stationary systolic array, and the post-processing unit.
+
+The baseline local control contract is MMIO. Through this command path, the CV32E40P firmware can launch execution, read status, and transfer memory payloads one accelerator word at a time. That path is portable because it only assumes the standard control registers are present.
+
+When the integration provides it, the same UB and IM storage can also be exposed through a wider shared-buffer window. This path is faster because it bypasses the MMIO memory-service loop for bulk preload and readback traffic. The arbitration policy is intentionally simple: it is time-multiplexed rather than fully concurrent. The firmware may use the shared window while the accelerator is idle, and shared access is blocked while the accelerator is busy. This avoids adding a more complex concurrent memory arbiter while still capturing the main performance benefit of direct buffer access.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{diagrams/hardware_architecture_graphviz.pdf}
+    \caption{Top-level TinyNPU hardware architecture.}
+    \label{fig:hardware-architecture}
+\end{figure}
+
+Figure~\ref{fig:hardware-architecture} shows the top-level organization. The compute path is a matrix path: the unified buffer feeds activation and weight streamers, the streamers feed the systolic array, and drained accumulators pass through the PPU before returning to the buffer. The figure also shows the two local access paths used by firmware. MMIO is the universal command and memory-service interface, while the shared-buffer window is the faster bulk path used for instruction images, tensor preload, and readback when the accelerator is idle. Boundary quantization and dequantization are handled by the runtime/compiler contract rather than by a separate hardware transform instruction.
+
+\subsubsection{Systolic Array and Processing Element}
+The array is output-stationary: packed activation words enter from the left edge and move one PE to the right per cycle, packed weight words enter from the top edge and move one PE downward per cycle, and each PE keeps its output accumulator stationary for the full reduction along the $K$ dimension. Only after the last $K$ contribution has been consumed does the array switch into drain mode and shift those accumulated results downward into the post-processing unit. This choice fits the dominant tiled-GEMM workload well because it keeps the reduction local to the PE and avoids repeatedly moving partial sums through the buffer system during the $K$ loop.
+
+The streamer logic between the unified buffer and the array provides the timing skew that makes the systolic wavefront legal. On the activation side, row \(i\) is delayed before it enters the left edge; on the weight side, column \(j\) is delayed before it enters the top edge. The values themselves do not change. What changes is when they enter the array. That timing offset creates the diagonal wavefront expected by the schedule, so the activation and weight pieces that belong together meet at the correct PE in the correct cycle. A tile therefore executes in three phases: feed the packed $K$-steps into the array, allow the wavefront to fill across the remaining diagonals, and then drain the stationary accumulators.
+
+The processing element is where mixed precision becomes concrete. Each PE consumes one packed activation word and one packed weight word. In INT16 mode that produces one signed multiply, in INT8 mode two byte multiplies, and in INT4 mode four nibble multiplies. The products are summed and accumulated into a 64-bit stationary register.
+
+One practical implementation detail is that the vertical PE-to-PE link is wider than the packed weight word used during feed. The reason is reuse. During the compute phase the array only needs the packed incoming weight value, but during drain the same physical column path is reused to move full accumulators toward the PPU. Reusing one wider column link keeps the PE interface uniform across compute and drain instead of introducing a second dedicated drain network.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.88\textwidth,height=0.64\textheight,keepaspectratio]{diagrams/pe_internals_graphviz.pdf}
+    \caption{Processing-element I/O in compute and drain modes.}
+    \label{fig:pe-internals}
+\end{figure}
+
+\subsubsection{Post-Processing Unit}
+The post-processing unit (PPU) is an \(N\)-lane row processor backed by an internal \(N \times N\) tile buffer. During drain, it receives one accumulator row vector per cycle from the bottom of the systolic array, processes the row in parallel, and stores the quantized result into its internal buffer. After the full tile has been captured, it writes the buffered rows back to the unified buffer.
+
+The PPU is a sequenced pipeline, not a single combinational tail after the array. Drain capture, bias/rescale/activation, packed-lane formation, and unified-buffer writeback are separated into controlled phases. The control unit stalls the surrounding execution state until the PPU reports completion, so the architectural result is still one completed matmul tile even though the post-processing work spans multiple cycles internally. This staging is important for timing because the original operation combines wide accumulation, fixed-point rescale, activation selection, saturation, and packed writeback.
+
+Before drain begins, the PPU loads the 32-bit bias vector for the output columns. For each drained row it then evaluates the same requantization pipeline lane by lane:
+\[
+q = \mathrm{clip}_{p}\left(\mathrm{act}\left(\left((acc + bias) \times multiplier + 2^{shift-1}\right) \gg shift\right)\right)
+\]
+where \(acc\) is the 64-bit drained accumulator, \(bias\) is a sign-extended 32-bit bias term, \(multiplier\) is the 16-bit fixed-point requantization factor, \(\gg\) is an arithmetic right shift, \(\mathrm{act}(\cdot)\) selects the configured post-processing nonlinearity, and \(\mathrm{clip}_{p}(\cdot)\) saturates to the signed range of the selected output precision. The PE and drain paths carry 64-bit accumulators; inside the staged PPU, the bias-added value is clamped into the narrower internal activation datapath before fixed-point multiplication. The compiler enforces the hardware ABI for this path: matmul rescale shifts are limited to 0--63, fused clipped-sigmoid shifts are limited to 0--29, and the hard-GELU input-domain shift is limited to 0--15. These limits keep the variable-shift hardware bounded and make the quantization configuration part of the compile-time validity check. The activation stage supports plain ReLU, a clipped affine integer sigmoid approximation, and a hardware-friendly hard-GELU approximation used when GELU is lowered into the accelerator \cite{hendrycks2016gelu,kim2021ibert}. Concretely, the datapath performs bias addition, fixed-point multiplication, round-to-nearest when \(shift > 0\), the selected activation, and final saturation to INT16, INT8, or INT4.
+
+Writeback is also precision-dependent. After the tile buffer has been filled, the ordinary C-layout path emits one buffered row per writeback cycle. For INT16 output, each 16-bit lane is written back directly. For INT8 and INT4 output, the PPU shifts the quantized value into the byte or nibble slot selected by the packed write offset, and the unified buffer applies a bit mask so that only that subword is written while sibling tiles in the same physical word are preserved. The control unit derives this packed write offset from the output tile index: two logical M-tiles share one physical word for INT8, and four logical M-tiles share one physical word for INT4.
+
+The PPU therefore supports several practical writeback forms. For firmware-visible outputs it emits the ordinary C-oriented packed result layout. For internal chained tensors it can instead emit an A-compatible layout so the next accelerator consumer can read the result directly without a scalar layout conversion on the core. The RTL also contains INT16 K-cache and V-cache append modes for transformer-shaped experiments. In the Llama-like lowering, V-cache append can be selected directly after the V projection. K-cache update is different because RoPE is always executed on the core in this design, and the rotated key is what must be stored. Appending the unrotated key directly from the accelerator would force firmware to read that cache entry back, apply RoPE, and rewrite the same cache location through the shared buffer. That round trip defeats the purpose of the append mode, so the compiler keeps the Llama-like K-cache update as an explicit scalar cache step after RoPE. The compiler selects the required form when it lowers a segment.
+
+\subsubsection{Compiler}
 The compiler converts model structure into a mixed execution structure. Rather than generating a monolithic accelerator-only program, it constructs an \texttt{ExecutionPlan} whose steps are typed as \texttt{NpuSegment}, \texttt{ScalarOp}, or \texttt{VerifyTensor}. A scalar operation is owned by the CV32E40P core: it is part of the compiled plan, but it is not executed by the matrix accelerator. This keeps unsupported behavior and verification points explicit instead of hiding them inside an accelerator-only view.
 
 The Python-side intermediate representation has two layers. The first layer records tensors with shape, dtype, storage role, and metadata such as cache role or view relationship. The second layer records operations and execution steps. Matmul-like operations carry the operands, bias tensor, precision, rescale multiplier and shift, activation selector, and required output layout. Scalar operations represent work intentionally executed on the core, such as normalization, softmax, reshape, cache scatter, or verification. This representation is semantic enough for partitioning and validation, but still close enough to the hardware contract that lowering can emit exact instruction fields and buffer layouts.
 
+\subsubsection{Runtime and Verification}
+The deployed firmware runtime is linked into the generated CV32E40P program. It executes the compiled plan as a mixed core/accelerator loop. For each step, it either launches an accelerator segment, executes a required scalar operation on the core, or checks an expected tensor. Scalar core work is therefore visible both in the plan and in the benchmark accounting.
+
+Verification is built into this same path. Compiler-owned expected tensors can be checked during execution, and the runtime can record RTL cycle counts for accelerator run windows separately from software-side overhead.
+
+\subsection{Dynamic Model}
+
+\subsubsection{Compilation Flow}
 Listing~\ref{lst:compiler-ir-example} shows the two practical ways to enter the compiler. A model can come from a small quantized PyTorch module, or it can be assembled directly with the IR builder when the workload is already known at the tensor/operation level. The compiler does not require the whole model to be accelerator-supported. It lowers the legal matrix regions into accelerator segments and keeps the remaining operations as explicit scalar operations owned by the core.
 
 \begin{lstlisting}[language=Python,caption={Example PyTorch input and equivalent IR-builder construction.},label={lst:compiler-ir-example}]
@@ -602,9 +606,7 @@ The compiler is responsible for more than emitting instruction fields. It decide
 
 Memory planning makes those execution boundaries explicit in the buffer layout. The unified buffer is divided into a static zone and a dynamic zone: weights and biases receive globally assigned packed addresses that can be shared across segments, while activations and outputs are placed in a per-segment dynamic region with liveness-based reuse. The planner also treats layout as a real physical requirement. If a tensor must be emitted in an A-compatible layout for an internal chained consumer, that requirement is carried explicitly instead of being inferred informally.
 
-\subsection{Runtime and Verification}
-The deployed firmware runtime is linked into the generated CV32E40P program. It executes the compiled plan as a mixed core/accelerator loop. For each step, it either launches an accelerator segment, executes a required scalar operation on the core, or checks an expected tensor. Scalar core work is therefore visible both in the plan and in the benchmark accounting.
-
+\subsubsection{Runtime Execution Flow}
 The generated program is therefore closer to a small bytecode interpreter than to a hand-written benchmark. The compiler emits constant C tables into the program image: tensor descriptors, unified-buffer preload images, instruction-memory preload images, accelerator segment descriptors, scalar-operation descriptors, verification descriptors, and a top-level operation list. At runtime, the firmware walks that operation list in order. Preload entries copy static tensor and instruction images into accelerator-visible memory. Segment entries stage live input tensors into the required physical layout, start the accelerator at the segment's instruction-memory address, wait for completion, and read selected outputs back into runtime tensors. Scalar-operation entries call the corresponding helper on the CV32E40P core, for example normalization, softmax, reshape, or cache update. Verification entries compare a runtime tensor against compiler-owned expected data.
 
 This structure is important because it makes the execution boundary measurable. The accelerator instruction stream controls only the tiled matrix region inside one segment. The firmware schedule around it accounts for the work needed to make that segment usable in a full program: tensor binding, preload, staging, launch, readback, scalar core operations, and optional verification. The same runtime can therefore execute a pure scalar-core plan, a mostly accelerator-backed plan, or a mixed attention-style plan without changing the hardware interface.
@@ -620,9 +622,7 @@ The firmware runtime also owns repeated-run behavior. It can preserve reusable s
 
 Figure~\ref{fig:runtime-state} shows this firmware loop. For accelerator segments, the runtime packs logical tensors into the physical layouts expected by the datapath, stages data into the unified buffer and instruction memory, starts the accelerator, waits for completion, and reads the outputs back. Output-layout support lets chained internal tensors be written directly in the layout needed by the next accelerator consumer.
 
-Verification is built into this same path. Compiler-owned expected tensors can be checked during execution, and the runtime can record RTL cycle counts for accelerator run windows separately from software-side overhead.
-
-\subsection{GPT- and Llama-Like Blocks}
+\subsubsection{Transformer Block Execution}
 The transformer experiments use reduced-dimensional decoder blocks rather than full pretrained language models. Their purpose is to stress the compiler/runtime boundary on attention-shaped workloads: normalization, attention score formation, softmax, key/value cache handling, residual connections, and feed-forward sublayers. These blocks are therefore structural tests of the system contract, not language-quality benchmarks.
 
 The Llama-like block uses RMSNorm, grouped-query attention, scalar RoPE on Q/K, an attention output projection, and a SwiGLU feed-forward tail. Dense projections are lowered to INT16 accelerator matmuls: Q/K/V projection, QK score matmul, probability-times-value matmul, attention output projection, gate/up projections, and down projection. The core handles the non-matrix pieces: RMSNorm, RoPE, softmax, residual adds, SiLU, elementwise feed-forward multiplication, and the quantize/dequantize boundaries around those operations.
