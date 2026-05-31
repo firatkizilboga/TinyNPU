@@ -320,10 +320,11 @@ module ppu (
       if (capture_en) begin
         row_we_s0 <= `ARRAY_SIZE'(1) << ((`ARRAY_SIZE - 1) - ppu_cycle_idx);
         shift_s0 <= ppu_effective_shift(shift);
-        sigmoid_shift_s0 <= ppu_effective_sigmoid_shift(shift);
-        // INT16 sigmoid uses qmax << (shift + 4). With a 48-bit activation
-        // datapath, shift=29 is the largest value that still fits.
-        sigmoid_shift_valid_s0 <= (shift <= 8'd29);
+        sigmoid_shift_s0 <= ppu_effective_sigmoid_shift(h_gelu_x_scale_shift);
+        // Sigmoid uses the activation-domain shift field, not the matmul
+        // requantization shift. This keeps calibrated large requant shifts
+        // legal without widening the activation datapath or adding a stage.
+        sigmoid_shift_valid_s0 <= (h_gelu_x_scale_shift <= 8'd29);
         activation_s0 <= activation;
         h_gelu_x_scale_shift_s0 <= ppu_effective_h_gelu_shift(h_gelu_x_scale_shift);
         precision_s0 <= precision;

@@ -648,8 +648,23 @@ def test_compile_plan_fuses_layout_restore_sigmoid_dequantize_tail():
 def test_fused_sigmoid_shift_contract_matches_ppu():
     assert supports_fused_activation("sigmoid", shift=29)
     assert not supports_fused_activation("sigmoid", shift=30)
+    assert supports_fused_activation("sigmoid", shift=36, h_gelu_x_scale_shift=10)
     assert supports_fused_activation("h_gelu", shift=30)
     assert supports_fused_activation(None, shift=30)
+
+
+def test_fused_sigmoid_uses_activation_scale_shift():
+    golden = GoldenModel()
+    out = golden.matmul(
+        np.array([[-3667]], dtype=np.int16),
+        np.array([[1]], dtype=np.int16),
+        multiplier=1,
+        shift=0,
+        activation="sigmoid",
+        h_gelu_x_scale_shift=10,
+        out_dtype=DType.INT16,
+    )
+    assert int(out[0, 0]) == 9050
 
 
 def test_emit_v2_keeps_npu_intermediate_resident_between_segments():
@@ -1685,8 +1700,8 @@ def test_qgpt2_quantized_reference_float_gap_budget():
 
     assert float(x_norm1_diff.max()) == pytest.approx(0.0009417533874511719, abs=1.0e-9)
     assert float(x_norm1_diff.mean()) == pytest.approx(0.00014864235708955675, abs=1.0e-12)
-    assert float(out_diff.max()) == pytest.approx(91.71893310546875, abs=1.0e-6)
-    assert float(out_diff.mean()) == pytest.approx(17.64895248413086, abs=1.0e-6)
+    assert float(out_diff.max()) == pytest.approx(92.12518310546875, abs=1.0e-6)
+    assert float(out_diff.mean()) == pytest.approx(17.684175491333008, abs=1.0e-6)
 
 
 def test_gpt2_two_block_prefill_decode_reuse_matches_full_sequence():
@@ -2776,4 +2791,3 @@ def test_rope_cos_sin_table_values():
         expected_sin = int(round(np.sin(angle) * Q14))
         assert int(table[i]) == expected_cos, f"cos mismatch at i={i}"
         assert int(table[half + i]) == expected_sin, f"sin mismatch at i={i}"
-

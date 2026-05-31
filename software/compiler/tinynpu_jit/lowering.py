@@ -550,7 +550,11 @@ class SegmentCompiler:
                                 and activation_step.inputs == step.outputs
                                 and next_step.kind == "dequantize"
                                 and next_step.inputs == activation_step.outputs
-                                and supports_fused_activation("sigmoid", shift=segment_op.shift)
+                                and supports_fused_activation(
+                                    "sigmoid",
+                                    shift=segment_op.shift,
+                                    h_gelu_x_scale_shift=segment_op.h_gelu_x_scale_shift,
+                                )
                             ):
                                 segment_op.activation = "sigmoid"
                                 step.outputs[0] = activation_step.outputs[0]

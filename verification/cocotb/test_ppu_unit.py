@@ -195,11 +195,19 @@ async def test_ppu_sigmoid_activation(dut):
     await _reset(dut)
 
     shift = 4
+    sigmoid_shift = 10
     rescaled_inputs = [-128, -64, -1, 0, 1, 64, 128, 256]
     acc_values = [value << shift for value in rescaled_inputs]
 
-    got = await _capture_row0(dut, acc_values, activation=2, multiplier=1, shift=shift)
-    expected = [_ppu_sigmoid(_ppu_rescale(acc, shift=shift), shift=shift) for acc in acc_values]
+    got = await _capture_row0(
+        dut,
+        acc_values,
+        activation=2,
+        multiplier=1,
+        shift=shift,
+        h_gelu_x_scale_shift=sigmoid_shift,
+    )
+    expected = [_ppu_sigmoid(_ppu_rescale(acc, shift=shift), shift=sigmoid_shift) for acc in acc_values]
     assert got == expected
 
 

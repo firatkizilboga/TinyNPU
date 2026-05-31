@@ -92,7 +92,45 @@ def _round_div_signed(numer: int, denom: int) -> int:
     return -int(((-numer) + half) // denom)
 
 
+def _clip_signed(value: int, bits: int) -> int:
+    max_value = (1 << (bits - 1)) - 1
+    min_value = -(1 << (bits - 1))
+    return int(min(max(int(value), min_value), max_value))
+
+
+def _rtl_round_shift_positive(value: int, shift: int) -> int:
+    """Match the current PPU rescale path.
+
+    The RTL adds a positive rounding constant before arithmetic right shift.
+    This is intentionally not symmetric for negative values.
+    """
+
+    if shift <= 0:
+        return int(value)
+    return int((int(value) + (1 << (shift - 1))) >> shift)
+
+
 def h_gelu(x_in: int, *, x_scale_shift: int = 7, slope_num: int = 218, slope_shift: int = 7) -> int:
+    if x_scale_shift < 0:
+        raise ValueError(f"x_scale_shift must be non-negative, got {x_scale_shift}.")
+    if slope_num <= 0:
+        raise ValueError(f"slope_num must be positive, got {slope_num}.")
+    if slope_shift < 0:
+        raise ValueError(f"slope_shift must be non-negative, got {slope_shift}.")
+
+    effective_shift = min(int(x_scale_shift), 15)
+    x_ext = _clip_signed(int(x_in), 16)
+    scale = 1 << effective_shift
+    gate_int = _rtl_round_shift_positive(x_ext * int(slope_num), int(slope_shift)) + 3 * scale
+    gate_int = min(max(gate_int, 0), 6 * scale)
+
+    # RTL replaces division by 6 with round((x * gate) * 10923 / 2**16), then
+    # applies the configured scale shift.
+    div6 = _rtl_round_shift_positive(x_ext * gate_int * 10923, 16)
+    return _clip_signed(_round_shift_signed(div6, effective_shift), 16)
+
+
+def h_gelu_ideal(x_in: int, *, x_scale_shift: int = 7, slope_num: int = 218, slope_shift: int = 7) -> int:
     if x_scale_shift < 0:
         raise ValueError(f"x_scale_shift must be non-negative, got {x_scale_shift}.")
     if slope_num <= 0:
@@ -108,6 +146,18 @@ def h_gelu(x_in: int, *, x_scale_shift: int = 7, slope_num: int = 218, slope_shi
     gate_int = min(max(slope_term + three_int, 0), six_int)
 
     return _round_div_signed(int(x_in) * gate_int, six_int)
+
+
+def _clip_for_dtype(value: int, out_dtype: DType) -> int:
+    if out_dtype == DType.INT4:
+        return int(np.clip(value, -8, 7))
+    if out_dtype == DType.INT8:
+        return int(np.clip(value, -128, 127))
+    if out_dtype == DType.INT16:
+        return int(np.clip(value, -32768, 32767))
+    if out_dtype == DType.INT32:
+        return int(np.clip(value, np.iinfo(np.int32).min, np.iinfo(np.int32).max))
+    raise ValueError(f"Unsupported integer dtype {out_dtype}.")
 
 
 class GoldenModel:
@@ -219,6 +269,9 @@ class GoldenModel:
     def h_gelu(self, x_in: int, *, x_scale_shift: int = 7, slope_num: int = 218, slope_shift: int = 7) -> int:
         return h_gelu(x_in, x_scale_shift=x_scale_shift, slope_num=slope_num, slope_shift=slope_shift)
 
+    def h_gelu_ideal(self, x_in: int, *, x_scale_shift: int = 7, slope_num: int = 218, slope_shift: int = 7) -> int:
+        return h_gelu_ideal(x_in, x_scale_shift=x_scale_shift, slope_num=slope_num, slope_shift=slope_shift)
+
     def quantized_mean(
         self,
         value,
@@ -303,21 +356,19 @@ class GoldenModel:
         h_gelu_x_scale_shift: int,
         out_dtype: DType,
     ) -> int:
-        value = np.int64(acc) + np.int64(np.int32(bias))
-        value *= np.int64(multiplier & 0xFFFF)
+        value = _clip_signed(int(acc) + int(np.int32(bias)), 48)
+        value *= int(multiplier & 0xFFFF)
         if shift > 0:
-            value = (value + (np.int64(1) << (shift - 1))) >> shift
+            value = _rtl_round_shift_positive(value, int(shift))
+        value = _clip_signed(value, 16)
         if activation == "relu":
             value = max(0, value)
         elif activation == "sigmoid":
             p_out = 4 if out_dtype == DType.INT4 else 8 if out_dtype == DType.INT8 else 16
-            clamped = int(np.clip(value, -32768, 32767))
-            return int(ppu_hard_sigmoid(clamped, shift=int(shift), p_out=p_out))
+            return _clip_for_dtype(
+                ppu_hard_sigmoid(value, shift=int(h_gelu_x_scale_shift), p_out=p_out),
+                out_dtype,
+            )
         elif activation == "h_gelu":
-            clamped = int(np.clip(value, -32768, 32767))
-            value = self.h_gelu(clamped, x_scale_shift=int(h_gelu_x_scale_shift))
-        if out_dtype == DType.INT4:
-            return int(np.clip(value, -8, 7))
-        if out_dtype == DType.INT8:
-            return int(np.clip(value, -128, 127))
-        return int(np.clip(value, -32768, 32767))
+            value = self.h_gelu(value, x_scale_shift=int(h_gelu_x_scale_shift))
+        return _clip_for_dtype(value, out_dtype)

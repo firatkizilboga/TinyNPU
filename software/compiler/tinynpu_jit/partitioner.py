@@ -1205,10 +1205,19 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                     current_ops
                     and current_ops[-1].out == source
                     and current_ops[-1].activation == "none"
-                    and supports_fused_activation(activation_kind, shift=current_ops[-1].shift)
+                    and supports_fused_activation(
+                        activation_kind,
+                        shift=current_ops[-1].shift,
+                        h_gelu_x_scale_shift=int(
+                            tensors[source].metadata.get(
+                                "h_gelu_x_scale_shift",
+                                current_ops[-1].h_gelu_x_scale_shift,
+                            )
+                        ),
+                    )
                 ):
                     matmul_op = current_ops[-1]
-                    if activation_kind == "h_gelu":
+                    if activation_kind in {"h_gelu", "sigmoid"}:
                         matmul_op.h_gelu_x_scale_shift = int(
                             tensors[source].metadata.get("h_gelu_x_scale_shift", matmul_op.h_gelu_x_scale_shift)
                         )
@@ -1261,10 +1270,19 @@ def partition_fx_graph(graph_module: Any, example_inputs: tuple[Any, ...], verif
                 current_ops
                 and current_ops[-1].out == source
                 and current_ops[-1].activation == "none"
-                and supports_fused_activation(activation_kind, shift=current_ops[-1].shift)
+                and supports_fused_activation(
+                    activation_kind,
+                    shift=current_ops[-1].shift,
+                    h_gelu_x_scale_shift=int(
+                        tensors[source].metadata.get(
+                            "h_gelu_x_scale_shift",
+                            current_ops[-1].h_gelu_x_scale_shift,
+                        )
+                    ),
+                )
             ):
                 matmul_op = current_ops[-1]
-                if activation_kind == "h_gelu":
+                if activation_kind in {"h_gelu", "sigmoid"}:
                     matmul_op.h_gelu_x_scale_shift = int(
                         tensors[source].metadata.get("h_gelu_x_scale_shift", matmul_op.h_gelu_x_scale_shift)
                     )

@@ -2368,6 +2368,25 @@ static int32_t host_di_sigmoid(int32_t x_in, int32_t m_i, int32_t k_i, int32_t p
     return host_int_div_prob(numer, exp_zero + exp_term, p_out);
 }
 
+static int32_t host_hard_sigmoid_i32(int32_t x_in, int32_t x_scale_shift, int32_t p_out)
+{
+    runtime_assert(x_scale_shift >= 0, "sigmoid scale shift must be non-negative");
+    runtime_assert(x_scale_shift <= 29, "sigmoid scale shift too large for activation datapath");
+    runtime_assert(p_out > 0, "probability width must be positive");
+    const int64_t bound = ((int64_t)8) << x_scale_shift;
+    const int64_t qmax = (((int64_t)1) << (p_out - 1)) - 1;
+    int64_t numer = 0;
+    if ((int64_t)x_in <= -bound) {
+        numer = 0;
+    } else if ((int64_t)x_in >= bound) {
+        numer = qmax << (x_scale_shift + 4);
+    } else {
+        numer = ((int64_t)x_in + bound) * qmax;
+    }
+    numer += ((int64_t)1) << (x_scale_shift + 3);
+    return (int32_t)(numer >> (x_scale_shift + 4));
+}
+
 static int32_t host_h_gelu_i32(int32_t x_in, int32_t x_scale_shift)
 {
     runtime_assert(x_scale_shift >= 0, "h_gelu scale shift must be non-negative");
@@ -2413,7 +2432,7 @@ static int32_t host_apply_ppu(
     } else if (activation == HOST_ACT_SIGMOID) {
         int32_t p_out = out_dtype == TINY_DTYPE_INT4 ? 4 : out_dtype == TINY_DTYPE_INT8 ? 8 : 16;
         int32_t clamped = clip_for_output_dtype(requantized, TINY_DTYPE_INT16);
-        return host_di_sigmoid(clamped, multiplier, shift, p_out, 1);
+        return host_hard_sigmoid_i32(clamped, h_gelu_x_scale_shift, p_out);
     } else if (activation == HOST_ACT_H_GELU) {
         int32_t clamped = clip_for_output_dtype(requantized, TINY_DTYPE_INT16);
         requantized = host_h_gelu_i32(clamped, h_gelu_x_scale_shift);
