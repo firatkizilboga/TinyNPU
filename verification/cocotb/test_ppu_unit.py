@@ -50,20 +50,16 @@ def _ppu_rescale(acc, *, multiplier=1, shift=0, bias=0):
 
 def _ppu_sigmoid(value, *, shift, precision=2):
     p_out = 4 if precision == 0 else 8 if precision == 1 else 16
-    bound = 8 << int(shift) if shift <= 29 else 0
     qmax = (1 << (p_out - 1)) - 1
-    if bound <= 0 or qmax <= 0 or value <= -bound:
-        numer = 0
-    elif value >= bound:
-        numer = qmax << (int(shift) + 4)
-    else:
-        numer = (int(value) + bound) * qmax
-
-    if (int(shift) + 4) < 63:
-        numer += 1 << (int(shift) + 3)
-    else:
-        numer = 0
-    return _clip_i16(numer >> (int(shift) + 4))
+    scale = 1 << int(shift) if shift <= 15 else 0
+    if scale <= 0 or qmax <= 0:
+        return 0
+    gate = ((int(value) * 218 + 64) >> 7) + (3 * scale)
+    gate = min(max(gate, 0), 6 * scale)
+    div6 = ((qmax * gate * 10923) + (1 << 15)) >> 16
+    if shift > 0:
+        div6 = (div6 + (1 << (int(shift) - 1))) >> int(shift)
+    return _clip_i16(div6)
 
 
 def _ppu_h_gelu(value, *, x_scale_shift=7):

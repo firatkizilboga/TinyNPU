@@ -44,15 +44,14 @@ def _round_shift_signed(value: np.ndarray, shift: int) -> np.ndarray:
 
 
 def ppu_hard_sigmoid(x: np.ndarray, *, shift: int) -> np.ndarray:
-    bound = 8 << int(shift)
-    numer = np.zeros_like(x, dtype=np.int64)
-    below = x <= -bound
-    above = x >= bound
-    middle = ~(below | above)
-    numer[above] = QMAX << (shift + 4)
-    numer[middle] = (x[middle].astype(np.int64) + bound) * QMAX
-    numer += 1 << (shift + 3)
-    y_int = numer >> (shift + 4)
+    scale = 1 << int(shift)
+    gate = ((x.astype(np.int64) * 218 + 64) >> 7) + (3 * scale)
+    gate = np.clip(gate, 0, 6 * scale)
+    div6 = ((QMAX * gate * 10923) + (1 << 15)) >> 16
+    if shift > 0:
+        y_int = (div6 + (1 << (shift - 1))) >> shift
+    else:
+        y_int = div6
     return np.clip(y_int.astype(np.float64) / QMAX, 0.0, 1.0)
 
 

@@ -646,8 +646,8 @@ def test_compile_plan_fuses_layout_restore_sigmoid_dequantize_tail():
 
 
 def test_fused_sigmoid_shift_contract_matches_ppu():
-    assert supports_fused_activation("sigmoid", shift=29)
-    assert not supports_fused_activation("sigmoid", shift=30)
+    assert supports_fused_activation("sigmoid", shift=15)
+    assert not supports_fused_activation("sigmoid", shift=16)
     assert supports_fused_activation("sigmoid", shift=36, h_gelu_x_scale_shift=10)
     assert supports_fused_activation("h_gelu", shift=30)
     assert supports_fused_activation(None, shift=30)
@@ -661,10 +661,10 @@ def test_fused_sigmoid_uses_activation_scale_shift():
         multiplier=1,
         shift=0,
         activation="sigmoid",
-        h_gelu_x_scale_shift=10,
+        h_gelu_x_scale_shift=12,
         out_dtype=DType.INT16,
     )
-    assert int(out[0, 0]) == 9050
+    assert int(out[0, 0]) == 8057
 
 
 def test_emit_v2_keeps_npu_intermediate_resident_between_segments():

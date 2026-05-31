@@ -9,11 +9,9 @@ import numpy as np
 from tinynpu.isa import PrecisionMode
 from tinynpu.packer import Packer
 
-# RTL PPU sigmoid supports INT16 qmax << (activation_shift + 4) in a 48-bit
-# activation datapath. The activation-domain shift is encoded in the existing
-# h_gelu_x_scale_shift field so large matmul requantization shifts can still
-# use fused sigmoid.
-MAX_FUSED_SIGMOID_SHIFT = 29
+# RTL PPU sigmoid reuses the hard-GELU clipped gate, so it follows the same
+# bounded activation-domain shift encoded in h_gelu_x_scale_shift.
+MAX_FUSED_SIGMOID_SHIFT = 15
 
 
 def supports_fused_activation(

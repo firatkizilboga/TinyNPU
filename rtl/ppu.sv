@@ -95,7 +95,6 @@ module ppu (
   logic [15:0] quantized_s9[`ARRAY_SIZE-1:0];
   logic [15:0] quantized_w_s9[`ARRAY_SIZE-1:0];
   logic signed [PPU_PRODUCT_WIDTH:0] shifted_wide_s3[`ARRAY_SIZE-1:0];
-  logic signed [PPU_ACT_WIDTH-1:0] sigmoid_bound_s4;
   logic signed [PPU_ACT_WIDTH-1:0] sigmoid_qmax_s4;
 
   function automatic logic [PPU_SHIFT_WIDTH-1:0] ppu_effective_shift(input logic [7:0] raw_shift);
@@ -133,8 +132,6 @@ module ppu (
       default:    sigmoid_qmax_s4 = PPU_ACT_WIDTH'(32767);
     endcase
   end
-
-  assign sigmoid_bound_s4 = sigmoid_shift_valid_s4 ? (PPU_ACT_WIDTH'(8) <<< sigmoid_shift_s4) : '0;
 
   always_comb begin
     for (int i = 0; i < `ARRAY_SIZE; i++) begin
@@ -321,10 +318,9 @@ module ppu (
         row_we_s0 <= `ARRAY_SIZE'(1) << ((`ARRAY_SIZE - 1) - ppu_cycle_idx);
         shift_s0 <= ppu_effective_shift(shift);
         sigmoid_shift_s0 <= ppu_effective_sigmoid_shift(h_gelu_x_scale_shift);
-        // Sigmoid uses the activation-domain shift field, not the matmul
-        // requantization shift. This keeps calibrated large requant shifts
-        // legal without widening the activation datapath or adding a stage.
-        sigmoid_shift_valid_s0 <= (h_gelu_x_scale_shift <= 8'd29);
+        // Sigmoid now reuses the hard-GELU clipped gate, so it follows the
+        // same bounded activation-domain shift contract.
+        sigmoid_shift_valid_s0 <= (h_gelu_x_scale_shift <= 8'd15);
         activation_s0 <= activation;
         h_gelu_x_scale_shift_s0 <= ppu_effective_h_gelu_shift(h_gelu_x_scale_shift);
         precision_s0 <= precision;
@@ -424,12 +420,10 @@ module ppu (
         unique case (activation_s4)
           8'd1: sigmoid_numer_s5[i] <= '0;
           8'd2: begin
-            if (!sigmoid_shift_valid_s4 || sigmoid_bound_s4 <= 0 || sigmoid_qmax_s4 <= 0 || x_ext <= -sigmoid_bound_s4) begin
+            if (!sigmoid_shift_valid_s4 || sigmoid_qmax_s4 <= 0) begin
               sigmoid_numer_s5[i] <= '0;
-            end else if (x_ext >= sigmoid_bound_s4) begin
-              sigmoid_numer_s5[i] <= sigmoid_qmax_s4 <<< (sigmoid_shift_s4 + 5'd4);
             end else begin
-              sigmoid_numer_s5[i] <= (x_ext + sigmoid_bound_s4) * sigmoid_qmax_s4;
+              sigmoid_numer_s5[i] <= sigmoid_qmax_s4 * gate;
             end
           end
           default: sigmoid_numer_s5[i] <= '0;
@@ -446,11 +440,7 @@ module ppu (
       for (int i = 0; i < `ARRAY_SIZE; i++) begin
         act_passthrough_s6[i] <= act_passthrough_s5[i];
         act_x_s6[i] <= act_x_s5[i];
-        if (sigmoid_shift_valid_s5) begin
-          sigmoid_rounded_s6[i] <= sigmoid_numer_s5[i] + (PPU_ACT_WIDTH'(1) <<< (sigmoid_shift_s5 + 5'd3));
-        end else begin
-          sigmoid_rounded_s6[i] <= '0;
-        end
+        sigmoid_rounded_s6[i] <= sigmoid_shift_valid_s5 ? sigmoid_numer_s5[i] : '0;
         gelu_prod_s6[i] <= act_x_s5[i] * gelu_gate_s5[i];
       end
 
@@ -463,7 +453,7 @@ module ppu (
       precision_s7 <= precision_s6;
       for (int i = 0; i < `ARRAY_SIZE; i++) begin
         act_passthrough_s7[i] <= act_passthrough_s6[i];
-        sigmoid_rounded_s7[i] <= sigmoid_rounded_s6[i];
+        sigmoid_rounded_s7[i] <= (sigmoid_rounded_s6[i] * PPU_ACT_WIDTH'(10923) + (PPU_ACT_WIDTH'(1) <<< 15)) >>> 16;
         gelu_div6_s7[i] <= (gelu_prod_s6[i] * PPU_ACT_WIDTH'(10923) + (PPU_ACT_WIDTH'(1) <<< 15)) >>> 16;
       end
 
@@ -484,7 +474,13 @@ module ppu (
           8'd1: activated_s8[i] <= (act_passthrough_s7[i] < 0) ? '0 : act_passthrough_s7[i];
           8'd2: begin
             logic signed [PPU_ACT_WIDTH-1:0] sigmoid_out;
-            sigmoid_out = sigmoid_shift_valid_s7 ? (sigmoid_rounded_s7[i] >>> (sigmoid_shift_s7 + 5'd4)) : '0;
+            if (!sigmoid_shift_valid_s7) begin
+              sigmoid_out = '0;
+            end else if (sigmoid_shift_s7 == '0) begin
+              sigmoid_out = sigmoid_rounded_s7[i];
+            end else begin
+              sigmoid_out = (sigmoid_rounded_s7[i] + (PPU_ACT_WIDTH'(1) <<< (sigmoid_shift_s7 - 1'b1))) >>> sigmoid_shift_s7;
+            end
             if (sigmoid_out > PPU_ACT_WIDTH'(32767)) activated_s8[i] <= 16'sd32767;
             else if (sigmoid_out < -PPU_ACT_WIDTH'(32768)) activated_s8[i] <= -16'sd32768;
             else activated_s8[i] <= sigmoid_out[15:0];

@@ -62,16 +62,19 @@ def ppu_hard_sigmoid(x_in: int, *, shift: int, p_out: int) -> int:
         raise ValueError(f"p_out must be positive, got {p_out}.")
     if shift < 0:
         raise ValueError(f"shift must be non-negative, got {shift}.")
-    bound = 8 << int(shift) if int(shift) <= 29 else 0
+    effective_shift = min(int(shift), 15)
+    scale = 1 << effective_shift
     qmax = (1 << (int(p_out) - 1)) - 1
-    if bound <= 0 or qmax <= 0 or x_in <= -bound:
-        numer = 0
-    elif x_in >= bound:
-        numer = qmax << (int(shift) + 4)
-    else:
-        numer = (int(x_in) + bound) * qmax
-    numer += 1 << (int(shift) + 3)
-    return int(numer >> (int(shift) + 4))
+    if qmax <= 0:
+        return 0
+    x_ext = _clip_signed(int(x_in), 16)
+    gate_int = _rtl_round_shift_positive(x_ext * 218, 7) + 3 * scale
+    gate_int = min(max(gate_int, 0), 6 * scale)
+
+    # Standalone sigmoid uses the same clipped gate as hard-GELU, normalized
+    # directly into the selected output precision instead of multiplying by x.
+    div6 = _rtl_round_shift_positive(qmax * gate_int * 10923, 16)
+    return int((div6 + (1 << (effective_shift - 1))) >> effective_shift) if effective_shift > 0 else int(div6)
 
 
 def _round_shift_signed(value: int, shift: int) -> int:

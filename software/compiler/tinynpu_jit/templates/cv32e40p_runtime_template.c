@@ -2371,20 +2371,24 @@ static int32_t host_di_sigmoid(int32_t x_in, int32_t m_i, int32_t k_i, int32_t p
 static int32_t host_hard_sigmoid_i32(int32_t x_in, int32_t x_scale_shift, int32_t p_out)
 {
     runtime_assert(x_scale_shift >= 0, "sigmoid scale shift must be non-negative");
-    runtime_assert(x_scale_shift <= 29, "sigmoid scale shift too large for activation datapath");
+    runtime_assert(x_scale_shift <= 15, "sigmoid scale shift too large for hard-gelu gate");
     runtime_assert(p_out > 0, "probability width must be positive");
-    const int64_t bound = ((int64_t)8) << x_scale_shift;
     const int64_t qmax = (((int64_t)1) << (p_out - 1)) - 1;
-    int64_t numer = 0;
-    if ((int64_t)x_in <= -bound) {
-        numer = 0;
-    } else if ((int64_t)x_in >= bound) {
-        numer = qmax << (x_scale_shift + 4);
-    } else {
-        numer = ((int64_t)x_in + bound) * qmax;
+    const int64_t scale = ((int64_t)1) << x_scale_shift;
+    const int64_t six_scale = 6 * scale;
+    int64_t gate = ((((int64_t)x_in * 218) + 64) >> 7) + (3 * scale);
+    if (gate < 0) {
+        gate = 0;
     }
-    numer += ((int64_t)1) << (x_scale_shift + 3);
-    return (int32_t)(numer >> (x_scale_shift + 4));
+    if (gate > six_scale) {
+        gate = six_scale;
+    }
+
+    int64_t div6 = (((qmax * gate) * 10923) + (((int64_t)1) << 15)) >> 16;
+    if (x_scale_shift > 0) {
+        div6 = (div6 + (((int64_t)1) << (x_scale_shift - 1))) >> x_scale_shift;
+    }
+    return (int32_t)div6;
 }
 
 static int32_t host_h_gelu_i32(int32_t x_in, int32_t x_scale_shift)
