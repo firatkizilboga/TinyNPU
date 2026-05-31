@@ -462,59 +462,57 @@ To verify and benchmark the hardware with non-random inputs, MNIST is used to tr
 \end{table}
 
 The small drop from FP32 to INT4 shows that these MNIST \texttt{is\_zero} models are useful hardware test cases but weak precision-stress tests. The task is binary, the networks have enough capacity for it, and the activation ranges are well behaved after calibration. As a result, INT4 remains close to FP32 accuracy, so Table~\ref{tab:trained-ptq-accuracy} should be read as a correctness and compilation check rather than as evidence that INT4 is generally safe.
+The unchanged INT16 metrics in these small examples should not be read as zero numerical error; they mean that the quantization error was not large enough to change the reported classification metrics.
+This is consistent with the usual engineering target for quantized inference: with an appropriate calibration, PTQ, or QAT policy, a model should often remain within roughly one to two accuracy points of its floating-point reference. More complex models should therefore use stronger quantization schemes and per-layer policy selection rather than assuming that the simple symmetric scaling used in these toy examples will always be sufficient \cite{kim2021ibert,xiao2023smoothquant}.
 
-To make the accuracy/speed tradeoff visible, a second experiment trains harder 10-class MNIST MLPs at \(1\times\), \(2\times\), and \(4\times\) width. Each model is evaluated under uniform PTQ, greedy mixed precision, and short QAT fine-tuning. Table~\ref{tab:mnist-speed-quality} reports both accuracy and macro-F1, where macro-F1 is the unweighted average F1 score across the ten digit classes. The speed column is an estimated resident-kernel speedup relative to the same model in INT16, using the measured TinyNPU kernel throughputs from the GEMM run-window experiments. It is not an additional end-to-end RTL timing measurement; it uses the measured accelerator precision scaling to connect model quality to expected dense-kernel cost.
+To make the quantization-quality tradeoff visible, a second experiment trains harder 10-class MNIST MLPs at \(1\times\), \(2\times\), and \(4\times\) width. Each model is evaluated under uniform PTQ, greedy mixed precision, and short QAT fine-tuning. Table~\ref{tab:mnist-speed-quality} reports macro-F1, the unweighted average F1 score across the ten digit classes. The table is intentionally limited to model quality and layer assignment; measured accelerator speed is reported separately in the evaluation chapter.
 
 \begin{table}[H]
     \centering
     \footnotesize
-    \caption{10-class MNIST scaled-MLP speed/quality sweep. Accuracy and macro-F1 are measured on the full MNIST test set at 8x8 input resolution. Kernel speedup is estimated from measured resident TinyNPU GEMM throughput and normalized to the same model in INT16.}
+    \caption{10-class MNIST scaled-MLP quantization-quality sweep. Macro-F1 is measured on the full MNIST test set at 8x8 input resolution.}
     \label{tab:mnist-speed-quality}
     \resizebox{\textwidth}{!}{%
-    \begin{tabular}{|l|l|r|r|r|r|l|}
+    \begin{tabular}{|l|l|r|r|l|}
         \hline
-        \textbf{Model} & \textbf{Config} & \textbf{Accuracy} & \makecell{\textbf{Macro}\\\textbf{F1}} & \makecell{\textbf{F1 drop}\\\textbf{vs. FP32}} & \makecell{\textbf{Kernel}\\\textbf{speedup}} & \textbf{Layer assignment} \\
+        \textbf{Model} & \textbf{Config} & \makecell{\textbf{Macro}\\\textbf{F1}} & \makecell{\textbf{F1 drop}\\\textbf{vs. FP32}} & \textbf{Layer assignment} \\
         \hline
-        MLP \(1\times\) h64 & INT16 PTQ & 83.31\% & 83.09\% & 0.01\% & \(1.00\times\) & all INT16 \\
+        MLP \(1\times\) h64 & INT16 PTQ & 84.36\% & 0.00\% & all INT16 \\
         \hline
-        MLP \(1\times\) h64 & INT8 PTQ & 83.32\% & 83.10\% & -0.01\% & \(2.00\times\) & all INT8 \\
+        MLP \(1\times\) h64 & INT8 PTQ & 84.30\% & 0.07\% & all INT8 \\
         \hline
-        MLP \(1\times\) h64 & INT4 PTQ & 79.93\% & 79.67\% & 3.43\% & \(3.98\times\) & all INT4 \\
+        MLP \(1\times\) h64 & INT4 PTQ & 82.08\% & 2.29\% & all INT4 \\
         \hline
-        MLP \(1\times\) h64 & Mixed PTQ & 82.11\% & 81.85\% & 1.24\% & \(2.92\times\) & fc1/fc3 INT4, fc2/fc4 INT8 \\
+        MLP \(1\times\) h64 & Mixed PTQ & 83.16\% & 1.20\% & fc1/fc4 INT8, fc2/fc3 INT4 \\
         \hline
-        MLP \(1\times\) h64 & INT4 QAT & 81.87\% & 81.59\% & 1.51\% & \(3.98\times\) & all INT4 \\
+        MLP \(1\times\) h64 & INT4 QAT & 82.08\% & 2.29\% & all INT4 \\
         \hline
-        MLP \(1\times\) h64 & Mixed QAT & 83.35\% & 83.12\% & -0.02\% & \(2.92\times\) & fc1/fc3 INT4, fc2/fc4 INT8 \\
+        MLP \(1\times\) h64 & Mixed QAT & 83.51\% & 0.85\% & fc1/fc4 INT8, fc2/fc3 INT4 \\
         \hline
-        MLP \(2\times\) h128 & INT16 PTQ & 86.94\% & 86.74\% & 0.00\% & \(1.00\times\) & all INT16 \\
+        MLP \(2\times\) h128 & INT16 PTQ & 86.92\% & 0.00\% & all INT16 \\
         \hline
-        MLP \(2\times\) h128 & INT8 PTQ & 87.01\% & 86.82\% & -0.07\% & \(2.00\times\) & all INT8 \\
+        MLP \(2\times\) h128 & INT8 PTQ & 86.96\% & -0.04\% & all INT8 \\
         \hline
-        MLP \(2\times\) h128 & INT4 PTQ & 84.94\% & 84.72\% & 2.02\% & \(3.98\times\) & all INT4 \\
+        MLP \(2\times\) h128 & INT4 PTQ & 84.21\% & 2.71\% & all INT4 \\
         \hline
-        MLP \(2\times\) h128 & Mixed PTQ & 86.12\% & 85.91\% & 0.83\% & \(3.26\times\) & fc1/fc4 INT8, fc2/fc3 INT4 \\
+        MLP \(2\times\) h128 & Mixed PTQ & 86.16\% & 0.76\% & fc1/fc4 INT8, fc2/fc3 INT4 \\
         \hline
-        MLP \(2\times\) h128 & INT4 QAT & 86.23\% & 86.06\% & 0.69\% & \(3.98\times\) & all INT4 \\
+        MLP \(2\times\) h128 & INT4 QAT & 86.13\% & 0.79\% & all INT4 \\
         \hline
-        MLP \(2\times\) h128 & Mixed QAT & 86.93\% & 86.74\% & 0.01\% & \(3.26\times\) & fc1/fc4 INT8, fc2/fc3 INT4 \\
+        MLP \(2\times\) h128 & Mixed QAT & 87.42\% & -0.50\% & fc1/fc4 INT8, fc2/fc3 INT4 \\
         \hline
-        MLP \(4\times\) h256 & INT16 PTQ & 90.67\% & 90.52\% & 0.00\% & \(1.00\times\) & all INT16 \\
+        MLP \(4\times\) h256 & INT16 PTQ & 90.37\% & 0.00\% & all INT16 \\
         \hline
-        MLP \(4\times\) h256 & INT8 PTQ & 90.75\% & 90.60\% & -0.08\% & \(2.00\times\) & all INT8 \\
+        MLP \(4\times\) h256 & INT8 PTQ & 90.30\% & 0.06\% & all INT8 \\
         \hline
-        MLP \(4\times\) h256 & INT4 PTQ & 88.72\% & 88.50\% & 2.01\% & \(3.98\times\) & all INT4 \\
+        MLP \(4\times\) h256 & INT4 PTQ & 89.01\% & 1.36\% & all INT4 \\
         \hline
-        MLP \(4\times\) h256 & Mixed PTQ & 89.26\% & 89.07\% & 1.44\% & \(3.92\times\) & fc1/fc2/fc3 INT4, fc4 INT8 \\
-        \hline
-        MLP \(4\times\) h256 & INT4 QAT & 90.12\% & 90.01\% & 0.51\% & \(3.98\times\) & all INT4 \\
-        \hline
-        MLP \(4\times\) h256 & Mixed QAT & 90.16\% & 90.06\% & 0.46\% & \(3.92\times\) & fc1/fc2/fc3 INT4, fc4 INT8 \\
+        MLP \(4\times\) h256 & INT4 QAT & 90.47\% & -0.10\% & all INT4 \\
         \hline
     \end{tabular}}
 \end{table}
 
-The sweep shows the role of the mixed-precision stack more clearly than the binary \texttt{is\_zero} case. Uniform INT8 is effectively lossless in these runs and gives the expected \(2\times\) dense-kernel speed estimate. Uniform INT4 gives almost \(4\times\) estimated dense-kernel speed but loses 2.01--3.43 macro-F1 points with PTQ. The smallest h64 model is the most sensitive because it has fewer redundant hidden dimensions to absorb quantization noise. QAT recovers most of the INT4 loss without changing the hardware cost: INT4 QAT reduces the macro-F1 drop to 0.51--1.51 points. The mixed rows show the compiler-facing policy that the hardware is meant to support: keep sensitive layers wider, push tolerant layers to INT4, and trade a small amount of quality for most of the INT4 speed benefit.
+The sweep shows the role of the mixed-precision stack more clearly than the binary \texttt{is\_zero} case. Uniform INT8 is effectively lossless in these runs. Uniform INT4 is more aggressive and loses 1.36--2.71 macro-F1 points with PTQ. The wider h256 model absorbs more INT4 noise than the h64 and h128 models, which is consistent with the intuition that extra hidden dimensions provide more redundancy. In that case the greedy precision selector chooses all INT4, so no separate mixed row is reported. QAT recovers most of the INT4 loss for the larger models; the h64 all-INT4 QAT row remains weak, but the mixed h64 row improves when sensitive layers are kept at INT8. The mixed rows show the compiler-facing policy that the hardware is meant to support: keep sensitive layers wider and push tolerant layers to INT4.
 
 \begin{figure}[H]
     \centering
@@ -654,6 +652,8 @@ Figure~\ref{fig:runtime-state} shows this firmware loop. For accelerator segment
 
 \subsubsection{Transformer Block Execution}
 The transformer experiments use reduced-dimensional decoder blocks rather than full pretrained language models. Their purpose is to stress the compiler/runtime boundary on attention-shaped workloads: normalization, attention score formation, softmax, key/value cache handling, residual connections, and feed-forward sublayers. These blocks are therefore structural tests of the system contract, not language-quality benchmarks.
+
+Their quantization configuration is selected conservatively. The reduced GPT-2-like and Llama-like scaling runs use INT16 for accelerator matmuls, a fixed shared activation scale of \(1/32\) for the integer tensor boundaries, and a fixed attention-probability scale of \(1/256\) for the probability-times-value matmul. These constants are hand-selected experiment parameters, not the output of a quantization search. This keeps the experiment focused on execution structure rather than on a learned bit-allocation policy. For the trained TinyLM run, the export flow instead records calibrated activation scales at transformer boundaries: calibration text is passed through the model, each observed boundary uses a high-percentile absolute range divided by the INT16 range, and the resulting scales are used to derive per-matmul multiplier/shift pairs from the observed input scale, weight scale, and chosen output scale. In both cases, the compiler consumes the supplied configuration and validates that the resulting multiplier and shift values are legal for the PPU; it does not infer an optimal transformer quantization scheme automatically.
 
 The Llama-like block uses RMSNorm, grouped-query attention, scalar RoPE on Q/K, an attention output projection, and a SwiGLU feed-forward tail. Dense projections are lowered to INT16 accelerator matmuls: Q/K/V projection, QK score matmul, probability-times-value matmul, attention output projection, gate/up projections, and down projection. The core handles the non-matrix pieces: RMSNorm, RoPE, softmax, residual adds, SiLU, elementwise feed-forward multiplication, and the quantize/dequantize boundaries around those operations.
 
